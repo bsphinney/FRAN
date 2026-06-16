@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FRAN · Fragment Reference & ANnotation — a live DIA proteomics corpus</title>
+  <meta name="description" content="FRAN is a live, read-only browser onto a growing DIA mass-spectrometry proteomics corpus: peptides, proteins, genes, MS2 spectra, XIC chromatograms, ion mobility, and predicted fragment intensities & flyability." />
+  <meta property="og:title" content="FRAN — Fragment Reference & ANnotation" />
+  <meta property="og:description" content="A live, DIA-only proteomics corpus browser: spectra, XICs, ion mobility, predicted flyability." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: {
+      ink: { 950:'#01122b', 900:'#022851', 800:'#0a3a70', 700:'#14497f' },
+      accent: { DEFAULT:'#FFBF00', 400:'#FFCF40' }, teal:{ DEFAULT:'#00B5E2' } },
+      fontFamily: { sans:['Inter','ui-sans-serif','system-ui','sans-serif'] } } } }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    body{background:radial-gradient(1200px 600px at 80% -10%,rgba(255,191,0,.10),transparent 60%),radial-gradient(900px 500px at -10% 10%,rgba(0,181,226,.09),transparent 55%),#01142e;color:#e2e8f0}
+    .glass{background:rgba(3,32,63,.55);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.07)}
+    .glow{box-shadow:0 0 0 1px rgba(255,191,0,.18),0 12px 50px -10px rgba(255,191,0,.35)}
+  </style>
+</head>
+<body class="font-sans antialiased">
+  <header class="max-w-6xl mx-auto px-6 py-5 flex items-center gap-3">
+    <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent to-teal grid place-items-center glow">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#022851" stroke-width="2.2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+    </div>
+    <div class="font-extrabold text-white tracking-tight text-lg"><span class="text-accent-400">FRAN</span></div>
+    <div class="text-[11px] uppercase tracking-[.2em] text-slate-400 hidden sm:block">Fragment Reference &amp; ANnotation</div>
+    <nav class="ml-auto flex items-center gap-4 text-sm">
+      <a href="#features" class="text-slate-300 hover:text-white">Features</a>
+      <a href="https://github.com/bsphinney/FRAN" class="text-slate-300 hover:text-white">GitHub</a>
+      <a href="https://huggingface.co/spaces/brettsp/delimp-corpus-browser" class="px-3 py-1.5 rounded-lg bg-accent text-ink-900 font-semibold hover:bg-accent-400">Open app ↗</a>
+    </nav>
+  </header>
+
+  <!-- hero -->
+  <section class="max-w-6xl mx-auto px-6 pt-10 pb-14 text-center">
+    <div class="inline-flex items-center gap-2 text-[11px] uppercase tracking-wider text-teal bg-teal/10 border border-teal/20 rounded-full px-3 py-1 mb-6">DIA, not DDA · live corpus</div>
+    <h1 class="text-4xl sm:text-6xl font-extrabold text-white tracking-tight leading-[1.05]">
+      A living reference of<br><span class="text-accent-400">DIA mass-spec</span> peptides &amp; spectra
+    </h1>
+    <p class="mt-6 max-w-2xl mx-auto text-slate-300 text-lg">
+      FRAN is a read-only window onto a growing data-independent-acquisition proteomics corpus —
+      browse by <b class="text-white">peptide, protein, gene, organism, or run</b> and see real
+      MS2 spectra, XIC chromatograms, ion mobility, and ML-predicted fragment intensities &amp; flyability.
+    </p>
+    <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
+      <a href="https://huggingface.co/spaces/brettsp/delimp-corpus-browser" class="px-6 py-3 rounded-xl bg-accent text-ink-900 font-bold text-lg hover:bg-accent-400 glow">Explore the corpus →</a>
+      <a href="https://github.com/bsphinney/FRAN" class="px-6 py-3 rounded-xl glass text-white font-semibold hover:border-white/20">View source</a>
+    </div>
+    <div class="mt-12 glass rounded-2xl p-2 max-w-4xl mx-auto">
+      <img src="screenshot_dashboard.png" alt="FRAN dashboard" class="rounded-xl w-full" />
+    </div>
+  </section>
+
+  <!-- what makes it different -->
+  <section class="max-w-6xl mx-auto px-6 py-8">
+    <div class="glass rounded-2xl p-7 sm:p-9">
+      <h2 class="text-2xl font-bold text-white">Why DIA?</h2>
+      <p class="mt-3 text-slate-300 max-w-3xl">
+        Public peptide repositories are built on DDA. FRAN is deliberately <b class="text-white">DIA-only</b>,
+        which lets it carry things DDA archives can't: <b class="text-teal">cross-run indexed retention time (iRT)</b>,
+        the <b class="text-teal">ion-mobility (1/K₀)</b> dimension, and the full <b class="text-teal">fragment &amp; chromatogram</b>
+        data behind every quantification — kept for reuse, QC, and AI training.
+      </p>
+    </div>
+  </section>
+
+  <!-- features -->
+  <section id="features" class="max-w-6xl mx-auto px-6 py-8 grid md:grid-cols-3 gap-5">
+    <div class="glass rounded-2xl p-6">
+      <div class="text-2xl mb-2">🧬</div><h3 class="font-bold text-white">Peptide &amp; precursor</h3>
+      <p class="mt-2 text-sm text-slate-300">Modified forms × charge, per-run RT / 1/K₀ / m/z / q-value / intensity, and a plain-language summary of what the peptide's proteins do.</p>
+    </div>
+    <div class="glass rounded-2xl p-6">
+      <div class="text-2xl mb-2">📈</div><h3 class="font-bold text-white">Real spectra &amp; XICs</h3>
+      <p class="mt-2 text-sm text-slate-300">Dual-pane chromatograms (MS1 + quant fragments) and predicted-vs-acquired mirror spectra from Koina (Prosit, AlphaPeptDeep, ms2pip).</p>
+    </div>
+    <div class="glass rounded-2xl p-6">
+      <div class="text-2xl mb-2">🌀</div><h3 class="font-bold text-white">Ion mobility</h3>
+      <p class="mt-2 text-sm text-slate-300">An IM × iRT map across the whole corpus — the timsTOF dimension GPMDB never had — toggling to an iRT × peptide-count view.</p>
+    </div>
+    <div class="glass rounded-2xl p-6">
+      <div class="text-2xl mb-2">🪰</div><h3 class="font-bold text-white">Predicted flyability</h3>
+      <p class="mt-2 text-sm text-slate-300">Koina PFly scores how readily each peptide ionizes &amp; is detected, plotted against its observed intensity across the corpus.</p>
+    </div>
+    <div class="glass rounded-2xl p-6">
+      <div class="text-2xl mb-2">🔬</div><h3 class="font-bold text-white">Protein &amp; gene</h3>
+      <p class="mt-2 text-sm text-slate-300">Sequence-mapped coverage, per-search/run stats, organisms, and STRING interaction links.</p>
+    </div>
+    <div class="glass rounded-2xl p-6">
+      <div class="text-2xl mb-2">🔒</div><h3 class="font-bold text-white">Safe by design</h3>
+      <p class="mt-2 text-sm text-slate-300">Read-only sessions and a strict table allowlist: the public layer structurally cannot reach internal or customer data.</p>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="max-w-6xl mx-auto px-6 py-14 text-center">
+    <h2 class="text-3xl font-extrabold text-white">Browse the corpus live</h2>
+    <p class="mt-3 text-slate-300">Counts grow as new searches are ingested.</p>
+    <a href="https://huggingface.co/spaces/brettsp/delimp-corpus-browser" class="inline-block mt-6 px-7 py-3 rounded-xl bg-accent text-ink-900 font-bold text-lg hover:bg-accent-400 glow">Open FRAN →</a>
+  </section>
+
+  <footer class="max-w-6xl mx-auto px-6 py-10 border-t border-white/10 text-[12px] text-slate-400 flex flex-wrap gap-x-4 gap-y-2 items-center">
+    <span>FRAN · Fragment Reference &amp; ANnotation</span>
+    <a href="https://github.com/bsphinney/FRAN" class="hover:text-white">GitHub</a>
+    <a href="https://github.com/bsphinney/DE-LIMP" class="hover:text-white">DE-LIMP</a>
+    <span class="ml-auto">Part of the DE-LIMP proteomics project · UC Davis Proteomics Core</span>
+  </footer>
+</body>
+</html>

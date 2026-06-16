@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+*.token
+.pgfarm_token
+.DS_Store
+.venv/

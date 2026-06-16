@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FRAN · proteomics corpus</title>
+  <meta name="description" content="FRAN (Fragment Reference & ANnotation) — the DE-LIMP proteomics corpus: peptides, proteins, spectra, ion mobility." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: {
+        fontFamily: { sans: ['Inter','ui-sans-serif','system-ui','sans-serif'], mono: ['"JetBrains Mono"','ui-monospace','monospace'] },
+        colors: {
+          // UC Davis brand: Aggie Blue #022851 (primary) + Aggie Gold #FFBF00 (accent)
+          ink: { 950:'#01122b', 900:'#022851', 850:'#053063', 800:'#0a3a70', 700:'#14497f', 600:'#1f5a93' },
+          accent: { DEFAULT:'#FFBF00', 400:'#FFCF40', 500:'#FFBF00', 600:'#D99E00' },
+          teal: { DEFAULT:'#00B5E2' },   /* UCD secondary "Tahoe" */
+          plum: { DEFAULT:'#6FCFEB' },   /* UCD secondary "Rec Pool" */
+        },
+        boxShadow: { glow:'0 0 0 1px rgba(255,191,0,.18), 0 8px 40px -8px rgba(255,191,0,.35)' }
+      }}
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    html { scroll-behavior: smooth; }
+    body { background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(255,191,0,.09), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(0,181,226,.08), transparent 55%),
+      #01142e; }
+    html:not(.dark) body { background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(91,140,255,.10), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(45,212,191,.08), transparent 55%),
+      #f6f8fc; color:#0f1525; }
+    .glass { background: rgba(3,32,63,.6); backdrop-filter: blur(14px); border:1px solid rgba(255,255,255,.06); }
+    html:not(.dark) .glass { background: rgba(255,255,255,.75); border:1px solid rgba(15,21,37,.08); }
+    .card { border-radius: 18px; }
+    .kpi-num { font-variant-numeric: tabular-nums; letter-spacing:-.02em; }
+    .fade-in { animation: fade .5s ease both; }
+    @keyframes fade { from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none} }
+    .row-hover:hover { background: rgba(255,191,0,.09); }
+    ::-webkit-scrollbar{height:10px;width:10px}
+    ::-webkit-scrollbar-thumb{background:rgba(120,140,180,.3);border-radius:8px}
+    .spin{animation:sp 1s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
+    .skeleton{background:linear-gradient(90deg,rgba(120,140,180,.08),rgba(120,140,180,.18),rgba(120,140,180,.08));background-size:200% 100%;animation:sk 1.3s infinite}
+    @keyframes sk{to{background-position:-200% 0}}
+    .tab-active{color:#022851;font-weight:700;background:linear-gradient(180deg,#FFCF40,#FFBF00);box-shadow:0 6px 20px -6px rgba(255,191,0,.6)}
+    html:not(.dark) .tab-active{color:#fff}
+  </style>
+</head>
+<body class="font-sans text-slate-200 min-h-screen">
+
+  <!-- Top bar -->
+  <header class="sticky top-0 z-40 glass border-b border-white/5">
+    <div class="max-w-7xl mx-auto px-5 py-3 flex items-center gap-4">
+      <div class="flex items-center gap-3 cursor-pointer" onclick="go('dashboard')">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent to-plum grid place-items-center shadow-glow">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+        </div>
+        <div>
+          <div class="font-extrabold text-[15px] tracking-tight text-white"><span class="text-accent-400">FRAN</span> <span id="appVersion" class="text-[10px] font-semibold text-slate-500 align-middle"></span></div>
+          <div class="text-[10px] uppercase tracking-[.18em] text-slate-400/80">Fragment Reference &amp; ANnotation · proteomics corpus</div>
+        </div>
+      </div>
+
+      <nav class="hidden md:flex items-center gap-1 ml-4 text-sm" id="navtabs">
+        <button data-view="dashboard" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Dashboard</button>
+        <button data-view="searches" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Searches</button>
+        <button data-view="ionmobility" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Ion Mobility</button>
+        <button data-view="highlights" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Highlights</button>
+      </nav>
+
+      <div class="flex-1"></div>
+
+      <!-- global search -->
+      <div class="relative w-full max-w-md hidden sm:block">
+        <input id="globalSearch" placeholder="Search peptide, protein, or gene…"
+          class="w-full bg-ink-800/70 border border-white/10 rounded-xl px-4 py-2 pl-10 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50"
+          onkeydown="if(event.key==='Enter')doGlobalSearch()" />
+        <svg class="absolute left-3 top-2.5 text-slate-500" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </div>
+
+      <span id="liveDot" class="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-400">
+        <span class="w-2 h-2 rounded-full bg-slate-500"></span><span id="liveStatus">connecting…</span>
+      </span>
+
+      <button onclick="toggleTheme()" title="Toggle theme" class="p-2 rounded-lg hover:bg-white/5 text-slate-300">
+        <svg id="themeIcon" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      </button>
+
+      <!-- mobile hamburger (md:hidden) -->
+      <button onclick="toggleMobileMenu()" title="Menu" class="md:hidden p-2 rounded-lg hover:bg-white/5 text-slate-300">
+        <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+    </div>
+
+    <!-- mobile menu panel (md:hidden) -->
+    <div id="mobileMenu" class="md:hidden hidden border-t border-white/5 px-5 py-3 space-y-2">
+      <div class="relative">
+        <input id="globalSearchM" placeholder="Search peptide, protein, or gene…"
+          class="w-full bg-ink-800/70 border border-white/10 rounded-xl px-4 py-2.5 pl-10 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50"
+          onkeydown="if(event.key==='Enter')doGlobalSearch('globalSearchM')" />
+        <svg class="absolute left-3 top-3 text-slate-500" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </div>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <button onclick="go('dashboard');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Dashboard</button>
+        <button onclick="go('searches');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Searches</button>
+        <button onclick="go('ionmobility');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Ion Mobility</button>
+        <button onclick="go('highlights');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Highlights</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-5 py-6">
+    <div id="view"></div>
+  </main>
+
+  <footer class="max-w-7xl mx-auto px-5 py-8 text-[11px] text-slate-500 flex flex-wrap gap-x-4 gap-y-1 items-center border-t border-white/5 mt-8">
+    <span>FRAN · DE-LIMP proteomics corpus · read-only public layer</span>
+    <span id="footCounts" class="text-slate-600"></span>
+    <span class="ml-auto">Live PG Farm <code class="text-slate-400">delimp</code> · last updated <span id="lastUpdated">—</span></span>
+  </footer>
+
+  <script src="/static/app.js?v=__APP_VERSION__"></script>
+</body>
+</html>
