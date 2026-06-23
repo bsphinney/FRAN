@@ -46,15 +46,57 @@ fragment/XIC data kept for reuse and AI training.
 4. **Credentials via env / Space secrets** — never committed. See `README_HF.md` for the
    public-hosting credential decision (use a dedicated read-only role or a snapshot DB).
 
-## Run locally
+## Installation
+
+**Prerequisites:** Python 3.11+ (or Docker) and a PG Farm credential for the `delimp`
+corpus — a 7-day PG Farm token, or a dedicated read-only role (see *Security & governance*).
+Without a credential the app still starts and serves the UI, but shows a "database
+unavailable" state — there is no local database to create.
+
+### Option A — local (Python)
 ```bash
+git clone https://github.com/bsphinney/FRAN.git && cd FRAN
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-export DELIMP_PG_TOKEN_FILE=/path/to/.pgfarm_token   # or export DELIMP_PG_PASSWORD / DELIMP_PG_SECRET
+
+# provide the DB credential — pick ONE:
+export DELIMP_PG_TOKEN_FILE=/path/to/.pgfarm_token   # token in a file (recommended for dev)
+# export DELIMP_PG_PASSWORD=<pg-farm-token>          # or pass the token directly
+
 uvicorn app.main:app --reload --port 7860
+# open http://localhost:7860   •   health: curl -s localhost:7860/health
+```
+
+### Option B — Docker
+```bash
+docker build -t fran .
+docker run --rm -p 7860:7860 -e DELIMP_PG_PASSWORD="$(cat /path/to/.pgfarm_token)" fran
 # open http://localhost:7860
 ```
-Configuration env vars and the Hugging Face deploy notes are in **`README_HF.md`** and
-**`DEPLOY_HF.md`**.
+
+### Option C — with an AI agent
+Point your coding agent (Claude Code, Cursor, etc.) at **[`AGENTS.md`](AGENTS.md)** — a
+self-contained runbook that installs dependencies, wires the credential, launches the app,
+and verifies `/health`. Hand the agent your PG Farm token and let it drive.
+
+### Configuration (environment variables)
+| Var | Default | Notes |
+|-----|---------|-------|
+| `DELIMP_PG_HOST` | `pgfarm.library.ucdavis.edu` | |
+| `DELIMP_PG_PORT` | `5432` | |
+| `DELIMP_PG_DB` | `uc-davis-genome-center-proteomics-core/delimp` | |
+| `DELIMP_PG_USER` | `genome-proteomics-service-account` | |
+| `DELIMP_PG_SSLMODE` | `require` | not `verify-full` |
+| `DELIMP_PG_PASSWORD` / `DELIMP_PG_SECRET` | — | PG Farm token (set as an **HF Secret** when deployed) |
+| `DELIMP_PG_TOKEN_FILE` / `DELIMP_PG_SECRET_FILE` | — | alternative: path to a token file |
+| `DELIMP_PG_MAXCONN` | `6` | read-only connection-pool size |
+| `DELIMP_CACHE_TTL` | `20` | seconds to cache dashboard aggregates |
+
+Copy **`.env.example`** as a starting template. Hugging Face Space deployment notes are in
+**`README_HF.md`** and **`DEPLOY_HF.md`**.
+
+### Verify
+`curl -s localhost:7860/health` should report `connected: true` and `read_only: "on"`.
 
 ## What FRAN is part of
 FRAN is the public corpus browser for **[DE-LIMP](https://github.com/bsphinney/DE-LIMP)**, a
