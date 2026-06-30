@@ -72,6 +72,11 @@
         <button data-view="searches" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Searches</button>
         <button data-view="ionmobility" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Ion Mobility</button>
         <button data-view="highlights" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Highlights</button>
+        <button data-view="proteins" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Proteins</button>
+        <button data-view="peptides" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Peptides</button>
+        <button data-view="allspecies" class="navbtn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:text-white">Species</button>
+        <button data-view="mydata" id="nav_mydata" class="navbtn hidden px-3 py-1.5 rounded-lg font-semibold text-emerald-300 hover:text-white">📁 My Submissions</button>
+        <button data-view="collaborators" id="nav_collab" class="navbtn hidden px-3 py-1.5 rounded-lg font-semibold text-accent-400 hover:text-white">🔒 Collaborators</button>
       </nav>
 
       <div class="flex-1"></div>
@@ -87,6 +92,14 @@
       <span id="liveDot" class="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-400">
         <span class="w-2 h-2 rounded-full bg-slate-500"></span><span id="liveStatus">connecting…</span>
       </span>
+
+      <!-- UC Davis SSO: public by default; logging in unlocks the confidential layer for authorized staff -->
+      <span id="authBox" class="hidden sm:flex items-center"></span>
+
+      <button onclick="shareLink()" title="Copy a shareable link to this exact page" class="flex items-center gap-1.5 px-2.5 py-2 rounded-lg hover:bg-white/5 text-slate-300 text-xs font-medium">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+        <span class="hidden lg:inline">Copy link</span>
+      </button>
 
       <button onclick="toggleTheme()" title="Toggle theme" class="p-2 rounded-lg hover:bg-white/5 text-slate-300">
         <svg id="themeIcon" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
@@ -111,6 +124,11 @@
         <button onclick="go('searches');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Searches</button>
         <button onclick="go('ionmobility');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Ion Mobility</button>
         <button onclick="go('highlights');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Highlights</button>
+        <button onclick="go('proteins');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Proteins</button>
+        <button onclick="go('peptides');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Peptides</button>
+        <button onclick="go('allspecies');closeMobileMenu()" class="px-3 py-2 rounded-lg glass text-slate-200 text-left">Species</button>
+        <button onclick="go('mydata');closeMobileMenu()" id="nav_mydata_m" class="hidden px-3 py-2 rounded-lg glass text-emerald-300 font-semibold text-left">📁 My Submissions</button>
+        <button onclick="go('collaborators');closeMobileMenu()" id="nav_collab_m" class="hidden px-3 py-2 rounded-lg glass text-accent-400 font-semibold text-left">🔒 Collaborators</button>
       </div>
     </div>
   </header>
@@ -125,6 +143,7 @@
     <span class="ml-auto">Live PG Farm <code class="text-slate-400">delimp</code> · last updated <span id="lastUpdated">—</span></span>
   </footer>
 
+  <script>window.__FRAN_INTERNAL__ = __INTERNAL_MODE__; window.__FRAN_TIER__ = "__ACCESS_TIER__"; window.__FRAN_USER__ = "__INTERNAL_USER__"; window.__APP_VERSION__ = "__APP_VERSION__";</script>
   <script src="/static/app.js?v=__APP_VERSION__"></script>
 </body>
 </html>

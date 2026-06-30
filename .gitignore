@@ -5,3 +5,6 @@ __pycache__/
 .pgfarm_token
 .DS_Store
 .venv/
+# CONFIDENTIAL — real customer/lab names (collaborator-directory curation). The app degrades
+# gracefully without it (collab.py: except FileNotFoundError). NEVER commit to the public repo.
+app/service_customer_aliases.json

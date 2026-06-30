@@ -17,6 +17,7 @@ GOVERNANCE (non-negotiable, enforced here):
 
 from __future__ import annotations
 
+import contextvars
 import os
 import threading
 import time
@@ -50,20 +51,122 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         "delimp_mv_top_proteins",
         "delimp_mv_top_genes",
         "delimp_mv_im_scatter",
+        # exact distinct peptide / protein-group counts for the header (planner n_distinct
+        # estimate is 8x low on high-cardinality columns) — refreshed offline
+        "delimp_mv_corpus_stats",
+        # per-species protein aggregation for the species detail page (avoids a live GROUP BY)
+        "delimp_mv_species_proteins",
+        # per-protein-group rollup (precomputed) — powers the proteins showcase via top-N slices
+        # instead of a live 499k-row aggregate. Refreshed offline.
+        "delimp_mv_protein_agg",
+        # per-species reference proteome sizes (NCBI protein-coding genes + UniProt reviewed/isoforms)
+        # — the denominator for the "% of proteome identified" stat. Public reference data.
+        "delimp_proteome_reference",
         # precomputed Koina PFly flyability per peptide (peptide page + Highlights scatter)
         "delimp_peptide_flyability",
+        # precomputed hidden-words leaderboard over ALL distinct peptides (Highlights word hunt) —
+        # scanning ~2M peptides live is too slow, so it's computed offline by scripts/wordhunt_all.py
+        "delimp_word_leaderboard",
+        # precomputed peptides-showcase superlatives over ALL peptides seen >=2x + the long-tail
+        # detection-frequency histogram — built offline by scripts/peptides_survey_all.py
+        "delimp_peptide_superlatives_snapshot",
+        # THE PROTEOME CODE 🔮 — hidden phrases/prophecies found in peptides (scripts/proteome_code.py)
+        "delimp_proteome_code",
     }
 )
 
+# INTERNAL MODE — admits the PRIVATE provenance/customer tables and reveals real names. There are
+# TWO ways it turns on, and they compose:
+#   (a) DEPLOYMENT-WIDE, env DELIMP_INTERNAL_MODE=1 — every request is internal. This is the legacy
+#       fran-confidential (HF-private) deployment + local dev convenience.
+#   (b) PER-REQUEST, set by the auth middleware from the SSO principal — used by the SINGLE merged
+#       deployment: anonymous callers get the public layer; only an authenticated, group-authorized
+#       caller gets the confidential layer, for THAT request only.
+# The allowlist below is therefore evaluated PER REQUEST against is_internal(); the private tables are
+# never reachable unless this specific request is internal. PUBLIC_TABLES/FORBIDDEN_TABLES stay the
+# PUBLIC (base) sets; the internal tables are folded in only when is_internal() is true.
+INTERNAL_MODE: bool = os.environ.get("DELIMP_INTERNAL_MODE") == "1"  # (a) deployment-wide force
+_INTERNAL_TABLES = frozenset({"delimp_search_provenance",
+                              "coreomics_submissions_cache", "coreomics_samples_cache",
+                              "delimp_submission_service_dir", "delimp_pi_profile",
+                              "delimp_lab_institute_override"})
+
+# Per-request ACCESS SCOPE — the tiered portal. The auth middleware sets this once per request from
+# the SSO principal. Tiers:
+#   "public" — anonymous / unmatched: sanitized aggregate corpus only.
+#   "lab"    — a logged-in user whose email matches a CoreOmics PI/submitter: may read the confidential
+#              tables BUT only for their OWN submissions (scope["submission_ids"]); global views stay
+#              sanitized (no cross-lab name reveal).
+#   "full"   — Proteomics Core staff: everything (the legacy confidential view).
+# Two layers read this:
+#   is_internal()  -> may the SQL touch the private tables at all? True for full AND lab (lab queries
+#                     MUST additionally self-filter to scope["submission_ids"]).
+#   is_full()      -> the unrestricted view: drives the global name-reveal + the all-labs directory.
+_PUBLIC_SCOPE = {"tier": "public"}
+_scope_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("fran_scope", default=_PUBLIC_SCOPE)
+
+
+def set_scope(scope: dict | None) -> None:
+    """Set the CURRENT request's access scope (auth middleware, once per request)."""
+    _scope_ctx.set(scope or _PUBLIC_SCOPE)
+
+
+def get_scope() -> dict:
+    return _scope_ctx.get()
+
+
+def access_tier() -> str:
+    if INTERNAL_MODE:
+        return "full"
+    return _scope_ctx.get().get("tier", "public")
+
+
+def scoped_submission_ids():
+    """For a 'lab' request, the submission_ids the caller is allowed to see; None for full/public."""
+    return _scope_ctx.get().get("submission_ids")
+
+
+def set_internal(value: bool) -> None:
+    """Back-compat shim: True => full scope, False => public. (New code uses set_scope.)"""
+    _scope_ctx.set({"tier": "full"} if value else _PUBLIC_SCOPE)
+
+
+def is_internal() -> bool:
+    """May THIS request's SQL touch the private/confidential tables? True for full + lab (env force =
+    full). Lab requests are additionally responsible for filtering to their own submission_ids."""
+    return access_tier() in ("full", "lab")
+
+
+def is_full() -> bool:
+    """Unrestricted confidential view (Proteomics Core staff or env force) — drives the global
+    name-reveal and the cross-lab directory. Fail-closed: defaults to False."""
+    return access_tier() == "full"
+
+
+@contextmanager
+def elevated():
+    """Temporarily run as 'full' for a trusted, FIXED internal query (e.g. the auth-time lookup that
+    maps a login email -> their CoreOmics submissions, which must read coreomics_* BEFORE the request's
+    real scope is known). Restores the prior scope afterward. Never gated on user input."""
+    tok = _scope_ctx.set({"tier": "full"})
+    try:
+        yield
+    finally:
+        _scope_ctx.reset(tok)
+
+
 # Belt-and-suspenders: tables we must never name. Used as an assertion guard.
-FORBIDDEN_TABLES: frozenset[str] = frozenset(
-    {
-        "delimp_searches_internal",
-        "delimp_raw_files_internal",
-        "coreomics_submissions_cache",
-        "coreomics_samples_cache",
-    }
-)
+# _assert_allowlisted() checks this FIRST and raises, so a forbidden table can't be reached even if
+# it somehow appears in PUBLIC_TABLES. The coreomics caches are forbidden in the PUBLIC layer; for an
+# INTERNAL request they're explicitly un-forbidden (and allowlisted) so the confidential layer can
+# read them. delimp_*_internal stay forbidden everywhere (unused).
+_FORBIDDEN_BASE = frozenset({
+    "delimp_searches_internal",
+    "delimp_raw_files_internal",
+    "coreomics_submissions_cache",
+    "coreomics_samples_cache",
+})
+FORBIDDEN_TABLES: frozenset[str] = _FORBIDDEN_BASE  # public (base); narrowed per-request when internal
 
 
 class GovernanceError(RuntimeError):
@@ -188,13 +291,27 @@ class _Pool:
 
 _POOL = _Pool()
 
+# Resilience under heavy ingestion load on the shared PG Farm cluster (see query()):
+# default per-statement timeout (fail fast, never the 30s connection cap) + one retry on a
+# transient stall. Overridable via env so it can be tuned without a redeploy.
+_DEFAULT_TIMEOUT_MS = int(os.environ.get("DELIMP_QUERY_TIMEOUT_MS", "12000"))
+# 3 attempts: during a heavy ingest batch a live read can stall through 1-2 attempts; a 3rd
+# usually lands in a gap. Each attempt is bounded by the timeout, so worst case stays well under
+# the connection cap. Tunable via env.
+_QUERY_ATTEMPTS = int(os.environ.get("DELIMP_QUERY_ATTEMPTS", "3"))
+
 
 def _assert_allowlisted(tables: Iterable[str]) -> None:
+    # Evaluate the allowlist for THIS request: an internal request additionally admits the private
+    # tables (and un-forbids the coreomics caches); a public request gets only the base public set.
+    internal = is_internal()
+    allowed = (PUBLIC_TABLES | _INTERNAL_TABLES) if internal else PUBLIC_TABLES
+    forbidden = (FORBIDDEN_TABLES - _INTERNAL_TABLES) if internal else FORBIDDEN_TABLES
     for t in tables:
         tl = t.lower().strip()
-        if tl in FORBIDDEN_TABLES:
+        if tl in forbidden:
             raise GovernanceError(f"Refusing to query forbidden table: {t!r}")
-        if tl not in PUBLIC_TABLES:
+        if tl not in allowed:
             raise GovernanceError(
                 f"Table {t!r} is not in the public-layer allowlist."
             )
@@ -230,28 +347,46 @@ def query(
     if not (stripped.startswith("select") or stripped.startswith("with")):
         raise GovernanceError("Only SELECT/WITH statements are permitted.")
 
-    with _POOL.connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if timeout_ms is not None:
-                cur.execute("SET statement_timeout = %s", (int(timeout_ms),))
-            try:
-                cur.execute(sql, params)
-                if fetch == "all":
-                    return cur.fetchall()
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "val":
-                    row = cur.fetchone()
-                    if not row:
-                        return None
-                    return next(iter(row.values()))
-                return None
-            finally:
-                if timeout_ms is not None:
+    # PG Farm is a SHARED cluster; during heavy ingestion even a tiny indexed read can
+    # intermittently stall for tens of seconds (observed: the same 246-row read taking 40s, then
+    # 3s seconds later). Two defenses, applied to EVERY query so no endpoint can hang:
+    #  1. a default per-statement timeout (so a stall fails in ~eff_timeout, never the 30s
+    #     connection cap), and
+    #  2. one automatic retry on a transient stall (statement-timeout cancel / dropped conn) — a
+    #     fresh pooled connection usually lands on a fast moment. Genuinely-slow queries that pass
+    #     an explicit short timeout_ms still fail fast (their caller degrades gracefully).
+    eff_timeout = timeout_ms if timeout_ms is not None else _DEFAULT_TIMEOUT_MS
+    last_exc = None
+    for attempt in range(_QUERY_ATTEMPTS):
+        try:
+            with _POOL.connection() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("SET statement_timeout = %s", (int(eff_timeout),))
                     try:
-                        cur.execute("SET statement_timeout = 30000")
-                    except Exception:  # noqa: BLE001 - conn returns to pool either way
-                        pass
+                        cur.execute(sql, params)
+                        if fetch == "all":
+                            return cur.fetchall()
+                        if fetch == "one":
+                            return cur.fetchone()
+                        if fetch == "val":
+                            row = cur.fetchone()
+                            if not row:
+                                return None
+                            return next(iter(row.values()))
+                        return None
+                    finally:
+                        try:
+                            cur.execute("SET statement_timeout = 30000")
+                        except Exception:  # noqa: BLE001 - conn returns to pool either way
+                            pass
+        except (psycopg2.errors.QueryCanceled, psycopg2.OperationalError,
+                psycopg2.InterfaceError) as e:
+            # transient under ingestion load -> retry once on a fresh connection
+            last_exc = e
+            if attempt + 1 < _QUERY_ATTEMPTS:
+                continue
+            raise
+    raise last_exc  # unreachable, for type-checkers
 
 
 def estimate_rows(relname: str) -> int | None:
@@ -394,9 +529,31 @@ class TTLCache:
             if hit and (now - hit[0]) < self.ttl:
                 return hit[1]
         value = producer()
-        with self._lock:
-            self._store[key] = (now, value)
+        # Do NOT cache a falsy result (None / {} / []). For these cached aggregates an empty value
+        # means a transient failure (timeout under load, matview mid-refresh) — caching it would
+        # stick the failure for the whole TTL (the bug that left the proteins showcase "not ready"
+        # for 30 min after a blip). Leaving it uncached means the next request simply retries.
+        if value:
+            with self._lock:
+                self._store[key] = (now, value)
         return value
+
+    def cached(self, key: str):
+        """Return the live (non-expired) cached value for key, else None. Lets a caller decide
+        for itself whether a freshly-produced result is worth caching (e.g. cache only on full
+        success, so a degraded/partial result self-heals on the next request instead of sticking
+        for the whole TTL)."""
+        now = time.time()
+        with self._lock:
+            hit = self._store.get(key)
+            if hit and (now - hit[0]) < self.ttl:
+                return hit[1]
+        return None
+
+    def put(self, key: str, value) -> None:
+        if value:
+            with self._lock:
+                self._store[key] = (time.time(), value)
 
     def clear(self) -> None:
         with self._lock:

@@ -82,7 +82,8 @@ def _pfly_score(probs: list[float]) -> float:
     return round(max(0.0, min(1.0, (exp - 1.0) / 3.0)), 4)
 
 
-def predict_flyability(sequences: list[str], batch: int = 1000) -> dict[str, dict]:
+def predict_flyability(sequences: list[str], batch: int = 100) -> dict[str, dict]:
+    # NOTE: the Koina PFly model rejects batches >=500 with HTTP 400 — keep batch <=100.
     """Map stripped peptide sequence -> {'score':0-1, 'classes':[p1,p2,p3,p4]} via the
     Koina PFly model. Flyability is sequence-intrinsic (no charge/CE), so we cache by
     sequence and can score the whole corpus in a handful of batched calls. Missing/failed

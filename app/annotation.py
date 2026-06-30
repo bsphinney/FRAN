@@ -8,44 +8,140 @@ Keywords give the 'commonalities' (Blood protein, Enzyme, Transport, Immunity…
 Cached; degrades to None on failure.
 """
 import json
+import re
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
 
+# Wikipedia asks for a descriptive User-Agent with contact; a bare UA can be rate-limited/blocked
+# (which silently poisoned the wiki cache with None for EVERY organism). https://w.wiki/CX6
+_WIKI_UA = "FRAN-corpus/1.0 (https://fran.stan-proteomics.org; UC Davis Proteomics Core) python-urllib"
+
+
+def clean_accession(acc: str) -> str:
+    """Strip contaminant-DB prefixes (cRAP-, Cont_/Cont-) to leave the real UniProt accession,
+    e.g. 'cRAP-P02768' -> 'P02768', 'Cont_P04264' -> 'P04264'. Unchanged if no such prefix.
+    Without this, contaminant accessions 404 on UniProt and produce dead protein links."""
+    a = (acc or "").strip()
+    stripped = re.sub(r"^(crap|cont)[-_]?", "", a, flags=re.I)
+    return stripped or a
+
 _cache: dict[str, dict | None] = {}
 _lock = threading.Lock()
-_wiki_cache: dict[str, dict | None] = {}
+_wiki_cache: dict[str, tuple] = {}  # title -> (result_or_None, monotonic_ts)
 _wiki_lock = threading.Lock()
 
 
+_WIKI_NEG_TTL = 900  # seconds to honor a NEGATIVE (None) result before retrying — so a transient
+                     # network/rate-limit blip doesn't permanently mark an organism "no page".
+
+
+def _http_json(url: str, timeout: int = 12):
+    req = urllib.request.Request(url, headers={"User-Agent": _WIKI_UA, "Accept": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+
+
+def _wiki_summary(title: str) -> dict | None:
+    """One Wikipedia REST summary lookup -> normalized dict or None."""
+    try:
+        d = _http_json("https://en.wikipedia.org/api/rest_v1/page/summary/"
+                       + urllib.parse.quote(title.replace(" ", "_")))
+    except Exception:  # noqa: BLE001
+        return None
+    if d.get("type") == "standard" and d.get("extract"):
+        return {"extract": d["extract"],
+                "url": (d.get("content_urls", {}).get("desktop", {}) or {}).get("page"),
+                "title": d.get("title"),
+                "image": ((d.get("thumbnail") or {}).get("source")
+                          or (d.get("originalimage") or {}).get("source")),
+                "source": "Wikipedia"}
+    return None
+
+
+def _wiki_opensearch(query: str) -> str | None:
+    """Best-matching Wikipedia article title for a query (catches name variants), else None."""
+    try:
+        d = _http_json("https://en.wikipedia.org/w/api.php?action=opensearch&limit=1&namespace=0"
+                       "&format=json&search=" + urllib.parse.quote(query))
+        return d[1][0] if d and len(d) > 1 and d[1] else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gbif_blurb(name: str) -> dict | None:
+    """Fallback for organisms with no Wikipedia page: GBIF taxonomy + a sourced description.
+    GBIF covers virtually every named species (real source, not fabricated)."""
+    try:
+        m = _http_json("https://api.gbif.org/v1/species/match?name=" + urllib.parse.quote(name))
+        key = m.get("usageKey")
+        if not key:
+            return None
+        rank = (m.get("rank") or "").lower()
+        lineage = " · ".join(filter(None, [m.get("kingdom"), m.get("phylum"), m.get("class"),
+                                           m.get("order"), m.get("family")]))
+        extract = None
+        try:  # GBIF stores free-text descriptions for many taxa
+            ds = _http_json(f"https://api.gbif.org/v1/species/{key}/descriptions?limit=20")
+            for r in (ds.get("results") or []):
+                if r.get("description") and len(r["description"]) > 40:
+                    extract = re.sub(r"<[^>]+>", "", r["description"]).strip()
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        vern = None
+        try:
+            vd = _http_json(f"https://api.gbif.org/v1/species/{key}/vernacularNames?limit=20")
+            for r in (vd.get("results") or []):
+                if (r.get("language") == "eng") and r.get("vernacularName"):
+                    vern = r["vernacularName"]; break
+        except Exception:  # noqa: BLE001
+            pass
+        if not extract:
+            # no free-text description anywhere -> synthesize a factual one-liner from the taxonomy
+            sci = m.get("scientificName") or name
+            extract = (f"{sci}" + (f" ({vern})" if vern else "")
+                       + (f" — a {rank} in the lineage {lineage}." if lineage else
+                          " — a taxon recorded in the GBIF backbone."))
+        elif vern and vern.lower() not in extract.lower():
+            extract = f"{vern}. {extract}"
+        return {"extract": extract, "title": m.get("scientificName") or name,
+                "url": f"https://www.gbif.org/species/{key}", "image": None, "source": "GBIF"}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def fetch_wikipedia(title: str) -> dict | None:
-    """Wikipedia REST summary (extract + page url) for fun trivia / discovery
-    history. Returns None for proteins with no encyclopedia page (most obscure ones)."""
+    """Encyclopedia blurb for an organism/gene: Wikipedia summary -> opensearch best-title ->
+    GBIF taxonomy/description fallback. Returns {extract,url,title,image,source} or None.
+    Positive results cached forever; NEGATIVE results cached only ~15 min so a transient
+    failure (the bug that showed 'no page' for Human/everything) doesn't stick."""
     title = (title or "").strip()
     if not title:
         return None
+    now = time.monotonic()
     with _wiki_lock:
-        if title in _wiki_cache:
-            return _wiki_cache[title]
-    out = None
-    try:
-        url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(title.replace(" ", "_"))
-        req = urllib.request.Request(url, headers={"User-Agent": "fran-corpus (research tool)", "Accept": "application/json"})
-        d = json.loads(urllib.request.urlopen(req, timeout=12).read().decode())
-        if d.get("type") == "standard" and d.get("extract"):
-            out = {"extract": d["extract"],
-                   "url": (d.get("content_urls", {}).get("desktop", {}) or {}).get("page"),
-                   "title": d.get("title")}
-    except Exception:  # noqa: BLE001 - no page / disambiguation -> None
-        out = None
+        hit = _wiki_cache.get(title)
+        if hit is not None:
+            out, ts = hit
+            if out is not None or (now - ts) < _WIKI_NEG_TTL:
+                return out
+    out = _wiki_summary(title)
+    if out is None:
+        alt = _wiki_opensearch(title)
+        if alt and alt.lower() != title.lower():
+            out = _wiki_summary(alt)
+    if out is None:
+        out = _gbif_blurb(title)
     with _wiki_lock:
-        _wiki_cache[title] = out
+        _wiki_cache[title] = (out, now)
     return out
 
 
 def fetch_uniprot_entry(acc: str) -> dict | None:
-    acc = (acc or "").split(";")[0].strip()
+    # strip contaminant prefixes (cRAP-/Cont_) so 'cRAP-P02768' resolves to the real entry
+    acc = clean_accession((acc or "").split(";")[0].strip())
     if not acc:
         return None
     with _lock:
