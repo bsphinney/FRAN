@@ -25,6 +25,9 @@ repo so it stays with the app it feeds, not scattered in the DE-LIMP repo. The F
 | `backfill_fragments.py` | corpus-wide recovery: archived FRAN report → per-search **Lance** dataset (fragments + MS1 envelope + extras) + registry. `--scan`, `--workers`, `--register`. |
 | `spectrum_lance.py` | the Lance schema (48 cols, fragments as list columns) + `delimp_spectrum_lane` registry helpers. |
 | `verify_spectrum_lane.py` | walk the registry, confirm each Lance dataset exists + content-md5 matches (durability / loss check). |
+| `plan_spectrum_backfill.py` | coverage: which searches' reports are on Hive (backfill now) vs missing (Windows). Writes worklists; `--enqueue` fills `delimp_spectrum_regen_queue`. |
+| `pull_reports_to_hive.py` | **run on a Windows ingestor** — copies every `C:\fran_sne_export\*_Report_FRAN*.parquet` onto Flinders so no report is trapped on Windows. Idempotent. |
+| `backfill_spectra.sbatch` | submit the corpus Lance backfill on a **compute node** (parallel Arrow/Lance OOM-kills the login node). |
 | `provenance.py` | writes **`delimp_search_provenance`** — the ingest coordination table (source `.sne`, exported report path, every raw file, LIMS linkage). |
 | `write_submission_service_dir.py` | writes `delimp_submission_service_dir` (submission → service folder ledger). |
 | `organism.py` | canonical organism/species normalization (single source of truth). |
@@ -59,14 +62,23 @@ counts, and a **content md5**, so a lost/corrupt dataset is *detectable* (`verif
 and re-derivable from the archived report on Flinders. The data has two independent homes; PG stays
 the manifest + labels; nothing bulk touches the 402M-row `delimp_precursors`.
 
-- **Backfill the existing corpus** (no re-search, no prediction — reports are on Flinders):
+- **First: get the reports onto Hive.** Coverage (`plan_spectrum_backfill.py`) found only ~19 of
+  1,890 Spectronaut reports on Flinders; **~1,871 are trapped on `C:\fran_sne_export\`** on the
+  Windows export box (the report exists — it was just never copied). A Windows ingestor pulls them:
   ```bash
-  python backfill_fragments.py --scan /nfs/lssc0/flinders/proteomics/Data/FRAN_reports \
-      --out-dir /quobyte/proteomics-grp/brett/glendon/spectra_lance --register --workers 8
+  # on a Windows ingestor (has C:\fran_sne_export + the Flinders share):
+  python pull_reports_to_hive.py --src "C:\fran_sne_export" --dest "\\flinders\...\FRAN_reports"
   ```
-  Parses reports in parallel (`--workers`, files/CPU-bound); DB writes stay paced (one registry
-  upsert per search) so the shared PG-Farm DB is never overloaded. Verified on one archived report:
-  6,594 precursors / 39,391 fragments, MS1 envelope + DIA window intact, checksummed.
+  This is the cheap path (copy, no re-export). Only genuinely-missing/corrupt reports need a
+  re-export via `manageSNE -rs FRAN.rs` (tracked in `delimp_spectrum_regen_queue`).
+- **Then backfill on a compute node** (parallel Arrow/Lance OOM-kills the login node — use sbatch):
+  ```bash
+  sbatch backfill_spectra.sbatch /nfs/lssc0/flinders/proteomics/Data/FRAN_reports \
+      /quobyte/proteomics-grp/brett/glendon/spectra_lance
+  ```
+  Parses reports in parallel; DB writes stay paced (one registry upsert per search) so the shared
+  PG-Farm DB is never overloaded. Corrupt/0-byte reports are logged + skipped. Verified on one
+  report: 6,594 precursors / 39,391 fragments, MS1 envelope + DIA window intact, checksummed.
 - **Verify integrity** (durability check): `python verify_spectrum_lane.py`.
 - **Read for training:** `lance.dataset(path).to_table()` (or point depthcharge at it) — each row
   is a precursor with its full observed spectrum.
