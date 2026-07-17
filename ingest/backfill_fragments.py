@@ -322,7 +322,10 @@ def main():
         print(f"  {name}: {note}")
 
     if a.workers > 1 and len(reports) > 1:
-        with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        # max_tasks_per_child=1: recycle each worker after one report so the memory a big report
+        # builds (agg(list) over millions of fragments) is fully freed before the next -> no
+        # accumulation across reports (the OOM cause at higher worker counts).
+        with ProcessPoolExecutor(max_workers=a.workers, max_tasks_per_child=1) as ex:
             futs = {ex.submit(process_one, rp, a.out_dir, a.dry_run): rp for rp in reports}
             for i, fut in enumerate(as_completed(futs), 1):
                 try:
