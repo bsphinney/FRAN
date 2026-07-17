@@ -163,30 +163,23 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
     # per (run, modified-seq, charge). We STREAM-dedup so a huge report (millions of fragment
     # rows) never has to fully materialize in memory. (DIA-NN report.parquet is already
     # precursor-level.)
-    # FRAGMENT PRESERVATION (2026-07-17): the observed MS2 fragments used to be DROPPED at this
-    # collapse — the whole reason FRAN held no real fragments. We now ACCUMULATE every fragment
-    # per precursor and, after the DB commit, write them to a per-search Parquet shard registered
-    # in delimp_searches.fragments_parquet_path (see _write_fragments / §fragment lane). Bulk
-    # fragments stay OUT of the 402M-row table (no DB bloat); the Parquet lane is queryable via
-    # DuckDB. This is the real acquired spectrum DIA-CLIP trains on — never predicted/guessed.
-    frag_by_key = {}   # precursor key -> [fragment dict, ...]  (the observed MS2 spectrum)
+    # OBSERVED SPECTRUM (2026-07-17): the report's fragments + MS1 isotope envelope + DIA window +
+    # predicted-vs-observed RT used to be DROPPED at this collapse. delimp_precursors stays
+    # precursor-level (unchanged); the full observed spectrum is written AFTER commit to the
+    # **Lance** training lane (backfill_fragments.process_one re-parses the same report) and
+    # recorded in the delimp_spectrum_lane registry — see the post-commit block below. Lance +
+    # DB registry is how DL people store training data (depthcharge/Casanovo), durable via the
+    # checksummed registry, and re-derivable from the archived report. Never predicted/guessed.
     if engine == "spectronaut":
         seen, recs, n_raw = set(), [], 0
         for x in _records(report, engine):
             n_raw += 1
             k = (str(x.get("run")), str(x.get("modified_seq_diann") or x.get("stripped_seq")), x.get("charge"))
-            if WRITE_FRAGMENTS:
-                fr = x.get("fragment")
-                if fr and fr.get("mz") is not None:
-                    frag_by_key.setdefault(k, []).append(fr)
             if k in seen:
                 continue
             seen.add(k); recs.append(x)
         if n_raw > len(recs):
             print(f"  collapsed {n_raw:,} fragment-rows -> {len(recs):,} precursors (fragment-level report)")
-        if frag_by_key:
-            nf = sum(len(v) for v in frag_by_key.values())
-            print(f"  captured {nf:,} observed fragments across {len(frag_by_key):,} precursors")
     else:
         recs = list(_records(report, engine))
     if not recs:
@@ -429,20 +422,26 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                   f"project={pv['project']} ({len(raw_files)} raw files)")
         except Exception as e:  # noqa: BLE001 - provenance is best-effort, never fail the ingest
             print(f"  [warn] provenance not recorded: {str(e)[:80]}")
-        # OBSERVED-FRAGMENT LANE: persist the real acquired MS2 fragments (accumulated at the
-        # collapse above) to a per-search Parquet shard + register the path. Best-effort — the
-        # precursors are already committed, so a fragment-write hiccup must never fail the ingest.
-        if frag_by_key:
+        # OBSERVED-SPECTRUM LANE: write the real acquired spectrum (fragments + MS1 envelope + DIA
+        # window + predicted-vs-observed RT/intensity) to a per-search Lance dataset and record it
+        # in delimp_spectrum_lane. Best-effort — precursors are already committed, so a lane hiccup
+        # must never fail the ingest. Disabled unless --lance-dir is given.
+        if WRITE_FRAGMENTS and engine == "spectronaut" and SPECTRUM_LANCE_DIR:
             try:
-                fpath = _write_fragments(output_dir, search_name, search_id, raw_paths, recs, frag_by_key)
-                _register_fragments(conn, search_id, fpath)
-                print(f"  fragments: {fpath}")
-            except Exception as e:  # noqa: BLE001 - fragment lane is best-effort
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import backfill_fragments as bf
+                import spectrum_lance as sln
+                _, lpath, n_prec, n_frag, md5, ver = bf.process_one(report, SPECTRUM_LANCE_DIR, dry=False)
+                if lpath:
+                    sln.ensure_registry(conn)
+                    sln.register(conn, search_id, search_name, lpath, n_prec, n_frag, md5, ver)
+                    print(f"  spectrum lane: {lpath}  ({n_prec:,} prec / {n_frag:,} frag, registered)")
+            except Exception as e:  # noqa: BLE001 - spectrum lane best-effort, never fail the ingest
                 try:
                     conn.rollback()
                 except Exception:  # noqa: BLE001
                     pass
-                print(f"  [warn] fragment lane not written: {str(e)[:120]}")
+                print(f"  [warn] spectrum lane not written: {str(e)[:120]}")
     except Exception as e:
         conn.rollback(); raise
     finally:
@@ -450,62 +449,8 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
 
 
 BULK_COPY = False  # set by --bulk-copy; uses COPY for the big precursor insert (fast on HIVE)
-WRITE_FRAGMENTS = True   # write the observed-fragment Parquet lane (Spectronaut fragment-level reports)
-FRAGMENTS_DIR = None     # dir for fragment shards (default: alongside the report / output_dir)
-
-
-def _write_fragments(output_dir, search_name, search_id, raw_paths, recs, frag_by_key):
-    """Write the observed MS2 fragments to a per-search Parquet shard — ONE ROW PER FRAGMENT:
-    the real acquired spectrum keyed to (raw_path, peptide, charge) + the precursor's RT/IM.
-    Bulk fragments live in this Parquet lane (queryable via DuckDB), NEVER in delimp_precursors
-    (no 402M-row bloat). Returns the shard path. This is the fragment source DIA-CLIP trains on."""
-    import pandas as pd
-    outdir = FRAGMENTS_DIR or output_dir
-    os.makedirs(outdir, exist_ok=True)
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", search_name or "search")
-    fpath = os.path.join(outdir, f"{safe}_fragments.parquet")
-    rows = []
-    for x in recs:
-        k = (str(x.get("run")), str(x.get("modified_seq_diann") or x.get("stripped_seq")), x.get("charge"))
-        frags = frag_by_key.get(k)
-        if not frags:
-            continue
-        rp = raw_paths.get(str(x["run"]))
-        for fr in frags:
-            rows.append((str(search_id), rp, str(x["run"]), x.get("stripped_seq"),
-                         x.get("modified_seq_proforma"),
-                         int(x["charge"]) if x.get("charge") else None,
-                         _flt(x.get("precursor_mz")), _flt(x.get("rt")), _im(x.get("im")),
-                         _flt(fr.get("mz")), fr.get("type"), _flt(fr.get("num")),
-                         _flt(fr.get("charge")), fr.get("loss"), _flt(fr.get("intensity"))))
-    cols = ["search_id", "raw_path", "run", "stripped_seq", "modified_seq_proforma", "charge",
-            "precursor_mz", "rt", "im", "frg_mz", "frg_type", "frg_num", "frg_charge",
-            "frg_loss", "frg_intensity"]
-    pd.DataFrame(rows, columns=cols).to_parquet(fpath, index=False)
-    return fpath
-
-
-def _register_fragments(conn, search_id, fpath):
-    """Point delimp_searches.fragments_parquet_path at the shard. delimp_searches is SMALL
-    (~2k rows) so the one-time ADD COLUMN is cheap — still guarded by a catalog check + short
-    lock_timeout (mirrors the irt/iim add) so it can never stall the shared DB. Commits itself."""
-    import psycopg2
-    cur = conn.cursor()
-    cur.execute("""SELECT 1 FROM information_schema.columns
-                   WHERE table_name='delimp_searches' AND column_name='fragments_parquet_path'""")
-    if not cur.fetchone():
-        cur.execute("SAVEPOINT addfrag")
-        try:
-            cur.execute("SET LOCAL lock_timeout = '5s'")
-            cur.execute("ALTER TABLE delimp_searches ADD COLUMN IF NOT EXISTS fragments_parquet_path TEXT")
-            cur.execute("RELEASE SAVEPOINT addfrag")
-            cur.execute("RESET lock_timeout")
-        except psycopg2.Error:  # LockNotAvailable etc. -> shard still on disk; backfill registers later
-            cur.execute("ROLLBACK TO SAVEPOINT addfrag")
-            conn.commit()
-            return
-    cur.execute("UPDATE delimp_searches SET fragments_parquet_path=%s WHERE id=%s", (fpath, str(search_id)))
-    conn.commit()
+WRITE_FRAGMENTS = True    # write the observed-spectrum Lance lane (Spectronaut fragment-level reports)
+SPECTRUM_LANCE_DIR = None # dir for per-search Lance datasets (set by --lance-dir); None disables the lane
 
 _PREC_COLS = ("search_id,raw_path,stripped_seq,modified_seq_diann,modified_seq_proforma,mods,n_mods,"
               "charge,precursor_mz,rt,irt,im,iim,q_value,global_q_value,pg_q_value,intensity,"
@@ -590,10 +535,10 @@ if __name__ == "__main__":
     ap.add_argument("--output-dir", default=None, help="stable provenance/idempotency key (e.g. the archived zip path) — use when the report is a temp extract")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--bulk-copy", action="store_true", help="use COPY for the precursor insert (much faster on a fast PG link, e.g. HIVE)")
-    ap.add_argument("--no-fragments", action="store_true", help="skip the observed-fragment Parquet lane (precursors only)")
-    ap.add_argument("--fragments-dir", default=None, help="dir for fragment Parquet shards (default: the report's dir)")
+    ap.add_argument("--no-fragments", action="store_true", help="skip the observed-spectrum Lance lane (precursors only)")
+    ap.add_argument("--lance-dir", default=None, help="dir for per-search Lance spectrum datasets (enables the observed-spectrum lane)")
     a = ap.parse_args()
     BULK_COPY = a.bulk_copy
     WRITE_FRAGMENTS = not a.no_fragments
-    FRAGMENTS_DIR = a.fragments_dir
+    SPECTRUM_LANCE_DIR = a.lance_dir
     ingest(a.searchdir, a.engine, a.organism_name, a.taxon, a.name, a.dry_run, a.output_dir)

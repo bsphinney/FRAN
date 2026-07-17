@@ -154,16 +154,18 @@ The fragments were **exported** but never **stored**:
    `delimp_precursors.peak_mz`/`peak_intensity`/… columns are an even older dead draft — no writer — don't
    use them.)
 
-**Recovery path (recommended, no re-search / no prediction):** re-parse the archived
-`…_Report_FRAN (Normal).parquet` files under `/nfs/lssc0/flinders/proteomics/Data/FRAN_reports/` (and
-`FRAN_SNE_export/`). Group by `(R_FileName, PEP_StrippedSequence, EG_ModifiedSequence, FG_Charge)` and read
-`F_FrgMz` / `F_FrgType` / `F_FrgNum` / `F_Charge` / `F_PeakArea` per precursor. That gives the **real
-observed fragments the search engine used** — exactly the DIA-CLIP requirement — keyed by the same RT/IM the
-DB already stores. Only `.sne` files whose report wasn't archived need a re-export via the §2 command.
+**Recovery path (implemented — `backfill_fragments.py`; no re-search / no prediction):** re-parse the
+archived `…_Report_FRAN (Normal).parquet` files under `/nfs/lssc0/flinders/proteomics/Data/FRAN_reports/`
+(and `FRAN_SNE_export/`) into the **Lance observed-spectrum lane** — one row per precursor with the
+observed fragments **and** the MS1 isotope envelope, DIA window, predicted-vs-observed RT, S/N,
+interference and decoy flags (all audited from the report's 131 columns; see the `ingest/` README and
+`spectrum_lance.py`). Each dataset is recorded in the `delimp_spectrum_lane` registry with a content md5,
+so nothing is lost and integrity is checkable (`verify_spectrum_lane.py`). Only `.sne` files whose report
+wasn't archived need a re-export via the §2 command. This gives the **real observed spectrum the search
+engine used** — exactly the DIA-CLIP requirement — keyed by the same RT/IM the DB already stores, and
+replaces the sequence-guessed `top6(seq)` fragments.
 
-This directly replaces the sequence-guessed `top6(seq)` fragments in `build_xic_shard.py`.
-
-## 7. Scripts (all in the DE-LIMP repo, `~/Documents/claude/scripts/` unless noted)
+## 7. Scripts (canonical home: this `ingest/` dir; originally from the DE-LIMP repo)
 
 | script | role |
 |---|---|

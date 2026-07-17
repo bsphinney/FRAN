@@ -60,6 +60,9 @@ COLMAP = {
     "frg_charge":   [r"^F\.FrgZ$", r"^F\.FrgCharge$", r"^F\.Charge$", r"FrgZ$"],
     "frg_loss":     [r"^F\.FrgLossType$", r"FrgLossType$"],
     "frg_intensity":[r"^F\.PeakArea$", r"^F\.NormalizedPeakArea$", r"^F\.MeasuredRelativeIntensity$", r"PeakArea$"],
+    "frg_ion":      [r"^F\.FrgIon$", r"FrgIon$"],                       # e.g. "y4" (label)
+    "frg_measured_relint":  [r"^F\.MeasuredRelativeIntensity$", r"MeasuredRelativeIntensity$"],
+    "frg_predicted_relint": [r"^F\.PredictedRelativeIntensity$", r"PredictedRelativeIntensity$"],  # library ref
 }
 FRAG_FIELDS = ("frg_mz", "frg_type", "frg_num", "frg_charge", "frg_loss", "frg_intensity")
 
@@ -189,6 +192,9 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
                     "charge": _f(r, cols, "frg_charge"),
                     "loss": str(r.get(cols["frg_loss"])) if "frg_loss" in cols else None,
                     "intensity": _f(r, cols, "frg_intensity"),
+                    "ion": str(r.get(cols["frg_ion"])) if "frg_ion" in cols else None,
+                    "measured_relint": _f(r, cols, "frg_measured_relint"),
+                    "predicted_relint": _f(r, cols, "frg_predicted_relint"),
                 }
             yield rec
 
