@@ -3,8 +3,8 @@
 #SBATCH -p high
 #SBATCH -q genome-center-grp-high-qos
 #SBATCH -c 14
-#SBATCH --mem=80G
-#SBATCH -t 08:00:00
+#SBATCH --mem=110G
+#SBATCH -t 16:00:00
 #SBATCH -J spectra_backfill
 #SBATCH -o spectra_backfill_%j.log
 # Corpus backfill of the observed-spectrum Lance lane. Run on a COMPUTE node (never the login
@@ -18,7 +18,7 @@ PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
 export DELIMP_PG_TOKEN_FILE=/quobyte/proteomics-grp/brett/.pgfarm_token
 echo "backfill: $REPORTS_ROOT -> $LANCE_DIR  ($(date))"
 cd "$ING"
-# 12 workers on a 14-core/80G node: parses reports in parallel, DB registration paced (one upsert
+# 10 workers on a 14-core/110G node: parses reports in parallel, DB registration paced (one upsert
 # per search). Corrupt/0-byte reports are logged and skipped (they go to the regen queue).
-"$PY" backfill_fragments.py --scan "$REPORTS_ROOT" --out-dir "$LANCE_DIR" --register --workers 12
+"$PY" backfill_fragments.py --scan "$REPORTS_ROOT" --out-dir "$LANCE_DIR" --register --workers 10
 echo "done ($(date))"
