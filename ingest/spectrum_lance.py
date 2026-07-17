@@ -48,9 +48,10 @@ SCHEMA = pa.schema([
 
 REGISTRY_DDL = """
 CREATE TABLE IF NOT EXISTS delimp_spectrum_lane (
-    search_id      UUID PRIMARY KEY,
+    id             BIGSERIAL PRIMARY KEY,
+    lance_path     TEXT UNIQUE NOT NULL,   -- the dataset dir; the idempotency key (upsert on it)
+    search_id      UUID,                   -- link to delimp_searches when the report matched (nullable)
     search_name    TEXT,
-    lance_path     TEXT NOT NULL,
     n_precursors   INTEGER,
     n_fragments    BIGINT,
     content_md5    TEXT,          -- md5 of the Arrow content (integrity + loss detection)
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS delimp_spectrum_lane (
     updated_at     TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_spectrum_lane_name ON delimp_spectrum_lane (search_name);
+CREATE INDEX IF NOT EXISTS idx_spectrum_lane_sid  ON delimp_spectrum_lane (search_id);
 """
 
 
@@ -82,18 +84,19 @@ def write_lance(table: pa.Table, path: str, mode: str = "overwrite"):
 
 
 def register(conn, search_id, search_name, lance_path, n_prec, n_frag, md5, version):
-    """Record the dataset in the DB registry (the durable manifest). Upsert by search_id.
-    Call ensure_registry(conn) once before the first register()."""
+    """Record the dataset in the DB registry (the durable manifest). Upsert by lance_path (so a
+    re-run overwrites cleanly and an UNMATCHED report — search_id NULL — still registers). Call
+    ensure_registry(conn) once before the first register()."""
     cur = conn.cursor()
     cur.execute("""INSERT INTO delimp_spectrum_lane
-                     (search_id, search_name, lance_path, n_precursors, n_fragments, content_md5, lance_version, updated_at)
+                     (lance_path, search_id, search_name, n_precursors, n_fragments, content_md5, lance_version, updated_at)
                    VALUES (%s,%s,%s,%s,%s,%s,%s, now())
-                   ON CONFLICT (search_id) DO UPDATE SET
-                     search_name=EXCLUDED.search_name, lance_path=EXCLUDED.lance_path,
+                   ON CONFLICT (lance_path) DO UPDATE SET
+                     search_id=EXCLUDED.search_id, search_name=EXCLUDED.search_name,
                      n_precursors=EXCLUDED.n_precursors, n_fragments=EXCLUDED.n_fragments,
                      content_md5=EXCLUDED.content_md5, lance_version=EXCLUDED.lance_version,
                      updated_at=now()""",
-                (str(search_id) if search_id else None, search_name, lance_path,
+                (lance_path, str(search_id) if search_id else None, search_name,
                  int(n_prec), int(n_frag), md5, int(version)))
     conn.commit()
 

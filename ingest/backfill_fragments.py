@@ -79,9 +79,15 @@ _KEYS = ["run", "modified_seq", "charge"]
 def _safe(n): return re.sub(r"[^A-Za-z0-9._-]+", "_", n or "search")
 
 
+def _strip_ts(n):
+    """drop a leading Spectronaut export timestamp 'YYYYMMDD_HHMMSS_' so re-exports of the same
+    experiment (differing only by timestamp) map to ONE dataset path -> no duplicate datasets."""
+    return re.sub(r"^\d{8}_\d{6}_", "", n or "")
+
+
 def report_name(p):
-    b = re.sub(r"_Report_FRAN \(Normal\)\.(parquet|tsv)$", "", os.path.basename(p), flags=re.I)
-    return b or os.path.basename(os.path.dirname(p))
+    b = re.sub(r"_Report_FRAN \(Normal\)\.(parquet|tsv)$", "", os.path.basename(str(p).replace("\\", "/")), flags=re.I)
+    return b or os.path.basename(os.path.dirname(str(p).replace("\\", "/")))
 
 
 def _resolve(header, fmap):
@@ -239,7 +245,9 @@ def process_one(report_path, out_dir, dry=False):
     n_prec = tbl.num_rows
     if dry:
         return (name, None, n_prec, n_frag, None, None)
-    lance_path = os.path.join(out_dir, f"{_safe(name)}.lance")
+    # name the dataset by the timestamp-stripped experiment name so re-exports collapse to one
+    # dataset (overwrite) instead of piling up duplicates.
+    lance_path = os.path.join(out_dir, f"{_safe(_strip_ts(name))}.lance")
     _, md5, version = sln.write_lance(tbl, lance_path, mode="overwrite")
     return (name, lance_path, n_prec, n_frag, md5, version)
 
