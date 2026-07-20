@@ -16,12 +16,13 @@ off the Windows export box, parsed, and ingested into per-search Lance datasets 
 | Lance datasets registered (`delimp_spectrum_lane` rows) | **1,539** | of 1,890 Spectronaut searches = **81% of searches** |
 | precursors stored | **353,884,368** | of ~384M Spectronaut corpus = **~92% by volume** |
 | fragments stored | **2,097,797,651** (~2.1 B) | observed MS2 fragment rows |
-| datasets linked to a `search_id` | **1,349** | 190 still unlinked — see below |
+| datasets linked to a `search_id` | **1,424** | 115 still unlinked — see below |
 | on-disk store | `glendon/spectra_lance/` — **137 GB** | one `<search>.lance` dataset per search |
 | ingest window | **2026-07-17 → 2026-07-20** | |
 
-_Update 2026-07-20 (later): ran `link_spectrum_lane.py`, which linked **171** of the 361 NULL rows.
-Linked went 1,178 → **1,349**; unlinked 361 → **190**._
+_Update 2026-07-20: two link passes of `link_spectrum_lane.py`. Pass 1 (name-match) linked 171;
+pass 2 added a **precursor-count tiebreak** (`n_precursors_total`) that linked 75 more. Linked went
+1,178 → **1,424**; unlinked 361 → **115**._
 
 ## Where the data lives
 
@@ -35,17 +36,25 @@ Linked went 1,178 → **1,349**; unlinked 361 → **190**._
 
 ## Two open follow-ups (small)
 
-1. **190 datasets still have `search_id = NULL`** (down from 361 — `link_spectrum_lane.py` cleared 171
-   on 2026-07-20). The spectra are stored safely; only the FK link to `delimp_searches` is missing
-   (report name didn't exactly match a search record). Of the remaining 190: **139 are ambiguous**
-   (the name maps to >1 Spectronaut search, so the linker refuses to guess — these need a manual/
-   provenance-based tiebreak) and **51 have no name match** at all. Re-run
-   **`python link_spectrum_lane.py`** (idempotent; `--dry-run` to preview) after any new ingest — it
-   only links unambiguous matches, so it never mislinks.
-2. **~351 searches (1,890 − 1,539) not yet in the lane.** These are the long tail — reports still
-   missing/corrupt, or searches whose report never got copied. Check with
-   `python plan_spectrum_backfill.py` and, for anything still only on Windows, `pull_reports_to_hive.py`
-   then `sbatch backfill_spectra.sbatch`.
+1. **115 datasets still have `search_id = NULL`** (down from 361 → 190 → 115 after two link passes on
+   2026-07-20). The spectra are stored safely; only the FK link to `delimp_searches` is missing. The
+   remaining 115 split into two hard cases that the linker deliberately will **not** guess:
+   - **64 ambiguous duplicates.** The name maps to >1 Spectronaut search AND those searches have the
+     *same* `n_precursors_total` (e.g. `[52772, 52772]`) — they are resubmits/re-runs of the same
+     data, so the count tiebreak can't split them. Linking to either is nearly equivalent; a real fix
+     picks the canonical search via `resubmit_of_search_id` / `parent_chain_depth`. Low priority.
+   - **51 no name match.** The dataset's `search_name` matches no Spectronaut search name at all
+     (renamed search, or report recorded under a different name) — needs manual/provenance lookup.
+   Re-run **`python link_spectrum_lane.py`** after any new ingest; it links unambiguous names plus the
+   exact-precursor-count tiebreak, and never mislinks. `diag_unlinked.py` breaks down what's left.
+2. **544 Spectronaut searches (~82.9M precursors) still have NO linked lane dataset** — the real long
+   tail, and bigger than first thought. All 544 are `status='completed'` with precursors in the DB, so
+   this is genuine observed-spectrum data still to recover (roughly +23% on top of the 353.9M already
+   stored). Plan with `python plan_spectrum_backfill.py` **from Hive** (it needs the Flinders/Windows
+   report filesystem to tell "report archived → backfill now" from "report missing → re-export"); pull
+   any Windows-only reports with `pull_reports_to_hive.py`, then `sbatch backfill_spectra.sbatch`.
+   (Note: some of the 115 unlinked datasets above cover a few of these 544 once linked, so the true
+   still-to-backfill count is slightly under 544.)
 
 ## Do NOT trust `delimp_spectrum_regen_queue`
 

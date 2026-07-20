@@ -5,8 +5,9 @@ search record (timestamp prefixes, provenance vs search_name drift). The spectra
 this just fills in the missing link. It builds a name->search_id index from delimp_searches +
 delimp_search_provenance (search_name, real_search_name, the exported report_path's name, the
 source .sne/output_dir name — each also timestamp-stripped, reusing plan_spectrum_backfill's
-matcher) and UPDATEs each NULL-search_id row for the UNAMBIGUOUS matches (skips any key that maps
-to more than one search, so it never mislinks).
+matcher) and UPDATEs each NULL-search_id row for the UNAMBIGUOUS matches. When a name maps to more
+than one search, it breaks the tie ONLY if exactly one candidate's stored n_precursors_total equals
+the dataset's n_precursors — otherwise it leaves the row unlinked. So it never mislinks.
 
     python link_spectrum_lane.py           # link + report
     python link_spectrum_lane.py --dry-run # report only, no writes
@@ -41,29 +42,35 @@ def main():
             if k:
                 key2ids[k].add(str(sid))
 
-    cur.execute("SELECT id, search_name FROM delimp_spectrum_lane WHERE search_id IS NULL")
+    # precursor count per search (stored column) — used to break name-collision ties
+    cur.execute("SELECT id, n_precursors_total FROM delimp_searches WHERE search_engine ILIKE '%spectro%'")
+    prec_count = {str(r[0]): r[1] for r in cur.fetchall() if r[1] is not None}
+
+    cur.execute("SELECT id, search_name, n_precursors FROM delimp_spectrum_lane WHERE search_id IS NULL")
     nulls = cur.fetchall()
-    ups, ambiguous, nomatch = [], 0, 0
-    for lane_id, sname in nulls:
+    ups, ambiguous, nomatch, by_count = [], 0, 0, 0
+    for lane_id, sname, n_prec in nulls:
         keys = {sname, P._strip_ts(sname)} if sname else set()
-        hit = None
-        amb = False
+        cand = set()
         for k in keys:
-            ids = key2ids.get(k)
-            if not ids:
-                continue
-            if len(ids) == 1:
-                hit = next(iter(ids)); break
-            amb = True
-        if hit:
-            ups.append((hit, lane_id))
-        elif amb:
-            ambiguous += 1
-        else:
+            cand |= key2ids.get(k, set())
+        if not cand:
             nomatch += 1
+            continue
+        if len(cand) == 1:
+            ups.append((next(iter(cand)), lane_id))
+            continue
+        # name is ambiguous — break the tie ONLY if exactly one candidate's stored
+        # precursor count equals this dataset's n_precursors (never mislinks: unique count).
+        exact = [sid for sid in cand if prec_count.get(sid) == n_prec]
+        if len(exact) == 1:
+            ups.append((exact[0], lane_id)); by_count += 1
+        else:
+            ambiguous += 1
 
     print(f"{len(nulls):,} datasets with NULL search_id: "
-          f"{len(ups):,} linkable, {ambiguous:,} ambiguous, {nomatch:,} no-match")
+          f"{len(ups):,} linkable ({by_count:,} via precursor-count tiebreak), "
+          f"{ambiguous:,} ambiguous, {nomatch:,} no-match")
     if ups and not a.dry_run:
         import psycopg2.extras
         psycopg2.extras.execute_batch(
