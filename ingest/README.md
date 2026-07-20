@@ -62,8 +62,14 @@ counts, and a **content md5**, so a lost/corrupt dataset is *detectable* (`verif
 and re-derivable from the archived report on Flinders. The data has two independent homes; PG stays
 the manifest + labels; nothing bulk touches the 402M-row `delimp_precursors`.
 
-- **First: get the reports onto Hive.** Coverage (`plan_spectrum_backfill.py`) found only ~19 of
-  1,890 Spectronaut reports on Flinders; **~1,871 are trapped on `C:\fran_sne_export\`** on the
+> **STATUS (2026-07-20): this backfill is essentially DONE — see [`INGEST_STATUS.md`](INGEST_STATUS.md).**
+> The reports were pulled off Windows and ingested: **1,539 Lance datasets / 353.9M precursors /
+> 2.1B fragments (~92% of the corpus)** now in `delimp_spectrum_lane`. The steps below are the
+> original how-to and are kept for the long tail (~351 searches) + re-runs. The
+> `delimp_spectrum_regen_queue` counts are **stale — do not trust them**; use `delimp_spectrum_lane`.
+
+- **First: get the reports onto Hive.** Coverage (`plan_spectrum_backfill.py`) originally found only
+  ~19 of 1,890 Spectronaut reports on Flinders; **~1,871 were on `C:\fran_sne_export\`** on the
   Windows export box (the report exists — it was just never copied). A Windows ingestor pulls them:
   ```bash
   # on a Windows ingestor (has C:\fran_sne_export + the Flinders share):
