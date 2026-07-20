@@ -77,6 +77,17 @@ snapshot DB.
   writes, schema changes, or to reach the internal/customer tables (the public-layer allowlist in
   `app/db.py` blocks them anyway).
 
+## Ingest / corpus state (for agents touching the pipeline)
+The `ingest/` scripts build FRAN's corpus, including the observed-spectrum **Lance lane**. Before
+reasoning about ingest state, read **`ingest/INGEST_STATUS.md`** — the dated live snapshot (dataset/
+precursor/fragment counts, what's linked, what's left). Durable rules that won't change:
+- **Source of truth for the spectrum lane is the DB table `delimp_spectrum_lane`.** Do **not** trust
+  `delimp_spectrum_regen_queue` — it is a stale, abandoned planning-phase tracker.
+- To fill `search_id = NULL` rows after any ingest, run `python ingest/link_spectrum_lane.py`
+  (idempotent; `--dry-run` to preview; only links unambiguous name matches, never mislinks).
+- Design docs `ingest/README.md` + `ingest/SPECTRONAUT_FRAN_INGEST.md` explain *how* the pipeline
+  works; `INGEST_STATUS.md` records *where it currently is*.
+
 ## Map of the repo (for orientation)
 | Path | What |
 |------|------|

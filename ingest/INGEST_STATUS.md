@@ -16,9 +16,12 @@ off the Windows export box, parsed, and ingested into per-search Lance datasets 
 | Lance datasets registered (`delimp_spectrum_lane` rows) | **1,539** | of 1,890 Spectronaut searches = **81% of searches** |
 | precursors stored | **353,884,368** | of ~384M Spectronaut corpus = **~92% by volume** |
 | fragments stored | **2,097,797,651** (~2.1 B) | observed MS2 fragment rows |
-| datasets linked to a `search_id` | **1,178** | 361 still unlinked — see below |
+| datasets linked to a `search_id` | **1,349** | 190 still unlinked — see below |
 | on-disk store | `glendon/spectra_lance/` — **137 GB** | one `<search>.lance` dataset per search |
 | ingest window | **2026-07-17 → 2026-07-20** | |
+
+_Update 2026-07-20 (later): ran `link_spectrum_lane.py`, which linked **171** of the 361 NULL rows.
+Linked went 1,178 → **1,349**; unlinked 361 → **190**._
 
 ## Where the data lives
 
@@ -32,10 +35,13 @@ off the Windows export box, parsed, and ingested into per-search Lance datasets 
 
 ## Two open follow-ups (small)
 
-1. **361 datasets have `search_id = NULL`.** The spectra are stored safely; only the FK link to
-   `delimp_searches` is missing (report name didn't exactly match a search record). Fix by running
-   **`python link_spectrum_lane.py`** (idempotent; `--dry-run` to preview). It only links unambiguous
-   matches, so it never mislinks.
+1. **190 datasets still have `search_id = NULL`** (down from 361 — `link_spectrum_lane.py` cleared 171
+   on 2026-07-20). The spectra are stored safely; only the FK link to `delimp_searches` is missing
+   (report name didn't exactly match a search record). Of the remaining 190: **139 are ambiguous**
+   (the name maps to >1 Spectronaut search, so the linker refuses to guess — these need a manual/
+   provenance-based tiebreak) and **51 have no name match** at all. Re-run
+   **`python link_spectrum_lane.py`** (idempotent; `--dry-run` to preview) after any new ingest — it
+   only links unambiguous matches, so it never mislinks.
 2. **~351 searches (1,890 − 1,539) not yet in the lane.** These are the long tail — reports still
    missing/corrupt, or searches whose report never got copied. Check with
    `python plan_spectrum_backfill.py` and, for anything still only on Windows, `pull_reports_to_hive.py`
