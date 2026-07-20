@@ -50,9 +50,9 @@ pass 2 added a **precursor-count tiebreak** (`n_precursors_total`) that linked 7
 2. **544 Spectronaut searches (~82.9M precursors) still have NO linked lane dataset** — the real long
    tail, and bigger than first thought. All 544 are `status='completed'` with precursors in the DB, so
    this is genuine observed-spectrum data still to recover (roughly +23% on top of the 353.9M already
-   stored). Plan with `python plan_spectrum_backfill.py` **from Hive** (it needs the Flinders/Windows
-   report filesystem to tell "report archived → backfill now" from "report missing → re-export"); pull
-   any Windows-only reports with `pull_reports_to_hive.py`, then `sbatch backfill_spectra.sbatch`.
+   stored). **Copy-paste steps are in [`BACKFILL_RUNBOOK.md`](BACKFILL_RUNBOOK.md)** — it all runs
+   from Hive (plan with `plan_spectrum_backfill.py`, pull any Windows-only reports with
+   `pull_reports_to_hive.py`, then `sbatch backfill_spectra.sbatch`; resume skips the already-done).
    (Note: some of the 115 unlinked datasets above cover a few of these 544 once linked, so the true
    still-to-backfill count is slightly under 544.)
 
