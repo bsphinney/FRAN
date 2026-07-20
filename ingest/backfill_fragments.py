@@ -231,11 +231,17 @@ def sln_parse(s):
     return out or None
 
 
-def process_one(report_path, out_dir, dry=False):
-    """Parse one report -> Lance dataset. Returns (name, lance_path, n_prec, n_frag, md5, version)
-    or None. No DB here (DB writes are done by the parent so they stay serialized/paced)."""
+def process_one(report_path, out_dir, dry=False, resume=True):
+    """Parse one report -> Lance dataset. Returns (name, lance_path, n_prec, n_frag, md5, version).
+    n_prec == -1 means SKIPPED (dataset already exists, resume mode). No DB here (DB writes are
+    done by the parent so they stay serialized/paced)."""
     import pyarrow as pa  # noqa: F401
     name = report_name(report_path)
+    lance_path = os.path.join(out_dir, f"{_safe(_strip_ts(name))}.lance")
+    # RESUME: if this experiment's dataset already exists, skip BEFORE the expensive parse — so a
+    # re-run only touches newly-arrived reports (already-done datasets are already registered).
+    if resume and not dry and os.path.isdir(lance_path) and os.listdir(lance_path):
+        return (name, lance_path, -1, -1, None, None)
     fdf, pdf = _extract(report_path)
     if fdf is None or fdf.empty or pdf is None or pdf.empty:
         return (name, None, 0, 0, None, None)
@@ -245,9 +251,7 @@ def process_one(report_path, out_dir, dry=False):
     n_prec = tbl.num_rows
     if dry:
         return (name, None, n_prec, n_frag, None, None)
-    # name the dataset by the timestamp-stripped experiment name so re-exports collapse to one
-    # dataset (overwrite) instead of piling up duplicates.
-    lance_path = os.path.join(out_dir, f"{_safe(_strip_ts(name))}.lance")
+    # dataset named by the timestamp-stripped experiment name so re-exports collapse to one.
     _, md5, version = sln.write_lance(tbl, lance_path, mode="overwrite")
     return (name, lance_path, n_prec, n_frag, md5, version)
 
@@ -289,8 +293,10 @@ def main():
     ap.add_argument("--register", action="store_true")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--no-resume", action="store_true", help="reprocess every report even if its Lance dataset already exists")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
+    resume = not a.no_resume
     reports = ([a.report] if a.report else []) + (list(_find_reports(a.scan)) if a.scan else [])
     if not reports:
         sys.exit("give a report path or --scan <dir>")
@@ -304,11 +310,13 @@ def main():
     if a.register and not a.dry_run:
         conn = _pg_conn(); sln.ensure_registry(conn)
 
-    tp = tf = done = 0
+    tp = tf = done = skipped = 0
 
     def handle(res):
-        nonlocal tp, tf, done
+        nonlocal tp, tf, done, skipped
         name, lpath, n_prec, n_frag, md5, ver = res
+        if n_prec == -1:   # resume: dataset already built (already registered by the prior run)
+            skipped += 1; return
         if not n_prec:
             print(f"  [skip] {name}: no fragment-level rows"); return
         tp += n_prec; tf += n_frag; done += 1
@@ -326,24 +334,25 @@ def main():
         # builds (agg(list) over millions of fragments) is fully freed before the next -> no
         # accumulation across reports (the OOM cause at higher worker counts).
         with ProcessPoolExecutor(max_workers=a.workers, max_tasks_per_child=1) as ex:
-            futs = {ex.submit(process_one, rp, a.out_dir, a.dry_run): rp for rp in reports}
+            futs = {ex.submit(process_one, rp, a.out_dir, a.dry_run, resume): rp for rp in reports}
             for i, fut in enumerate(as_completed(futs), 1):
                 try:
                     handle(fut.result())
                 except Exception as e:  # noqa: BLE001
                     print(f"  [warn] {os.path.basename(futs[fut])}: {str(e)[:100]}")
                 if i % 25 == 0:
-                    print(f"[{i}/{len(reports)}] {done} datasets, {tf:,} fragments so far")
+                    print(f"[{i}/{len(reports)}] {done} new, {skipped} skipped, {tf:,} fragments so far")
     else:
         for i, rp in enumerate(reports, 1):
             try:
-                handle(process_one(rp, a.out_dir, a.dry_run))
+                handle(process_one(rp, a.out_dir, a.dry_run, resume))
             except Exception as e:  # noqa: BLE001
                 print(f"  [warn] {os.path.basename(rp)}: {str(e)[:100]}")
             if i % 25 == 0:
-                print(f"[{i}/{len(reports)}] {done} datasets, {tf:,} fragments so far")
+                print(f"[{i}/{len(reports)}] {done} new, {skipped} skipped, {tf:,} fragments so far")
 
-    print(f"DONE: {done} Lance datasets, {tp:,} precursors / {tf:,} fragments -> {a.out_dir}")
+    print(f"DONE: {done} new Lance datasets ({skipped} already existed, skipped), "
+          f"{tp:,} precursors / {tf:,} fragments -> {a.out_dir}")
     if conn is not None:
         conn.close()
 
