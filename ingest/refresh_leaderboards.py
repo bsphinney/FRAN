@@ -17,10 +17,13 @@ import time
 
 import psycopg2
 
-_MVS = ("delimp_mv_top_peptides", "delimp_mv_top_proteins", "delimp_mv_top_genes",
-        "delimp_mv_im_scatter", "delimp_mv_corpus_stats", "delimp_mv_species_proteins",
-        # protein_agg DEPENDS ON species_proteins → must be refreshed AFTER it (keep last).
-        "delimp_mv_protein_agg")
+# Order matters: refresh the cheap, high-value overview views FIRST so the site's headline numbers
+# update even if a later view times out, and put the most expensive view (top_peptides — multiple
+# COUNT(DISTINCT) over the ~400M-row delimp_precursors) LAST. protein_agg DEPENDS ON
+# species_proteins so it must follow it.
+_MVS = ("delimp_mv_corpus_stats", "delimp_mv_top_proteins", "delimp_mv_top_genes",
+        "delimp_mv_species_proteins", "delimp_mv_protein_agg", "delimp_mv_im_scatter",
+        "delimp_mv_top_peptides")
 
 _CREATE = {
     "delimp_mv_top_peptides": """CREATE MATERIALIZED VIEW IF NOT EXISTS delimp_mv_top_peptides AS
@@ -123,7 +126,7 @@ def main():
         user=os.environ.get("DELIMP_PG_USER", "genome-proteomics-service-account"),
         password=_token(), sslmode="require", connect_timeout=30,
         keepalives=1, keepalives_idle=20, keepalives_interval=10, keepalives_count=6,
-        options="-c statement_timeout=1800000")
+        options="-c statement_timeout=7200000")  # 2h — top_peptides/corpus_stats do COUNT(DISTINCT) over ~400M rows
     con.autocommit = True
     cur = con.cursor()
     for mv in _MVS:
