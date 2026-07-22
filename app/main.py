@@ -804,6 +804,20 @@ def api_peptide_fragments(stripped_seq: str, carbamidomethyl: bool = True, max_c
     return ok({"fragments": frag.fragments(stripped_seq, carbamidomethyl, max(1, min(max_charge, 3)))})
 
 
+@app.get("/api/peptide/{stripped_seq}/observed")
+def api_peptide_observed(request: Request, stripped_seq: str, charge: int | None = None):
+    """Layer-0: the REAL measured MS2 spectrum for this peptide, read on demand from the
+    observed-spectrum blob (identity-decoupled). Rate-limited per client; one peptide per request,
+    no bulk path — so the corpus can't be scraped out through it."""
+    from . import ratelimit, observed_spectrum as obs
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        request.client.host if request.client else "?")
+    if not ratelimit.allow(f"observed:{ip}", limit=30, window_s=60):
+        raise HTTPException(429, "Too many spectrum requests — please slow down.")
+    z = max(1, min(charge, 6)) if charge else None
+    return ok({"observed": _safe(lambda: obs.observed_spectrum(stripped_seq, z), None)})
+
+
 @app.get("/api/peptide/{stripped_seq}/predicted")
 def api_peptide_predicted(stripped_seq: str, charge: int = 2, ce: float = 28.0):
     """Koina model-predicted fragment intensities (Prosit/AlphaPeptDeep/ms2pip) + the

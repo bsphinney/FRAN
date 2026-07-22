@@ -45,6 +45,10 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         "delimp_precursor_xic",
         "delimp_xic_quant",
         "delimp_search_sources",
+        # observed-spectrum Lance registry: maps search_id -> blob dataset path + row/fragment counts.
+        # No customer data (just paths/counts/md5); used to locate a peptide's measured spectrum in
+        # the franfragments blob for the /api/peptide/{seq}/observed layer.
+        "delimp_spectrum_lane",
         # precomputed leaderboard snapshots (Highlights) — full GROUP BY over millions of
         # precursor rows times out live on PG Farm, so these are refreshed offline.
         "delimp_mv_top_peptides",

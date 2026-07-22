@@ -499,6 +499,7 @@ async function renderPeptide(seq){
     <div id="sumbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-20 rounded-xl"></div></div>
     <div id="flybox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-16 rounded-xl"></div></div>
     <div id="predbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-48 rounded-xl"></div></div>
+    <div id="obsbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-48 rounded-xl"></div></div>
     <div id="xicbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-64 rounded-xl"></div></div>
     <div id="interfbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-32 rounded-xl"></div></div>
     <div id="lcabox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-20 rounded-xl"></div></div>
@@ -509,7 +510,7 @@ async function renderPeptide(seq){
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Observations across runs (${d.observations.length})</h3>
     ${table(['Search','Engine','Run','Charge','m/z','RT','1/K₀','q-value','Intensity'],
       d.observations.map(o=>[`<span class="text-accent-400 cursor-pointer" onclick="event.stopPropagation();go('run','${o.search_id}')">${esc(o.search_name||'—')}</span>`,esc(o.search_engine||'—'),`<span class="font-mono text-[11px]">${esc((o.raw_path||'').split('/').pop())}</span>`,o.charge+'+',fmtF(o.precursor_mz,4),fmtF(o.rt),fmtF(o.im,3),sci(o.q_value),sci(o.intensity)])) }</div>`;
-    loadFunFacts(seq); loadSummary(seq); loadFlyability(seq); loadPredicted(seq, 2); loadXIC(seq); loadInterference(seq); loadLCA(seq); loadProteins(seq);
+    loadFunFacts(seq); loadSummary(seq); loadFlyability(seq); loadPredicted(seq, 2); loadObserved(seq); loadXIC(seq); loadInterference(seq); loadLCA(seq); loadProteins(seq);
   }catch(e){ dbError(e); }
 }
 
@@ -629,6 +630,39 @@ async function loadFragments(seq){
         scales:{x:{type:'linear',title:{display:true,text:'m/z',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}},
           y:{display:false,min:0,max:1.2}},maintainAspectRatio:false}});
   }catch(e){ const el=$('#fragbox'); if(el) el.remove(); }
+}
+
+// Layer-0: the REAL acquired MS2 spectrum, read on demand from the observed-spectrum blob.
+async function loadObserved(seq){
+  const el=$('#obsbox'); if(!el)return;
+  try{
+    if(charts.c_frag_obs){try{charts.c_frag_obs.destroy()}catch(e){} delete charts.c_frag_obs;}
+    const d=await api(`/api/peptide/${encodeURIComponent(seq)}/observed`); const o=d.observed;
+    if(!o || !o.ions || !o.ions.length){
+      el.innerHTML=`<h3 class="font-bold text-white mb-1">Measured spectrum <span class="text-[10px] text-slate-500 font-normal">observed MS2 · acquired</span></h3>
+        ${empty('No stored measured spectrum for this peptide yet (only searches whose observed fragments were backfilled into the spectrum lane appear here).')}`;
+      return;
+    }
+    const cc=chartColors();
+    const col=t=>t==='b'?'#00B5E2':(t==='y'?'#FF6B6B':'#94a3b8');  // b cyan, y red, other slate
+    const maxI=Math.max(...o.ions.map(i=>i.rel_intensity||0))||100;
+    const ds=[['b','b ions'],['y','y ions'],[null,'other']].map(([t,lab])=>({label:lab,
+      data:o.ions.filter(i=>t?i.type===t:(i.type!=='b'&&i.type!=='y')).map(i=>({x:i.mz,y:(i.rel_intensity||0)/maxI,ion:i.ion,ppm:i.mass_acc_ppm})),
+      backgroundColor:col(t),borderColor:col(t),barThickness:2}));
+    el.innerHTML=`
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+        <h3 class="font-bold text-white">Measured spectrum <span class="text-[10px] text-slate-500 font-normal">observed MS2 · a representative high-confidence acquisition</span></h3>
+        <span class="text-[10px] text-slate-500">${o.n_fragments} fragments · precursor +${o.charge} ${o.precursor_mz?('· m/z '+fmtF(o.precursor_mz,4)):''}</span>
+      </div>
+      <p class="text-[11px] text-slate-500 mb-2">Stick heights are the engine's real relative fragment intensities; positions are measured m/z. This is the actually-acquired spectrum, not predicted.</p>
+      <div class="h-44"><canvas id="c_frag_obs"></canvas></div>`;
+    charts.c_frag_obs=new Chart($('#c_frag_obs'),{type:'bar',data:{datasets:ds},
+      options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
+        tooltip:{callbacks:{label:c=>`${c.raw.ion||''}  m/z ${fmtF(c.raw.x,4)}  ·  ${Math.round(c.raw.y*100)}%${c.raw.ppm!=null?('  ·  '+fmtF(c.raw.ppm,1)+' ppm'):''}`}}},
+        scales:{x:{type:'linear',title:{display:true,text:'m/z',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}},
+          y:{min:0,max:1.05,title:{display:true,text:'relative intensity',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}}},
+        maintainAspectRatio:false}});
+  }catch(e){ const el=$('#obsbox'); if(el) el.innerHTML=`<h3 class="font-bold text-white mb-1">Measured spectrum</h3>${empty('Spectrum service unavailable: '+esc(e.message))}`; }
 }
 
 let _xic=null;
