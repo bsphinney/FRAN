@@ -4,5 +4,5 @@ psycopg2-binary==2.9.10
 pandas==2.2.3
 pyarrow==18.1.0
 mcp==1.28.0  # official MCP Python SDK (bundles FastMCP) — read-only corpus MCP server at /mcp
-pylance==0.22.0  # read observed-spectrum Lance datasets from Azure Blob on demand (/observed layer)
+pylance==8.0.0  # read observed-spectrum Lance datasets from Azure Blob on demand (/observed layer). MUST match the writer (Hive alphadia2 wrote the v2.1 'encodings21' file format; older pylance can't decode it)
 azure-identity==1.19.0  # App Service managed-identity token for private-blob reads (no keys/secrets)
