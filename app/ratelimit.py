@@ -5,9 +5,23 @@ from scraping the blob-backed spectra in a tight loop. Strong global limits woul
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import defaultdict, deque
+
+_PORT_SUFFIX = re.compile(r":\d+$")
+
+
+def client_ip(request) -> str:
+    """Stable per-client key from behind Azure App Service. Azure sets X-Forwarded-For's first hop
+    to `client_ip:port`, and the port changes every request — strip it, or the limiter keys on a
+    value that's unique per request and never trips."""
+    xff = (request.headers.get("x-forwarded-for", "") or "").split(",")[0].strip()
+    if xff:
+        return _PORT_SUFFIX.sub("", xff)  # "1.2.3.4:5678" -> "1.2.3.4"; bare IPs unchanged
+    return request.client.host if request.client else "?"
+
 
 _lock = threading.Lock()
 _hits: dict[str, deque] = defaultdict(deque)
