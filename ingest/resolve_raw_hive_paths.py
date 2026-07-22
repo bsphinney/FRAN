@@ -41,7 +41,19 @@ def _base(name):
 
 
 def _platform_of(ext):
-    return {".d": "bruker_timstof", ".raw": "thermo_orbitrap"}.get(ext)
+    # match the DB's coarse platform vocabulary: Bruker .d => timstof, Thermo .raw => orbitrap
+    return {".d": "timstof", ".raw": "orbitrap"}.get(ext)
+
+
+def _prefer(paths):
+    """When a raw has several physical copies (the raw_data + service-dir two-copy practice, plus the
+    Quobyte archive), pick ONE by root priority — this is not ambiguity, just duplication."""
+    order = ("/raw_data/", "/nfs/lssc0/flinders/", "/quobyte/")
+    for key in order:
+        hit = [p for p in paths if key in p]
+        if hit:
+            return sorted(hit)[0]
+    return sorted(paths)[0]
 
 
 def index_raws(roots):
@@ -95,24 +107,27 @@ def main():
     cur.execute("SELECT raw_path, raw_basename, platform FROM raw_files WHERE hive_path IS NULL OR hive_path=''")
     rows = cur.fetchall()
     hive_ups, plat_ups = [], []
-    n_match = n_conflict = ambiguous = nomatch = 0
+    n_match = n_conflict = multi_copy = nomatch = 0
     conflict_samples = []
     for raw_path, base, db_platform in rows:
         cands = idx.get(base) if base else None
         if not cands:
             nomatch += 1; continue
-        reals = _dedupe_realpath(cands)
+        reals = _dedupe_realpath(cands)          # collapse symlinks/hardlinks to one per real file
         want = _ext(raw_path)
         same = [p for p in reals if _ext(p) == want]
         other = [p for p in reals if _ext(p) != want]
-        if len(same) == 1:
-            chosen, conflict = same[0], False
-        elif len(same) > 1:
-            ambiguous += 1; continue           # >1 distinct file, same ext -> genuinely ambiguous
-        elif len(other) == 1:
-            chosen, conflict = other[0], True   # only a different-format file exists -> resolve + flag
+        # Multiple copies (raw_data + service dir + quobyte archive) is duplication, not ambiguity:
+        # prefer the same-extension copy by root priority; only fall back to a different-format file
+        # (a real conflict) when NO same-extension copy exists anywhere.
+        if same:
+            chosen, conflict = _prefer(same), False
+            if len(same) > 1:
+                multi_copy += 1
+        elif other:
+            chosen, conflict = _prefer(other), True
         else:
-            ambiguous += 1; continue
+            nomatch += 1; continue
         hive_ups.append((chosen, raw_path))
         true_plat = _platform_of(_ext(chosen))
         if true_plat and true_plat != (db_platform or ""):
@@ -125,9 +140,8 @@ def main():
             n_match += 1
 
     print(f"\n{len(rows):,} rows with empty hive_path:")
-    print(f"  resolved (extension matches DB) : {n_match:,}")
+    print(f"  resolved (extension matches DB) : {n_match:,}   ({multi_copy:,} had >1 physical copy)")
     print(f"  resolved but FORMAT CONFLICT    : {n_conflict:,}  (DB ext != physical file ext)")
-    print(f"  ambiguous (>1 distinct file)    : {ambiguous:,}")
     print(f"  not found on disk               : {nomatch:,}")
     print(f"  => platform metadata that disagrees with the real file: {len(plat_ups):,}")
     for b, dbe, phe in conflict_samples:
