@@ -494,8 +494,8 @@ def _flt(v):
         f = float(v) if v not in (None, "") else None
     except (TypeError, ValueError):
         return None
-    if f is None:
-        return None
+    if f is None or f != f:      # f != f is True ONLY for NaN — Spectronaut emits NaN for some
+        return None              # EG.Qvalue; store NULL, never a literal NaN (breaks math/ML/sorts)
     # delimp_precursors numeric columns are PostgreSQL `real` (float4). Spectronaut q/p-values
     # can be ~1e-46, which UNDERFLOWS float4 (min ~1e-38) -> "out of range for type real".
     # Clamp the underflow to 0 (an infinitesimal q-value is effectively 0); drop float4

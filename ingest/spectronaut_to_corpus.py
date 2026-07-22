@@ -204,9 +204,10 @@ def _f(row, cols, field):
         return None
     v = row.get(cols[field])
     try:
-        return float(v) if pd.notna(v) else None
+        f = float(v) if pd.notna(v) else None
     except (TypeError, ValueError):
         return None
+    return None if (f is not None and f != f) else f   # coerce NaN (incl. the string "NaN") -> None
 
 
 if __name__ == "__main__":
