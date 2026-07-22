@@ -96,6 +96,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--fix-meta", action="store_true", help="also correct raw_files.platform from the resolved file's format")
+    ap.add_argument("--dump", help="write the full resolution table (basename, db path, resolved path, exts, conflict) to this CSV")
     ap.add_argument("--root", action="append", default=[])
     a = ap.parse_args()
     roots = a.root or DEFAULT_ROOTS
@@ -109,8 +110,12 @@ def main():
     hive_ups, plat_ups = [], []
     n_match = n_conflict = multi_copy = nomatch = 0
     conflict_samples = []
+    records = []   # (basename, raw_path_db, resolved_path, db_ext, phys_ext, conflict)
     for raw_path, base, db_platform in rows:
-        cands = idx.get(base) if base else None
+        # raw_basename is inconsistent: some rows include the .d/.raw extension, some don't.
+        # The index is keyed on the extension-stripped name, so normalize the DB basename too.
+        key = (_base(base) or base) if base else None
+        cands = idx.get(key) if key else None
         if not cands:
             nomatch += 1; continue
         reals = _dedupe_realpath(cands)          # collapse symlinks/hardlinks to one per real file
@@ -129,6 +134,7 @@ def main():
         else:
             nomatch += 1; continue
         hive_ups.append((chosen, raw_path))
+        records.append((base, raw_path, chosen, want or "", _ext(chosen), "conflict" if conflict else "match"))
         true_plat = _platform_of(_ext(chosen))
         if true_plat and true_plat != (db_platform or ""):
             plat_ups.append((true_plat, raw_path))
@@ -146,6 +152,14 @@ def main():
     print(f"  => platform metadata that disagrees with the real file: {len(plat_ups):,}")
     for b, dbe, phe in conflict_samples:
         print(f"     CONFLICT  {b}  DB={dbe}  physical={phe}")
+
+    if a.dump and records:
+        import csv
+        with open(a.dump, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["raw_basename", "raw_path_db", "resolved_path", "db_ext", "phys_ext", "kind"])
+            w.writerows(records)
+        print(f"  wrote {len(records):,} resolution rows -> {a.dump}")
 
     if not a.dry_run and hive_ups:
         import psycopg2.extras
