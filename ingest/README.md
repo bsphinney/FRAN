@@ -30,6 +30,7 @@ repo so it stays with the app it feeds, not scattered in the DE-LIMP repo. The F
 | `backfill_spectra.sbatch` | submit the corpus Lance backfill on a **compute node** (parallel Arrow/Lance OOM-kills the login node). |
 | `provenance.py` | writes **`delimp_search_provenance`** — the ingest coordination table (source `.sne`, exported report path, every raw file, LIMS linkage). |
 | `write_submission_service_dir.py` | writes `delimp_submission_service_dir` (submission → service folder ledger). |
+| `backfill_protein_counts.py` | one-time corpus fix: splits `n_proteins_total` into **proteins vs protein groups** (see below). `--dry-run`, `--revert`. |
 | `organism.py` | canonical organism/species normalization (single source of truth). |
 | `refresh_leaderboards.py` | PG-Farm auth (`_token`) + leaderboard refresh; imported by the others. |
 | `sne_xic_ingest.py`, `xic_ingest.py` | ingest the GUI-exported **All-XIC SQLite** dbs → `delimp_precursor_xic` for the peptide-page chromatogram viewer (minority of runs). |
@@ -93,6 +94,34 @@ the manifest + labels; nothing bulk touches the 402M-row `delimp_precursors`.
 
 This is the acquired-data source DIA-CLIP trains on — the search engine's own recorded values,
 keyed to the RT/IM already in FRAN. It replaces the sequence-guessed `top6(seq)` fragments.
+
+## Proteins vs protein groups (fixed 2026-07-27)
+
+Spectronaut reports **both**, and they are not the same number. A protein group's label is the
+`;`-joined accessions of its members (`E2RE03;J9P669`), so a run with 635 protein groups can hold
+1,350 proteins. FRAN stored only the **group** count — in a column named `n_proteins_total`, which
+the UI rendered as **"Proteins"** — so every search under-reported proteins against the customer's
+own Spectronaut overview (2.13x low on Ver_15; ~1.2x across the corpus).
+
+Nothing had to be re-exported or re-parsed: the accessions were never lost, they were already inside
+`delimp_proteins.protein_group`. Expanding that label on `;` reproduces the report's
+`PG.ProteinAccessions` set **exactly** (verified on Ver_15 + 6 archived FRAN reports). So the fix is a
+pure SQL derivation:
+
+- `delimp_searches.n_protein_groups_total` (**new**) — the group count (what `n_proteins_total` held).
+- `delimp_searches.n_proteins_total` — now the **true protein count**.
+
+`corpus_ingest.py` writes both for every new search; `backfill_protein_counts.py` did the corpus.
+It is reversible — the old value is preserved verbatim in `n_protein_groups_total`, so
+`--revert` restores the previous semantics. No matview or view reads `n_proteins_total`, so the
+change is live as soon as it's written (no refresh needed).
+
+> **Caveat — how "identified" is defined.** FRAN filters precursors on `EG.Qvalue <= 0.01`, but
+> Spectronaut's own summaries count what its `EG.Identified` flag marks true, which is stricter.
+> On Ver_15 that is 7,517 precursors / 635 groups vs FRAN's 7,525 / 637 — the 8 extra precursors have
+> **negative Cscores** (below the decoy mean), i.e. marginal hits the bare q-cutoff lets through.
+> `EG.Identified` is **not** in the archived FRAN reports (128-131 cols), so aligning the corpus to it
+> would need a re-export — unlike the protein-count fix. Small (+0.11% here) but systematic.
 
 ## Auth / running
 

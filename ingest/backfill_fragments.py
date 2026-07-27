@@ -86,7 +86,12 @@ def _strip_ts(n):
 
 
 def report_name(p):
-    b = re.sub(r"_Report_FRAN \(Normal\)\.(parquet|tsv)$", "", os.path.basename(str(p).replace("\\", "/")), flags=re.I)
+    # Strip the report suffix in either flavour: the canonical FRAN.rs export
+    # "<name>_Report_FRAN (Normal).parquet", or a plain "<name>_Report.parquet" from a custom
+    # scheme (e.g. the everything+decoys ML export) — otherwise the extension lands in the
+    # dataset directory name ("Ver_15_Report.parquet.lance").
+    b = re.sub(r"_Report(_FRAN \(Normal\))?\.(parquet|tsv)$", "",
+               os.path.basename(str(p).replace("\\", "/")), flags=re.I)
     return b or os.path.basename(os.path.dirname(str(p).replace("\\", "/")))
 
 
