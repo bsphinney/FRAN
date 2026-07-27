@@ -3,6 +3,35 @@
 Versions are recorded in `xic_extractor.VERSION`. Each release states what it was measured against,
 because "the extractor works" is only meaningful next to a number.
 
+## v1.1.0 — 2026-07-27
+
+**10–37× faster, bit-identical output.** No API change, no flag, no per-file setup.
+
+Profiling showed the extractor was I/O bound and that ~2/3 of its runtime was spent merely
+*locating* data: `searchsorted` over a ~300M-row memory-mapped cycle index costs ~28 random page
+faults per call on network storage. The actual science — matching six fragment m/z — was **0.5 ms**.
+
+v1.1.0 builds a per-cycle row-offset index (one int64 per cycle, ~9 KB for a 21-minute gradient) so
+slicing is a lookup instead of a search. It is built automatically the first time a cache is opened
+and persisted next to the arrays, so it applies to **every** run with no intervention and costs
+nothing on later opens. If the cache directory is read-only it stays in memory and is still fast.
+
+Measured, with output verified bit-identical to the engine implementation throughout:
+
+| cache | before | after | speedup | identical |
+|---|---|---|---|---|
+| `..._VER_185_S2-B5_1_21766` (index warm) | 3,468 ms/precursor | **94 ms** | **36.8×** | 40/40 |
+| `..._VER_10_S2-B2_1_21552` (never seen, index built on open) | 1,647 ms/precursor | **102 ms** | **16.2×** | 12/12 |
+
+First open of a new cache spends a few seconds building the index (0.5–6.7 s depending on I/O
+contention); re-opening an indexed cache takes 0.17 s. The spread in "before" numbers is shared-
+filesystem contention, which is exactly what the index removes sensitivity to.
+
+**Still open:** only ~1.8% of the events read survive the isolation-window and mobility gate,
+because events are indexed by cycle but not by isolation window — every precursor still reads all
+~12 diaPASEF windows to use one. Partitioning events by window is the next significant win and
+needs a cache-format change.
+
 ## v1.0.0 — 2026-07-27
 
 First published version. Extraction core lifted out of the Retriever-DIA pipeline driver
