@@ -259,7 +259,20 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         qv = _flt(x.get("pg_q_value"))
         if qv is not None:
             a["pgq"] = qv if a["pgq"] is None else min(a["pgq"], qv)
-    print(f"[{engine}] {search_name}: {len(recs):,} precursors, {len(runs)} runs, {len(prot):,} protein×run, platform={platform}")
+    # PROTEIN GROUPS vs PROTEINS (2026-07-27). Spectronaut reports both and they are NOT the same:
+    # a protein group's label is the ';'-joined accessions of its members ("E2RE03;J9P669"), so 635
+    # groups can expand to 1,350 proteins. FRAN stored only the group count — in a column named
+    # n_proteins_total, which the UI rendered as "Proteins" — so every search under-reported proteins
+    # by ~2x against the customer's own Spectronaut overview. Record BOTH: n_protein_groups_total is
+    # the group count (what n_proteins_total used to hold), n_proteins_total is now the true protein
+    # count. Verified: expanding PG.ProteinGroups == PG.ProteinAccessions exactly, on Ver_15 and 6
+    # archived FRAN reports — so this is derivable from protein_group alone, no re-export needed.
+    pg_labels = {k[1] for k in prot}
+    n_protein_groups = len(pg_labels)
+    n_proteins = len({a.strip() for lbl in pg_labels for a in str(lbl).split(";")
+                      if a.strip() and a.strip().lower() not in ("nan", "none", "null")})
+    print(f"[{engine}] {search_name}: {len(recs):,} precursors, {len(runs)} runs, {len(prot):,} protein×run, "
+          f"{n_protein_groups:,} protein groups / {n_proteins:,} proteins, platform={platform}")
     if dry:
         print("  DRY RUN — sample precursor:", {k: recs[0][k] for k in ("run", "stripped_seq", "charge", "rt", "im", "q_value", "protein_group")})
         print("  (no DB writes)")
@@ -321,11 +334,49 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         _SEARCH_NS = uuid.UUID("5f6b1c9e-2d3a-4e7b-9c1d-fab4c0d5e600")
         search_id = str(uuid.uuid5(_SEARCH_NS, output_dir.rstrip("/")))
         raw_paths = {run: os.path.join(output_dir, run + (".d" if platform == "timstof" else ".raw")) for run in runs}
-        cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
-                       pipeline_id,n_raw_files,n_precursors_total,n_proteins_total,status,ingested_schema_version)
-                       VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,'completed',%s)""",
-                    (search_id, search_name, output_dir, engine, f"{engine}-uploader",
-                     len(runs), len(recs), len({k[1] for k in prot}), SCHEMA_VERSION))
+        # n_protein_groups_total: same lockless-catalog-check-then-guarded-ALTER discipline as the
+        # delimp_precursors block above. delimp_searches is small (~2k rows) so the ALTER is cheap,
+        # but the lock_timeout guard stays — an AccessExclusiveLock that queues behind a long write
+        # still blocks readers of THIS table, and every page hits it.
+        cur.execute("""SELECT column_name FROM information_schema.columns
+                       WHERE table_name='delimp_searches' AND column_name='n_protein_groups_total'""")
+        has_npg = bool(cur.fetchone())
+        if not has_npg:
+            try:
+                cur.execute("SAVEPOINT addnpg")
+                cur.execute("SET LOCAL lock_timeout = '3s'")
+                cur.execute("ALTER TABLE delimp_searches ADD COLUMN IF NOT EXISTS n_protein_groups_total INTEGER")
+                cur.execute("RELEASE SAVEPOINT addnpg")
+                cur.execute("RESET lock_timeout")
+                has_npg = True
+                print("  added delimp_searches.n_protein_groups_total")
+            except psycopg2.Error as e:
+                cur.execute("ROLLBACK TO SAVEPOINT addnpg")
+                print(f"  [skip] could not add n_protein_groups_total now ({type(e).__name__}); a later ingest will")
+        # ENGINE VERSION (2026-07-27): search_engine_version existed but nothing wrote it — it was
+        # NULL for all 1,891 Spectronaut searches. Sniff it from the export's sidecar files
+        # (setup.txt / RunOverview / DIA-NN log); None when the sidecars aren't next to the report,
+        # which is the case for reports extracted from the Flinders archive (parquet only).
+        try:
+            from engine_version import detect as _detect_version
+            engine_ver = _detect_version(engine, report, output_dir)
+        except Exception:  # noqa: BLE001 - never fail an ingest over a version string
+            engine_ver = None
+        print(f"  engine version: {engine_ver or 'not found (no setup.txt/log beside the report)'}")
+        if has_npg:
+            cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
+                           search_engine_version,pipeline_id,n_raw_files,n_precursors_total,
+                           n_proteins_total,n_protein_groups_total,status,ingested_schema_version)
+                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,'completed',%s)""",
+                        (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader",
+                         len(runs), len(recs), n_proteins, n_protein_groups, SCHEMA_VERSION))
+        else:  # column not there yet — keep the OLD semantics rather than silently mixing the two
+            cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
+                           search_engine_version,pipeline_id,n_raw_files,n_precursors_total,
+                           n_proteins_total,status,ingested_schema_version)
+                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,'completed',%s)""",
+                        (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader",
+                         len(runs), len(recs), n_protein_groups, SCHEMA_VERSION))
         # per-run max RT (≈ gradient length) for gradient_minutes
         run_max_rt = {}
         for x in recs:
@@ -431,11 +482,43 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 import backfill_fragments as bf
                 import spectrum_lance as sln
+                sln.ensure_registry(conn)
                 _, lpath, n_prec, n_frag, md5, ver = bf.process_one(report, SPECTRUM_LANCE_DIR, dry=False)
+                if lpath and n_prec == -1:
+                    # RESUME SKIP: the dataset already exists on disk, so process_one returns the
+                    # sentinel (-1, -1, None, None) INSTEAD of real counts — registering that would
+                    # overwrite a good row with junk (and int(None) raises, which is how this was
+                    # found: a re-ingest logged "spectrum lane not written"). Keep the existing row;
+                    # only if the dataset is on disk but UNregistered do we re-parse for real values.
+                    cur.execute("SELECT 1 FROM delimp_spectrum_lane WHERE lance_path=%s", (lpath,))
+                    if cur.fetchone():
+                        print(f"  spectrum lane: {lpath} (dataset already present, registry row kept)")
+                        lpath = None
+                    else:
+                        _, lpath, n_prec, n_frag, md5, ver = bf.process_one(
+                            report, SPECTRUM_LANCE_DIR, dry=False, resume=False)
                 if lpath:
-                    sln.ensure_registry(conn)
                     sln.register(conn, search_id, search_name, lpath, n_prec, n_frag, md5, ver)
                     print(f"  spectrum lane: {lpath}  ({n_prec:,} prec / {n_frag:,} frag, registered)")
+                # OBSERVED-CHROMATOGRAM LANE: if this export also dumped the "All XIC" SQLite dbs
+                # (--setXICExportDirectory), store the full elution profiles in their own Lance
+                # dataset + delimp_xic_lane registry. Same best-effort contract as the spectrum lane.
+                if XIC_DIR:
+                    import xic_lance as xln
+                    xln.ensure_registry(conn)
+                    # Own directory, NOT the spectrum-lane dir: verify_spectrum_lane.py and
+                    # plan_spectrum_backfill.py glob "*.lance" there, and "<x>.xic.lance" would
+                    # be silently counted as a spectrum dataset.
+                    xic_out = XIC_LANCE_DIR or os.path.join(
+                        os.path.dirname(SPECTRUM_LANCE_DIR.rstrip("/")) or ".", "xic_lance")
+                    xpath, xn_prec, xn_tr, xmd5, xver = xln.process_one(
+                        report, XIC_DIR, xic_out, search_id=search_id,
+                        search_name=search_name)
+                    if xpath:
+                        xln.register(conn, search_id, search_name, xpath, xn_prec, xn_tr, xmd5, xver)
+                        print(f"  XIC lane: {xpath}  ({xn_prec:,} prec / {xn_tr:,} traces, registered)")
+                    else:
+                        print("  [warn] XIC lane: no traces matched the report's precursors")
             except Exception as e:  # noqa: BLE001 - spectrum lane best-effort, never fail the ingest
                 try:
                     conn.rollback()
@@ -451,6 +534,8 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
 BULK_COPY = False  # set by --bulk-copy; uses COPY for the big precursor insert (fast on HIVE)
 WRITE_FRAGMENTS = True    # write the observed-spectrum Lance lane (Spectronaut fragment-level reports)
 SPECTRUM_LANCE_DIR = None # dir for per-search Lance datasets (set by --lance-dir); None disables the lane
+XIC_DIR = None            # dir of Spectronaut *.xic.db All-XIC dbs (set by --xic-dir); None disables the XIC lane
+XIC_LANCE_DIR = None      # where the .xic.lance datasets go (set by --xic-lance-dir); defaults to a sibling 'xic_lance' dir
 
 _PREC_COLS = ("search_id,raw_path,stripped_seq,modified_seq_diann,modified_seq_proforma,mods,n_mods,"
               "charge,precursor_mz,rt,irt,im,iim,q_value,global_q_value,pg_q_value,intensity,"
@@ -537,8 +622,12 @@ if __name__ == "__main__":
     ap.add_argument("--bulk-copy", action="store_true", help="use COPY for the precursor insert (much faster on a fast PG link, e.g. HIVE)")
     ap.add_argument("--no-fragments", action="store_true", help="skip the observed-spectrum Lance lane (precursors only)")
     ap.add_argument("--lance-dir", default=None, help="dir for per-search Lance spectrum datasets (enables the observed-spectrum lane)")
+    ap.add_argument("--xic-dir", default=None, help="dir of Spectronaut *.xic.db All-XIC dbs (enables the observed-chromatogram Lance lane; needs --lance-dir)")
+    ap.add_argument("--xic-lance-dir", default=None, help="where to write .xic.lance datasets (default: a sibling 'xic_lance' dir next to --lance-dir)")
     a = ap.parse_args()
     BULK_COPY = a.bulk_copy
     WRITE_FRAGMENTS = not a.no_fragments
     SPECTRUM_LANCE_DIR = a.lance_dir
+    XIC_DIR = a.xic_dir
+    XIC_LANCE_DIR = a.xic_lance_dir
     ingest(a.searchdir, a.engine, a.organism_name, a.taxon, a.name, a.dry_run, a.output_dir)

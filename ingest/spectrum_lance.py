@@ -66,7 +66,16 @@ CREATE INDEX IF NOT EXISTS idx_spectrum_lane_sid  ON delimp_spectrum_lane (searc
 
 def content_md5(table: pa.Table) -> str:
     """Deterministic content checksum of the Arrow table (independent of Lance file layout).
-    Re-read a dataset, rebuild the table, recompute this -> matches iff the data is intact."""
+    Re-read a dataset, rebuild the table, recompute this -> matches iff the data is intact.
+
+    combine_chunks() is REQUIRED (fixed 2026-07-27): the IPC stream encodes each record batch
+    separately, so the same rows split differently produce different bytes. A table is one chunk
+    when built in memory at write time, but Lance hands back MULTIPLE chunks when reading a larger
+    dataset — so every dataset big enough to read back multi-chunk reported a false MISMATCH, i.e.
+    the integrity check silently failed open on exactly the biggest datasets. Canonicalising to a
+    single chunk makes the checksum chunking-independent, and matches how the stored md5s were
+    computed (single-chunk, at write time), so existing registry rows verify correctly."""
+    table = table.combine_chunks()
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as w:
         w.write_table(table)

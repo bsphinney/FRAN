@@ -39,6 +39,9 @@ COLMAP = {
     "modified_seq": [r"^EG\.ModifiedSequence$", r"^EG\.ModifiedPeptide$", r"ModifiedSequence$", r"^EG\.PrecursorId$"],
     "charge":       [r"^FG\.Charge$", r"Charge$"],
     "q_value":      [r"^EG\.Qvalue$", r"EG.*Qvalue"],
+    # Decoys: absent from the target-only FRAN.rs schema, but present in the "everything + decoys"
+    # ML export. They must never reach the public corpus — see the skip in iter_records().
+    "is_decoy":     [r"^EG\.IsDecoy$", r"IsDecoy$"],
     "precursor_mz": [r"^FG\.PrecMz$", r"^EG\.PrecursorMz$", r"PrecMz$", r"PrecursorMz$"],
     "rt":           [r"^EG\.ApexRT$", r"^EG\.MeanApexRT$", r"^EG\.RTEmpirical$", r"ApexRT$"],
     "irt":          [r"^EG\.iRT$", r"^EG\.IRTEmpirical$", r"^EG\.RTPredicted$", r"\biRT\b"],
@@ -146,6 +149,12 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
     usecols = list(dict.fromkeys(cols.values()))
     for chunk in iter_chunks(report_path, usecols, chunksize):
         for _, r in chunk.iterrows():
+            # Decoys are reversed/scrambled sequences, not identifications: drop them before the
+            # q-filter. Their EG.Qvalue is the string "NaN", and NaN > q_max is False, so the
+            # filter below would otherwise WAVE THEM THROUGH into delimp_precursors as real IDs.
+            dv = r.get(cols["is_decoy"]) if "is_decoy" in cols else None
+            if dv is not None and pd.notna(dv) and str(dv).strip().lower() in ("true", "1", "1.0"):
+                continue
             qv = r.get(cols["q_value"]) if "q_value" in cols else None
             if qv is not None and pd.notna(qv) and float(qv) > q_max:
                 continue
