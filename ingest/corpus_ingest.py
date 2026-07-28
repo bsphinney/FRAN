@@ -405,23 +405,73 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                         pass
             return None
 
+        # go-forward raw-instrument metadata (FRAN_COLUMN_AUDIT Tier B #2/#3): the stored raw_path is
+        # SYNTHETIC (<.sne>/<run>.d), so index the ACTUAL .d/.raw beside the .sne project folder and read
+        # each via raw_metadata (Bruker analysis.tdf / Thermo .raw). Best-effort: nothing here can fail
+        # the ingest, and ON CONFLICT COALESCEs so a re-ingest that can't locate the raw never wipes
+        # metadata a prior raw-access pass already filled.
+        try:
+            from raw_metadata import read_raw_metadata
+            import glob as _glob
+            _rawbase = os.path.dirname(output_dir or "")
+            _rawidx = {}
+            if _rawbase and os.path.isdir(_rawbase):
+                for _pat in ("*.d", "*.raw", "*/*.d", "*/*.raw"):
+                    for _p in _glob.glob(os.path.join(_rawbase, _pat)):
+                        _rawidx.setdefault(os.path.splitext(os.path.basename(_p))[0], _p)
+        except Exception:
+            read_raw_metadata = None; _rawidx = {}
+        _rawmeta_cache = {}
+
+        def _runmeta(run):
+            if read_raw_metadata is None or run not in _rawidx:
+                return {}
+            ap = _rawidx[run]
+            if ap not in _rawmeta_cache:
+                try:
+                    _rawmeta_cache[ap] = read_raw_metadata(ap, with_size=False) or {}
+                except Exception:
+                    _rawmeta_cache[ap] = {}
+            return _rawmeta_cache[ap]
+
         # raw_files (ON CONFLICT update anonymized name) + sample_metadata + junction
         for run in runs:
             rp = raw_paths[run]
-            # acquisition: DIA-NN is a DIA tool; on timsTOF (.d) that's diaPASEF.
-            acq = "diaPASEF" if platform == "timstof" else "DIA"
+            md = _runmeta(run)
+            # acquisition: prefer the real value sniffed from the raw; else DIA-NN-on-timsTOF = diaPASEF.
+            acq = md.get("acquisition_method") or ("diaPASEF" if platform == "timstof" else "DIA")
             spd = _detect_spd(run)
             # gradient: EvoSep map if SPD known, else the observed RT span as a proxy
             grad = (_SPD_GRAD.get(int(spd)) if (spd and int(spd) in _SPD_GRAD)
                     else (round(float(run_max_rt[run]), 2) if run_max_rt.get(run) else None))
             cur.execute("""INSERT INTO raw_files (raw_path,raw_basename,raw_name_anonymized,platform,
-                           acquisition_method,samples_per_day,gradient_minutes,ingested_schema_version)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (raw_path) DO UPDATE SET
+                           acquisition_method,samples_per_day,gradient_minutes,
+                           instrument_model,instrument_serial,acquisition_date,
+                           mass_range_min,mass_range_max,mobility_min,mobility_max,
+                           n_ms1_frames,n_ms2_frames,file_size_bytes,instrument_metadata_json,
+                           ingested_schema_version)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s, %s)
+                           ON CONFLICT (raw_path) DO UPDATE SET
                            raw_name_anonymized=EXCLUDED.raw_name_anonymized,
                            acquisition_method=EXCLUDED.acquisition_method,
                            samples_per_day=EXCLUDED.samples_per_day,
-                           gradient_minutes=EXCLUDED.gradient_minutes""",
-                        (rp, run, sanitize(run), platform, acq, spd, grad, SCHEMA_VERSION))
+                           gradient_minutes=EXCLUDED.gradient_minutes,
+                           instrument_model=COALESCE(EXCLUDED.instrument_model, raw_files.instrument_model),
+                           instrument_serial=COALESCE(EXCLUDED.instrument_serial, raw_files.instrument_serial),
+                           acquisition_date=COALESCE(EXCLUDED.acquisition_date, raw_files.acquisition_date),
+                           mass_range_min=COALESCE(EXCLUDED.mass_range_min, raw_files.mass_range_min),
+                           mass_range_max=COALESCE(EXCLUDED.mass_range_max, raw_files.mass_range_max),
+                           mobility_min=COALESCE(EXCLUDED.mobility_min, raw_files.mobility_min),
+                           mobility_max=COALESCE(EXCLUDED.mobility_max, raw_files.mobility_max),
+                           n_ms1_frames=COALESCE(EXCLUDED.n_ms1_frames, raw_files.n_ms1_frames),
+                           n_ms2_frames=COALESCE(EXCLUDED.n_ms2_frames, raw_files.n_ms2_frames),
+                           file_size_bytes=COALESCE(EXCLUDED.file_size_bytes, raw_files.file_size_bytes),
+                           instrument_metadata_json=COALESCE(EXCLUDED.instrument_metadata_json, raw_files.instrument_metadata_json)""",
+                        (rp, run, sanitize(run), md.get("platform") or platform, acq, spd, grad,
+                         md.get("instrument_model"), md.get("instrument_serial"), md.get("acquisition_date"),
+                         md.get("mass_range_min"), md.get("mass_range_max"), md.get("mobility_min"), md.get("mobility_max"),
+                         md.get("n_ms1_frames"), md.get("n_ms2_frames"), md.get("file_size_bytes"),
+                         md.get("instrument_metadata_json"), SCHEMA_VERSION))
             cur.execute("""INSERT INTO delimp_sample_metadata (raw_path,sample_type,organism_taxon_id,organism_name,ingested_schema_version)
                            VALUES (%s,'study_sample',%s,%s,%s) ON CONFLICT (raw_path) DO UPDATE
                            SET organism_taxon_id=EXCLUDED.organism_taxon_id, organism_name=EXCLUDED.organism_name""",
