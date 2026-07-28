@@ -3,6 +3,50 @@
 Versions are recorded in `xic_extractor.VERSION`. Each release states what it was measured against,
 because "the extractor works" is only meaningful next to a number.
 
+## v1.4.0 — 2026-07-28
+
+**Neutral loss is now carried through, and channel pairing uses Spectronaut's own trace naming.**
+
+`ObservedFragments.get()` returns `(label, charge, loss)` per fragment instead of `(label, charge)`,
+and `spectronaut_trace_label()` builds the key Spectronaut actually uses — `y5+`, `y5+ -H2O`,
+`y6+ -NH3`, `y19++`. Pairing on the bare ion label was wrong: **5,756 of 108,852** observed
+fragments carry a neutral loss, and **34.2% of precursors** contain the same ion label more than
+once (y5, y5−NH3, y5−H2O differ only by loss and m/z). That mispaired **4,187 channels**, comparing
+a loss-ion chromatogram against its parent's.
+
+**Final verification, loss-aware, full run:**
+
+| channel | n | *r* median | *r* > 0.8 | apex \|Δ\| | area |
+|---|---|---|---|---|---|
+| MS2 fragments | 99,500 | **0.8791** | 72.1% | 0.39 s | 1.028× |
+| MS2 loss ions | 5,576 | **0.8608** | 65.0% | 0.39 s | 1.047× |
+| mono-isotopic | 18,015 | **0.9861** | 94.3% | 0.37 s | 0.963× |
+| M+1 | 18,015 | **0.9835** | 92.7% | 0.37 s | 0.976× |
+| M+2 | 18,015 | **0.9663** | 87.2% | 0.39 s | 1.035× |
+| M+3 | 18,010 | **0.9259** | 76.8% | 0.39 s | 1.111× |
+| M+4 | 13,086 | **0.8931** | 70.2% | 0.39 s | 1.192× |
+
+Channels Spectronaut never traced are now **excluded rather than mispaired** — 4,926 M+4 (it traced
+M+4 for only 13,290 of 18,287 precursors), 614 fragments, 115 loss ions.
+
+**Honest note on impact:** fixing this moved the MS2 median only **0.8751 → 0.8791**, and the
+worst-channel flag 31 → 30 of 100. A loss ion and its parent are the same peptide at the same
+retention time, so their *shapes* barely differ and a correlation metric was nearly blind to the
+mispairing. An area metric would not have been. The fix is still correct — loss ions are now
+evaluated on their own terms and hold up at r 0.861 — but the predicted impact was overstated.
+
+### Known defect, open: MS2 timestamps run ~0.3 s early
+
+Over 42,199 clean fragment channels (r > 0.9, sub-bin apex), our MS2 apex sits a median **−0.295 s**
+from Spectronaut's while MS1 sits at **−0.032 s** — a systematic **−0.263 s** between the two levels,
+about a quarter of the 1.098 s acquisition cycle.
+
+Cause: `cycle_rt[c] = rt[c × frames_per_cycle]` stamps every event in a cycle with the time of that
+cycle's **first** frame, which is the MS1 frame. The 11 MS2 frames are acquired later in the same
+cycle, so fragment traces are labelled early while MS1 lands correctly. Peak *shape* is unaffected
+(correlations don't change), but absolute fragment RT is wrong and this is the likely source of the
+residual MS1-vs-MS2 co-elution scatter. Fix: offset the MS2 axis by the mean MS1→MS2 frame gap.
+
 ## v1.3.0 — 2026-07-27
 
 **The ion-mobility window was too wide, and that — not integration philosophy — was the 1.2× area

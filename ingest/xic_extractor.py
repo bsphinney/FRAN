@@ -37,33 +37,55 @@ CACHE FORMAT
     rt_values, mobility_values, meta, ms1_{mz,int,scan,cycle_idx}, ev_{mz,int,scan},
     cycle_idx, iso_{lo,hi}. Arrays are memory-mapped, so a cache far larger than RAM is fine.
 
-VERIFICATION (v1.0.0, 2026-07-27)
+VERIFICATION (v1.4.0, 2026-07-28)
 ---------------------------------
 Validated against Spectronaut 21's own exported chromatograms — its "All XIC" SQLite export for the
-same run (11May2026_DIA_60spd_VER_185_S2-B5_1_21766, diaPASEF, dog + yeast entrapment), ingested
-into FRAN's XIC Lance lane. Both sides describe the same acquisition, so any disagreement is real.
-Nothing below is fitted; 400 precursors sampled per test.
+same run (11May2026_DIA_60spd_VER_185_S2-B5_1_21766, diaPASEF, dog + yeast entrapment). Both sides
+describe the same acquisition, so any disagreement is real. Nothing is fitted. Every one of our
+curves is read from the Lance store; the raw .d is not opened during comparison.
 
-  Summed MS2 profile, per precursor, using the observed fragments:
-      Pearson r   median 0.915   (78% > 0.8, 4.5% < 0.5)
-      apex RT     median 0.55 s  (74% within one 1.1 s acquisition cycle)
-      empty traces 0 / 400
-  Ion-for-ion, each fragment against Spectronaut's trace for that same ion (2,325 pairs):
-      Pearson r   median 0.833   apex median 0.59 s   (66% within one cycle)
-  Intensity, raw counts both sides (2,312 pairs):
-      area ours/SN   median 1.238   (47% within +/-20%, 81% within 2x)
-      peak ours/SN   median 0.886
+  channel              n      r median   r>0.8   apex |d|   area ours/SN
+  MS2 fragments   99,500        0.8791   72.1%      0.39s        1.028x
+  MS2 loss ions    5,576        0.8608   65.0%      0.39s        1.047x
+  mono-isotopic   18,015        0.9861   94.3%      0.37s        0.963x
+  M+1             18,015        0.9835   92.7%      0.37s        0.976x
+  M+2             18,015        0.9663   87.2%      0.39s        1.035x
+  M+3             18,010        0.9259   76.8%      0.39s        1.111x
+  M+4             13,086        0.8931   70.2%      0.39s        1.192x
 
-  THAT 1.238x WAS A BUG, NOT A PROPERTY (corrected in v1.3.0). Earlier versions documented the
-  excess area as an inherent difference — Spectronaut integrating within fitted peak boundaries
-  while this extractor sums across the gate. The tolerance sweep disproved that: the excess is
-  simply an ion-mobility window 4.6x wider than the peak. At IM_TOL 0.05 -> 0.030 the area ratio
-  goes 1.214x -> ~1.00 and MS2 correlation 0.847 -> ~0.874, on the same data. Beware documenting a
-  systematic before checking whether a parameter explains it.
+  MS1 agrees better than MS2 for a structural reason: MS1 extracts the precursor itself, with no
+  isolation-window ambiguity, while fragments must survive a 12-window diaPASEF gate where
+  co-isolated precursors contribute interference.
 
-  For contrast, the same test with top6_by_mz() instead of the observed fragments: r median 0.679,
-  apex median 1.33 s, and 108 of 400 precursors returned an EMPTY trace. That gap is the reason
-  ObservedFragments exists.
+KNOWN DEFECT — MS2 timestamps run ~0.3 s early (open)
+-----------------------------------------------------
+Measured over 42,199 clean fragment channels (r>0.9, sub-bin apex): our MS2 apex sits a median
+-0.295 s from Spectronaut's, while MS1 sits at -0.032 s. The cause is `cycle_rt[c] = rt[c *
+frames_per_cycle]` — every event in a cycle is stamped with the time of that cycle's FIRST frame,
+which is the MS1 frame. The 11 MS2 frames are acquired later within the same cycle, so fragment
+traces are labelled ~a quarter-cycle early while MS1 lands correctly. It does not alter peak SHAPE
+(correlations are unaffected) but it is wrong for anything reading absolute fragment RT, and it is
+the likely source of the residual MS1-vs-MS2 co-elution scatter. Fix: offset the MS2 axis by the
+mean MS1->MS2 frame gap within a cycle.
+
+TWO CORRECTIONS WORTH REMEMBERING
+---------------------------------
+1. v1.0.0 documented a 1.238x area excess as INHERENT — Spectronaut integrating within fitted peak
+   boundaries while this extractor sums across the gate. It was not inherent. It was an ion-mobility
+   window 4.6x wider than the measured peak. A tolerance sweep moved the area ratio to ~1.00 and
+   improved every channel. The mechanism was plausible and fit every measurement, which is exactly
+   why it survived three verification rounds: the data could not separate "integrates differently"
+   from "window too wide". Only a sweep could. Check whether a PARAMETER explains a systematic
+   before writing it down as a property.
+2. Pairing channels on the bare ion label mispaired 4,187 loss-ion channels (y5-H2O compared against
+   plain y5). Fixing it moved the MS2 median only 0.8751 -> 0.8791, because a loss ion and its parent
+   are the same peptide at the same retention time — their shapes barely differ. A shape metric was
+   nearly blind to the error; an area metric would not have been. Match the metric to the mistake
+   you are trying to catch.
+
+  For contrast, the same comparison using top6_by_mz() instead of the observed fragments: r median
+  0.679, apex median 1.33 s, and 108 of 400 precursors returned an EMPTY trace. That gap is the
+  reason ObservedFragments exists.
 
 PERFORMANCE
     This extractor is I/O bound, not compute bound. A +/-12 s window spans ~6.5M MS2 events of
@@ -88,7 +110,7 @@ import re
 
 import numpy as np
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ── tunables (env-overridable) ───────────────────────────────────────────────────────────────
 PPM = float(os.environ.get("FRAN_XIC_PPM", "15"))
@@ -196,6 +218,7 @@ class ObservedFragments:
         seq = t["stripped_seq"].to_pylist(); chg = t["charge"].to_pylist()
         mz = t["frg_mz"].to_pylist(); ion = t["frg_ion"].to_pylist()
         fz = t["frg_charge"].to_pylist(); ri = t["frg_measured_relint"].to_pylist()
+        lo = t["frg_loss"].to_pylist() if "frg_loss" in t.schema.names else [None] * len(seq)
         self._map: dict[tuple[str, int], tuple[np.ndarray, list]] = {}
         for i in range(len(seq)):
             if not seq[i] or not mz[i]:
@@ -203,16 +226,34 @@ class ObservedFragments:
             m = list(mz[i]); lab = list(ion[i] or []); z = list(fz[i] or []); r = list(ri[i] or [])
             order = np.argsort([-(r[j] if j < len(r) and r[j] is not None else 0)
                                 for j in range(len(m))])[:limit]
+            L = list(lo[i] or [])
             self._map[(seq[i], int(chg[i] or 0))] = (
                 np.array([float(m[j]) for j in order], dtype=float),
                 [(str(lab[j]) if j < len(lab) and lab[j] else None,
-                  int(z[j]) if j < len(z) and z[j] else 1) for j in order])
+                  int(z[j]) if j < len(z) and z[j] else 1,
+                  str(L[j]) if j < len(L) and L[j] else "noloss") for j in order])
 
     def __len__(self):
         return len(self._map)
 
     def get(self, seq: str, charge: int):
+        """(m/z array, [(ion_label, charge, neutral_loss), ...]) ordered by measured intensity."""
         return self._map.get((seq, int(charge)), (None, None))
+
+
+def spectronaut_trace_label(ion: str, charge: int = 1, loss: str = "noloss") -> str | None:
+    """Spectronaut names its exported XIC traces `y5+`, `y19++`, `b6+ -H2O`, `y6+ -NH3`.
+
+    Pair on THIS, never on the bare ion label: 5,756 of 108,852 observed fragments in a real run
+    carry a neutral loss, and 34.2% of precursors contain the same ion label more than once
+    (y5, y5-NH3, y5-H2O differ only by loss and m/z). Keying on the label alone silently compares a
+    loss-ion chromatogram against the plain ion's — it mispaired 4,187 channels before this existed
+    and depressed the measured MS2 agreement."""
+    if not ion:
+        return None
+    key = f"{ion}{'+' * max(int(charge or 1), 1)}"
+    L = (loss or "noloss").strip()
+    return key if L.lower() in ("noloss", "none", "") else f"{key} -{L}"
 
 
 # ── the extractor ─────────────────────────────────────────────────────────────────────────────
