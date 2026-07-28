@@ -29,6 +29,7 @@ CONFIGURATION — environment, no hard-coded site paths, no credentials.
     FRAN_XIC_IM_TOL   ion-mobility half-window, 1/K0 (default 0.05)
     FRAN_XIC_RT_HALF  RT half-window, seconds        (default 12)
     FRAN_XIC_POINTS   points per resampled trace     (default 32)
+    FRAN_XIC_MS1_CHANNELS  isotope channels M, M+1 ...   (default 5, matching Spectronaut)
 This module never opens a database or a credential file.
 
 CACHE FORMAT
@@ -53,11 +54,12 @@ Nothing below is fitted; 400 precursors sampled per test.
       area ours/SN   median 1.238   (47% within +/-20%, 81% within 2x)
       peak ours/SN   median 0.886
 
-  KNOWN SYSTEMATIC: more area but a lower apex means our peaks are slightly BROADER than
-  Spectronaut's. Expected — Spectronaut integrates within fitted peak boundaries, while this
-  extractor sums everything passing the m/z + mobility gate across the whole RT window, so more
-  shoulder and interference is included. Shape and position agree; treat absolute areas as
-  comparable to ~1.2x, not interchangeable.
+  THAT 1.238x WAS A BUG, NOT A PROPERTY (corrected in v1.3.0). Earlier versions documented the
+  excess area as an inherent difference — Spectronaut integrating within fitted peak boundaries
+  while this extractor sums across the gate. The tolerance sweep disproved that: the excess is
+  simply an ion-mobility window 4.6x wider than the peak. At IM_TOL 0.05 -> 0.030 the area ratio
+  goes 1.214x -> ~1.00 and MS2 correlation 0.847 -> ~0.874, on the same data. Beware documenting a
+  systematic before checking whether a parameter explains it.
 
   For contrast, the same test with top6_by_mz() instead of the observed fragments: r median 0.679,
   apex median 1.33 s, and 108 of 400 precursors returned an EMPTY trace. That gap is the reason
@@ -86,14 +88,27 @@ import re
 
 import numpy as np
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 
 # ── tunables (env-overridable) ───────────────────────────────────────────────────────────────
 PPM = float(os.environ.get("FRAN_XIC_PPM", "15"))
-IM_TOL = float(os.environ.get("FRAN_XIC_IM_TOL", "0.05"))
+# 0.030 (full width 0.060) — measured, not inherited. A sweep against Spectronaut 21's own
+# chromatograms over 1,200 precursors x 7 tolerances shows correlation tracing a clean inverted-U
+# that peaks at 0.025 on BOTH levels, with the area ratio crossing 1.0 at ~0.030. Spectronaut's own
+# window for the same file is +/-0.03 (its IM extraction plot reports median WIDTH 0.06), so two
+# independent routes land on the same number. The previous 0.05 was ~4.6x the measured ion-mobility
+# peak width (median 0.0216) and admitted co-eluting ions at other mobilities -- that, not any
+# difference in integration philosophy, was the 1.2x area inflation earlier versions documented.
+IM_TOL = float(os.environ.get("FRAN_XIC_IM_TOL", "0.030"))
 RT_HALF = float(os.environ.get("FRAN_XIC_RT_HALF", "12"))
 N_POINTS = int(os.environ.get("FRAN_XIC_POINTS", "32"))
-N_MS1_CHANNELS = 3          # monoisotope, M+1, M+2
+# Isotope channels: M, M+1 ... Five because that is what Spectronaut 21 traces (measured on a real
+# export: M+3 present for 18,286 of 18,287 precursors, M+4 for 13,290), and the isotope ENVELOPE
+# SHAPE discriminates a real precursor from interference -- truncating it discards part of that
+# comparison, worst on larger peptides whose envelope centre of mass sits high. Overridable because
+# the tensor's first dimension is N_FRAG + N_MS1; downstream code with a hard-coded row count must
+# be updated in step (the Lance trace lane stores n_frag/n_ms1/n_points, so readers can adapt).
+N_MS1_CHANNELS = int(os.environ.get("FRAN_XIC_MS1_CHANNELS", "5"))
 N_FRAG_CHANNELS = 6
 C13 = 1.0033548378
 
@@ -269,7 +284,7 @@ class Cache:
         return ax / 60.0 if (minutes and self.rt_in_seconds) else ax
 
     def extract(self, precursor_mz: float, charge: int, fragment_mz, rt_native: float,
-                im: float, normalize: bool = True) -> np.ndarray:
+                im: float, normalize: bool | str = True) -> np.ndarray:
         """[9, N_POINTS] = 6 fragment channels + 3 MS1 isotope channels, resampled onto a common
         axis. Rows beyond the fragments supplied stay zero. `im` is REQUIRED for diaPASEF: the
         mobility gate is what separates co-isolated precursors, and passing a wrong value silently
@@ -315,7 +330,23 @@ class Cache:
                 T[i] = np.interp(xt, xs, raw[i])
         elif n_cycles == 1:
             T[:, :] = raw[:, :1]
-        if normalize:
+        # NORMALISATION. MS1 and MS2 are not the same magnitude: measured over 18,015 precursors,
+        # MS1 is 5.5x louder at the median and louder in 95.1% of cases (p90 18.8x). So a single
+        # global max -- `normalize=True`, kept as the default only for backward compatibility --
+        # hands MS1 the full range and squashes the FRAGMENT rows to a median peak of 0.18, below
+        # 0.1 for a quarter of precursors. The fragments are the identification evidence.
+        #   False       raw counts. Correct for STORAGE: normalisation is lossy and cannot be undone.
+        #   "per_block" MS1 and MS2 each scaled to their own max, so both use the full range. The
+        #               cross-modality ratio this discards is real information -- carry it alongside
+        #               as log10(ms1_max/ms2_max) rather than losing it.
+        #   True        legacy single global max.
+        if normalize == "per_block":
+            f = T[:N_FRAG_CHANNELS]; m = T[N_FRAG_CHANNELS:]
+            if f.max() > 0:
+                f /= f.max()
+            if m.max() > 0:
+                m /= m.max()
+        elif normalize:
             mx = T.max()
             if mx > 0:
                 T /= mx

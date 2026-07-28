@@ -3,6 +3,74 @@
 Versions are recorded in `xic_extractor.VERSION`. Each release states what it was measured against,
 because "the extractor works" is only meaningful next to a number.
 
+## v1.3.0 — 2026-07-27
+
+**The ion-mobility window was too wide, and that — not integration philosophy — was the 1.2× area
+inflation v1.0.0 documented as inherent.** `IM_TOL` 0.05 → **0.030**.
+
+Spectronaut measures the ion-mobility peak width at a median of **0.0216** 1/K0. The old ±0.05 was a
+full width of 0.10, about **4.6× the peak**, so every extraction admitted co-eluting ions at other
+mobilities. A sweep over 1,200 precursors × 7 tolerances against Spectronaut's own chromatograms
+shows correlation tracing a clean inverted-U peaking at ±0.025 on *both* levels, with the area ratio
+crossing 1.0 at ~±0.030. Spectronaut's own window for the same file is **±0.03** (its IM extraction
+plot reports median *width* 0.06) — two independent routes landing on the same number.
+
+| IM tol | full width | MS2 *r* | MS2 area | MS1 *r* | MS1 area |
+|---|---|---|---|---|---|
+| 0.0100 | 0.020 | 0.832 | 0.665× | 0.970 | 0.632× |
+| 0.0200 | 0.040 | 0.872 | 0.880× | 0.985 | 0.847× |
+| 0.0250 | 0.050 | **0.878** | 0.954× | **0.988** | 0.897× |
+| **0.0300** | 0.060 | *chosen* | ~1.00× | | |
+| 0.0500 *(old)* | 0.100 | 0.847 | 1.214× | 0.976 | 1.117× |
+| 0.0800 | 0.160 | 0.818 | 1.363× | 0.969 | 1.234× |
+
+Tightening *below* ±0.025 clips the peptide's own mobility peak — area collapses to 0.665× and
+empty traces climb — so this is a genuine optimum, not "narrower is better".
+
+**Full-run verification at ±0.030** (18,016 precursors, every channel, against Spectronaut 21):
+
+| channel | n | *r* median | *r* > 0.8 | apex | area | empty |
+|---|---|---|---|---|---|---|
+| MS2 fragments | 103,797 | **0.8751** | 70.1% | 0.39 s | **1.022×** | 1,039 |
+| mono-isotopic | 18,015 | **0.9861** | 94.3% | 0.37 s | 0.963× | 0 |
+| M+1 | 18,015 | **0.9835** | 92.7% | 0.37 s | 0.976× | 0 |
+| M+2 | 18,015 | **0.9663** | 87.2% | 0.39 s | 1.035× | 0 |
+| M+3 | 18,010 | **0.9259** | 76.8% | 0.39 s | 1.111× | 0 |
+| M+4 | 13,086 | **0.8931** | 70.2% | 0.39 s | 1.192× | 0 |
+
+Every channel improved on both correlation and area versus ±0.05, and **every area ratio now sits
+near 1.0**. The weakest channels gained most — M+4 went 0.812 → 0.893 with area 1.680× → 1.192× —
+because the faintest signal was the most contaminated by out-of-mobility interference. Cost: 1,039
+empty MS2 fragment traces (1.0%), zero empty MS1.
+
+**Method note worth keeping.** v1.0.0 documented the area excess as a property of the extractor. It
+was a parameter. The mechanism was plausible and every measurement agreed with it, which is exactly
+why it survived three rounds of verification — the data could not separate "integrates differently"
+from "window too wide". Only a sweep could. Check whether a parameter explains a systematic before
+writing it down as inherent.
+
+**Still approximate:** a fixed tolerance can only approach what Spectronaut does — its window is
+*dynamic* and DNN-predicted per precursor, and the measured peak width varies 1.7× across precursors
+(p10 0.0165, p90 0.0277). Scaling the window per precursor from `FG_IonMobilityPeakWidth`, a column
+Spectronaut records and this extractor does not yet read, is the better long-term fix.
+
+## v1.2.0 — 2026-07-27
+
+**Five isotope channels instead of three**, matching what Spectronaut traces (`M`, `M+1` … `M+4`);
+the tensor becomes `[11, 32]`. Measured on a real export, Spectronaut has M+3 for 18,286 of 18,287
+precursors and M+4 for 13,290, and both agree well enough to be worth keeping (see v1.3.0 table).
+The isotope envelope's *shape* discriminates a real precursor from interference, so truncating at
+M+2 discarded part of that comparison. Costs ~256 bytes per precursor.
+
+**Explicit normalisation modes.** MS1 and MS2 are not the same magnitude: measured over 18,015
+precursors, MS1 is **5.5× louder** at the median and louder in **95.1%** of cases (p90 18.8×). The
+single global max — one scale for all channels — therefore hands MS1 the full range and squashes the
+FRAGMENT rows to a median peak of **0.182**, below 0.1 for **24.5%** of precursors. The fragments are
+the identification evidence. `normalize=False` (raw counts) is correct for storage; `"per_block"`
+scales MS1 and MS2 to their own maxima; the legacy global mode remains the default only for backward
+compatibility. Per-block discards the cross-modality ratio, which is real information — carry it
+alongside as `log10(ms1_max/ms2_max)`.
+
 ## v1.1.0 — 2026-07-27
 
 **10–37× faster, bit-identical output.** No API change, no flag, no per-file setup.
