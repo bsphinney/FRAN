@@ -8,7 +8,20 @@ The collaborator page groups DB rows by raw service_customer, then merges them t
 from __future__ import annotations
 import json, os, re
 
-_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_customer_aliases.json")
+# The curation file is CONFIDENTIAL and gitignored, so it is NOT in a git checkout. Manual zip
+# deploys happened to work because they were built from a working tree that had it; a CI deploy is
+# built from a checkout and would silently ship without it (Oryx rebuilds the app tree, so `clean`
+# is irrelevant). `_load()` swallows FileNotFoundError, so the collaborator page would just quietly
+# lose every canonical name, spelling merge and internal/standard flag — no error, no failing health
+# check. Hence FRAN_ALIASES_PATH: point it at a location OUTSIDE the deployed tree (on Azure App
+# Service, /home/data is a persisted share that a wwwroot deploy never touches).
+_PATH = os.environ.get("FRAN_ALIASES_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "service_customer_aliases.json")
+
+# Set by _load(); surfaced on /api/health so a deploy that lost the file is DETECTABLE rather than
+# silently degraded.
+ALIASES_LOADED = False
+ALIASES_PATH_USED = _PATH
 
 
 def _norm(s: str) -> str:
@@ -33,8 +46,13 @@ def _load():
                 by_rawvar[_norm(rv)] = entry
                 canon_raws.setdefault(ck, set()).add(rv)
             by_rawvar.setdefault(c.get("norm_key", ck), entry)
+        global ALIASES_LOADED
+        ALIASES_LOADED = True
     except FileNotFoundError:
-        pass
+        # Degrade, but SAY SO. Silence here is what would let a CI deploy strip the curation
+        # without anything going red.
+        print(f"collab: curation file not found at {_PATH} — collaborator names will fall back to "
+              f"raw values. Set FRAN_ALIASES_PATH if it lives outside the app directory.", flush=True)
     return by_rawvar, canon_raws
 
 

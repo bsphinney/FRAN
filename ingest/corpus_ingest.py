@@ -28,7 +28,9 @@ import re
 import sys
 import uuid
 
-SCHEMA_VERSION = "1.0.0"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from versions import CORPUS_INGEST_VERSION, SCHEMA_VERSION  # noqa: E402
+
 _UNIMOD = {"UniMod:4": 4, "UniMod:35": 35, "UniMod:1": 1, "UniMod:21": 21, "UniMod:7": 7}
 
 
@@ -282,6 +284,12 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
     conn = _conn(); conn.autocommit = False
     try:
         cur = conn.cursor()
+        # Stamp this run into delimp_component_version before doing any work, so a run that later
+        # dies still leaves a record of which code touched the corpus. Never fatal.
+        import versions as _V
+        _V.record_run(cur, "corpus_ingest", CORPUS_INGEST_VERSION,
+                      notes=f"schema={SCHEMA_VERSION}")
+        conn.commit()
         # auto-add the cross-run-comparable columns (not in v1 schema) so the uploader
         # can store iRT/iIM straight from the report — the path to a TRUE iRT axis.
         # IMPORTANT: never run ALTER TABLE unconditionally here. `ADD COLUMN` takes an
@@ -410,21 +418,28 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # each via raw_metadata (Bruker analysis.tdf / Thermo .raw). Best-effort: nothing here can fail
         # the ingest, and ON CONFLICT COALESCEs so a re-ingest that can't locate the raw never wipes
         # metadata a prior raw-access pass already filled.
+        # NOTE: this used to swallow every failure, including `raw_metadata` not being importable at
+        # all. It stayed that way for months and silently NULLed the whole instrument block on every
+        # ingest. Locating the raws is genuinely best-effort, but a missing module is a bug — so the
+        # import is no longer inside the try, and an empty index says so out loud.
+        from raw_metadata import read_raw_metadata
+        import glob as _glob
+        _rawbase = os.path.dirname(output_dir or "")
+        _rawidx = {}
         try:
-            from raw_metadata import read_raw_metadata
-            import glob as _glob
-            _rawbase = os.path.dirname(output_dir or "")
-            _rawidx = {}
             if _rawbase and os.path.isdir(_rawbase):
                 for _pat in ("*.d", "*.raw", "*/*.d", "*/*.raw"):
                     for _p in _glob.glob(os.path.join(_rawbase, _pat)):
                         _rawidx.setdefault(os.path.splitext(os.path.basename(_p))[0], _p)
-        except Exception:
-            read_raw_metadata = None; _rawidx = {}
+        except OSError as e:
+            print(f"  raw-metadata: cannot index raws under {_rawbase}: {e}", flush=True)
+        if not _rawidx:
+            print(f"  raw-metadata: no .d/.raw found beside {_rawbase or '(no output_dir)'} — "
+                  f"instrument fields will fall back to COALESCE", flush=True)
         _rawmeta_cache = {}
 
         def _runmeta(run):
-            if read_raw_metadata is None or run not in _rawidx:
+            if run not in _rawidx:
                 return {}
             ap = _rawidx[run]
             if ap not in _rawmeta_cache:

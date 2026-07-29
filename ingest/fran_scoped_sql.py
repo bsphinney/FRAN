@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""fran_scoped_sql.py — the Phase 1 gate: does a SQL-SELECTED cohort beat the filename grep?
+
+This is `fran_scoped.py` with EXACTLY ONE THING CHANGED: how the cohort is chosen.
+
+The original selected datasets by `"60spd" in os.path.basename(p).lower()` — a filename substring
+that found 16 datasets (horse, manatee, mouse, HeLa and one canine) and scored **10.57 s robust sd**,
+against 15.52 s for the whole corpus pooled and 27.42 s for DIA-NN's own predicted iRT.
+
+Here the cohort comes from the run dimension instead:
+
+    delimp_spectrum_lane_runs  (lance_path -> run, built by build_lane_run_index.py)
+      JOIN raw_files ON raw_files.raw_basename = run
+      WHERE gradient_minutes BETWEEN :lo AND :hi
+
+Everything downstream is byte-for-byte the original: q_value <= 0.01, non-decoy, the same 16 TEST run
+ids excluded by substring, mean irt_empirical per (stripped_seq, charge), the same ground truth from
+sn21cmp/every_precursor.parquet, IsotonicRegression(out_of_bounds="clip") under
+KFold(5, shuffle=True, random_state=0), and robust sd = 1.4826 x MAD. If any of that drifts the
+comparison is meaningless.
+
+Two things the SQL cohort can do that the grep cannot:
+
+  1. **Scope by RUN, not by dataset.** Datasets are one per SEARCH and only 218 of 1,552 hold a single
+     run, so dataset-level scoping drags in every other run that search happened to contain. Rows are
+     filtered to cohort runs here.
+  2. **Be complete.** The grep found 16 datasets / 111 runs. The gradient 18-22 min band holds
+     **3,480 runs across 559 datasets** — 31x more comparable data, selected on the actual LC
+     parameter rather than on whether someone typed "60spd" in a filename.
+
+Usage (compute node):
+    python fran_scoped_sql.py --grad-lo 18 --grad-hi 22
+    python fran_scoped_sql.py --legacy-grep      # reproduce the original cohort as a control
+"""
+import argparse
+import functools
+import glob
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+import lance
+from sklearn.isotonic import IsotonicRegression
+from sklearn.model_selection import KFold
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+print = functools.partial(print, flush=True)  # noqa: A001
+
+G = "/quobyte/proteomics-grp/brett/glendon"
+C = "/quobyte/proteomics-grp/brett/sn21cmp"
+# The 16 held-out benchmark runs. Unchanged from fran_scoped.py — the leakage guard is a substring
+# test against the run name, and `Dog_yeast_entrapment_SN21` IS in the corpus, so dropping this
+# makes the result circular and flattering.
+TEST = {"21552", "21561", "21524", "21567", "21585", "21533", "21579", "21664",
+        "21620", "21673", "21663", "21637", "21779", "21782", "21766", "21783"}
+
+
+def _conn():
+    import psycopg2
+    from refresh_leaderboards import _token
+    return psycopg2.connect(
+        host="pgfarm.library.ucdavis.edu", port=5432,
+        dbname="uc-davis-genome-center-proteomics-core/delimp",
+        user=os.environ.get("DELIMP_PG_USER", "genome-proteomics-service-account"),
+        password=_token(), sslmode="require", connect_timeout=30,
+        options="-c statement_timeout=300000")
+
+
+def sql_cohort(grad_lo, grad_hi, instrument=None):
+    """(dataset -> set(cohort runs)) for every run whose gradient sits in the band.
+
+    DISTINCT matters: raw_basename is 1:many against raw_files (a basename recurs across resubmits),
+    so without it a run is counted once per duplicate raw_files row."""
+    q = """
+        SELECT DISTINCT lr.lance_path, lr.run
+        FROM delimp_spectrum_lane_runs lr
+        JOIN raw_files rf ON rf.raw_basename = lr.run
+        WHERE rf.gradient_minutes BETWEEN %s AND %s
+    """
+    args = [grad_lo, grad_hi]
+    if instrument:
+        q += " AND rf.instrument_model ILIKE %s"
+        args.append(f"%{instrument}%")
+    con = _conn(); cur = con.cursor()
+    cur.execute(q, args)
+    out = {}
+    for path, run in cur.fetchall():
+        out.setdefault(path, set()).add(run)
+    con.close()
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--grad-lo", type=float, default=18.0)
+    ap.add_argument("--grad-hi", type=float, default=22.0)
+    ap.add_argument("--instrument", default=None, help='e.g. "timsTOF HT"')
+    ap.add_argument("--legacy-grep", action="store_true", help="reproduce the original 60spd cohort")
+    ap.add_argument("--max-datasets", type=int, default=0, help="cap datasets (smoke test)")
+    a = ap.parse_args()
+
+    if a.legacy_grep:
+        sets = [p for p in sorted(glob.glob(f"{G}/spectra_lance/*.lance"))
+                if "60spd" in os.path.basename(p).lower()]
+        cohort = {p: None for p in sets}   # None => accept every run in the dataset (original behaviour)
+        print(f"COHORT = legacy filename grep: {len(cohort)} datasets")
+    else:
+        cohort = sql_cohort(a.grad_lo, a.grad_hi, a.instrument)
+        nruns = sum(len(v) for v in cohort.values())
+        print(f"COHORT = SQL, gradient {a.grad_lo}-{a.grad_hi} min"
+              + (f", instrument ~ {a.instrument}" if a.instrument else "")
+              + f": {len(cohort)} datasets / {nruns} runs")
+    if a.max_datasets:
+        cohort = dict(list(cohort.items())[:a.max_datasets])
+        print(f"  capped to {len(cohort)} datasets")
+
+    acc = {}
+    n_ds = 0
+    for p in sorted(cohort):
+        keep_runs = cohort[p]
+        if not os.path.exists(p):
+            continue
+        try:
+            t = lance.dataset(p).scanner(
+                columns=["stripped_seq", "charge", "run", "q_value", "irt_empirical", "is_decoy"],
+                filter="q_value <= 0.01").to_table().to_pydict()
+        except Exception as e:  # noqa: BLE001
+            print(f"  skip {os.path.basename(p)}: {str(e)[:60]}")
+            continue
+        n = 0
+        for i in range(len(t["stripped_seq"])):
+            if t["is_decoy"][i]:
+                continue
+            run = str(t["run"][i])
+            if any(x in run for x in TEST):        # leakage guard, unchanged
+                continue
+            if keep_runs is not None and run not in keep_runs:
+                continue                            # run-level scoping (the new part)
+            ie = t["irt_empirical"][i]; ch = t["charge"][i]
+            if ie is None or ch is None:
+                continue
+            k = (str(t["stripped_seq"][i]), int(ch))
+            s, c = acc.get(k, (0.0, 0)); acc[k] = (s + float(ie), c + 1)
+            n += 1
+        n_ds += 1
+        if n_ds % 25 == 0:
+            print(f"  [{n_ds}/{len(cohort)}] {len(acc):,} covered precursors")
+    print(f"datasets scanned: {n_ds}   consensus precursors: {len(acc):,}")
+
+    sn = pd.read_parquet(f"{C}/every_precursor.parquet")
+    sn = sn[(sn.sn_is_decoy == False) & (sn.sn_qvalue <= 0.01) & sn.our_pid.notna()].copy()  # noqa: E712
+    sn["our_rt"] = sn["sn_apex_rt_s"] + sn["our_delta_rt_to_sn"]
+    sn = sn[np.isfinite(sn.our_rt)]
+    sn["k"] = list(zip(sn.sn_stripped_seq.astype(str), sn.sn_charge.astype(int)))
+    sn["scoped"] = [acc[k][0] / acc[k][1] if k in acc else np.nan for k in sn.k]
+    sn["nobs"] = [acc[k][1] if k in acc else 0 for k in sn.k]
+
+    cov = np.isfinite(sn.scoped)
+    print(f"\ncoverage of the SN-confident precursors: {cov.sum()} ({100 * cov.mean():.1f}%)")
+    print(f"observations per covered precursor: median {int(np.median(sn.nobs[cov])) if cov.sum() else 0}, "
+          f"max {int(sn.nobs.max())}")
+
+    def rsd(r):
+        r = r[np.isfinite(r)]
+        return 1.4826 * np.median(np.abs(r - np.median(r)))
+
+    def cv(x, y):
+        ok = np.isfinite(x) & np.isfinite(y)
+        xi, yi = x[ok], y[ok]
+        if len(xi) < 200:
+            return np.array([np.nan])
+        pr = np.full(len(xi), np.nan)
+        for tr, te in KFold(5, shuffle=True, random_state=0).split(xi):
+            pr[te] = IsotonicRegression(out_of_bounds="clip").fit(xi[tr], yi[tr]).predict(xi[te])
+        return yi - pr
+
+    print("\n%-44s %7s %10s %10s" % ("predictor (5-fold held out)", "n", "robust_sd", "med|r|"))
+    sub = sn[cov]
+    for nm, x, s in (("FRAN scoped (this cohort)", sub.scoped.to_numpy(float), sub),
+                     ("  same, n_obs >= 2", sub[sub.nobs >= 2].scoped.to_numpy(float), sub[sub.nobs >= 2]),
+                     ("  same, right-peak only",
+                      sub[sub.our_delta_rt_to_sn.abs() <= 10].scoped.to_numpy(float),
+                      sub[sub.our_delta_rt_to_sn.abs() <= 10])):
+        r = cv(x, s["our_rt"].to_numpy(float))
+        if np.all(~np.isfinite(r)):
+            print("%-44s %7d   (too few)" % (nm, len(s))); continue
+        print("%-44s %7d %9.2fs %9.2fs" % (nm, len(s), rsd(r), np.median(np.abs(r[np.isfinite(r)]))))
+
+    print("\nreference (same fit, same held-out split):")
+    print("   FRAN scoped to the 60spd filename grep   10.57 s   <- the number to beat")
+    print("   FRAN pooled over all 1,552 runs          15.52 s")
+    print("   DIA-NN 2.6 predicted iRT                 27.42 s")
+    print("   DIA-NN 2.6.1 within-run                  16.7  s")
+    print("   Spectronaut 21 within-run                 7.4  s")
+
+
+if __name__ == "__main__":
+    main()

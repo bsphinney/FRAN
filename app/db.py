@@ -76,6 +76,12 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         "delimp_peptide_superlatives_snapshot",
         # THE PROTEOME CODE 🔮 — hidden phrases/prophecies found in peptides (scripts/proteome_code.py)
         "delimp_proteome_code",
+        # which pipeline code produced the corpus (ingest/versions.py writes it; /version reads it).
+        # Versions, git shas and hostnames only — no customer data.
+        "delimp_component_version",
+        # delimp_precursor_xic.fragments flattened to one row per fragment with a btree on mz, so the
+        # shared-transition panel is an index range scan instead of a 264k-row jsonb explosion.
+        "delimp_xic_fragment",
     }
 )
 
@@ -385,8 +391,14 @@ def query(
                             pass
         except (psycopg2.errors.QueryCanceled, psycopg2.OperationalError,
                 psycopg2.InterfaceError) as e:
-            # transient under ingestion load -> retry once on a fresh connection
+            # transient under ingestion load -> retry once on a fresh connection.
+            # EXCEPT a cancel under an explicit short timeout_ms: that caller chose its own bound
+            # precisely because the query is known-slow, so retrying just spends the bound twice and
+            # doubles the caller's worst case (the peptide substring scan took 2x4s per statement,
+            # 4 statements per search -> the request hung long enough to look like a dead page).
             last_exc = e
+            if isinstance(e, psycopg2.errors.QueryCanceled) and timeout_ms is not None:
+                raise
             if attempt + 1 < _QUERY_ATTEMPTS:
                 continue
             raise

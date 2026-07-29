@@ -1,0 +1,329 @@
+# .github/workflows/deploy.yml
+#
+# Auto-deploy FRAN (FastAPI, linuxFxVersion=PYTHON|3.11 -- a CODE deploy via Oryx, not a
+# container) to Azure App Service fran-ucd-proteomics on push to main.
+#
+# AUTH: Entra ID workload identity federation (OIDC). Basic publishing credentials are
+# DISABLED on this app (scm.allow=false, ftp.allow=false), so the publish-profile pattern
+# CANNOT work. HARD RULES for this repo:
+#   * `publish-profile:` must never appear in any workflow.
+#   * No workflow may call `az webapp deployment list-publishing-profiles` or
+#     `... list-publishing-credentials`.
+#   * No `--debug`, no `set -x`, no `az webapp config appsettings list/set`. This is a
+#     PUBLIC repo; Actions logs are world-readable and the app settings hold
+#     DELIMP_PG_SECRET / FRAN_MCP_KEY_SECRET / MICROSOFT_PROVIDER_AUTHENTICATION_SECRET.
+#
+# Required repo secrets (see the one-time setup runbook):
+#   AZURE_CLIENT_ID        appId of the "FRAN GitHub Deploy" app registration (NOT the
+#                          Easy Auth app 3129af59-332e-428a-abdc-9e25e143292b)
+#   AZURE_TENANT_ID        a8046f64-66c0-4f00-9046-c8daf92ff62b
+#   AZURE_SUBSCRIPTION_ID  7c2f921b-c35c-4c1c-aa76-bc51a89e2229
+#
+# Exactly ONE federated credential is required and it must match the token this workflow
+# actually mints:
+#   issuer   https://token.actions.githubusercontent.com
+#   subject  repo:bsphinney/FRAN:ref:refs/heads/main
+#   audience api://AzureADTokenExchange
+# That subject covers `push` to main AND `workflow_dispatch` run from main. This workflow
+# therefore declares NO `environment:` -- adding one silently changes the subject to
+# repo:bsphinney/FRAN:environment:<name> and breaks token exchange (AADSTS700213).
+# Rollback uses a `ref` INPUT that checkout consumes, never a dispatch against a tag ref,
+# for the same reason.
+#
+# This workflow NEVER touches app settings. A code deploy neither reads nor rewrites them.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'requirements.txt'
+      - 'scripts/predeploy_check.py'
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/verify.yml'
+      # Exclusions LAST: GitHub path filters are last-match-wins, so this cancels any .md
+      # under app/ while leaving .py/.js/.html/.txt included. ingest/** (60 of 98 tracked
+      # files, Hive/sbatch scripts unrelated to the web app) and docs/** never appear
+      # above, so they never trigger a production restart.
+      - '!**/*.md'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build and deploy (rollback: a previous tag or SHA). Leave blank for main.'
+        required: false
+        default: ''
+
+# One deploy at a time. B1, single worker, no slots: two overlapping OneDeploy publishes
+# would fight over /home/site/wwwroot with no rollback path.
+# cancel-in-progress:false protects the IN-FLIGHT publish. GitHub still supersedes the
+# PENDING run, so a burst of N commits produces at most two deploys -- the first and the
+# last. A middle run showing as "cancelled" is expected behaviour, not a failure.
+concurrency:
+  group: deploy-fran-production
+  cancel-in-progress: false
+
+jobs:
+  # Gate. `needs: gate` on the deploy job is the only thing that makes this a PRE-deploy
+  # gate rather than a parallel one.
+  gate:
+    uses: ./.github/workflows/verify.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ github.event.inputs.ref || github.sha }}
+
+  deploy:
+    name: Package, OneDeploy, health gate
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write    # mint the OIDC token for azure/login
+      contents: read     # actions/checkout
+    env:
+      AZURE_RESOURCE_GROUP: rg-fran
+      AZURE_WEBAPP_NAME: fran-ucd-proteomics
+      SITE_URL: https://fran.stan-proteomics.org
+      HEALTH_TIMEOUT_SECONDS: '900'   # alwaysOn=false: cold start is on the critical path
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+          fetch-depth: 1
+
+      # APP_VERSION in app/main.py is the only version surface the app exposes. Parse it
+      # with a real regex: app/main.py:26 is
+      #   APP_VERSION = "0.16.0"  # 0.16.0: ...
+      # followed by several continuation comment lines, so cut/awk are not safe.
+      - name: Read APP_VERSION from app/main.py
+        id: appver
+        run: |
+          set -euo pipefail
+          python3 - > "${RUNNER_TEMP}/appver.txt" <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path("app/main.py").read_text(encoding="utf-8")
+          m = re.search(r'''^APP_VERSION\s*=\s*["']([^"']+)["']''', src, re.M)
+          if not m:
+              sys.exit("FATAL: APP_VERSION not found in app/main.py")
+          print(m.group(1))
+          PY
+          version="$(tr -d '[:space:]' < "${RUNNER_TEMP}/appver.txt")"
+          [ -n "$version" ] || { echo "::error::APP_VERSION parsed as empty"; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Expected APP_VERSION: ${version}"
+
+      # Advisory only. A version-equality health gate is a tautology when APP_VERSION was
+      # not bumped -- it can pass against the OLD process. This must NOT be a hard failure:
+      # that would make the pipeline non-idempotent (a run that times out on a cold start
+      # could never be retried, and rollbacks/redeploys of an unchanged version would be
+      # permanently blocked). Fail-closed on the curl instead of fail-open on the parse.
+      - name: Record currently-live version (advisory)
+        id: livebefore
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          raw="$(curl -fsS --max-time 20 -H 'Cache-Control: no-cache' "${SITE_URL}/version" || true)"
+          before="$(printf '%s' "$raw" | jq -r '.version // empty' 2>/dev/null || true)"
+          : "${before:=unknown}"
+          echo "before=${before}" >> "$GITHUB_OUTPUT"
+          echo "Live before deploy: ${before}"
+
+      # The archive ROOT must contain app/ and requirements.txt because Oryx builds from
+      # the zip root (it looks for ./requirements.txt there). NOTE: the runtime cwd is NOT
+      # wwwroot -- oryx-manifest.toml on this site has CompressDestinationDir="true", so
+      # Oryx packs the built app into /home/site/wwwroot/output.tar.zst and App Service
+      # extracts it to a /tmp directory at container start; uvicorn runs from that
+      # extraction. Zipping the repo folder itself would produce a nested FRAN/app and
+      # break the Oryx build.
+      #
+      # Payload: the 22 tracked files under app/ plus requirements.txt = 23 files (a zip
+      # index also lists 3 directory entries: app/, app/static/, app/templates/).
+      # Excluded: ingest/**, docs/**, *.md, Dockerfile (HuggingFace, not how this site
+      # runs), dev_mock_preview.py, .git/, .omc/, __pycache__.
+      # Built from a clean checkout, never a working directory, so a stray local .env or
+      # scratch file can never enter the artifact.
+      - name: Build deployment zip
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          zip -r -q dist/fran.zip app requirements.txt \
+            -x '*__pycache__*' -x '*.pyc' -x '*.md'
+          unzip -l dist/fran.zip
+          # Refuse to publish an empty or malformed package. --type zip OneDeploy replaces
+          # wwwroot, so an empty archive would take the site down.
+          test -s dist/fran.zip
+          unzip -l dist/fran.zip | grep -q 'app/main.py'
+          unzip -l dist/fran.zip | grep -q 'app/static/app.js'
+          unzip -l dist/fran.zip | grep -q 'app/templates/index.html'
+          unzip -l dist/fran.zip | grep -q 'requirements.txt'
+          echo "appjs_bytes=$(stat -c%s app/static/app.js)" >> "$GITHUB_OUTPUT"
+          echo "zip_bytes=$(stat -c%s dist/fran.zip)" >> "$GITHUB_OUTPUT"
+
+      # Retained so a rollback can redeploy a known-good SOURCE tree without re-resolving
+      # it from git. It does NOT skip the Oryx build (see the rollback notes below).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fran-deploy-${{ github.sha }}
+          path: dist/fran.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Azure login (OIDC federated credential -- no publish profile, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Mechanically identical to today's working manual deploy: OneDeploy POST to the
+      # Kudu endpoint /api/publish?type=zip. az CLI 2.87.0's get_scm_site_headers()
+      # (custom.py:6662) falls back to `Authorization: Bearer <appservice token>` when
+      # basic_auth_supported() is false, so scm.allow=false is a non-issue for this path.
+      #
+      # --timeout is SECONDS in az CLI 2.87.0 despite the --help text saying milliseconds:
+      #   custom.py:9650  max_time_sec = int(timeout) if timeout else 1000   (track-status)
+      #   custom.py:9549  total_trials = (int(timeout) // 2) if timeout else 450, sleep(2)
+      # Passing 900000 would set a ~250-hour cap, i.e. no effective timeout at all.
+      # --track-status polls runtime startup status and FAILS the step if the site does not
+      # come up. That is the authoritative "it deployed AND started" signal.
+      - name: Deploy to App Service (OneDeploy zip, Oryx remote build)
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          az webapp deploy \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" \
+            --src-path dist/fran.zip \
+            --type zip \
+            --restart true \
+            --track-status true \
+            --enriched-errors true \
+            --timeout 900
+
+      # Second gate, against the public hostname. Easy Auth on this app is
+      # requireAuthentication=false / unauthenticatedClientAction=AllowAnonymous, so these
+      # routes are anonymously reachable today. If that is ever tightened, this gate fails
+      # loudly on the 302 rather than passing silently -- the status code is asserted
+      # numerically, never via `curl -f` (which treats 302 as success).
+      - name: Health gate
+        env:
+          EXPECTED: ${{ steps.appver.outputs.version }}
+          BEFORE: ${{ steps.livebefore.outputs.before }}
+          APPJS_BYTES: ${{ steps.package.outputs.appjs_bytes }}
+        run: |
+          set -uo pipefail
+          if [ "$EXPECTED" = "$BEFORE" ]; then
+            echo "::warning title=APP_VERSION not bumped::app/main.py APP_VERSION is still '${EXPECTED}', the same string the site served before this deploy. The version poll below can then only prove the app is up -- not that the new code is live. The az webapp deploy --track-status step and the /static/app.js byte check are the authoritative signals. Bump APP_VERSION on every user-visible change."
+          fi
+
+          deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+          attempt=0; last=""; ok=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            attempt=$(( attempt + 1 ))
+            code="$(curl -sS -o /tmp/version.json -w '%{http_code}' --max-time 30 \
+                    -H 'Cache-Control: no-cache' "${SITE_URL}/version" || echo 000)"
+            if [ "$code" = "200" ]; then
+              got="$(jq -r '.version // empty' /tmp/version.json 2>/dev/null || echo '')"
+              if [ "$got" = "$EXPECTED" ]; then ok=1; break; fi
+              last="HTTP 200 but version='${got}' (want '${EXPECTED}')"
+            elif [ "$code" = "302" ] || [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              last="HTTP ${code} -- Easy Auth appears to be intercepting /version"
+            else
+              last="HTTP ${code} -- not answering yet (cold start; alwaysOn=false)"
+            fi
+            echo "attempt ${attempt}: ${last}"
+            sleep 10
+          done
+          # Explicit exit -- never rely on a loop's own status (a trailing `sleep` exits 0).
+          if [ "$ok" != "1" ]; then
+            echo "::error title=Health gate FAILED::${SITE_URL}/version never reported '${EXPECTED}' within ${HEALTH_TIMEOUT_SECONDS}s. Last: ${last}"
+            exit 1
+          fi
+          echo "version OK after ${attempt} attempt(s): ${EXPECTED}"
+
+          # /api/health, not /health: app/main.py:456 documents that the custom-domain edge
+          # layer hijacks the bare /health path and returns its own "OK". Assert the BODY --
+          # this route returns 200 even when the DB is unreachable, so a status-code check
+          # proves nothing. Catches "app up, DELIMP_PG_SECRET lost/rotated".
+          curl -sS --max-time 30 "${SITE_URL}/api/health" -o /tmp/health.json
+          jq -c . /tmp/health.json
+          jq -e '.connected == true' /tmp/health.json >/dev/null \
+            || { echo "::error title=DB gate FAILED::/api/health does not report connected:true"; exit 1; }
+
+          # Confidential-alias canary. Written to be forward-compatible: the key does not
+          # exist in the currently-live 0.14.10 build, so the deploy that INTRODUCES it
+          # cannot be gated by it. Asserted only once the running app reports the key.
+          if jq -e 'has("aliases_loaded")' /tmp/health.json >/dev/null 2>&1; then
+            jq -e '.aliases_loaded == true' /tmp/health.json >/dev/null \
+              || { echo "::error title=Alias gate FAILED::service_customer_aliases.json did not load -- the collaborator page has silently lost every canonical name. Check FRAN_ALIASES_PATH and /home/data."; exit 1; }
+            echo "aliases OK"
+          fi
+
+          # Data assertion: catches "app up, DB reachable, allowlist/scope broken".
+          curl -sS --max-time 60 "${SITE_URL}/api/counts" -o /tmp/counts.json
+          jq -e '.searches > 0' /tmp/counts.json >/dev/null \
+            || { echo "::error title=Data gate FAILED::/api/counts reports no searches"; cat /tmp/counts.json; exit 1; }
+
+          # Byte-exact bundle check. StaticFiles serves app.js uncompressed (no GZipMiddleware
+          # in app/main.py -- verified), so Content-Length equals the file size exactly. A
+          # threshold would pass a truncated bundle; equality proves the exact artifact we
+          # built is the artifact being served, and it is the ONLY assertion here that still
+          # detects a frontend change shipped without an APP_VERSION bump.
+          served="$(curl -sSI --max-time 30 "${SITE_URL}/static/app.js" | tr -d '\r' \
+                    | awk 'tolower($1)=="content-length:"{print $2}')"
+          if [ "$served" != "$APPJS_BYTES" ]; then
+            echo "::error title=Bundle gate FAILED::/static/app.js is ${served} bytes, expected ${APPJS_BYTES}"
+            exit 1
+          fi
+          echo "bundle OK: /static/app.js = ${served} bytes"
+          echo "HEALTH GATE PASSED"
+
+      # `always()`, not `failure()`: GitHub CANCELS (not fails) a job that hits
+      # timeout-minutes, and a cancelled job skips `if: failure()` steps -- losing the
+      # diagnostics in exactly the scenario they exist for.
+      - name: Diagnostics and rollback instructions
+        if: always() && job.status != 'success'
+        run: |
+          set -uo pipefail
+          echo "=== Last deployment record ==="
+          az webapp log deployment show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_WEBAPP_NAME" 2>&1 | tail -80 || true
+          cat <<'EOF'
+          ============================== ROLLBACK ==============================
+          plan-fran is B1 (Basic). B1 supports NO deployment slots, so there is
+          NO slot swap and NO instant rollback. Every option below re-runs the
+          Oryx build (SCM_DO_BUILD_DURING_DEPLOYMENT is a persistent app setting
+          on this site) and costs the same ~5 minutes as a normal deploy.
+
+          1. ROLL FORWARD (preferred). `git revert <bad-sha>` and push to main.
+
+          2. REDEPLOY A KNOWN-GOOD SOURCE TREE. Run this workflow via
+             workflow_dispatch with `ref` set to the last good tag or SHA. Its
+             advantage over option 3 is that YOU choose the source, not that it
+             skips the build -- transitive deps are unpinned, so it is no more
+             byte-reproducible than any other deploy.
+
+          3. LAST RESORT: replay a historical Kudu deployment
+             (POST https://fran-ucd-proteomics.scm.azurewebsites.net/api/deployments/<id>).
+             These were Oryx REMOTE builds; replaying re-resolves dependencies.
+             Treat as unreliable.
+
+          A failed Oryx BUILD is the benign case: Oryx builds in an intermediate
+          directory and copies to /home/site/wwwroot only on success, so a bad
+          pip resolve leaves the previous version serving. The dangerous case is
+          a build that succeeds and a process that will not start -- which is
+          what --track-status and the health gate above are for.
+
+          Blast radius: the app is READ-ONLY against PG Farm. A bad deploy
+          degrades availability; it cannot corrupt corpus data.
+
+          If instant rollback ever becomes a requirement, the only real fix is
+          plan-fran B1 -> S1 (5 slots), then deploy to a `staging` slot, gate
+          against the slot hostname, and swap.
+          =====================================================================
+          EOF

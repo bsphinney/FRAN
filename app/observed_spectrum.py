@@ -68,20 +68,35 @@ def _clean_seq(s: str) -> str:
 
 
 def _best_occurrence(seq: str, charge: int | None):
-    """One representative precursor of this peptide that HAS a spectrum-lane dataset, ordered by
-    best q-value (a high-confidence example). Returns (basename, charge) or None. search_id/raw_path
-    are used only to locate the blob — never returned."""
+    """One representative precursor of this peptide that HAS a spectrum-lane dataset: the most
+    intense high-confidence acquisition of its MOST-OBSERVED charge state. Returns (basename, charge)
+    or None. search_id/raw_path are used only to locate the blob — never returned.
+
+    Deliberately does NOT order by `best_q_value`: that column is unpopulated for ~99.9% of the
+    corpus (56 of 41,849 sampled rows), so ordering by it was a total tie and the "representative"
+    was whichever row the scan reached first. For AAQEEYIKR that surfaced a 1+ precursor seen 108
+    times out of 2,919 — a 6-fragment spectrum — instead of the 2+ seen 1,590 times. `q_value` IS
+    populated, and picking the modal charge keeps the panel on the form the corpus actually measures.
+    """
     where = "p.stripped_seq = %s"
     params = [seq]
     if charge:
         where += " AND p.charge = %s"
         params.append(int(charge))
     row = db.query(
-        f"""SELECT l.lance_path AS lance_path, p.charge AS charge
-            FROM delimp_precursors p
-            JOIN delimp_spectrum_lane l ON l.search_id = p.search_id
-            WHERE {where} AND l.lance_path IS NOT NULL
-            ORDER BY p.best_q_value NULLS LAST
+        f"""WITH lane AS (
+                SELECT p.charge AS charge, p.q_value AS q_value,
+                       p.intensity AS intensity, l.lance_path AS lance_path
+                FROM delimp_precursors p
+                JOIN delimp_spectrum_lane l ON l.search_id = p.search_id
+                WHERE {where} AND l.lance_path IS NOT NULL
+            ),
+            modal AS (
+                SELECT charge FROM lane GROUP BY charge ORDER BY COUNT(*) DESC, charge LIMIT 1
+            )
+            SELECT lane.lance_path AS lance_path, lane.charge AS charge
+            FROM lane JOIN modal ON modal.charge = lane.charge
+            ORDER BY lane.q_value NULLS LAST, lane.intensity DESC NULLS LAST
             LIMIT 1""",
         tuple(params),
         tables=["delimp_precursors", "delimp_spectrum_lane"],
@@ -91,6 +106,24 @@ def _best_occurrence(seq: str, charge: int | None):
     if not row:
         return None
     return os.path.basename(str(row["lance_path"]).rstrip("/")), int(row["charge"])
+
+
+def _available_charges(seq: str) -> list[dict]:
+    """Charge states of this peptide that have a spectrum-lane dataset behind them, with how often
+    each was observed — so the UI can offer a charge selector (and show which form dominates) instead
+    of silently presenting one arbitrary charge as though it were the only one."""
+    rows = db.query(
+        """SELECT p.charge AS charge, COUNT(*) AS n_obs
+           FROM delimp_precursors p
+           JOIN delimp_spectrum_lane l ON l.search_id = p.search_id
+           WHERE p.stripped_seq = %s AND l.lance_path IS NOT NULL
+           GROUP BY p.charge ORDER BY p.charge""",
+        (seq,),
+        tables=["delimp_precursors", "delimp_spectrum_lane"],
+        timeout_ms=8000,
+    ) or []
+    return [{"charge": int(r["charge"]), "n_obs": int(r["n_obs"])}
+            for r in rows if r.get("charge") is not None]
 
 
 def observed_spectrum(stripped_seq: str, charge: int | None = None) -> dict | None:
@@ -134,5 +167,6 @@ def observed_spectrum(stripped_seq: str, charge: int | None = None) -> dict | No
         "precursor_mz": round(float(r["precursor_mz"]), 5) if r.get("precursor_mz") is not None else None,
         "n_fragments": len(ions),
         "ions": ions,
+        "available_charges": _available_charges(seq),
         "source": "measured",  # neutral label; no search/customer identity exposed
     }

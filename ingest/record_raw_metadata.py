@@ -1,91 +1,67 @@
 """Extract instrument metadata from located raws (Thermo .raw via ThermoRawFileParser, Bruker .d via
-analysis.tdf) and (with --apply) record it in raw_files. Default: dry-run on a --sample of raws."""
-import argparse, glob, json, os, sqlite3, subprocess, sys, tempfile
+analysis.tdf) and (with --apply) record it in raw_files. Default: dry-run on a --sample of raws.
+
+The readers live in `raw_metadata.py` — the same module `corpus_ingest.py` uses on the go-forward
+path, so a field fixed here is fixed for new ingests too."""
+import argparse, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/quobyte/proteomics-grp/brett/glendon/fran_ingest")
 import plan_spectrum_backfill as P
-
-TRFP = "/quobyte/proteomics-grp/tools/ThermoRawFileParser/ThermoRawFileParser"
-
-
-def read_thermo(path):
-    out = tempfile.mkdtemp()
-    try:
-        subprocess.run([TRFP, "-i", path, "-m", "0", "-o", out], capture_output=True, text=True, timeout=240)
-        js = glob.glob(out + "/*etadata*") + glob.glob(out + "/*.json")
-        if not js:
-            return None
-        d = json.load(open(js[0]))
-        flat = {it.get("name"): it.get("value") for sec in d.values() if isinstance(sec, list) for it in sec if isinstance(it, dict)}
-    finally:
-        for f in glob.glob(out + "/*"):
-            try: os.remove(f)
-            except OSError: pass
-        os.rmdir(out)
-    return {
-        "instrument_model": flat.get("Thermo Scientific instrument model"),
-        "instrument_serial": flat.get("instrument serial number"),
-        "acquisition_method": "DIA",
-        "n_ms1_frames": _int(flat.get("Number of MS1 spectra")),
-        "n_ms2_frames": _int(flat.get("Number of MS2 spectra")),
-        "mass_range_min": _flt(flat.get("MS min MZ")), "mass_range_max": _flt(flat.get("MS max MZ")),
-        "gradient_minutes": _flt(flat.get("MS max RT")),
-    }
-
-
-def read_bruker(path):
-    con = sqlite3.connect(f"file:{path}/analysis.tdf?mode=ro", uri=True)
-    g = dict(con.execute("SELECT Key, Value FROM GlobalMetadata").fetchall())
-    try:
-        n_ms1 = con.execute("SELECT count(*) FROM Frames WHERE MsMsType=0").fetchone()[0]
-        n_ms2 = con.execute("SELECT count(*) FROM Frames WHERE MsMsType<>0").fetchone()[0]
-    except sqlite3.Error:
-        n_ms1 = n_ms2 = None
-    con.close()
-    return {
-        "instrument_model": g.get("InstrumentName"),
-        "instrument_serial": g.get("InstrumentSerialNumber"),
-        "acquisition_method": g.get("MethodName"),          # exact: DIA_11x3-k07t13Ra85.m
-        "n_ms1_frames": n_ms1, "n_ms2_frames": n_ms2,
-        "mass_range_min": _flt(g.get("MzAcqRangeLower")), "mass_range_max": _flt(g.get("MzAcqRangeUpper")),
-        "gradient_minutes": None,
-    }
-
-
-def _int(v):
-    try: return int(float(v))
-    except (TypeError, ValueError): return None
-def _flt(v):
-    try: return round(float(v), 3)
-    except (TypeError, ValueError): return None
+from raw_metadata import read_bruker, read_thermo, read_raw_metadata  # noqa: F401
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bruker", action="store_true", help="all located Bruker .d raws (full run)")
+    ap.add_argument("--thermo", action="store_true", help="all located Thermo .raw files (full run)")
     ap.add_argument("--sample", type=int, default=0)
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--only-missing", action="store_true",
+                    help="restrict to rows still missing instrument_model or acquisition_date")
     a = ap.parse_args()
+    ext, label = (".raw", "Thermo .raw") if a.thermo else (".d", "Bruker .d")
     c = P._conn(); c.autocommit = False; cur = c.cursor()
-    if a.bruker:
-        cur.execute("SELECT DISTINCT hive_path FROM raw_files WHERE hive_path ILIKE '%.d' AND hive_path<>''")
-        paths = [r[0] for r in cur.fetchall()]
-    else:
-        cur.execute("SELECT DISTINCT hive_path FROM raw_files WHERE hive_path ILIKE '%.d' AND hive_path<>'' LIMIT %s", (a.sample,))
-        paths = [r[0] for r in cur.fetchall()]
-    print(f"{len(paths):,} distinct Bruker .d to process. apply={a.apply}", flush=True)
+    where = "hive_path ILIKE %s AND hive_path<>''"
+    args = [f"%{ext}"]
+    if a.only_missing:
+        where += " AND (instrument_model IS NULL OR acquisition_date IS NULL)"
+    sql = f"SELECT DISTINCT hive_path FROM raw_files WHERE {where}"
+    if not (a.bruker or a.thermo):
+        sql += " LIMIT %s"; args.append(a.sample)
+    cur.execute(sql, args)
+    paths = [r[0] for r in cur.fetchall()]
+    print(f"{len(paths):,} distinct {label} to process. apply={a.apply}", flush=True)
     ok = err = written = 0
     for i, hp in enumerate(paths, 1):
         try:
-            m = read_bruker(hp)
+            # with_size=False: a .d size walk over thousands of raws is the expensive part and
+            # file_size_bytes is not what this pass is for.
+            m = read_raw_metadata(hp, with_size=False)
             if not m or not m.get("instrument_model"):
                 err += 1; continue
             ok += 1
             if a.apply:
-                cur.execute("""UPDATE raw_files SET instrument_model=%s, instrument_serial=%s,
-                    acquisition_method=%s, n_ms1_frames=%s, n_ms2_frames=%s,
-                    mass_range_min=%s, mass_range_max=%s WHERE hive_path=%s""",
+                # COALESCE on the incoming value, not the stored one: a reader that returns NULL for
+                # a field must not blank a value some other pass already established.
+                cur.execute("""UPDATE raw_files SET
+                    instrument_model = COALESCE(%s, instrument_model),
+                    instrument_serial = COALESCE(%s, instrument_serial),
+                    acquisition_method = COALESCE(%s, acquisition_method),
+                    acquisition_date = COALESCE(%s::timestamptz, acquisition_date),
+                    n_ms1_frames = COALESCE(%s, n_ms1_frames),
+                    n_ms2_frames = COALESCE(%s, n_ms2_frames),
+                    mass_range_min = COALESCE(%s, mass_range_min),
+                    mass_range_max = COALESCE(%s, mass_range_max),
+                    mobility_min = COALESCE(%s, mobility_min),
+                    mobility_max = COALESCE(%s, mobility_max),
+                    gradient_minutes = COALESCE(gradient_minutes, %s),
+                    instrument_metadata_json = COALESCE(%s::jsonb, instrument_metadata_json)
+                    WHERE hive_path=%s""",
                     (m["instrument_model"], m["instrument_serial"], m["acquisition_method"],
-                     m["n_ms1_frames"], m["n_ms2_frames"], m["mass_range_min"], m["mass_range_max"], hp))
+                     m.get("acquisition_date"), m["n_ms1_frames"], m["n_ms2_frames"],
+                     m["mass_range_min"], m["mass_range_max"],
+                     m.get("mobility_min"), m.get("mobility_max"),
+                     m.get("gradient_minutes"), m.get("instrument_metadata_json"), hp))
                 written += cur.rowcount
         except Exception as e:
             err += 1
