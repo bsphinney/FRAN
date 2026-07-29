@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS delimp_spectrum_lane (
 );
 CREATE INDEX IF NOT EXISTS idx_spectrum_lane_name ON delimp_spectrum_lane (search_name);
 CREATE INDEX IF NOT EXISTS idx_spectrum_lane_sid  ON delimp_spectrum_lane (search_id);
+-- Which code wrote this dataset. Added after the 2026-07-27 content_md5 chunking fix, which left
+-- pre- and post-fix datasets indistinguishable on disk; NULL means "written before versions were
+-- tracked", which is itself the answer to "could this be an old one?".
+ALTER TABLE delimp_spectrum_lane ADD COLUMN IF NOT EXISTS writer_version TEXT;
 """
 
 
@@ -96,17 +100,20 @@ def register(conn, search_id, search_name, lance_path, n_prec, n_frag, md5, vers
     """Record the dataset in the DB registry (the durable manifest). Upsert by lance_path (so a
     re-run overwrites cleanly and an UNMATCHED report — search_id NULL — still registers). Call
     ensure_registry(conn) once before the first register()."""
+    from versions import SPECTRUM_LANE_WRITER_VERSION
     cur = conn.cursor()
     cur.execute("""INSERT INTO delimp_spectrum_lane
-                     (lance_path, search_id, search_name, n_precursors, n_fragments, content_md5, lance_version, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s, now())
+                     (lance_path, search_id, search_name, n_precursors, n_fragments, content_md5,
+                      lance_version, writer_version, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
                    ON CONFLICT (lance_path) DO UPDATE SET
                      search_id=EXCLUDED.search_id, search_name=EXCLUDED.search_name,
                      n_precursors=EXCLUDED.n_precursors, n_fragments=EXCLUDED.n_fragments,
                      content_md5=EXCLUDED.content_md5, lance_version=EXCLUDED.lance_version,
+                     writer_version=EXCLUDED.writer_version,
                      updated_at=now()""",
                 (lance_path, str(search_id) if search_id else None, search_name,
-                 int(n_prec), int(n_frag), md5, int(version)))
+                 int(n_prec), int(n_frag), md5, int(version), SPECTRUM_LANE_WRITER_VERSION))
     conn.commit()
 
 

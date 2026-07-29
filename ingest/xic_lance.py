@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS delimp_xic_lane (
 );
 CREATE INDEX IF NOT EXISTS idx_xic_lane_name ON delimp_xic_lane (search_name);
 CREATE INDEX IF NOT EXISTS idx_xic_lane_sid  ON delimp_xic_lane (search_id);
+ALTER TABLE delimp_xic_lane ADD COLUMN IF NOT EXISTS writer_version TEXT;
 """
 
 
@@ -97,18 +98,20 @@ def ensure_registry(conn):
 
 
 def register(conn, search_id, search_name, lance_path, n_prec, n_traces, md5, version):
+    from versions import XIC_LANE_WRITER_VERSION
     cur = conn.cursor()
     cur.execute("""INSERT INTO delimp_xic_lane
                      (lance_path, search_id, search_name, n_precursors, n_traces, content_md5,
-                      lance_version, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s, now())
+                      lance_version, writer_version, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
                    ON CONFLICT (lance_path) DO UPDATE SET
                      search_id=EXCLUDED.search_id, search_name=EXCLUDED.search_name,
                      n_precursors=EXCLUDED.n_precursors, n_traces=EXCLUDED.n_traces,
                      content_md5=EXCLUDED.content_md5, lance_version=EXCLUDED.lance_version,
+                     writer_version=EXCLUDED.writer_version,
                      updated_at=now()""",
                 (lance_path, str(search_id) if search_id else None, search_name,
-                 int(n_prec), int(n_traces), md5, int(version)))
+                 int(n_prec), int(n_traces), md5, int(version), XIC_LANE_WRITER_VERSION))
     conn.commit()
 
 
