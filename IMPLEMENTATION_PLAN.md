@@ -291,8 +291,23 @@ The control first: `--legacy-grep` reproduced **10.57 s at n=4,115**, with cover
 observations, max 229 — matching `STORAGE_DESIGN.md` §4 exactly. The harness is faithful, so the
 comparison below is real.
 
-*(Note for anyone quoting these numbers: **10.57 s is the `right-peak only` row**, not the headline.
-Unrestricted, the same grep cohort scores 26.07 s at n=5,716. Compare like with like.)*
+### ⚠️ Three numbers exist for the DIA-NN baseline. Know which one you are holding.
+
+This is the trap most likely to produce a wrong claim, because the values are close enough to look
+like rounding:
+
+| value | what it actually is | where it appears |
+|---|---|---|
+| **27.9 s** | an **earlier, superseded** measurement from the partial-scan era | `LANCE_PRIORS_AND_XIC_SPEC.md` line 40 |
+| **27.42 s** | right-peak only, **n=4,115** (grep cohort) | `STORAGE_DESIGN.md` §1, `LANCE_PRIORS` supersede notice |
+| **35.87 s** | **unrestricted**, n=5,716 (same cohort) | `STORAGE_DESIGN.md` §1 |
+
+27.9 and 27.42 are *not* the same measurement rounded differently, and 27.42 vs 35.87 differ only by
+which row subset is scored. Substituting any one for another silently changes the claim. Always state
+the subset and the n.
+
+The same hazard applies to FRAN's own figures: **10.57 s is the `right-peak only` row**, not the
+headline — unrestricted, that grep cohort scores 26.07 s at n=5,716. Compare like with like.
 
 | | filename grep | SQL cohort (gradient 18–22 min) |
 |---|---|---|
@@ -309,8 +324,17 @@ Two things deserve to be said plainly:
 
 1. **This is at Spectronaut-within-run parity.** Spectronaut 21 achieves 7.4 s *within a single run*.
    A SQL-selected FRAN cohort now predicts retention time on a run it has never seen to 7.52 s —
-   essentially the same precision, cross-run. Against the shipped DIA-NN 2.6 predicted iRT (27.42 s)
-   that is a **73% reduction**.
+   essentially the same precision, cross-run.
+
+   ⚠️ **Do not quote a "% better than DIA-NN" figure from these two numbers.** I did, at 73%, and it
+   is not established. 27.42 s was measured on the grep cohort's **4,115** right-peak rows; 7.52 s is
+   on this cohort's **10,039**. Different row sets, so the ratio mixes them. The *direction* is safe —
+   DIA-NN predicts every precursor, so its coverage does not shrink when the row set grows — but the
+   margin is unmeasured. It cannot be closed from FRAN's side either: the truth parquet
+   (`sn21cmp/every_precursor.parquet`, 64 columns) carries `our_selected_rt` and
+   `our_delta_rt_engine` but **no DIA-NN predicted-iRT column**, so the baseline cannot be re-scored
+   on this row set here. Closing it needs DIA-NN's predicted iRT joined to these 10,039 keys, which is
+   engine-side work.
 2. **Coverage is the quieter result and may matter more.** 37.4% → **92.9%** of SN-confident
    precursors now have a prior at all. A predictor that is excellent on a third of precursors is a
    research result; one that covers 93% is infrastructure.

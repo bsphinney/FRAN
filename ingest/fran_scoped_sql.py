@@ -91,6 +91,126 @@ def sql_cohort(grad_lo, grad_hi, instrument=None):
     return out
 
 
+def _rsd(r):
+    r = r[np.isfinite(r)]
+    return 1.4826 * np.median(np.abs(r - np.median(r)))
+
+
+def _cv(x, y):
+    ok = np.isfinite(x) & np.isfinite(y)
+    xi, yi = x[ok], y[ok]
+    if len(xi) < 200:
+        return np.array([np.nan])
+    pr = np.full(len(xi), np.nan)
+    for tr, te in KFold(5, shuffle=True, random_state=0).split(xi):
+        pr[te] = IsotonicRegression(out_of_bounds="clip").fit(xi[tr], yi[tr]).predict(xi[te])
+    return yi - pr
+
+
+def compare(a):
+    """Score the grep cohort and the SQL cohort ON THE SAME ROWS.
+
+    WHY THIS MODE EXISTS. The headline "10.57 s -> 7.52 s" compares n=4,115 against n=10,039 — two
+    different row sets, because the wider cohort covers more precursors. A robust sd computed over
+    more (and different) precursors is not directly comparable to one over fewer: the extra
+    precursors are the ones the grep cohort could not predict at all, and they are not guaranteed to
+    be equally easy. So the improvement was real in direction but unquantified in size.
+
+    Here both cohorts are evaluated on the INTERSECTION of what they cover, under one identical fit,
+    so the difference is attributable to cohort selection and nothing else. The union/each-alone
+    numbers are printed too, because coverage is itself a result — a prior that covers 2.4x more
+    precursors is more useful even at equal per-precursor accuracy.
+
+    NOT CLOSED HERE: the DIA-NN 2.6 baseline (27.42 s) was measured on the grep cohort's 4,115
+    right-peak rows, and the truth parquet carries no DIA-NN predicted-iRT column, so it cannot be
+    re-scored on this row set from FRAN's side. Any "% better than DIA-NN" figure therefore mixes row
+    sets. Direction is safe (DIA-NN predicts every precursor, so its coverage does not shrink), but
+    the margin is not established. Closing it needs DIA-NN's predicted iRT joined to these keys.
+    """
+    print("=== cohort A: legacy filename grep (60spd) ===")
+    setsA = [p for p in sorted(glob.glob(f"{G}/spectra_lance/*.lance"))
+             if "60spd" in os.path.basename(p).lower()]
+    cohortA = {p: None for p in setsA}
+    print(f"  {len(cohortA)} datasets")
+    accA = scan_cohort(cohortA, "grep")
+
+    print(f"\n=== cohort B: SQL, gradient {a.grad_lo}-{a.grad_hi} min ===")
+    cohortB = sql_cohort(a.grad_lo, a.grad_hi, a.instrument)
+    print(f"  {len(cohortB)} datasets / {sum(len(v) for v in cohortB.values())} runs")
+    accB = scan_cohort(cohortB, "sql")
+
+    sn = pd.read_parquet(f"{C}/every_precursor.parquet")
+    sn = sn[(sn.sn_is_decoy == False) & (sn.sn_qvalue <= 0.01) & sn.our_pid.notna()].copy()  # noqa: E712
+    sn["our_rt"] = sn["sn_apex_rt_s"] + sn["our_delta_rt_to_sn"]
+    sn = sn[np.isfinite(sn.our_rt)]
+    sn["k"] = list(zip(sn.sn_stripped_seq.astype(str), sn.sn_charge.astype(int)))
+    sn["A"] = [accA[k][0] / accA[k][1] if k in accA else np.nan for k in sn.k]
+    sn["B"] = [accB[k][0] / accB[k][1] if k in accB else np.nan for k in sn.k]
+
+    right = sn.our_delta_rt_to_sn.abs() <= 10          # the "right-peak only" subset, as in the original
+    covA, covB = np.isfinite(sn.A), np.isfinite(sn.B)
+    both = covA & covB
+
+    print("\n" + "=" * 74)
+    print("SAME-ROWS COMPARISON (right-peak only, one identical isotonic 5-fold fit)")
+    print("=" * 74)
+    rows = [
+        ("A grep,  rows A covers",       sn[right & covA], "A"),
+        ("B SQL,   rows A covers",       sn[right & covA], "B"),
+        ("A grep,  rows BOTH cover",     sn[right & both], "A"),
+        ("B SQL,   rows BOTH cover",     sn[right & both], "B"),
+        ("B SQL,   rows B covers",       sn[right & covB], "B"),
+    ]
+    print(f"{'variant':34s} {'n':>7s} {'robust_sd':>10s} {'med|r|':>9s}")
+    for nm, sub, col in rows:
+        r = _cv(sub[col].to_numpy(float), sub["our_rt"].to_numpy(float))
+        if np.all(~np.isfinite(r)):
+            print(f"{nm:34s} {len(sub):>7d}   (too few)"); continue
+        print(f"{nm:34s} {len(sub):>7d} {_rsd(r):9.2f}s {np.median(np.abs(r[np.isfinite(r)])):8.2f}s")
+
+    print(f"\ncoverage (right-peak rows): grep {int((right & covA).sum()):,}  "
+          f"SQL {int((right & covB).sum()):,}  both {int((right & both).sum()):,}")
+    print("\nRead the two 'rows BOTH cover' lines against each other -- that is the only pair that\n"
+          "differs solely by cohort selection. The DIA-NN 27.42 s baseline is NOT on this row set\n"
+          "and is deliberately not printed here; see this function's docstring.")
+
+
+def scan_cohort(cohort, label):
+    """Build the (seq, charge) -> (irt_sum, n) consensus for one cohort. Identical accumulation to
+    fran_scoped.py; only which rows are admitted differs."""
+    acc = {}
+    n_ds = 0
+    for p in sorted(cohort):
+        keep_runs = cohort[p]
+        if not os.path.exists(p):
+            continue
+        try:
+            t = lance.dataset(p).scanner(
+                columns=["stripped_seq", "charge", "run", "q_value", "irt_empirical", "is_decoy"],
+                filter="q_value <= 0.01").to_table().to_pydict()
+        except Exception as e:  # noqa: BLE001
+            print(f"  skip {os.path.basename(p)}: {str(e)[:60]}")
+            continue
+        for i in range(len(t["stripped_seq"])):
+            if t["is_decoy"][i]:
+                continue
+            run = str(t["run"][i])
+            if any(x in run for x in TEST):
+                continue
+            if keep_runs is not None and run not in keep_runs:
+                continue
+            ie = t["irt_empirical"][i]; ch = t["charge"][i]
+            if ie is None or ch is None:
+                continue
+            k = (str(t["stripped_seq"][i]), int(ch))
+            s, c = acc.get(k, (0.0, 0)); acc[k] = (s + float(ie), c + 1)
+        n_ds += 1
+        if n_ds % 50 == 0:
+            print(f"  [{label}] {n_ds}/{len(cohort)} datasets, {len(acc):,} covered")
+    print(f"  [{label}] done: {n_ds} datasets, {len(acc):,} covered precursors")
+    return acc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grad-lo", type=float, default=18.0)
@@ -98,7 +218,12 @@ def main():
     ap.add_argument("--instrument", default=None, help='e.g. "timsTOF HT"')
     ap.add_argument("--legacy-grep", action="store_true", help="reproduce the original 60spd cohort")
     ap.add_argument("--max-datasets", type=int, default=0, help="cap datasets (smoke test)")
+    ap.add_argument("--compare", action="store_true",
+                    help="score BOTH cohorts on the SAME rows (see the note in --compare's output)")
     a = ap.parse_args()
+
+    if a.compare:
+        return compare(a)
 
     if a.legacy_grep:
         sets = [p for p in sorted(glob.glob(f"{G}/spectra_lance/*.lance"))
