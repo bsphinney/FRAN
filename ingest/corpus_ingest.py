@@ -34,6 +34,16 @@ from versions import CORPUS_INGEST_VERSION, SCHEMA_VERSION  # noqa: E402
 _UNIMOD = {"UniMod:4": 4, "UniMod:35": 35, "UniMod:1": 1, "UniMod:21": 21, "UniMod:7": 7}
 
 
+def _acq_for(engine, platform):
+    """Acquisition label implied by the SEARCH ENGINE (with platform only choosing the DIA flavour).
+
+    Both engines FRAN ingests are DIA search engines, so the result being in the corpus at all is the
+    evidence. `platform` picks the name a proteomicist expects: diaPASEF on timsTOF, plain DIA on an
+    Orbitrap. Kept as a named function so the one place this is decided is greppable — the previous
+    inline expression keyed on platform alone, which is the wrong basis."""
+    return "diaPASEF" if platform == "timstof" else "DIA"
+
+
 def _conn():
     import psycopg2
     # Use _token() so a token FILE holding the service-account SECRET (not a JWT) is exchanged
@@ -454,7 +464,17 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             rp = raw_paths[run]
             md = _runmeta(run)
             # acquisition: prefer the real value sniffed from the raw; else DIA-NN-on-timsTOF = diaPASEF.
-            acq = md.get("acquisition_method") or ("diaPASEF" if platform == "timstof" else "DIA")
+            # Acquisition type is a property of the SEARCH, not of the raw header. A result ingested
+            # from Spectronaut or DIA-NN is DIA — that is a far stronger signal than anything a
+            # Thermo header yields (see raw_metadata.read_thermo: the canonical ScanFilter `d` flag
+            # is absent from `-m 0` metadata, and STAN's heuristics are not reliable). The raw's own
+            # method name still wins when present, because on Bruker it is the exact method.
+            #
+            # CAVEAT, deliberately recorded: DIA-NN can now run DDA, so engine=='diann' is not proof
+            # of DIA. Current exposure is small — 71 of 1,963 searches (2,025 of 19,874 raws) — and of
+            # the DIA-NN logs reachable on disk, none carried a DDA marker. If that changes, the
+            # authoritative source is the DIA-NN log, which engine_version.py already opens.
+            acq = md.get("acquisition_method") or _acq_for(engine, platform)
             spd = _detect_spd(run)
             # gradient: EvoSep map if SPD known, else the observed RT span as a proxy
             grad = (_SPD_GRAD.get(int(spd)) if (spd and int(spd) in _SPD_GRAD)

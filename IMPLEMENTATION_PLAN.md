@@ -155,10 +155,62 @@ makes it usable as the column-aging proxy (§8.1). For the gate cohort specifica
 Note `mobility_*` and `instrument_metadata_json` were *never* written by the old
 `record_raw_metadata.py` — its `UPDATE` omitted them entirely. This is new data, not a re-fill.
 
-**Remaining:** the other 36.9% are Thermo `.raw` files (~7,336). `--thermo` is implemented and
-dry-run clean, but needs the `dotnet-core-sdk/8.0.4` module and `DOTNET_ROOT` on the compute node.
-That is the "ready, not run" Thermo pass, now genuinely one command away:
-`sbatch record_raw_metadata.sbatch --thermo --apply --only-missing`.
+### 3.2 The Thermo pass — and why the first version of it would have done nothing
+
+The other 36.9% are Thermo `.raw` files. Running them turned up two real defects and one bonus.
+
+**The dotnet environment problem.** ThermoRawFileParser is a self-contained .NET apphost. The
+`dotnet-core-sdk/8.0.4` module puts `dotnet` on `PATH` but leaves **`DOTNET_ROOT` empty**, and without
+it the apphost dies with *"You must install .NET to run this application / Failed to resolve
+libhostfxr.so"*. A `module load` in the submitting shell does **not** reach the compute node either.
+`record_raw_metadata.sbatch` now loads the module and derives `DOTNET_ROOT` from
+`dotnet --list-runtimes` itself.
+
+**The key names were guesses, and one was wrong in a silent way.** Measured against a real Orbitrap
+Exploris 480 export, the metadata keys are:
+
+| field | actual TRFP key | was |
+|---|---|---|
+| `acquisition_date` | **`Content Creation Date`**, format `02/22/2025 05:15:29` (US M/D/Y, **not ISO**) | `creation date` — matched nothing |
+| `lc_method` | `device acquisition method` (`C:\Xcalibur\methods\…\ela_DiaOlsW22_30m.m`) | not read |
+| `activation_method` | `beam-type collision-induced dissociation` → `HCD` | not read |
+| `ms2_resolution` | `mass resolution` | not read |
+| instrument model / serial / frame counts / mass range | as guessed — correct | ✓ |
+
+Had the pass run as first written, `acquisition_date` would have stayed NULL for all ~7,100 Orbitrap
+raws and nothing would have reported a failure. `datetime.fromisoformat` rejects that date format
+outright, so the ISO-only parse was a second silent no-op layered on the first.
+
+**Bonus: three columns that were 0% populated corpus-wide now have a source** — `lc_method`,
+`activation_method`, `ms2_resolution`. `lc_method` is the field §3 asked for; note it is the combined
+Xcalibur *instrument* method, not a pure LC gradient program, which is still the best
+"were these acquired the same way" signal a raw header carries.
+
+### 3.3 Acquisition type: do NOT read it from the raw
+
+`acquisition_method` is deliberately **not** returned by the Thermo reader, for two reasons.
+
+It is unreliable from the header: the canonical DIA/DDA marker is the ScanFilter `d` flag
+(`FTMS + c NSI d Full ms2 …`), and `-m 0` metadata contains no scan filters. What remains is a
+method-name substring or an MS2:MS1 ratio. STAN attempts exactly this and does not get it right every
+time.
+
+It is also unnecessary — **acquisition type is a property of the SEARCH, not the raw.** A result
+ingested from Spectronaut or DIA-NN is DIA. `corpus_ingest.py` previously inferred it from
+`platform`, which is the wrong basis; it now goes through `_acq_for(engine, platform)`, where the
+engine carries the evidence and the platform only picks the flavour (diaPASEF vs DIA).
+
+**Caveat, recorded rather than assumed away: DIA-NN can now run DDA**, so `engine == 'diann'` is not
+proof of DIA. Measured exposure:
+
+| engine | searches | distinct raws |
+|---|---|---|
+| spectronaut | 1,892 | 17,785 |
+| **diann** | **71** | **2,025** |
+
+So ~10% of raws are in the ambiguous population. Of the DIA-NN logs reachable on disk (9 of the first
+40 searches checked), **none carried a DDA marker**. The authoritative source if this ever matters is
+the DIA-NN log, which `engine_version.py` already opens for the version string.
 
 ## 4. Phase 1 — the run dimension (the real §3)
 

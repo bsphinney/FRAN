@@ -42,6 +42,29 @@ def _flt(v, nd=6):
         return None
 
 
+def _thermo_date(v):
+    """ThermoRawFileParser emits 'Content Creation Date' as US M/D/Y H:M:S — e.g.
+    '02/22/2025 05:15:29' — NOT ISO 8601, and with no timezone.
+
+    Measured, not assumed. `datetime.fromisoformat` rejects it outright, so a naive ISO parse leaves
+    the field NULL and the failure is invisible. Returned as ISO so Postgres timestamptz accepts it;
+    the absent offset means the DB applies its own timezone, which is fine for a column used as a
+    coarse column-aging proxy but is NOT to be trusted for sub-day arithmetic."""
+    if not v:
+        return None
+    s = str(v).strip()
+    from datetime import datetime
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).isoformat(timespec="seconds")
+        except ValueError:
+            continue
+    try:  # last resort: already ISO-ish, possibly with an offset
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).isoformat(timespec="seconds")
+    except ValueError:
+        return None
+
+
 def _dir_size(path):
     """Total bytes under a Bruker .d directory. Walks, so it is gated behind with_size."""
     tot = 0
@@ -115,21 +138,53 @@ def read_thermo(path):
             os.rmdir(out)
         except OSError:
             pass
+    # Key names and formats below are MEASURED from a real ThermoRawFileParser 1.4.x run on an
+    # Orbitrap Exploris 480, not guessed. The earlier guesses ("creation date") matched nothing, so
+    # acquisition_date would have silently stayed NULL for all ~7,100 Orbitrap raws.
     return {
         "platform": "orbitrap",
         "instrument_model": flat.get("Thermo Scientific instrument model"),
         "instrument_serial": flat.get("instrument serial number"),
-        # TRFP exposes no method name; corpus_ingest's platform fallback supplies "DIA".
-        "acquisition_method": "DIA",
-        "acquisition_date": flat.get("creation date") or flat.get("Creation date") or None,
+        # DELIBERATELY None — the raw header is the WRONG PLACE to get this, twice over.
+        #
+        # 1. It is unreliable from a Thermo file. The canonical marker is the ScanFilter `d` flag
+        #    ("FTMS + c NSI d Full ms2 …" — `d` = data-dependent; DIA omits it), and `-m 0` metadata
+        #    does not include scan filters at all. What is left is weak: a "dia"/"dda" substring in
+        #    the method name, or an MS2:MS1 ratio (34:1 on the file measured here vs STAN's >=15
+        #    heuristic). STAN attempts this and does not get it right every time.
+        #
+        # 2. It is unnecessary. The acquisition type is a property of the SEARCH, not the raw: a
+        #    result ingested from Spectronaut or DIA-NN is DIA. `delimp_searches.search_engine` is
+        #    already recorded and is a far stronger signal than any header heuristic.
+        #    Caveat to carry: DIA-NN can now run DDA, so "engine == diann" is not *proof* of DIA —
+        #    the authoritative answer for those lives in the DIA-NN log, which `engine_version.py`
+        #    already opens for the version string and could be extended to read.
+        #
+        # Returning None makes the writer's COALESCE preserve what is stored rather than stamping a
+        # guess over it, while the evidence (n_ms1_frames, n_ms2_frames, full method path) is
+        # persisted regardless, so a better classifier can run later from the database without
+        # re-reading 7,000 raws.
+        "acquisition_method": None,
+        # The Xcalibur instrument method, e.g. C:\Xcalibur\methods\gabri\pS_DIA\ela_DiaOlsW22_30m.m.
+        # Strictly this is the combined LC+MS instrument method, not a pure LC gradient program — but
+        # it is the best "were these runs acquired the same way" signal the raw header carries, which
+        # is what STORAGE_DESIGN.md §3 wants lc_method for.
+        "lc_method": flat.get("device acquisition method"),
+        "acquisition_date": _thermo_date(flat.get("Content Creation Date")),
+        # e.g. "HCD". Column exists in raw_files and is 0% populated corpus-wide.
+        "activation_method": (flat.get("beam-type collision-induced dissociation")
+                              or flat.get("collision-induced dissociation") or None),
         "mass_range_min": _flt(flat.get("MS min MZ")),
         "mass_range_max": _flt(flat.get("MS max MZ")),
         "mobility_min": None,
         "mobility_max": None,
         "n_ms1_frames": _int(flat.get("Number of MS1 spectra")),
         "n_ms2_frames": _int(flat.get("Number of MS2 spectra")),
-        # Orbitrap runs have no IM, so max RT is the honest gradient estimate.
+        # Orbitrap runs have no IM, so max RT is the honest gradient estimate. Note corpus_ingest
+        # already fills gradient_minutes for 98.7% of rows from the EvoSep SPD map or the observed RT
+        # span, and the backfill COALESCEs, so this only fills genuine gaps.
         "gradient_minutes": _flt(flat.get("MS max RT"), 3),
+        "ms2_resolution": _flt(flat.get("mass resolution")),
         "instrument_metadata_json": json.dumps(flat),
     }
 

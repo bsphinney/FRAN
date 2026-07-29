@@ -10,6 +10,14 @@ import plan_spectrum_backfill as P
 from raw_metadata import read_bruker, read_thermo, read_raw_metadata  # noqa: F401
 
 
+def _int_or_none(v):
+    """raw_files.ms2_resolution is INTEGER but TRFP reports 'mass resolution' as a float (0.5)."""
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bruker", action="store_true", help="all located Bruker .d raws (full run)")
@@ -55,13 +63,19 @@ def main():
                     mobility_min = COALESCE(%s, mobility_min),
                     mobility_max = COALESCE(%s, mobility_max),
                     gradient_minutes = COALESCE(gradient_minutes, %s),
+                    lc_method = COALESCE(%s, lc_method),
+                    activation_method = COALESCE(%s, activation_method),
+                    ms2_resolution = COALESCE(%s, ms2_resolution),
                     instrument_metadata_json = COALESCE(%s::jsonb, instrument_metadata_json)
                     WHERE hive_path=%s""",
                     (m["instrument_model"], m["instrument_serial"], m["acquisition_method"],
                      m.get("acquisition_date"), m["n_ms1_frames"], m["n_ms2_frames"],
                      m["mass_range_min"], m["mass_range_max"],
                      m.get("mobility_min"), m.get("mobility_max"),
-                     m.get("gradient_minutes"), m.get("instrument_metadata_json"), hp))
+                     m.get("gradient_minutes"),
+                     m.get("lc_method"), m.get("activation_method"),
+                     _int_or_none(m.get("ms2_resolution")),
+                     m.get("instrument_metadata_json"), hp))
                 written += cur.rowcount
         except Exception as e:
             err += 1

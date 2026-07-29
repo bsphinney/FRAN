@@ -26,6 +26,20 @@ ING=/quobyte/proteomics-grp/brett/glendon/fran_ingest
 PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
 export DELIMP_PG_TOKEN_FILE=${DELIMP_PG_TOKEN_FILE:-/quobyte/proteomics-grp/de-limp/fran_refresh/.pgfarm_token}
 
+# ThermoRawFileParser is a self-contained .NET apphost. It needs BOTH the module (for `dotnet` on
+# PATH) and DOTNET_ROOT — the module sets PATH but leaves DOTNET_ROOT empty, and without it the
+# apphost dies with "You must install .NET to run this application. / Failed to resolve
+# libhostfxr.so". A module load in the submitting shell does NOT reach the compute node, so it has to
+# happen here. Harmless for --bruker (pure SQLite), so it is unconditional.
+if command -v module >/dev/null 2>&1; then
+    module load dotnet-core-sdk/8.0.4 2>/dev/null || echo "WARN: dotnet module not loaded"
+fi
+if [ -z "${DOTNET_ROOT:-}" ] && command -v dotnet >/dev/null 2>&1; then
+    export DOTNET_ROOT="$(dotnet --list-runtimes 2>/dev/null \
+        | sed -n 's|.*\[\(.*\)/shared/Microsoft.NETCore.App\]|\1|p' | head -1)"
+fi
+echo "DOTNET_ROOT=${DOTNET_ROOT:-<unset>}"
+
 cd "$ING"
 echo "host=$(hostname) start=$(date -Is) args=$*"
 "$PY" record_raw_metadata.py "$@"
