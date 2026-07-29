@@ -209,6 +209,44 @@ The gate itself is `ingest/fran_scoped_sql.py` — `fran_scoped.py` with exactly
 (cohort selection), and a `--legacy-grep` mode that reproduces the original cohort as a control so
 the two are compared under an identical fit.
 
+### 4.2 Phase 1 step 4 — THE GATE PASSED, 2026-07-29
+
+The control first: `--legacy-grep` reproduced **10.57 s at n=4,115**, with coverage 37.4%, median 14
+observations, max 229 — matching `STORAGE_DESIGN.md` §4 exactly. The harness is faithful, so the
+comparison below is real.
+
+*(Note for anyone quoting these numbers: **10.57 s is the `right-peak only` row**, not the headline.
+Unrestricted, the same grep cohort scores 26.07 s at n=5,716. Compare like with like.)*
+
+| | filename grep | SQL cohort (gradient 18–22 min) |
+|---|---|---|
+| datasets scanned | 16 | **559** |
+| consensus precursors | 103,459 | **2,753,503** (26.6×) |
+| coverage of SN-confident precursors | 5,716 (37.4%) | **14,193 (92.9%)** |
+| robust sd, unrestricted | 26.07 s (n=5,716) | **21.43 s** (n=14,193) |
+| **robust sd, right-peak only** | **10.57 s** (n=4,115) | **7.52 s** (n=10,039) |
+
+**7.52 s against a 10.57 s target — a 29% improvement, on 2.4× more evaluated precursors.** The
+prediction that 10.57 s was not the floor was correct, and the margin is not marginal.
+
+Two things deserve to be said plainly:
+
+1. **This is at Spectronaut-within-run parity.** Spectronaut 21 achieves 7.4 s *within a single run*.
+   A SQL-selected FRAN cohort now predicts retention time on a run it has never seen to 7.52 s —
+   essentially the same precision, cross-run. Against the shipped DIA-NN 2.6 predicted iRT (27.42 s)
+   that is a **73% reduction**.
+2. **Coverage is the quieter result and may matter more.** 37.4% → **92.9%** of SN-confident
+   precursors now have a prior at all. A predictor that is excellent on a third of precursors is a
+   research result; one that covers 93% is infrastructure.
+
+The mechanism is exactly what §1.3 argued: the grep cohort was 111 runs selected on whether someone
+typed "60spd" in a filename. The band is 3,480 runs selected on the LC parameter that actually drives
+comparability — reachable only because `delimp_spectrum_lane_runs` now exists.
+
+Remaining to close Phase 1 fully: sweep the gradient band and add `instrument_model` /
+`acquisition_date` terms to see whether tighter or differently-shaped cohorts do better still. 7.52 s
+is now the number to beat, and there is no reason to assume *it* is the floor either.
+
 ## 5. Phase 2 — additive aggregates keyed by run (§4/§5)
 
 Evolve, don't restart — `delimp_peptide_consensus` is 3.96M rows of correct arithmetic with the wrong
