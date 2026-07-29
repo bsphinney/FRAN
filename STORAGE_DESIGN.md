@@ -27,37 +27,59 @@ result. Both columns below are measured on **identical rows with an identical fi
 | predictor | right-peak only | unrestricted |
 |---|---|---|
 | DIA-NN 2.6 predicted iRT (what the engine ships) | 27.42 s *(n=4,115)* | 35.87 s *(n=5,716)* |
-| FRAN, 16 filename-grep runs | **10.57 s** −61% | 26.07 s −27% |
-| FRAN, 3,480 SQL-selected runs (Phase 1) | **7.52 s** *(n=10,039)* | 21.43 s *(n=14,193)* |
-| *Spectronaut 21 within-run, for reference* | *7.4 s* | — |
+| FRAN, 16 filename-grep runs | 10.57 s *(n=4,115)* | 26.07 s *(n=5,716)* |
+| FRAN, 3,480 SQL-selected runs — **same 4,115 rows** | **9.94 s** | — |
+| FRAN, 3,480 SQL-selected runs — all rows it covers | 7.52 s *(n=10,039)* | 21.43 s *(n=14,193)* |
+| *Spectronaut 21 within-run — **its own row set**, not comparable* | *7.4 s* | — |
 
-Note the fair set is FRAN's **coverage**, not the whole cohort: DIA-NN covers 100% of precursors,
+**The row set is the whole argument, and it applies to FRAN-vs-FRAN too, not just FRAN-vs-DIA-NN.**
+The grep cohort's rows are a complete subset of the SQL cohort's, so the two can be scored on the
+intersection under one fit (`fran_scoped_sql.py --compare`). Doing that splits what looked like a
+single 29% improvement into two different claims:
+
+- **Cohort selection is worth ~6%** — 10.57 → 9.94 s on identical rows. This is the methodology
+  number, and 9.94 s is what a future selection change has to beat.
+- **The rest of the drop to 7.52 s is composition**, not method. The 5,924 extra precursors carry more
+  observations each and are intrinsically easier. 7.52 s is the deployment-surface figure: what the
+  prior delivers across everything it now covers.
+
+Both are real; they answer different questions. Quoting 7.52 s as evidence that *selection* works is
+the same row-set error one level up.
+
+Note the fair set is also FRAN's **coverage**, not the whole cohort: DIA-NN covers 100% of precursors,
 FRAN 37.4% at grep scope. Comparing across different coverage is the other way to get a fake margin.
 
-Two things fall out, and the second one contradicts the obvious design:
+⛔ **Spectronaut parity is retracted.** Spectronaut's 7.4 s is measured on its own row set, so
+"7.52 s ≈ 7.4 s = parity" was never a comparison. Open, not established.
 
-**Comparability decides the answer, not volume.** Both directions are now measured. Pooling *all*
-1,552 runs indiscriminately was worse than 16 hand-selected ones — a 2021 Orbitrap run and a 2024
-manatee serum run both vote on a dog peptide's retention time, and their votes are noise. But
-**3,480 runs selected on gradient beat 111 runs selected on a filename substring**, by 29%. So the
-lesson is not "use less corpus"; it is that a *selected* corpus improves monotonically while an
-*unselected* one degrades. Volume is only an asset downstream of selection.
+Three things fall out:
 
-**Selection is also the cheap direction.** The scoped query took 37 seconds; the pooled build takes
-over 5 hours and, run against a 6-hour wall, has already timed out once producing nothing. The better
-answer is also ~500× cheaper — there is no trade-off to manage here.
+**What survives with no caveat is the counts, not the ratios.** Coverage of SN-confident precursors
+**37.4% → 92.9%**; consensus precursors **103,459 → 2,753,503**. These are direct counts, immune to
+row-set and filter arguments, and they are the reason Phase 1 mattered. A prior covering a third of
+precursors is an optional branch; one covering 93% can carry the calibration itself.
 
-**Coverage may be the more important half.** Phase 1 moved SN-confident precursors with any prior at
-all from **37.4% → 92.9%**. A predictor that is excellent on a third of precursors is a research
-result; one covering 93% is infrastructure.
+**Selection buys a little accuracy and a lot of reach.** ~6% on matched rows, 2.5× the coverage. Plan
+around the coverage.
+
+**Indiscriminate pooling still hurts.** All 1,552 runs pooled was worse than 16 hand-selected ones — a
+2021 Orbitrap run and a 2024 manatee serum run both voting on a dog peptide's RT is noise. So the rule
+is not "more corpus" or "less corpus": *select*, then take everything the selection admits. Selection
+is also the cheap direction — 37 s scoped against a 5-hour pooled build that has already hit a 6-hour
+wall and produced nothing.
 
 ⇒ **The core requirement is not "aggregate the corpus". It is "select comparable runs, then
 aggregate."** Everything below follows from that.
 
-> **Open cell.** The 7.52 s row is compared against DIA-NN's 27.42 s, but 27.42 s was measured on the
-> grep cohort's 4,115 right-peak rows, not on Phase 1's 10,039. DIA-NN has 100% coverage so the
-> direction is safe, but the exact margin on the Phase 1 cohort is unmeasured. Anyone quoting "73%"
-> should measure that cell first.
+> **Open cell.** No DIA-NN column exists in `sn21cmp/every_precursor.parquet`, so the margin could not
+> be closed from the FRAN side. The engine side has now exported it —
+> `glendon/diann_pred_irt_for_fran.tsv`, 14,992 `(stripped_seq, charge)` keys, 100% finite, no
+> ambiguous keys — for `--compare` to take as a fourth row.
+>
+> ⚠️ It is the library's **predicted-iRT axis, not seconds** (range −52.01 … 169.17). Monotone-
+> invariant, so an isotonic fit handles it unchanged; never subtract it from an observed RT. And 3,014
+> of 18,287 pid-joined rows fell outside the engine's paired library, so check the intersection with
+> the 10,039 before quoting coverage.
 
 ---
 
