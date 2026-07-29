@@ -8,6 +8,7 @@ All SQL for the corpus browser. Every function:
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 from functools import lru_cache
@@ -89,6 +90,24 @@ def _lab_institute_overrides() -> dict[str, str]:
         except Exception:  # noqa: BLE001 — table not created yet
             return {}
     return CACHE.get_or_set("lab_institute_overrides", _p)
+
+
+def component_versions() -> list[dict[str, Any]]:
+    """Latest recorded version per pipeline component, newest first.
+
+    DISTINCT ON keeps one row per component out of an append-only log, so the endpoint shows what is
+    current rather than every run ever. Empty list if the ingest side has not stamped anything yet."""
+    def _p() -> list[dict[str, Any]]:
+        try:
+            return query(
+                """SELECT DISTINCT ON (component)
+                          component, version, git_sha, recorded_at
+                     FROM delimp_component_version
+                    ORDER BY component, recorded_at DESC""",
+                tables=["delimp_component_version"])
+        except Exception:  # noqa: BLE001 — table not created until the first stamped ingest
+            return []
+    return SLOW_CACHE.get_or_set("component_versions", _p)
 
 
 def _proteome_reference() -> dict[int, dict[str, Any]]:
@@ -512,6 +531,16 @@ def peptide_fun_facts(stripped_seq: str) -> dict[str, Any]:
                   MIN(im) FILTER (WHERE im > 0.3) AS im_min, MAX(im) FILTER (WHERE im > 0.3) AS im_max,
                   COUNT(*) FILTER (WHERE im > 0.3) AS n_im,
                   MIN(rt) AS rt_min, MAX(rt) AS rt_max, MIN(irt) AS irt_min, MAX(irt) AS irt_max,
+                  -- Median + IQR, not min/max: a peptide's RT/iRT min-max is set by a handful of
+                  -- outliers and reads as a huge "spread" even when the distribution is tight
+                  -- (AAQEEYIKR: 6 of 2,516 precursors stretch iRT to -70..-21 around a -29.4 median
+                  -- whose IQR is 0.8 units wide). percentile_cont ignores NULL inputs.
+                  percentile_cont(0.25) WITHIN GROUP (ORDER BY irt) AS irt_p25,
+                  percentile_cont(0.50) WITHIN GROUP (ORDER BY irt) AS irt_p50,
+                  percentile_cont(0.75) WITHIN GROUP (ORDER BY irt) AS irt_p75,
+                  percentile_cont(0.25) WITHIN GROUP (ORDER BY rt)  AS rt_p25,
+                  percentile_cont(0.50) WITHIN GROUP (ORDER BY rt)  AS rt_p50,
+                  percentile_cont(0.75) WITHIN GROUP (ORDER BY rt)  AS rt_p75,
                   COUNT(*) FILTER (WHERE irt IS NOT NULL) AS n_irt, MAX(intensity) AS max_intensity
            FROM delimp_precursors WHERE stripped_seq = %s""",
         (seq,), tables=["delimp_precursors"], fetch="one")
@@ -533,6 +562,7 @@ def peptide_fun_facts(stripped_seq: str) -> dict[str, Any]:
     return {"stripped_seq": seq, "found": True, "physchem": physchem,
             "breadth": {k: breadth.get(k) for k in ("n_obs", "n_searches", "n_runs", "max_engines",
                         "n_im", "im_min", "im_max", "rt_min", "rt_max", "n_irt", "irt_min", "irt_max",
+                        "irt_p25", "irt_p50", "irt_p75", "rt_p25", "rt_p50", "rt_p75",
                         "max_intensity")} | {"charges": list(breadth.get("charges") or [])},
             "n_organisms": len(named), "organisms": named[:24],
             "n_unknown_runs": sum(o["n_runs"] for o in organisms if o["organism"] == "Unknown"),
@@ -677,6 +707,76 @@ def charge_distribution() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Search / browse
 # ---------------------------------------------------------------------------
+_AA = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+# Below this length a pure-AA string is far more likely a motif ("KKK") than a peptide the user
+# expects to exist, so it keeps the substring behaviour instead of the sequence lookup.
+_SEQ_LOOKUP_MIN_LEN = 5
+
+# 2**n spellings are enumerated, so cap n. 12 I/L sites -> 4096 array elements, still a cheap
+# indexed = ANY() probe; longer peptides fall through to the substring path.
+_IL_MAX_SITES = 12
+
+
+def _il_variants(seq: str) -> list[str]:
+    """Every I/L spelling of `seq`, `seq` itself included.
+
+    Leucine and isoleucine are isobaric, so MS cannot tell them apart and the search engine writes
+    whichever letter its FASTA happened to carry. delimp_precursors therefore stores exactly ONE
+    spelling per peptide, and searching the other one finds nothing (e.g. AAQEEYLKR -> 0 rows, while
+    the corpus holds 2,919 precursors of AAQEEYIKR). Returns [] when there are too many I/L sites
+    to enumerate.
+    """
+    sites = [i for i, c in enumerate(seq) if c in "IL"]
+    if len(sites) > _IL_MAX_SITES:
+        return []
+    out = []
+    for combo in itertools.product("IL", repeat=len(sites)):
+        chars = list(seq)
+        for i, c in zip(sites, combo):
+            chars[i] = c
+        out.append("".join(chars))
+    return out
+
+
+# Columns aggregated by every peptide search path (indexed lookup + substring fallback).
+_PEPTIDE_SEARCH_COLS = """
+    stripped_seq,
+    COUNT(*)                              AS n_precursors,
+    COUNT(DISTINCT modified_seq_proforma) AS n_modforms,
+    COUNT(DISTINCT charge)                AS n_charges,
+    COUNT(DISTINCT raw_path)              AS n_runs,
+    COUNT(DISTINCT search_id)             AS n_searches,
+    MIN(q_value)                          AS best_q_value,
+    bool_or(im IS NOT NULL)               AS has_im,
+    MAX(n_engines_confirming)             AS max_engines
+"""
+
+
+def _search_peptides_exact(seqs: list[str], lim: int, off: int) -> dict[str, Any]:
+    """Aggregate every precursor whose stripped_seq is one of `seqs` — an indexed `= ANY()` probe
+    against idx_prec_stripped_charge, so it needs no statement-timeout bound."""
+    rows = query(
+        f"""
+        SELECT {_PEPTIDE_SEARCH_COLS}
+        FROM delimp_precursors
+        WHERE stripped_seq = ANY(%s)
+        GROUP BY stripped_seq
+        ORDER BY n_precursors DESC
+        LIMIT %s OFFSET %s
+        """,
+        (seqs, lim, off),
+        tables=["delimp_precursors"],
+    )
+    total = query(
+        "SELECT COUNT(DISTINCT stripped_seq) FROM delimp_precursors WHERE stripped_seq = ANY(%s)",
+        (seqs,),
+        tables=["delimp_precursors"],
+        fetch="val",
+    )
+    return {"rows": rows, "total": total or 0, "limit": lim, "offset": off}
+
+
 def search_peptides(
     seq: str, exact: bool = False, limit: int = 50, offset: int = 0
 ) -> dict[str, Any]:
@@ -685,29 +785,35 @@ def search_peptides(
     if not seq:
         return {"rows": [], "total": 0}
 
+    # A pure amino-acid string of peptide length is a LOOKUP, not a motif search. Resolve it against
+    # the btree on stripped_seq over every I/L spelling (~0.3s) instead of the unindexed ILIKE below,
+    # which cannot finish inside any bound a web request can wait for. Falls through to the substring
+    # path when nothing matches, so motif search still works. (bug-sql #1, I/L blindness)
+    if not exact and len(seq) >= _SEQ_LOOKUP_MIN_LEN and set(seq) <= _AA:
+        variants = _il_variants(seq)
+        if variants:
+            hit = _search_peptides_exact(variants, lim, off)
+            if hit["rows"]:
+                if not any(r["stripped_seq"] == seq for r in hit["rows"]):
+                    hit["il_note"] = (
+                        f"No peptide is spelled {seq}. I and L are isobaric — the corpus stores the "
+                        "spelling from the search FASTA — so these I/L-equivalent peptides are shown."
+                    )
+                return hit
+
     if exact:
-        where = "stripped_seq = %s"
-        param: Any = seq
-        tmo: int | None = None  # indexed equality — no bound needed
-    else:
-        # NOTE: there is NO trigram index on stripped_seq, so a substring `ILIKE '%seq%'` is a full
-        # scan of the 300M-row precursors table. Bound it with a SHORT statement timeout and degrade
-        # gracefully (like search_proteins) instead of riding the 30s connection cap to a 503. (bug-sql #1)
-        where = "stripped_seq ILIKE %s"
-        param = f"%{seq}%"
-        tmo = _PROTEIN_FALLBACK_TIMEOUT_MS
+        return _search_peptides_exact([seq], lim, off)
+
+    # NOTE: there is NO trigram index on stripped_seq, so a substring `ILIKE '%seq%'` is a full
+    # scan of the 300M-row precursors table. Bound it with a SHORT statement timeout and degrade
+    # gracefully (like search_proteins) instead of riding the 30s connection cap to a 503. (bug-sql #1)
+    where = "stripped_seq ILIKE %s"
+    param: Any = f"%{seq}%"
+    tmo = _PROTEIN_FALLBACK_TIMEOUT_MS
     try:
         rows = query(
             f"""
-            SELECT stripped_seq,
-                   COUNT(*)                         AS n_precursors,
-                   COUNT(DISTINCT modified_seq_proforma) AS n_modforms,
-                   COUNT(DISTINCT charge)           AS n_charges,
-                   COUNT(DISTINCT raw_path)         AS n_runs,
-                   COUNT(DISTINCT search_id)        AS n_searches,
-                   MIN(q_value)                     AS best_q_value,
-                   bool_or(im IS NOT NULL)          AS has_im,
-                   MAX(n_engines_confirming)        AS max_engines
+            SELECT {_PEPTIDE_SEARCH_COLS}
             FROM delimp_precursors
             WHERE {where}
             GROUP BY stripped_seq
@@ -727,8 +833,9 @@ def search_peptides(
         )
     except Exception:  # noqa: BLE001 — substring scan exceeded the short bound
         return {"rows": [], "total": 0, "limit": lim, "offset": off, "degraded": True,
-                "hint": "Substring peptide search is unindexed and timed out — search an EXACT "
-                        "sequence (toggle Exact) or use a longer, more specific substring."}
+                "hint": "Substring peptide search is unindexed and timed out, so this is NOT a "
+                        "statement that the peptide is absent. Search a full sequence (which is "
+                        "matched exactly, I/L-insensitively) or use a longer, more specific substring."}
     return {"rows": rows, "total": total or 0, "limit": lim, "offset": off}
 
 
@@ -2593,6 +2700,64 @@ def _protein_coverage_peptides(pg: str, limit: int) -> dict[str, Any] | None:
     return {"gene": gene, "peptides": peps} if peps else None
 
 
+def peptide_charge_distribution(stripped_seq: str) -> dict[str, Any]:
+    """Per-charge abundance for ONE peptide: how OFTEN each charge state is detected and how much
+    SIGNAL it carries.
+
+    "Is the +2 seen more than the +3?" has two legitimate answers that can disagree — a charge can be
+    detected in more runs yet carry less total intensity — so both shares are returned rather than
+    implying one number settles it. Intensity is summed only over rows that actually have it, and
+    `n_obs_with_intensity` is reported so a sparse intensity column can't masquerade as low abundance.
+    """
+    seq = (stripped_seq or "").strip().upper()
+    if not seq.isalpha():
+        return {"charges": [], "n_obs": 0}
+    rows = query(
+        """SELECT charge,
+                  COUNT(*)                                               AS n_obs,
+                  COUNT(intensity)                                       AS n_obs_with_intensity,
+                  COUNT(DISTINCT raw_path)                               AS n_runs,
+                  COUNT(DISTINCT search_id)                              AS n_searches,
+                  AVG(precursor_mz)                                      AS avg_mz,
+                  AVG(im) FILTER (WHERE im > 0.3)                        AS avg_im,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY rt)        AS median_rt,
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY intensity) AS median_intensity,
+                  SUM(intensity)                                         AS sum_intensity,
+                  MIN(q_value)                                           AS best_q_value
+           FROM delimp_precursors
+           WHERE stripped_seq = %s AND charge BETWEEN 1 AND 8
+           GROUP BY charge ORDER BY charge""",
+        (seq,), tables=["delimp_precursors"], timeout_ms=8000)
+    rows = rows or []
+    tot_obs = sum(int(r["n_obs"] or 0) for r in rows)
+    tot_int = sum(float(r["sum_intensity"] or 0) for r in rows)
+    out = []
+    for r in rows:
+        n = int(r["n_obs"] or 0)
+        si = float(r["sum_intensity"] or 0)
+        out.append({
+            "charge": int(r["charge"]),
+            "n_obs": n,
+            "n_obs_with_intensity": int(r["n_obs_with_intensity"] or 0),
+            "n_runs": int(r["n_runs"] or 0),
+            "n_searches": int(r["n_searches"] or 0),
+            "avg_mz": float(r["avg_mz"]) if r["avg_mz"] is not None else None,
+            "avg_im": float(r["avg_im"]) if r["avg_im"] is not None else None,
+            "median_rt": float(r["median_rt"]) if r["median_rt"] is not None else None,
+            "median_intensity": float(r["median_intensity"]) if r["median_intensity"] is not None else None,
+            "sum_intensity": si or None,
+            "best_q_value": r["best_q_value"],
+            "obs_share": (n / tot_obs) if tot_obs else None,
+            "intensity_share": (si / tot_int) if tot_int else None,
+        })
+    dominant = max(out, key=lambda c: c["n_obs"])["charge"] if out else None
+    dominant_by_signal = (max([c for c in out if c["sum_intensity"]],
+                              key=lambda c: c["sum_intensity"])["charge"]
+                          if any(c["sum_intensity"] for c in out) else None)
+    return {"charges": out, "n_obs": tot_obs, "dominant_charge": dominant,
+            "dominant_charge_by_signal": dominant_by_signal}
+
+
 def peptide_detail(stripped_seq: str) -> dict[str, Any]:
     seq = (stripped_seq or "").strip().upper()
     summary = query(
@@ -2735,17 +2900,35 @@ def peptide_interference(stripped_seq: str, mz_tol: float = 0.01,
 
     def _producer():
         transitions, partners = [], {}
+        n_scanned = n_failed = 0
         for label, mz, rt0, ch in targets[:12]:
-            try:  # each transition is an unindexed jsonb-exploding scan — bound it; skip on timeout
+            # delimp_xic_fragment is delimp_precursor_xic.fragments flattened to one row per
+            # fragment with a btree on mz (ingest/build_xic_fragment_index.py). The old form —
+            # jsonb_array_elements over 264k rows with no usable index — timed out on all 12 of 12
+            # transitions for DLTDYLMK; this returns the same rows in ~0.1 s.
+            try:
                 rows = query(
-                    """SELECT x.stripped_seq, x.charge, x.rt_apex
-                       FROM delimp_precursor_xic x, jsonb_array_elements(x.fragments) f
-                       WHERE x.stripped_seq <> %s AND (f->>'mz')::float BETWEEN %s AND %s
+                    """SELECT stripped_seq, charge, rt_apex
+                       FROM delimp_xic_fragment
+                       WHERE stripped_seq <> %s AND mz BETWEEN %s AND %s
                        LIMIT 3000""",
-                    (seq, mz - mz_tol, mz + mz_tol), tables=["delimp_precursor_xic"], timeout_ms=5000,
+                    (seq, mz - mz_tol, mz + mz_tol), tables=["delimp_xic_fragment"], timeout_ms=5000,
                 )
-            except Exception:  # noqa: BLE001 — one transition's scan exceeded the bound; keep the rest
-                continue
+                n_scanned += 1
+            except Exception:  # noqa: BLE001 — index table absent (not built yet) or scan too slow
+                try:  # fall back to the original scan so the panel still works on a fresh deploy
+                    rows = query(
+                        """SELECT x.stripped_seq, x.charge, x.rt_apex
+                           FROM delimp_precursor_xic x, jsonb_array_elements(x.fragments) f
+                           WHERE x.stripped_seq <> %s AND (f->>'mz')::float BETWEEN %s AND %s
+                           LIMIT 3000""",
+                        (seq, mz - mz_tol, mz + mz_tol), tables=["delimp_precursor_xic"],
+                        timeout_ms=5000,
+                    )
+                    n_scanned += 1
+                except Exception:  # noqa: BLE001 — genuinely could not measure this transition
+                    n_failed += 1
+                    continue
             seen, co = set(), 0
             for r in rows:
                 p = r["stripped_seq"]
@@ -2769,8 +2952,16 @@ def peptide_interference(stripped_seq: str, mz_tol: float = 0.01,
             if pe["min_dRT"] is not None:
                 pe["min_dRT"] = round(pe["min_dRT"], 3)
         plist = sorted(partners.values(), key=lambda x: (-x["co_eluting"], -x["shared"]))[:max_partners]
+        # Report coverage, not just results. `delimp_precursor_xic` has only a PK index on
+        # precursor_id, so each transition explodes the fragments jsonb across all 264k rows and
+        # routinely exceeds the 5 s bound — for DLTDYLMK, all 12 of 12 scans timed out. Without these
+        # counts an all-timeout result is indistinguishable from a genuine "nothing shares these
+        # transitions", and the UI confidently rendered "transitions look specific" having measured
+        # nothing at all. `complete` is the flag the UI must gate that claim on.
         return {"available": True, "stripped_seq": seq, "rt_window": rt_window, "mz_tol": mz_tol,
-                "transitions": transitions, "partners": plist}
+                "transitions": transitions, "partners": plist,
+                "n_transitions": len(targets[:12]), "n_scanned": n_scanned, "n_failed": n_failed,
+                "complete": n_failed == 0 and n_scanned > 0}
 
     return SLOW_CACHE.get_or_set(f"interf_{seq}", _producer)
 
@@ -2846,7 +3037,8 @@ def peptide_xic(stripped_seq: str, top_n: int = 6) -> dict[str, Any]:
     seq = (stripped_seq or "").strip().upper()
     try:
         meas = query(
-            """SELECT precursor_id, charge, raw_path, rt_apex, ms1_apex, ms1, fragments
+            """SELECT precursor_id, charge, raw_path, rt_apex, ms1_apex, ms1, fragments,
+                      engine, engine_version
                FROM delimp_precursor_xic WHERE stripped_seq = %s ORDER BY charge""",
             (seq,), tables=["delimp_precursor_xic"], timeout_ms=6000,
         )
@@ -2915,10 +3107,16 @@ def peptide_xic(stripped_seq: str, top_n: int = 6) -> dict[str, Any]:
                    "trace": rep_frags[lab].get("trace") or []}
                   for lab in top if lab in rep_frags]
         has_real = any(b["trace"] for b in bottom)
+        # The library the predicted intensities came from. The UI used to hard-code "DIA-NN library"
+        # for every peptide; the corpus is >90% Spectronaut (for DLTDYLMK: 3 spectronaut XIC rows to
+        # 1 diann), so that label was simply wrong most of the time.
+        eng = (m.get("engine") or "").strip().lower()
+        eng_label = {"diann": "DIA-NN", "spectronaut": "Spectronaut"}.get(eng, m.get("engine") or None)
         precursors.append({
             "precursor_id": pid, "charge": m["charge"], "rt_apex": m["rt_apex"],
             "representative_run": m["raw_path"], "n_searches": len(searches_by_pid.get(pid, set())),
             "ms1": _j(m["ms1"]) or [], "fragments": bottom, "fragment_usage": usage_list,
+            "engine": eng_label, "engine_version": m.get("engine_version"),
             "has_real_trace": has_real})
     precursors.sort(key=lambda p: -(p.get("rt_apex") is not None), )  # stable; keep charge order from SQL
     return {"available": True, "stripped_seq": seq,
@@ -2957,6 +3155,7 @@ def search_detail(search_id: str) -> dict[str, Any]:
         SELECT id, search_name, search_engine, search_engine_version,
                pipeline_id, pipeline_version, status, sharing_status,
                n_raw_files, n_precursors_total, n_proteins_total,
+               n_protein_groups_total,
                fasta_path, fasta_n_proteins, contaminant_lib,
                completed_at, submitted_at, ingested_at, delimp_version,
                doi, pride_accession, citation

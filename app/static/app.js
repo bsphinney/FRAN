@@ -379,9 +379,9 @@ async function renderSearchDetail(id){
         <button onclick="exportReport('${esc(id)}',this,'brief')" class="px-3 py-1 rounded-lg text-xs font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a markdown brief (raw-file locations, FASTA to download, conditions) to hand to a HIVE-connected Claude to re-search with DIA-NN + analyze with LIMPA">📝 Re-search this data</button>`:''}</div>
       </div>
       ${window.__FRAN_TIER__&&window.__FRAN_TIER__!=='public'?`<div class="mt-3 text-[11px] text-slate-500"><b>report.parquet</b> → upload into <b>DE-LIMP</b> (Hugging Face or local) to run LIMPA. &nbsp;·&nbsp; <b>HIVE brief</b> → a markdown packet (raw-file paths, FASTA to download, conditions) to give a HIVE-connected Claude to re-search with DIA-NN + analyze with LIMPA.</div>`:''}
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-5">
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-4 mt-5">
         ${stat('Raw files',fmt(s.n_raw_files))}${stat('Precursors',fmt(s.n_precursors_total))}
-        ${stat('Proteins',fmt(s.n_proteins_total))}${stat('FASTA proteins',fmt(s.fasta_n_proteins))}
+        ${stat('Proteins',fmt(s.n_proteins_total))}${s.n_protein_groups_total!=null?stat('Protein groups',fmt(s.n_protein_groups_total)):''}${stat('FASTA proteins',fmt(s.fasta_n_proteins))}
       </div>
       ${s.fasta_path?`<div class="mt-4 text-xs text-slate-500">FASTA: <code class="text-slate-400">${esc(s.fasta_path)}</code></div>`:''}
       ${s.doi?`<div class="mt-1 text-xs text-slate-500">DOI: ${esc(s.doi)}</div>`:''}
@@ -460,8 +460,11 @@ async function srTab(which){
     } else if(which==='pep'){
       const exact=$('#exactChk')?.checked?'&exact=true':'';
       const d=await api(`/api/search/peptides?q=${encodeURIComponent(q)}${exact}&limit=100`);
-      if(!d.rows.length){ body.innerHTML=empty('No peptides match.'); return; }
-      body.innerHTML = `<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} matching peptides</div>`+table(
+      // A degraded (timed-out) substring scan is NOT evidence of absence — say so, or the user reads
+      // an unindexed timeout as "this peptide is not in the corpus".
+      if(!d.rows.length){ body.innerHTML=empty(d.hint||'No peptides match.'); return; }
+      const ilNote = d.il_note ? `<div class="text-xs text-amber-300/90 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2 mb-3">${esc(d.il_note)}</div>` : '';
+      body.innerHTML = ilNote+`<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} matching peptides</div>`+table(
         ['Peptide','Precursors','Mod-forms','Charges','Runs','Searches','Best q','IM','Engines'],
         d.rows.map(r=>[`<span class="font-mono text-white">${esc(r.stripped_seq)}</span>`,fmt(r.n_precursors),fmt(r.n_modforms),fmt(r.n_charges),fmt(r.n_runs),fmt(r.n_searches),sci(r.best_q_value),r.has_im?'<span class="text-teal">●</span>':'<span class="text-slate-600">—</span>',r.max_engines>1?`<span class="text-plum font-semibold">${r.max_engines}×</span>`:'1']),
         d.rows.map(r=>`go('peptide','${encodeURIComponent(r.stripped_seq)}')`));
@@ -498,6 +501,7 @@ async function renderPeptide(seq){
     <div id="funbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-40 rounded-xl"></div></div>
     <div id="sumbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-20 rounded-xl"></div></div>
     <div id="flybox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-16 rounded-xl"></div></div>
+    <div id="chargebox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-40 rounded-xl"></div></div>
     <div id="predbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-48 rounded-xl"></div></div>
     <div id="obsbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-48 rounded-xl"></div></div>
     <div id="xicbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-64 rounded-xl"></div></div>
@@ -510,7 +514,7 @@ async function renderPeptide(seq){
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Observations across runs (${d.observations.length})</h3>
     ${table(['Search','Engine','Run','Charge','m/z','RT','1/K₀','q-value','Intensity'],
       d.observations.map(o=>[`<span class="text-accent-400 cursor-pointer" onclick="event.stopPropagation();go('run','${o.search_id}')">${esc(o.search_name||'—')}</span>`,esc(o.search_engine||'—'),`<span class="font-mono text-[11px]">${esc((o.raw_path||'').split('/').pop())}</span>`,o.charge+'+',fmtF(o.precursor_mz,4),fmtF(o.rt),fmtF(o.im,3),sci(o.q_value),sci(o.intensity)])) }</div>`;
-    loadFunFacts(seq); loadSummary(seq); loadFlyability(seq); loadPredicted(seq, 2); loadObserved(seq); loadXIC(seq); loadInterference(seq); loadLCA(seq); loadProteins(seq);
+    loadFunFacts(seq); loadSummary(seq); loadFlyability(seq); loadCharges(seq); loadPredicted(seq, 2); loadObserved(seq); loadXIC(seq); loadInterference(seq); loadLCA(seq); loadProteins(seq);
   }catch(e){ dbError(e); }
 }
 
@@ -553,13 +557,30 @@ async function loadInterference(seq){
           <td class="py-1.5 px-2 text-slate-300">${p.shared}</td>
           <td class="py-1.5 px-2 text-amber-300">${p.co_eluting}</td>
           <td class="py-1.5 px-2 text-slate-400">${p.min_dRT!=null?fmtF(p.min_dRT,2)+' min':'—'}</td></tr>`).join('');
+    // The scan is unindexed and frequently times out on every transition. When that happens we have
+    // measured NOTHING, so we must not render the "looks specific" verdict — an absence of evidence
+    // was being shown as evidence of absence.
+    const incomplete = x.complete===false;
+    const measuredNothing = incomplete && !(x.n_scanned>0);
+    const note = incomplete
+      ? `<div class="text-[11px] text-amber-300/90 mb-3">⚠ ${measuredNothing
+          ? `Could not compute: all ${x.n_transitions||0} transition scans timed out.`
+          : `Partial: ${x.n_scanned} of ${x.n_transitions} transitions scanned, ${x.n_failed} timed out.`}
+          Counts below are a lower bound, not a clean bill of health.</div>`
+      : '';
+    const partnersEmpty = measuredNothing
+      ? empty('Not determined — no transition could be scanned in time.')
+      : empty(incomplete
+          ? 'No co-eluting interferers among the transitions that completed.'
+          : 'No co-eluting interferers — transitions look specific.');
     el.innerHTML=`
       <h3 class="font-bold text-white mb-1">Shared transitions &amp; interference <span class="text-[10px] text-slate-500 font-normal">other peptides sharing this one's quant fragments</span></h3>
       <p class="text-[11px] text-slate-500 mb-3">A transition shared by a <span class="text-amber-300">co-eluting</span> peptide (|ΔRT| ≤ ${x.rt_window} min, ±${x.mz_tol} m/z) is potential interference; RT-resolved sharing is fine. Helps judge each transition's specificity.</p>
+      ${note}
       <div class="grid lg:grid-cols-2 gap-5">
-        <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">This peptide's quant transitions</div>${tr||empty('—')}</div>
+        <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">This peptide's quant transitions</div>${tr||empty(measuredNothing?'Not determined — scans timed out.':'—')}</div>
         <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Co-eluting peptides sharing a transition</div>
-          ${partners?`<div class="overflow-x-auto"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase text-slate-500 border-b border-white/10"><th class="py-1 px-2">Peptide</th><th class="py-1 px-2">Shared</th><th class="py-1 px-2">Co-elute</th><th class="py-1 px-2">min ΔRT</th></tr></thead><tbody>${partners}</tbody></table></div>`:empty('No co-eluting interferers — transitions look specific.')}</div>
+          ${partners?`<div class="overflow-x-auto"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase text-slate-500 border-b border-white/10"><th class="py-1 px-2">Peptide</th><th class="py-1 px-2">Shared</th><th class="py-1 px-2">Co-elute</th><th class="py-1 px-2">min ΔRT</th></tr></thead><tbody>${partners}</tbody></table></div>`:partnersEmpty}</div>
       </div>`;
   }catch(e){ const el=$('#interfbox'); if(el) el.innerHTML=`<h3 class="font-bold text-white mb-1">Shared transitions &amp; interference</h3>${empty('Unavailable: '+esc(e.message))}`; }
 }
@@ -633,11 +654,56 @@ async function loadFragments(seq){
 }
 
 // Layer-0: the REAL acquired MS2 spectrum, read on demand from the observed-spectrum blob.
-async function loadObserved(seq){
+/* Charge-state abundance. Detection frequency and signal share are shown side by side because they
+   can disagree — a charge seen in more runs can still carry less of the peptide's total intensity,
+   and only one of those is "seen more" depending on what you meant. */
+async function loadCharges(seq){
+  const el=$('#chargebox'); if(!el)return;
+  try{
+    if(charts.c_charge_pep){try{charts.c_charge_pep.destroy()}catch(e){} delete charts.c_charge_pep;}
+    const d=await api(`/api/peptide/${encodeURIComponent(seq)}/charges`); const c=d.charges||{};
+    const rows=c.charges||[];
+    if(!rows.length){
+      el.innerHTML=`<h3 class="font-bold text-white mb-1">Charge-state abundance</h3>${empty('No charge states recorded for this peptide.')}`;
+      return;
+    }
+    const cc=chartColors();
+    const anyInt=rows.some(r=>r.intensity_share!=null);
+    const byObs=c.dominant_charge, bySig=c.dominant_charge_by_signal;
+    const verdict = (!anyInt||bySig==null)
+      ? `The <span class="text-accent-400 font-semibold">+${byObs}</span> is detected most often (${Math.round(100*(rows.find(r=>r.charge===byObs)||{}).obs_share)}% of detections). No intensity recorded, so signal share can't be compared.`
+      : (byObs===bySig
+          ? `The <span class="text-accent-400 font-semibold">+${byObs}</span> dominates both ways — most detections and most signal.`
+          : `Most <span class="text-accent-400 font-semibold">detections</span> are +${byObs}, but most <span class="text-plum font-semibold">signal</span> comes from +${bySig}.`);
+    el.innerHTML=`
+      <h3 class="font-bold text-white mb-1">Charge-state abundance <span class="text-[10px] text-slate-500 font-normal">how often each form is seen vs how much signal it carries</span></h3>
+      <p class="text-[11px] text-slate-400 mb-3">${verdict}</p>
+      <div class="h-40 mb-3"><canvas id="c_charge_pep"></canvas></div>
+      ${table(['Charge','Detections','Share','Signal share','Runs','Searches','Avg m/z','Median RT','Avg 1/K₀','Median intensity'],
+        rows.map(r=>[`<span class="font-semibold text-white">+${r.charge}</span>`,fmt(r.n_obs),
+          r.obs_share!=null?`${(100*r.obs_share).toFixed(1)}%`:'—',
+          r.intensity_share!=null?`${(100*r.intensity_share).toFixed(1)}%`:'—',
+          fmt(r.n_runs),fmt(r.n_searches),fmtF(r.avg_mz,4),fmtF(r.median_rt,2),
+          r.avg_im!=null?fmtF(r.avg_im,3):'—',r.median_intensity!=null?sci(r.median_intensity):'—']))}
+      <div class="text-[10px] text-slate-500 mt-3">Shares are over this peptide's precursors in FRAN. Signal share sums recorded intensity, which is absent on some rows — the Detections column is the more complete count.</div>`;
+    charts.c_charge_pep=new Chart($('#c_charge_pep'),{type:'bar',
+      data:{labels:rows.map(r=>'+'+r.charge),datasets:[
+        {label:'% of detections',data:rows.map(r=>r.obs_share!=null?100*r.obs_share:null),backgroundColor:'#00B5E2'},
+        {label:'% of signal',data:rows.map(r=>r.intensity_share!=null?100*r.intensity_share:null),backgroundColor:'#B57BFF'}]},
+      options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
+        tooltip:{callbacks:{label:x=>`${x.dataset.label}: ${x.raw==null?'—':x.raw.toFixed(1)+'%'}`}}},
+        scales:{x:{grid:{display:false},ticks:{color:cc.tick}},
+          y:{beginAtZero:true,max:100,title:{display:true,text:'%',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}}},
+        maintainAspectRatio:false}});
+  }catch(e){ const el=$('#chargebox'); if(el) el.innerHTML=`<h3 class="font-bold text-white mb-1">Charge-state abundance</h3>${empty('Unavailable: '+esc(e.message))}`; }
+}
+
+async function loadObserved(seq, charge){
   const el=$('#obsbox'); if(!el)return;
   try{
     if(charts.c_frag_obs){try{charts.c_frag_obs.destroy()}catch(e){} delete charts.c_frag_obs;}
-    const d=await api(`/api/peptide/${encodeURIComponent(seq)}/observed`); const o=d.observed;
+    const qs=charge?`?charge=${encodeURIComponent(charge)}`:'';
+    const d=await api(`/api/peptide/${encodeURIComponent(seq)}/observed${qs}`); const o=d.observed;
     if(!o || !o.ions || !o.ions.length){
       el.innerHTML=`<h3 class="font-bold text-white mb-1">Measured spectrum <span class="text-[10px] text-slate-500 font-normal">observed MS2 · acquired</span></h3>
         ${empty('No stored measured spectrum for this peptide yet (only searches whose observed fragments were backfilled into the spectrum lane appear here).')}`;
@@ -649,12 +715,20 @@ async function loadObserved(seq){
     const ds=[['b','b ions'],['y','y ions'],[null,'other']].map(([t,lab])=>({label:lab,
       data:o.ions.filter(i=>t?i.type===t:(i.type!=='b'&&i.type!=='y')).map(i=>({x:i.mz,y:(i.rel_intensity||0)/maxI,ion:i.ion,ppm:i.mass_acc_ppm})),
       backgroundColor:col(t),borderColor:col(t),barThickness:2}));
+    // Every lane-backed charge state gets a button (labelled with how often it was actually seen),
+    // so the panel shows the peptide's real charge envelope rather than one charge in isolation.
+    const zs=o.available_charges||[];
+    const zBtns=zs.length>1?`<div class="flex items-center gap-1 text-[10px]">
+        <span class="text-slate-500 mr-1">charge</span>
+        ${zs.map(c=>`<button onclick="loadObserved('${encodeURIComponent(seq)}',${c.charge})" title="${fmt(c.n_obs)} observations" class="px-2 py-0.5 rounded ${c.charge===o.charge?'tab-active':'glass text-slate-300'}">+${c.charge}<span class="opacity-60 ml-1">${fmt(c.n_obs)}</span></button>`).join('')}
+      </div>`:'';
     el.innerHTML=`
       <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
-        <h3 class="font-bold text-white">Measured spectrum <span class="text-[10px] text-slate-500 font-normal">observed MS2 · a representative high-confidence acquisition</span></h3>
+        <h3 class="font-bold text-white">Measured spectrum <span class="text-[10px] text-slate-500 font-normal">observed MS2 · most intense high-confidence acquisition</span></h3>
         <span class="text-[10px] text-slate-500">${o.n_fragments} fragments · precursor +${o.charge} ${o.precursor_mz?('· m/z '+fmtF(o.precursor_mz,4)):''}</span>
       </div>
       <p class="text-[11px] text-slate-500 mb-2">Stick heights are the engine's real relative fragment intensities; positions are measured m/z. This is the actually-acquired spectrum, not predicted.</p>
+      ${zBtns?`<div class="mb-2">${zBtns}</div>`:''}
       <div class="h-44"><canvas id="c_frag_obs"></canvas></div>`;
     charts.c_frag_obs=new Chart($('#c_frag_obs'),{type:'bar',data:{datasets:ds},
       options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
@@ -696,6 +770,9 @@ function selectXICPrec(i){
   x.precursors.forEach((_,j)=>{const b=$('#xicp_'+j); if(b) b.className='px-3 py-1 rounded-lg text-xs '+(j===i?'tab-active':'glass text-slate-300');});
   ['xic_ms1','xic_frag','xic_mirror'].forEach(id=>{ if(charts[id]){try{charts[id].destroy()}catch(e){} delete charts[id];} });
   const synthetic=!p.has_real_trace;
+  // Name the library that actually produced these predicted intensities. This was hard-coded to
+  // "DIA-NN library" for every peptide, which is wrong for most of a >90% Spectronaut corpus.
+  const libLabel=(p.engine?(p.engine+(p.engine_version?' '+p.engine_version:'')+' library'):'spectral library');
   const usage=(p.fragment_usage||[]).slice(0,12).map(u=>`<div class="flex items-center gap-2 text-[11px] py-0.5">
       <span class="font-mono w-12 text-slate-300">${esc(u.label)}</span>
       <div class="flex-1 h-2 rounded bg-white/5 overflow-hidden"><div style="width:${u.pct}%;height:100%;background:#FFBF00"></div></div>
@@ -708,7 +785,7 @@ function selectXICPrec(i){
         <div class="lg:col-span-3 space-y-2">
           <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">MS1 precursor (+${p.charge})</div><div class="h-24"><canvas id="xic_ms1"></canvas></div></div>
           <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Fragment ions (top ${p.fragments.length} quantified)</div><div class="h-44"><canvas id="xic_frag"></canvas></div></div>
-          ${synthetic?'':`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Predicted (DIA-NN library) ↑ vs acquired (XIC apex) ↓ — mirror</div><div class="h-44"><canvas id="xic_mirror"></canvas></div></div>`}
+          ${synthetic?'':`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Predicted (${esc(libLabel)}) ↑ vs acquired (XIC apex) ↓ — mirror</div><div class="h-44"><canvas id="xic_mirror"></canvas></div></div>`}
         </div>
         <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Quant-fragment usage % across searches</div>${usage||empty('—')}</div>
       </div>`;
@@ -724,7 +801,7 @@ function selectXICPrec(i){
     borderColor:PALETTE[j%PALETTE.length],backgroundColor:'transparent',tension:.35,borderWidth:1.8,borderDash:synthetic?[4,3]:[]}))},
     options:{...opts(x.rt_axis||'RT − apex (min)'),plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
     tooltip:{callbacks:{title:items=>`${synthetic?'Δ':''}RT ${fmtF(items[0].parsed.x)} min`}}}}});
-  // mirror plot: predicted (DIA-NN library rel-intensity) up, acquired (XIC peak apex) down,
+  // mirror plot: predicted (spectral-library rel-intensity) up, acquired (XIC peak apex) down,
   // each normalized to its own max so the spectral PATTERNS compare regardless of scale.
   if(!synthetic){
     const frg=(p.fragments||[]).filter(f=>f.mz);
@@ -733,7 +810,7 @@ function selectXICPrec(i){
     const maxApex=Math.max(...frg.map(apexOf),1e-9);
     const mstem=(fn)=>{const a=[];frg.forEach(f=>{a.push({x:f.mz,y:0});a.push({x:f.mz,y:fn(f),ion:f.ion||f.label});a.push({x:f.mz,y:null});});return a;};
     charts.xic_mirror=new Chart($('#xic_mirror'),{type:'line',data:{datasets:[
-      {label:'predicted (DIA-NN library)',data:mstem(f=>(f.rel_intensity||0)/maxRel),borderColor:'#00B5E2',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false},
+      {label:'predicted ('+libLabel+')',data:mstem(f=>(f.rel_intensity||0)/maxRel),borderColor:'#00B5E2',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false},
       {label:'acquired (XIC apex)',data:mstem(f=>-(apexOf(f)/maxApex)),borderColor:'#FFBF00',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false}]},
       options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
         tooltip:{filter:it=>it.raw&&it.raw.ion,callbacks:{label:c=>`${c.dataset.label}: ${c.raw.ion} (${fmtF(Math.abs(c.parsed.y),3)})`}}},
@@ -767,8 +844,14 @@ async function loadFunFacts(seq){
     const resBadges=[resBadge('C','Cys','bg-yellow-500/15 text-yellow-300'),resBadge('W','Trp','bg-indigo-500/15 text-indigo-300'),resBadge('H','His','bg-sky-500/15 text-sky-300'),resBadge('P','Pro','bg-rose-500/15 text-rose-300'),resBadge('M','Met','bg-orange-500/15 text-orange-300')].filter(Boolean).join(' ');
     const gravyTxt=pc.gravy==null?'—':`${fmtF(pc.gravy,2)} <span class="text-[10px] ${pc.hydrophobic?'text-orange-300':'text-sky-300'}">(${pc.hydrophobic?'hydrophobic':'hydrophilic'})</span>`;
     const imTxt=(b.n_im>0&&b.im_min!=null)?`${fmtF(b.im_min,3)} – ${fmtF(b.im_max,3)} <span class="text-[10px] text-slate-500">(${fmt(b.n_im)} obs)</span>`:'—';
-    const useIrt=(b.n_irt||0)>0&&b.irt_min!=null;
-    const rtTxt=useIrt?`${fmtF(b.irt_min,1)} – ${fmtF(b.irt_max,1)} <span class="text-[10px] text-slate-500">iRT</span>`:(b.rt_min!=null?`${fmtF(b.rt_min,1)} – ${fmtF(b.rt_max,1)} <span class="text-[10px] text-slate-500">min</span>`:'—');
+    // Median + IQR rather than min–max: the extremes are set by a few outliers and made a tight
+    // distribution look wildly spread (AAQEEYIKR read as −70 … −21 iRT when the median is −29.4 and
+    // half the precursors sit inside 0.8 units of it). The IQR is what "spread" should mean here.
+    const useIrt=(b.n_irt||0)>0&&b.irt_p50!=null;
+    const iqr=(lo,hi,unit,n)=>`<span class="text-[10px] text-slate-500">${unit} · IQR ${fmtF(lo,1)} – ${fmtF(hi,1)}${n?` · ${fmt(n)} obs`:''}</span>`;
+    const rtTxt=useIrt
+      ? `${fmtF(b.irt_p50,1)} ${iqr(b.irt_p25,b.irt_p75,'iRT',b.n_irt)}`
+      : (b.rt_p50!=null?`${fmtF(b.rt_p50,1)} ${iqr(b.rt_p25,b.rt_p75,'min',0)}`:'—');
     const mi=f.most_intense;
     const intTxt=mi?`${sci(mi.intensity)} <span class="text-[10px] text-slate-500">in ${esc(mi.organism)} (+${mi.charge})</span>`:'—';
     const chargeTxt=(b.charges&&b.charges.length)?b.charges.map(c=>c+'+').join(', '):'—';
@@ -786,7 +869,7 @@ async function loadFunFacts(seq){
         ${stat('Species',fmt(nOrg))}
         ${stat('Charge states',chargeTxt)}
         ${stat('Ion mobility 1/K₀',imTxt)}
-        ${stat(useIrt?'iRT spread':'RT spread',rtTxt)}
+        ${stat(useIrt?'iRT median':'RT median',rtTxt)}
         ${stat('Cross-engine',b.max_engines>1?`<span class="text-plum">${b.max_engines}× engines</span>`:'1 engine')}
         ${stat('Peak abundance',intTxt)}</div>
       ${resBadges?`<div class="mb-3"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Interesting residues</div><div class="flex flex-wrap gap-1.5">${resBadges}</div></div>`:''}
@@ -859,7 +942,7 @@ async function loadLCA(seq){
         <div class="text-right"><span class="text-xl font-extrabold text-accent-400">${esc(l.taxon_name||'—')}</span>
           <span class="px-2 py-0.5 ml-1 rounded text-[10px] bg-white/10 text-slate-300">${esc(l.taxon_rank||'')}</span></div>
       </div>
-      <div class="text-xs leading-relaxed">${lin||'<span class="text-slate-500">lineage unavailable</span>'}</div>
+      <div class="text-xs leading-relaxed">${lin||`<span class="text-slate-400">No rank below <span class="text-accent-400">${esc(l.taxon_name||'this taxon')}</span> is resolved — the peptide is shared too widely to place it any more precisely.</span>`}</div>
       <div class="text-[10px] text-slate-500 mt-2">LCA = lowest common ancestor of all UniProt taxa containing this tryptic peptide (I/L equated). Higher rank ⇒ less taxon-specific.</div>`;
   }catch(e){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Taxonomic LCA</h3>${empty('LCA unavailable: '+esc(e.message))}`; }
 }

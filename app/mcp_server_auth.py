@@ -37,7 +37,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import db, privacy, queries
-from .mcp_server import _safe  # reuse the exact JSON-safe conversion the public server uses
+from .mcp_server import _OBSERVED_RATE, _safe  # reuse the public server's conversion + spectrum rate
 
 # Per-request authorization decision, set by the FastAPI middleware in app/main.py just before the
 # mounted /mcp-auth app handles the request. Shape:
@@ -176,6 +176,33 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
         stripped_seq: the unmodified amino-acid sequence (case-insensitive).
     """
     return _safe(queries.peptide_detail(stripped_seq))
+
+
+@mcp.tool()
+def peptide_observed_spectrum(stripped_seq: str, charge: int | None = None) -> dict[str, Any]:
+    """The REAL measured MS2 spectrum for ONE peptide — the fragment ions actually acquired on the
+    instrument (m/z, relative intensity, b/y annotation, ppm mass error), not a prediction. Read on
+    demand from the observed-spectrum blob and identity-decoupled: no search, sample, run or customer
+    is revealed. Returns {"observed": null} when the corpus holds no stored spectrum. PUBLIC.
+
+    Without `charge` this returns the peptide's MOST-OBSERVED charge state (the form the corpus
+    actually measures), picking its most intense high-confidence acquisition.
+
+    ONE peptide per call by design — there is no bulk path, and calls are rate-limited per user. For
+    a corpus-wide fragment export, contact the Proteomics Core (bsphinney@ucdavis.edu).
+
+    Args:
+        stripped_seq: the unmodified amino-acid sequence (case-insensitive).
+        charge: optional precursor charge (1-6) to request a specific charge state.
+    """
+    from . import observed_spectrum as obs, ratelimit
+    who = (get_auth().get("email") or "anon").lower()
+    if not ratelimit.allow(f"mcp-observed:{who}", limit=_OBSERVED_RATE, window_s=60):
+        return {"error": "rate limited",
+                "detail": "Too many spectrum requests. This endpoint is deliberately not a bulk-download "
+                          "path; contact bsphinney@ucdavis.edu for an export."}
+    z = max(1, min(charge, 6)) if charge else None
+    return _safe({"observed": obs.observed_spectrum(stripped_seq, z)})
 
 
 @mcp.tool()

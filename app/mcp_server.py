@@ -32,6 +32,12 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from . import queries
 
+# Spectra are served per-peptide and rate-limited so the blob cannot be scraped in a loop — the same
+# "no bulk-download path" invariant the REST /api/peptide/{seq}/observed route enforces per client IP.
+# MCP calls carry no request object here, so the public bucket is shared across anonymous callers;
+# /mcp-auth keys the identical limit per authenticated user.
+_OBSERVED_RATE = 60
+
 # stateless_http=True: each call is self-contained (no server-side session affinity needed for these
 # pure read tools), which is the simplest, most robust shape behind Azure App Service. json_response
 # lets simple clients (and curl) read a plain JSON body instead of an SSE stream. streamable_http_path
@@ -148,6 +154,32 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
         stripped_seq: the unmodified amino-acid sequence (case-insensitive).
     """
     return _safe(queries.peptide_detail(stripped_seq))
+
+
+@mcp.tool()
+def peptide_observed_spectrum(stripped_seq: str, charge: int | None = None) -> dict[str, Any]:
+    """The REAL measured MS2 spectrum for ONE peptide — the fragment ions actually acquired on the
+    instrument (m/z, relative intensity, b/y annotation, ppm mass error), not a prediction. Read on
+    demand from the observed-spectrum blob and identity-decoupled: no search, sample, run or customer
+    is revealed. Returns {"observed": null} when the corpus holds no stored spectrum for the peptide.
+
+    Without `charge` this returns the peptide's MOST-OBSERVED charge state (the form the corpus
+    actually measures), picking its most intense high-confidence acquisition.
+
+    ONE peptide per call by design — there is no bulk path, and calls are rate-limited. For a corpus-
+    wide fragment export, contact the Proteomics Core (bsphinney@ucdavis.edu) rather than looping.
+
+    Args:
+        stripped_seq: the unmodified amino-acid sequence (case-insensitive).
+        charge: optional precursor charge (1-6) to request a specific charge state.
+    """
+    from . import observed_spectrum as obs, ratelimit
+    if not ratelimit.allow("mcp-observed:public", limit=_OBSERVED_RATE, window_s=60):
+        return {"error": "rate limited",
+                "detail": "Too many spectrum requests through the public MCP server. This endpoint is "
+                          "deliberately not a bulk-download path; contact bsphinney@ucdavis.edu for an export."}
+    z = max(1, min(charge, 6)) if charge else None
+    return _safe({"observed": obs.observed_spectrum(stripped_seq, z)})
 
 
 @mcp.tool()

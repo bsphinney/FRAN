@@ -23,7 +23,21 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.14.10"  # 0.14.8: honest proteome stat — "% of genes (cumulative)" + isoform-level %;
+APP_VERSION = "0.16.0"  # 0.16.0: measured-spectrum panel picks the MODAL charge's most intense
+                        #         high-confidence acquisition (best_q_value is NULL for ~99.9% of the
+                        #         corpus, so the old ORDER BY was a tie -> arbitrary +1 spectra) and
+                        #         gains a per-charge selector; +charge-state abundance pane (detection
+                        #         share vs signal share); peptide card reports iRT/RT median+IQR
+                        #         instead of outlier-driven min-max; LCA rank list refreshed for
+                        #         Unipept's superkingdom->domain rename (+ the sub/super ranks it now
+                        #         returns) which had emptied lineages; +peptide_observed_spectrum MCP
+                        #         tool (rate-limited, one peptide per call) on /mcp and /mcp-auth.
+                        # 0.15.0: peptide search resolves a full sequence via the stripped_seq btree
+                        #         across all I/L spellings (I/L are isobaric, so the corpus stores only
+                        #         the FASTA's letter — AAQEEYLKR now finds AAQEEYIKR); the unindexed
+                        #         substring scan no longer double-runs its own timeout, and a degraded
+                        #         search says so instead of rendering "No peptides match".
+                        # 0.14.8: honest proteome stat — "% of genes (cumulative)" + isoform-level %;
                         #         +Taxonomic-breadth-by-run-count chart on the species overview.
                         # 0.13.0: rich lab/customer page — search stats (most-identified proteins,
                         # organisms, totals), submission topics (description/prep), + PI profile banner
@@ -450,7 +464,24 @@ def health():
 
 @app.get("/version")
 def version():
-    return ok({"version": APP_VERSION})
+    """App version plus the pipeline versions recorded in the corpus.
+
+    The app is read-only and cannot stamp itself, so the ingest side records into
+    `delimp_component_version` and this reads back the latest row per component. That makes one URL
+    answer "which code produced what I'm looking at" — the question that was unanswerable while the
+    ingestor, the XIC extractor and the app each kept a version constant that reached nothing."""
+    out = {"version": APP_VERSION, "app": APP_VERSION}
+    try:
+        rows = queries.component_versions()
+        if rows:
+            out["pipeline"] = {r["component"]: {"version": r["version"],
+                                                "recorded_at": r["recorded_at"],
+                                                "git_sha": r.get("git_sha")}
+                               for r in rows}
+    except Exception:
+        # Never let version reporting take down the endpoint that reports health.
+        out["pipeline"] = None
+    return ok(out)
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +846,14 @@ def api_peptide_observed(request: Request, stripped_seq: str, charge: int | None
         raise HTTPException(429, "Too many spectrum requests — please slow down.")
     z = max(1, min(charge, 6)) if charge else None
     return ok({"observed": _safe(lambda: obs.observed_spectrum(stripped_seq, z), None)})
+
+
+@app.get("/api/peptide/{stripped_seq}/charges")
+def api_peptide_charges(stripped_seq: str):
+    """Per-charge abundance for this peptide — detection frequency AND intensity share, so
+    "is the +2 seen more than the +3?" can be answered both ways."""
+    return ok({"charges": _safe(lambda: queries.peptide_charge_distribution(stripped_seq),
+                                {"charges": [], "n_obs": 0})})
 
 
 @app.get("/api/peptide/{stripped_seq}/predicted")

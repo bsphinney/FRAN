@@ -13,8 +13,16 @@ import urllib.request
 _cache: dict[str, dict | None] = {}
 _lock = threading.Lock()
 
-_RANKS = ["superkingdom", "kingdom", "phylum", "class", "order",
-          "family", "genus", "species"]
+# Unipept's rank fields, coarse -> fine. NCBI renamed `superkingdom` to `domain`, and this list used
+# to start at superkingdom: for a peptide whose LCA sits at domain (e.g. AAQEEYIKR -> Eukaryota) EVERY
+# name lookup then missed, the lineage came back empty, and the panel read "lineage unavailable" even
+# though Unipept had answered fine. `superkingdom` is kept as a harmless fallback; empty ranks are
+# filtered out below, so listing the full set costs nothing and survives the next rank addition.
+_RANKS = ["superkingdom", "domain", "realm", "kingdom", "subkingdom", "superphylum", "phylum",
+          "subphylum", "superclass", "class", "subclass", "superorder", "order", "suborder",
+          "infraorder", "superfamily", "family", "subfamily", "tribe", "subtribe", "genus",
+          "subgenus", "species_group", "species_subgroup", "species", "subspecies", "strain",
+          "varietas", "forma"]
 
 
 def peptide_lca(seq: str) -> dict | None:
