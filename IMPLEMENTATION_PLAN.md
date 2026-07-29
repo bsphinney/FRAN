@@ -317,8 +317,42 @@ headline — unrestricted, that grep cohort scores 26.07 s at n=5,716. Compare l
 | robust sd, unrestricted | 26.07 s (n=5,716) | **21.43 s** (n=14,193) |
 | **robust sd, right-peak only** | **10.57 s** (n=4,115) | **7.52 s** (n=10,039) |
 
-**7.52 s against a 10.57 s target — a 29% improvement, on 2.4× more evaluated precursors.** The
-prediction that 10.57 s was not the floor was correct, and the margin is not marginal.
+**7.52 s against a 10.57 s target.** But see the same-rows measurement immediately below before
+quoting that as a 29% improvement — I did, and it is wrong.
+
+### 4.3 SAME-ROWS CORRECTION — most of the apparent gain is coverage, not accuracy
+
+`10.57 s → 7.52 s` compares **n=4,115 against n=10,039**. Scoring both cohorts on identical rows
+(`fran_scoped_sql.py --compare`) separates the two effects:
+
+| variant | n | robust sd | med abs resid |
+|---|---|---|---|
+| grep cohort, rows the grep cohort covers | 4,115 | **10.57 s** | 10.85 s |
+| **SQL cohort, the SAME 4,115 rows** | 4,115 | **9.94 s** | 10.14 s |
+| SQL cohort, all rows it covers | 10,039 | **7.52 s** | 7.46 s |
+
+*(The grep cohort's covered set is a complete subset of the SQL cohort's — `both = 4,115`.)*
+
+**So the accuracy gain from better cohort selection is 10.57 → 9.94 s, about 6% — not 29%.** The rest
+of the drop to 7.52 s is a **composition effect**: the 5,924 additional precursors the SQL cohort
+reaches are, on average, *easier* to predict (more observations each), which pulls the robust sd down.
+
+Both numbers are true and they answer different questions:
+
+- **9.94 s** — "does selecting comparable runs by gradient beat selecting them by filename?" Yes, by
+  ~6% on identical precursors. A modest, real methodological win.
+- **7.52 s** — "how well does FRAN's prior perform over the population it actually serves?" This is
+  the operationally meaningful figure, because 10,039 precursors is the real deployment surface. It is
+  *not* the same measurement improved.
+
+⚠️ **The Spectronaut-parity claim inherits the same defect.** Spectronaut's 7.4 s within-run was
+measured on its own row set, not these 10,039, so "7.52 s ≈ parity" is not established either. State
+it as "7.52 s over the precursors FRAN covers, against Spectronaut's 7.4 s within-run on its own set"
+and leave the comparison open.
+
+**What actually stands, unambiguously:** coverage of SN-confident precursors went **37.4% → 92.9%**,
+and consensus precursors **103,459 → 2,753,503**. That is the dominant result, and it needs no
+row-set caveat — it is a count, not a ratio of two differently-scored metrics.
 
 Two things deserve to be said plainly:
 
