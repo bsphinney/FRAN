@@ -67,6 +67,24 @@ Step 1 is what makes step 2 small. Today step 1 is impossible, so everything sca
 
 ## 3. Run similarity metadata — the highest-value single addition
 
+> ⚠️ **CORRECTED 2026-07-29 — see `IMPLEMENTATION_PLAN.md` §1.1 and §1.3.** This section was written
+> without inspecting Postgres (§0 says so). The schema was then inspected live, and the premise below
+> is wrong: **the metadata largely exists.** `raw_files` holds 19,874 rows with `gradient_minutes`
+> **98.7% populated** — the dominant term in RT comparability — plus `instrument_model`/`serial` at
+> 63.1%, `acquisition_method` and `platform` at 100%. The query this document proposes as
+> aspirational is answerable today.
+>
+> **What does not exist is the JOIN.** Lance datasets are one per *search*, not per run; only 288 of
+> 1,963 searches are single-raw; and `delimp_spectrum_lane` carries no run or raw_path column. So you
+> cannot tell which runs a `.lance` holds without opening it, and adding more metadata buys nothing
+> on its own. The highest-value single item is therefore `delimp_spectrum_lane_runs`
+> (`IMPLEMENTATION_PLAN.md` §4.2), not a metadata-collection push.
+>
+> Genuinely absent and worth adding: `irt_calibration_source` (the subtle one this section is right
+> about — recoverable from `RunSummaries/`). Genuinely absent and **dropped by decision**:
+> `column_id` and `column_age_injections` — no upstream source, and a permanently-NULL column is
+> worse than an absent one. `acquisition_date` is the column-aging proxy instead.
+
 **This is worth 5 seconds of RT accuracy and a 500× speedup, and it does not exist.**
 
 Yesterday I had to select comparable runs by **grepping dataset filenames for the string `60spd`**.

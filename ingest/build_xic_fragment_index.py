@@ -59,6 +59,30 @@ SELECT x.precursor_id, x.stripped_seq, x.charge, x.rt_apex,
 """
 
 
+def refresh_for_precursors(cur, precursor_ids):
+    """Re-derive the fragment rows for just these precursors, on an open psycopg2 cursor.
+
+    Called by the XIC ingest writers in the SAME transaction as the delimp_precursor_xic upsert, so
+    there is no window in which the two disagree and no scheduled job to forget.
+
+    DELETE-then-INSERT rather than insert-only, because the upsert is
+    `... DO UPDATE ... WHERE excluded.ms1_apex > delimp_precursor_xic.ms1_apex`: an existing
+    precursor_id can have its `fragments` REPLACED when a better acquisition arrives. Appending only
+    new ids would leave fragment rows behind that no longer correspond to anything in the source.
+    """
+    ids = [p for p in dict.fromkeys(precursor_ids) if p]
+    if not ids:
+        return 0
+    for stmt in filter(str.strip, DDL.split(";")):
+        cur.execute(stmt)
+    cur.execute("DELETE FROM delimp_xic_fragment WHERE precursor_id = ANY(%s)", (ids,))
+    cur.execute(FILL + " AND x.precursor_id = ANY(%s)", (ids,))
+    n = cur.rowcount
+    for stmt in filter(str.strip, INDEXES.split(";")):
+        cur.execute(stmt)
+    return n
+
+
 def _conn():
     import psycopg2
     from refresh_leaderboards import _token

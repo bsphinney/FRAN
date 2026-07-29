@@ -141,10 +141,27 @@ that is not in the repo.
 1. **`delimp_runs`** — a view (not a table) over `raw_files` + `delimp_sample_metadata`, keyed
    `raw_path`, projecting the §3 similarity fields. A view because these are already maintained
    elsewhere; a second copy would drift.
-2. **`delimp_spectrum_lane_runs (lance_path, raw_path, run, n_precursors)`** — the missing join.
-   Build it by scanning each of the 1,553 datasets for its distinct `(run, raw_path)`; that is a
-   projection of two string columns, cheap in Lance, and it is a one-off. **This is the single
-   highest-value item in the plan** — it is what makes `WHERE run_id IN (...)` expressible.
+2. **`delimp_spectrum_lane_runs (lance_path, run, raw_path, n_precursors, search_id)`** — the missing
+   join. Built by scanning each of the 1,553 datasets for its distinct `(run, raw_path)`: a
+   projection of two string columns, cheap in Lance, and a one-off. **This is the single
+   highest-value item in the plan** — it is what makes `WHERE run IN (...)` expressible.
+   `ingest/build_lane_run_index.py` + `.sbatch`; checkpointed per dataset and flushed, per §8.1/§8.2.
+
+   **The join key is `run` → `raw_files.raw_basename`, NOT `raw_path`.** Measured on a smoke test,
+   because the obvious choice fails in two independent ways:
+
+   - The Lance `raw_path` column is in the 48-column schema but is **NULL** — the fragment backfill
+     never populated it.
+   - `raw_files.raw_path` is a *synthetic Windows* path (`R:\Data\…\<x>.sne\<run>.d`), so it could
+     never match a Spectronaut run name even if Lance had one.
+   - `raw_files.raw_basename` **is** the run name and does match: on the smoke test, **100 of 100
+     runs reached `gradient_minutes`** through it.
+
+   ⚠️ That join is **1:many** — 100 runs matched 183 `raw_files` rows (~1.8×), because a basename
+   recurs across resubmits. Cohort queries must `SELECT DISTINCT` on the run or pick a canonical
+   raw_file, or run-scoped aggregates will double-count. This is the same duplicate-name problem that
+   left 64 lane datasets ambiguously linked; it does not block the gate, but §4's additive aggregates
+   must be keyed on `run`, not on a `raw_files` row.
 3. **Add the four genuinely-absent fields**: `lc_method` (column exists, 0 rows),
    `column_id`, `column_age_injections`, `library_type`, `irt_calibration_source`.
    Prioritise `irt_calibration_source` — §3 is right that it is the subtle one: if two runs normalised
@@ -174,6 +191,59 @@ key.
 3. **Fragment aggregates** per `(frg_type, frg_num, frg_charge, frg_loss)` → `relint_sum,
    relint_sumsq, n`. This is new work with no precedent in the schema, and it is the part that
    delivers `frg_loss` and `frg_charge` — the capability no other engine has.
+
+   **Plus the per-fragment usability signal — cheap now, expensive to backfill.** Carry `n_used` and
+   `n_total` per fragment key, sums and counts for `frg_mass_acc_ppm`, and precursor-level sums and
+   counts for `int_corr_score` / `interference_ms1` / `interference_ms2`. Same additive rule, keyed
+   so it scopes by run.
+
+   Why it earns the slot: Spectronaut excludes ~41% of fragments as interfered and our engine
+   excludes none. A per-fragment "did SN trust this fragment" is supervision for the co-elution
+   judgment DIA-Umpire derives unsupervised — and the measured bottleneck, 29.9% wrong peak picks,
+   is a co-elution failure. Nobody else can train on this, because nobody else has 1,552 runs of
+   another engine's per-fragment verdicts.
+
+### 5.1 Does that signal exist? — measured 2026-07-29
+
+It was right to check before designing around it. Results, and one correction:
+
+**The proposed proxy is falsified.** "`frg_peak_area`/`frg_norm_area` is 0 or NaN on excluded
+fragments" is not true. On `Dog_yeast_entrapment_SN21.lance`, of 23,786 fragments: **0% NULL, 0%
+zero or non-finite** — every fragment carries a real positive peak area, excluded or not.
+Spectronaut excludes a fragment for interference, not for absence of signal. Building the aggregate
+on that proxy would have measured ~0% excluded and concluded Spectronaut excludes nothing.
+
+**The real verdict exists in the source reports, under a different naming convention.** Report
+columns use underscores, not dots (`F_ExcludedFromQuantification`, not `F.ExcludedFromQuantification`)
+— which is also why the `F.*` scan finds nothing. Measured:
+
+| | |
+|---|---|
+| `F_ExcludedFromQuantification` | **31.1% True** on the entrapment benchmark, 48.4% on a mouse open-PTM search |
+| also present, also un-ingested | `F_HasChannelInterference`, `EG_UsedForPeptideQuantity`, `EG_UsedForProteinGroupQuantity`, `EG_UsedInNormalizationSet`, `PEP_UsedForProteinGroupQuantity` |
+| already ingested | `FG_HasPossibleInterference_(MS1)`/`(MS2)` → the Lance `interference_ms1`/`_ms2` |
+
+**Good news on cost: only the FLAG was dropped, not the rows.** A matched comparison of the same
+search, report vs Lance, gives an identical per-precursor fragment distribution — **median 6, min 3,
+max 6 on both sides** — while the report marks 31.1% of those rows excluded. So the excluded
+fragments are already sitting in the Lance corpus; ingest simply never carried the column that says
+which they are.
+
+So this is **not** the expensive finding it could have been:
+
+- It is a **one-column addition** to `spectrum_lance.SCHEMA` plus a mapping entry in
+  `backfill_fragments.py` (`"frg_excluded": ["F_ExcludedFromQuantification"]`), then a re-parse.
+- The re-parse reads the **archived reports already on Hive** (`FRAN_reports` / `FRAN_SNE_export`) —
+  it is not a Windows re-export. That is the same path the original backfill ran.
+- Worth adding the other un-ingested verdicts in the same pass, since the expensive part is the scan,
+  not the columns.
+
+**Separate defect found while measuring: `frg_norm_area` is 100% NULL** across all 23,786 fragments
+sampled, while `frg_peak_area` is 100% populated. The mapping is
+`"frg_norm_area": ["F.NormalizedPeakArea"]`. Given the underscore convention above, confirm whether
+`F_NormalizedPeakArea` exists in the reports at all before concluding it is a mapping bug — but a
+column that is 100% NULL corpus-wide is either a bug or should be dropped, per the `lc_method`
+argument in §8.1.
 4. **Checkpoint per search**, reusing the `delimp_peptide_consensus_done` pattern, which already
    works. Flush stdout (§8.2).
 5. **Version-stamp** each build against the corpus revision (§8.4).
@@ -247,6 +317,7 @@ Its method, which must not change:
 | truth | `sn21cmp/every_precursor.parquet`, `our_rt = sn_apex_rt_s + our_delta_rt_to_sn` |
 | fit | `IsotonicRegression(out_of_bounds="clip")`, `KFold(5, shuffle=True, random_state=0)` |
 | metric | robust sd = `1.4826 × MAD` of held-out residuals |
+| evaluated on | the **4,115 covered precursors** |
 
 **Change exactly one thing: how the cohort is selected.** Replace the filename-substring glob with a
 SQL-selected cohort over the run dimension. Everything else stays identical, or the comparison means

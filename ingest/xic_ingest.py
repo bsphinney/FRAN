@@ -472,6 +472,18 @@ def main():
         psycopg2.extras.execute_values(cur,
             "INSERT INTO delimp_search_sources (search_id,file_role,path,host,bytes,extracted,available_features) VALUES %s",
             src_rows, page_size=200)
+        # Keep the fragment index in step, in this transaction. It is a flattening of
+        # delimp_precursor_xic.fragments with a btree on mz; without it the peptide page's
+        # shared-transition panel falls back to exploding jsonb over the whole table and times out,
+        # which it then renders as "transitions look specific". Stale here = silently under-reported
+        # interference, so it must not be a separate step someone can forget.
+        try:
+            import build_xic_fragment_index as _xfi
+            n_frag = _xfi.refresh_for_precursors(cur, [m[0] for m in meas])
+            print(f"  fragment index: refreshed {n_frag} rows for {len(meas)} precursors")
+        except Exception as e:  # noqa: BLE001 — never fail an ingest over a derived index
+            print(f"  fragment index: NOT refreshed ({str(e)[:80]}); "
+                  f"run build_xic_fragment_index.py --apply --refresh")
         con.commit(); con.close()
         print(f"upserted {len(meas)} measurements + {len(quant)} quant rows + {len(src)} source pointers -> PG Farm")
     else:
