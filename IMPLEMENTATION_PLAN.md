@@ -136,6 +136,30 @@ that is not in the repo.
 **Done when:** a re-ingest of one known search leaves `raw_files.instrument_model` non-NULL, and
 `git log` shows both builders.
 
+### 3.1 Phase 0 — DONE, 2026-07-29
+
+The restored reader ran corpus-wide on a compute node: **3,800 of 3,803 raws extracted (3 failed),
+6,847 `raw_files` rows updated.**
+
+| field | before | after | |
+|---|---|---|---|
+| `acquisition_date` | 7,241 (36.4%) | **12,538 (63.1%)** | +5,297 |
+| `mobility_min` / `mobility_max` | 7,241 | **12,538** | +5,297 |
+| `instrument_metadata_json` | 7,241 | **12,538** | +5,297 |
+
+`acquisition_date` now matches `instrument_model` coverage exactly — every Bruker raw that has
+instrument metadata now has a date, spanning **2019-11-07 → 2026-06-19**. That 6.6-year range is what
+makes it usable as the column-aging proxy (§8.1). For the gate cohort specifically, runs with
+`acquisition_date` went 2,593 → **3,441 of 3,480 (98.9%)**.
+
+Note `mobility_*` and `instrument_metadata_json` were *never* written by the old
+`record_raw_metadata.py` — its `UPDATE` omitted them entirely. This is new data, not a re-fill.
+
+**Remaining:** the other 36.9% are Thermo `.raw` files (~7,336). `--thermo` is implemented and
+dry-run clean, but needs the `dotnet-core-sdk/8.0.4` module and `DOTNET_ROOT` on the compute node.
+That is the "ready, not run" Thermo pass, now genuinely one command away:
+`sbatch record_raw_metadata.sbatch --thermo --apply --only-missing`.
+
 ## 4. Phase 1 — the run dimension (the real §3)
 
 1. **`delimp_runs`** — a view (not a table) over `raw_files` + `delimp_sample_metadata`, keyed

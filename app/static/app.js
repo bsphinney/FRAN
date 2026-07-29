@@ -600,10 +600,12 @@ async function loadPredicted(seq, charge){
     const ds=names.map(n=>({label:n.replace(/_/g,' '),data:stems(p.models[n]),borderColor:(MCOL[n]||'#9aa')+'cc',
       borderWidth:1.4,pointRadius:0,spanGaps:false,tension:0,fill:false}));
     ds.push({label:'average',data:stems(p.average,true),borderColor:'#ffffff',borderWidth:2.5,pointRadius:0,spanGaps:false,tension:0,fill:false});
-    // the search's OWN library intensities (DIA-NN), overlaid when ingested
+    // The search's OWN library intensities, overlaid when ingested. The engine comes from the API
+    // (delimp_precursor_xic.engine) -- this used to say "DIA-NN" for every peptide, which is wrong
+    // for most of a >90% Spectronaut corpus.
     const sl=d.search_library;
     if(sl && sl.peaks && sl.peaks.length){
-      ds.push({label:`DIA-NN ${sl.version||''} (this search)`.replace('  ',' '),data:stems(sl.peaks),
+      ds.push({label:`${sl.engine||'search library'} ${sl.version||''} (this search)`.replace(/\s+/g,' ').trim(),data:stems(sl.peaks),
         borderColor:'#ff5cf0',borderWidth:2,pointRadius:0,spanGaps:false,tension:0,fill:false,borderDash:[3,2]});
     }
     el.innerHTML=`
@@ -643,7 +645,7 @@ async function loadFragments(seq){
         <h3 class="font-bold text-white">Theoretical fragment ions (b/y) <span class="text-[10px] text-slate-500 font-normal">computed from sequence · monoisotopic</span></h3>
         <span class="text-[10px] text-slate-500">${f.carbamidomethyl?'Cys +57.02 (carbamidomethyl)':'Cys unmodified'}</span>
       </div>
-      <p class="text-[11px] text-slate-500 mb-2">Stick positions are exact m/z; heights are uniform — real intensities and the engine's quant fragments overlay here once the DIA-NN spectral library is ingested.</p>
+      <p class="text-[11px] text-slate-500 mb-2">Stick positions are exact m/z; heights are uniform — real intensities and the engine's quant fragments overlay here once that search's spectral library is ingested.</p>
       <div class="h-40"><canvas id="c_frag_theo"></canvas></div>`;
     charts.c_frag_theo=new Chart($('#c_frag_theo'),{type:'bar',data:{datasets:ds},
       options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
@@ -749,7 +751,7 @@ async function loadXIC(seq){
     const d=await api(`/api/peptide/${encodeURIComponent(seq)}/xic`); const x=d.xic;
     if(!x || !x.available){
       el.innerHTML=`<h3 class="font-bold text-white mb-1">Extracted-ion chromatogram (XIC) <span class="text-[10px] text-slate-500 font-normal">DIA · the GPMDB-can't-show view</span></h3>
-        ${empty('Per-precursor dual-pane XIC (MS1 on top, quantifying fragments below) appears here once a search ingested with DIA-NN --xic / spectral library covers this peptide.')}`;
+        ${empty('Per-precursor dual-pane XIC (MS1 on top, quantifying fragments below) appears here once a search ingested with chromatograms (DIA-NN --xic, or a Spectronaut XIC export) covers this peptide.')}`;
       return;
     }
     _xic=x;

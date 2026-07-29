@@ -2838,7 +2838,7 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
 
 
 def peptide_search_library(stripped_seq: str, charge: int | None = None) -> dict[str, Any] | None:
-    """The search's OWN predicted/library fragment intensities (from the ingested DIA-NN
+    """The search's OWN predicted/library fragment intensities (from the ingested
     report-lib) for the predicted-spectrum panel — labeled with the engine + version that
     produced them. Returns None until XIC/library is ingested."""
     import json as _json
@@ -2862,7 +2862,13 @@ def peptide_search_library(stripped_seq: str, charge: int | None = None) -> dict
               "mz": f.get("mz"), "rel_intensity": f.get("rel_intensity")}
              for f in (_j(row["fragments"]) or []) if f.get("mz") and f.get("rel_intensity")]
     peaks.sort(key=lambda p: -(p["rel_intensity"] or 0))
-    return {"engine": row.get("engine"), "version": row.get("engine_version"),
+    # Ship a ready-to-render label so the front end cannot re-hardcode an engine name. The raw
+    # `engine` values are lowercase slugs ('spectronaut', 'diann'); the corpus is >90% Spectronaut,
+    # so anything that assumes DIA-NN is wrong most of the time.
+    eng = (row.get("engine") or "").strip().lower()
+    eng_label = {"diann": "DIA-NN", "spectronaut": "Spectronaut"}.get(eng, row.get("engine") or None)
+    return {"engine": eng_label, "engine_raw": row.get("engine"),
+            "version": row.get("engine_version"),
             "charge": row["charge"], "peaks": peaks}
 
 
