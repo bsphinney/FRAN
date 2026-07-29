@@ -23,7 +23,8 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.16.0"  # 0.16.0: measured-spectrum panel picks the MODAL charge's most intense
+APP_VERSION = "0.16.1"  # 0.16.1: predicted-spectrum overlay names the REAL engine, not always DIA-NN
+# 0.16.0: measured-spectrum panel picks the MODAL charge's most intense
                         #         high-confidence acquisition (best_q_value is NULL for ~99.9% of the
                         #         corpus, so the old ORDER BY was a tie -> arbitrary +1 spectra) and
                         #         gains a per-charge selector; +charge-state abundance pane (detection
