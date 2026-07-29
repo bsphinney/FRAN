@@ -176,6 +176,39 @@ that is not in the repo.
 
 **Done when:** step 4 reproduces ~10.57 s from a SQL-selected cohort.
 
+### 4.1 Phase 1 step 2 — BUILT and measured, 2026-07-29
+
+`delimp_spectrum_lane_runs` is live: **15,249 rows, 11,392 distinct runs, 1,552 of 1,553 datasets**
+(one is not on disk). Built on a compute node in ~14 minutes, checkpointed per dataset.
+
+Reachability into the run dimension, via `raw_files.raw_basename = run`:
+
+| | runs |
+|---|---|
+| matching a `raw_files` row | 10,801 |
+| reaching `gradient_minutes` | **10,801** |
+| reaching `instrument_model` | 6,525 |
+
+**The cohort question is now SQL, and the answer is 31× bigger than the grep:**
+
+| cohort | datasets | runs |
+|---|---|---|
+| filename grep `60spd` (the original) | 16 | 111 |
+| `gradient_minutes BETWEEN 18 AND 22` | 559 | **3,480** |
+| … `AND instrument_model ILIKE '%timsTOF HT%'` | — | 2,999 |
+
+That is the concrete reason to expect the gate to beat 10.57 s rather than merely match it: the grep
+cohort was 111 runs selected on whether someone typed "60spd" in a filename; the band is 3,480 runs
+selected on the actual LC parameter.
+
+**And it confirms why the index was necessary at all** — dataset-level scoping is not run-level
+scoping. Only **218 of 1,552** datasets hold a single run; the rest hold 2, 3, 4, 6, 8 or more. Any
+"scope by dataset" approach silently drags in every other run that search happened to contain.
+
+The gate itself is `ingest/fran_scoped_sql.py` — `fran_scoped.py` with exactly one thing changed
+(cohort selection), and a `--legacy-grep` mode that reproduces the original cohort as a control so
+the two are compared under an identical fit.
+
 ## 5. Phase 2 — additive aggregates keyed by run (§4/§5)
 
 Evolve, don't restart — `delimp_peptide_consensus` is 3.96M rows of correct arithmetic with the wrong
