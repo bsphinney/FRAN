@@ -1,0 +1,69 @@
+# .github/workflows/verify.yml
+#
+# Pre-deploy gate. Contacts Azure not at all; needs only `contents: read`.
+#
+# NOTE the triggers: `pull_request` + `workflow_call` ONLY. There is deliberately no
+# `push: branches: [main]` here. `needs:` cannot reference a job in another workflow file,
+# so a standalone push-triggered verify.yml would run BESIDE deploy.yml and never block it.
+# deploy.yml calls this workflow as its first job and gates the deploy on `needs: gate`.
+
+name: verify
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (defaults to the calling workflow ref)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Static gate + no-credential smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'      # MUST match linuxFxVersion PYTHON|3.11
+          cache: pip
+
+      # This install is itself a check. SCM_DO_BUILD_DURING_DEPLOYMENT=true means Oryx runs
+      # the identical install on the B1 worker during the deploy. An unresolvable pin
+      # (pyarrow==18.1.0, pylance==8.0.0, pandas==2.2.3) fails here in ~60s instead of
+      # five minutes into a live deploy.
+      - name: Install runtime deps (also validates the pins Oryx will resolve)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # httpx is TestClient's transport, not a FastAPI dependency. CI only -- do NOT
+          # add it to requirements.txt; it would ship to App Service for nothing.
+          pip install httpx 'ruff==0.15.9'
+
+      - name: Python syntax (3.11 grammar)
+        run: python -m compileall -q -f app/ ingest/
+
+      # ubuntu-latest ships Node; no setup-node needed. app/static/app.js is unbuilt plain
+      # JS with 0 import/export statements today, so CommonJS parsing is correct. If the
+      # frontend ever adopts ESM this must become `node --check --input-type=module`.
+      - name: JS syntax (app/static/app.js)
+        run: node --check app/static/app.js
+
+      - name: Ruff error-class rules (undefined names, broken f-strings, syntax)
+        run: ruff check app/ ingest/ --select E9,F63,F7,F82 --isolated --no-cache
+
+      - name: FRAN pre-deploy gate
+        run: python scripts/predeploy_check.py
+
+      - name: Ruff full lint (advisory -- 13 pre-existing cosmetic findings)
+        continue-on-error: true
+        run: ruff check app/ --no-cache --output-format github
