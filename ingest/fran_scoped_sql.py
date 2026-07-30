@@ -107,6 +107,85 @@ def _cv(x, y):
     return yi - pr
 
 
+def scan_candidates(cohort, label="cand"):
+    """One pass over the cohort keeping EVERY candidate search per (seq, charge, run).
+
+    Scanning once and resolving all selectors from the same candidate set (rather than rescanning
+    per selector) is both ~5x faster and strictly safer: every arm then sees byte-identical input, so
+    a difference between arms cannot be an artefact of two different scans.
+
+    Returns rk -> list of (q, sn, ics, nf, irt).
+    """
+    cands = {}
+    n_ds = 0
+    cols = ["stripped_seq", "charge", "run", "q_value", "irt_empirical", "is_decoy",
+            "signal_to_noise", "int_corr_score", "fragment_count"]
+    for p in sorted(cohort):
+        keep_runs = cohort[p]
+        if not os.path.exists(p):
+            continue
+        try:
+            t = lance.dataset(p).scanner(columns=cols,
+                                         filter="q_value <= 0.01").to_table().to_pydict()
+        except Exception as e:  # noqa: BLE001
+            print(f"  skip {os.path.basename(p)}: {str(e)[:60]}")
+            continue
+        for i in range(len(t["stripped_seq"])):
+            if t["is_decoy"][i]:
+                continue
+            run = str(t["run"][i])
+            if any(x in run for x in TEST):
+                continue
+            if keep_runs is not None and run not in keep_runs:
+                continue
+            ie = t["irt_empirical"][i]; ch = t["charge"][i]
+            if ie is None or ch is None:
+                continue
+            def _f(col, dflt):
+                v = t[col][i]
+                return float(v) if v is not None else dflt
+            rk = (str(t["stripped_seq"][i]), int(ch), run)
+            cands.setdefault(rk, []).append(
+                (_f("q_value", 1.0), _f("signal_to_noise", -1.0),
+                 _f("int_corr_score", -1.0), _f("fragment_count", -1.0), float(ie)))
+        n_ds += 1
+        if n_ds % 50 == 0:
+            print(f"  [{label}] {n_ds}/{len(cohort)} datasets, {len(cands):,} observations")
+    print(f"  [{label}] done: {n_ds} datasets, {len(cands):,} (seq,charge,run) observations")
+    return cands
+
+
+_IDX = {"q": 0, "sn": 1, "ics": 2, "nf": 3}
+
+
+def resolve(cands, selector, floor_on=None, floor_pct=25.0):
+    """Collapse candidates to one observation per (seq,charge,run), then to a per-precursor mean.
+
+    floor_on: apply a MINIMUM percentile on a physical measure before taking best-q. This is the
+    fifth arm — it exists because the discriminator showed best-q is typically fine (median 72.7th
+    percentile on signal_to_noise) but has a left tail (p25 = 7.7), i.e. ~a quarter of the time it
+    keeps a physically weak measurement. The floor is a WITHIN-CANDIDATE PERCENTILE, not an absolute
+    threshold, so it never compares a raw score across searches — the same incomparability that made
+    raw q suspect in the first place.
+    """
+    acc = {}
+    i = _IDX[selector]
+    hib = selector != "q"          # higher-is-better for the physical measures
+    fi = _IDX[floor_on] if floor_on else None
+    for (seq, ch, _run), cs in cands.items():
+        pool = cs
+        if fi is not None and len(cs) > 1:
+            vals = sorted(c[fi] for c in cs)
+            cut = vals[min(len(vals) - 1, int(len(vals) * floor_pct / 100.0))]
+            kept = [c for c in cs if c[fi] >= cut]
+            pool = kept or cs      # never empty out an observation
+        best = max(pool, key=lambda c: c[i]) if hib else min(pool, key=lambda c: c[i])
+        k = (seq, ch)
+        s, n = acc.get(k, (0.0, 0))
+        acc[k] = (s + best[4], n + 1)
+    return acc
+
+
 def selector_compare(a):
     """Score all four collapse selectors ON THE INTERSECTION OF WHAT ALL FOUR COVER.
 
@@ -125,10 +204,20 @@ def selector_compare(a):
     """
     cohort = sql_cohort(a.grad_lo, a.grad_hi, a.instrument)
     print(f"cohort: {len(cohort)} datasets / {sum(len(v) for v in cohort.values())} runs")
-    accs = {}
-    for sel in ("q", "sn", "ics", "nf"):
-        print(f"\n=== selector: {sel} ({SELECTORS[sel][0]}) ===")
-        accs[sel] = scan_cohort(cohort, f"sel:{sel}", dedup_runs=True, selector=sel)
+    cands = scan_candidates(cohort)
+    ARMS = [
+        ("q",        dict(selector="q")),
+        ("sn",       dict(selector="sn")),
+        ("ics",      dict(selector="ics")),
+        ("nf",       dict(selector="nf")),
+        # fifth arm: best-q, but only among candidates clearing a 25th-percentile floor on
+        # signal_to_noise. Targets the left tail the discriminator exposed (q-winner S/N p25 = 7.7).
+        ("q|sn>=p25",  dict(selector="q", floor_on="sn", floor_pct=25.0)),
+        ("q|ics>=p25", dict(selector="q", floor_on="ics", floor_pct=25.0)),
+    ]
+    accs = {name: resolve(cands, **kw) for name, kw in ARMS}
+    for name in accs:
+        print(f"  arm {name:12s} covers {len(accs[name]):,} precursors")
 
     sn = pd.read_parquet(f"{C}/every_precursor.parquet")
     sn = sn[(sn.sn_is_decoy == False) & (sn.sn_qvalue <= 0.01) & sn.our_pid.notna()].copy()  # noqa: E712
@@ -146,15 +235,15 @@ def selector_compare(a):
     print("\n" + "=" * 72)
     print("SELECTOR COMPARISON — accuracy on COMMON rows, reach reported separately")
     print("=" * 72)
-    print(f"{'selector':10s} {'common n':>9s} {'robust_sd':>10s} | {'own n':>8s} {'own sd':>9s}")
-    for sel in ("q", "sn", "ics", "nf"):
+    print(f"{'arm':12s} {'common n':>9s} {'robust_sd':>10s} | {'own n':>8s} {'own sd':>9s}")
+    for sel in accs:
         sub = sn[common]
         r = _cv(sub[sel].to_numpy(float), sub["our_rt"].to_numpy(float))
         own = sn[right & np.isfinite(sn[sel])]
         ro = _cv(own[sel].to_numpy(float), own["our_rt"].to_numpy(float))
         sd_c = _rsd(r) if np.any(np.isfinite(r)) else float("nan")
         sd_o = _rsd(ro) if np.any(np.isfinite(ro)) else float("nan")
-        print(f"{sel:10s} {int(common.sum()):>9,} {sd_c:9.2f}s | {len(own):>8,} {sd_o:8.2f}s")
+        print(f"{sel:12s} {int(common.sum()):>9,} {sd_c:9.2f}s | {len(own):>8,} {sd_o:8.2f}s")
     print("\nLeft block is the comparable one (identical rows). The right block is each selector's")
     print("own reach and is NOT comparable across rows — it is there so a coverage/accuracy trade is")
     print("visible rather than hidden inside a single ranking.")
