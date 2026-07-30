@@ -139,6 +139,9 @@ def compare(a):
     print(f"  {len(cohortB)} datasets / {sum(len(v) for v in cohortB.values())} runs")
     accB = scan_cohort(cohortB, "sql")
 
+    print("\n=== cohort B, SEARCH-DEDUPLICATED (one physical acquisition = n 1) ===")
+    accBd = scan_cohort(cohortB, "sql-dedup", dedup_runs=True)
+
     sn = pd.read_parquet(f"{C}/every_precursor.parquet")
     sn = sn[(sn.sn_is_decoy == False) & (sn.sn_qvalue <= 0.01) & sn.our_pid.notna()].copy()  # noqa: E712
     sn["our_rt"] = sn["sn_apex_rt_s"] + sn["our_delta_rt_to_sn"]
@@ -146,6 +149,7 @@ def compare(a):
     sn["k"] = list(zip(sn.sn_stripped_seq.astype(str), sn.sn_charge.astype(int)))
     sn["A"] = [accA[k][0] / accA[k][1] if k in accA else np.nan for k in sn.k]
     sn["B"] = [accB[k][0] / accB[k][1] if k in accB else np.nan for k in sn.k]
+    sn["Bd"] = [accBd[k][0] / accBd[k][1] if k in accBd else np.nan for k in sn.k]
 
     right = sn.our_delta_rt_to_sn.abs() <= 10          # the "right-peak only" subset, as in the original
     covA, covB = np.isfinite(sn.A), np.isfinite(sn.B)
@@ -160,6 +164,8 @@ def compare(a):
         ("A grep,  rows BOTH cover",     sn[right & both], "A"),
         ("B SQL,   rows BOTH cover",     sn[right & both], "B"),
         ("B SQL,   rows B covers",       sn[right & covB], "B"),
+        ("Bd SQL dedup, rows A covers",  sn[right & covA], "Bd"),
+        ("Bd SQL dedup, rows B covers",  sn[right & covB], "Bd"),
     ]
     print(f"{'variant':34s} {'n':>7s} {'robust_sd':>10s} {'med|r|':>9s}")
     for nm, sub, col in rows:
@@ -175,10 +181,30 @@ def compare(a):
           "and is deliberately not printed here; see this function's docstring.")
 
 
-def scan_cohort(cohort, label):
-    """Build the (seq, charge) -> (irt_sum, n) consensus for one cohort. Identical accumulation to
-    fran_scoped.py; only which rows are admitted differs."""
+def scan_cohort(cohort, label, dedup_runs=False):
+    """Build the (seq, charge) -> (irt_sum, n) consensus for one cohort.
+
+    dedup_runs=False reproduces fran_scoped.py exactly: every Lance row is one observation.
+
+    dedup_runs=True collapses the SEARCH dimension first, so one physical acquisition contributes
+    n=1 regardless of how many searches covered it. This matters more than it sounds:
+
+      * The same run appears in multiple Lance datasets because the same raw was searched several
+        times -- 1.34x corpus-wide, 1.40x in the gate cohort, up to 14 datasets for one run
+        (datasets == search_ids exactly, so they are distinct searches, not duplicate storage).
+      * Those searches DISAGREE. Measured on two 14-dataset runs: only 4.9-5.6% of precursors have
+        an identical irt_empirical across all of them; median spread 0.50 iRT, p90 3.5-4.5, max 84.
+
+    So without dedup, n is overstated AND the consensus is pulled toward whichever acquisitions
+    happened to be searched most often, using genuinely different values. That is a biased estimator,
+    not just an inflated count.
+
+    The collapse rule is BEST-Q, not mean-across-searches. Averaging would blend different libraries'
+    iRT conventions inside a single acquisition -- re-introducing, at run level, exactly the
+    cross-run comparability problem irt_calibration_source exists to expose.
+    """
     acc = {}
+    best = {}   # (seq, charge, run) -> (q_value, irt)  when dedup_runs
     n_ds = 0
     for p in sorted(cohort):
         keep_runs = cohort[p]
@@ -203,10 +229,25 @@ def scan_cohort(cohort, label):
             if ie is None or ch is None:
                 continue
             k = (str(t["stripped_seq"][i]), int(ch))
-            s, c = acc.get(k, (0.0, 0)); acc[k] = (s + float(ie), c + 1)
+            if dedup_runs:
+                q = t["q_value"][i]
+                q = float(q) if q is not None else 1.0
+                rk = (k[0], k[1], run)
+                prev = best.get(rk)
+                if prev is None or q < prev[0]:
+                    best[rk] = (q, float(ie))
+            else:
+                s, c = acc.get(k, (0.0, 0)); acc[k] = (s + float(ie), c + 1)
         n_ds += 1
         if n_ds % 50 == 0:
-            print(f"  [{label}] {n_ds}/{len(cohort)} datasets, {len(acc):,} covered")
+            print(f"  [{label}] {n_ds}/{len(cohort)} datasets, "
+                  f"{len(best) if dedup_runs else len(acc):,} seen")
+    if dedup_runs:
+        for (seq, ch, _run), (_q, ie) in best.items():
+            k = (seq, ch)
+            s, c = acc.get(k, (0.0, 0)); acc[k] = (s + ie, c + 1)
+        print(f"  [{label}] dedup: {len(best):,} (seq,charge,run) observations "
+              f"-> {len(acc):,} precursors")
     print(f"  [{label}] done: {n_ds} datasets, {len(acc):,} covered precursors")
     return acc
 
