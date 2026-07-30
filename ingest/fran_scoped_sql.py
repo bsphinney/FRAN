@@ -107,6 +107,59 @@ def _cv(x, y):
     return yi - pr
 
 
+def selector_compare(a):
+    """Score all four collapse selectors ON THE INTERSECTION OF WHAT ALL FOUR COVER.
+
+    WHY NOT "lowest robust sd wins". Because the selectors CHANGE THE ROW SET: a selector that keeps
+    fewer, easier precursors wins on robust sd for free. That is the same composition effect that made
+    the cohort work look like a 29% methodology win when it was 6% — and judging selectors on a
+    benchmark whose rows they themselves determine would repeat it a fourth time.
+
+    So this is a TWO-NUMBER decision, deliberately not collapsed into one:
+      * accuracy  — robust sd on the rows ALL FOUR selectors cover (composition held fixed)
+      * reach     — how many precursors each covers, reported separately
+
+    Neither number alone decides it; a selector that is 0.1 s better on common rows while covering
+    20% fewer precursors is not obviously better, and that trade should be visible rather than
+    silently resolved by whichever metric was printed.
+    """
+    cohort = sql_cohort(a.grad_lo, a.grad_hi, a.instrument)
+    print(f"cohort: {len(cohort)} datasets / {sum(len(v) for v in cohort.values())} runs")
+    accs = {}
+    for sel in ("q", "sn", "ics", "nf"):
+        print(f"\n=== selector: {sel} ({SELECTORS[sel][0]}) ===")
+        accs[sel] = scan_cohort(cohort, f"sel:{sel}", dedup_runs=True, selector=sel)
+
+    sn = pd.read_parquet(f"{C}/every_precursor.parquet")
+    sn = sn[(sn.sn_is_decoy == False) & (sn.sn_qvalue <= 0.01) & sn.our_pid.notna()].copy()  # noqa: E712
+    sn["our_rt"] = sn["sn_apex_rt_s"] + sn["our_delta_rt_to_sn"]
+    sn = sn[np.isfinite(sn.our_rt)]
+    sn["k"] = list(zip(sn.sn_stripped_seq.astype(str), sn.sn_charge.astype(int)))
+    for sel, acc in accs.items():
+        sn[sel] = [acc[k][0] / acc[k][1] if k in acc else np.nan for k in sn.k]
+
+    right = sn.our_delta_rt_to_sn.abs() <= 10
+    common = right.copy()
+    for sel in accs:
+        common &= np.isfinite(sn[sel])
+
+    print("\n" + "=" * 72)
+    print("SELECTOR COMPARISON — accuracy on COMMON rows, reach reported separately")
+    print("=" * 72)
+    print(f"{'selector':10s} {'common n':>9s} {'robust_sd':>10s} | {'own n':>8s} {'own sd':>9s}")
+    for sel in ("q", "sn", "ics", "nf"):
+        sub = sn[common]
+        r = _cv(sub[sel].to_numpy(float), sub["our_rt"].to_numpy(float))
+        own = sn[right & np.isfinite(sn[sel])]
+        ro = _cv(own[sel].to_numpy(float), own["our_rt"].to_numpy(float))
+        sd_c = _rsd(r) if np.any(np.isfinite(r)) else float("nan")
+        sd_o = _rsd(ro) if np.any(np.isfinite(ro)) else float("nan")
+        print(f"{sel:10s} {int(common.sum()):>9,} {sd_c:9.2f}s | {len(own):>8,} {sd_o:8.2f}s")
+    print("\nLeft block is the comparable one (identical rows). The right block is each selector's")
+    print("own reach and is NOT comparable across rows — it is there so a coverage/accuracy trade is")
+    print("visible rather than hidden inside a single ranking.")
+
+
 def compare(a):
     """Score the grep cohort and the SQL cohort ON THE SAME ROWS.
 
@@ -311,10 +364,14 @@ def main():
     ap.add_argument("--instrument", default=None, help='e.g. "timsTOF HT"')
     ap.add_argument("--legacy-grep", action="store_true", help="reproduce the original 60spd cohort")
     ap.add_argument("--max-datasets", type=int, default=0, help="cap datasets (smoke test)")
+    ap.add_argument("--selector-compare", action="store_true",
+                    help="score all four collapse selectors on the rows ALL of them cover")
     ap.add_argument("--compare", action="store_true",
                     help="score BOTH cohorts on the SAME rows (see the note in --compare's output)")
     a = ap.parse_args()
 
+    if a.selector_compare:
+        return selector_compare(a)
     if a.compare:
         return compare(a)
 
