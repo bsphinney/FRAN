@@ -41,6 +41,8 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from organism import canonical_organism  # noqa: E402 — the ONLY place sentinels are defined
+
 print = functools.partial(print, flush=True)   # noqa: A001
 
 METHOD = "lance_pep_all_occurring_organisms_unique_mode/1.0"
@@ -107,10 +109,16 @@ def main():
             o = orgs[j]
             if not o:
                 continue
-            parts = [p.strip() for p in str(o).split(";") if p.strip()]
+            # Route every value through canonical_organism(): the Lance lane stores the report
+            # value RAW, so it still contains the junk sentinels organism.py exists to eliminate.
+            # Measured: 'Unknown' was the single most common inferred organism (312 runs) before
+            # this filter. Writing that as a prediction would reintroduce the exact bug
+            # organism.py was written to prevent -- a sentinel masquerading as a species.
+            parts = [canonical_organism(p) for p in str(o).split(";")]
+            parts = [p for p in parts if p]
             if len(parts) == 1:
                 uniq[r][parts[0]] += 1
-            else:
+            elif len(parts) > 1:
                 shared[r] += 1
         for r, cnt in uniq.items():
             total = sum(cnt.values())
