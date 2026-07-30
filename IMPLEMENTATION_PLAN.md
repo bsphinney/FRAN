@@ -397,6 +397,46 @@ key.
    relint_sumsq, n`. This is new work with no precedent in the schema, and it is the part that
    delivers `frg_loss` and `frg_charge` — the capability no other engine has.
 
+### 5.0 The aggregate key: one physical acquisition = n 1 (decided 2026-07-30)
+
+Two axes can inflate `n`, and only the second is real:
+
+- **`raw_basename` → `raw_files` is 1:many (~1.8×)** — benign. Of 4,534 duplicated basenames, **4,478
+  are the same acquisition** (identical serial *and* date), **0 are different acquisitions**, 56
+  undecidable. A duplicated basename is one acquisition stored at several paths. And `n` never comes
+  from that join: `sql_cohort()` uses `SELECT DISTINCT` to build a membership *set*, and observations
+  are counted from Lance rows.
+- **The same run appears in multiple Lance datasets** — real. The same raw is searched by several
+  searches: **1.34× corpus-wide, 1.40× in the gate cohort, up to 14 datasets for one run**
+  (`datasets == search_ids` exactly). And those searches **disagree**: only **4.9–5.6%** of precursors
+  share an identical `irt_empirical` across all 14; median spread 0.50 iRT, p90 3.5–4.5, max 84.
+
+So without collapsing the search dimension, `n` is overstated **and** the consensus is pulled toward
+whichever acquisitions were searched most often, using materially different values. That is a biased
+estimator — the same defect as pooling interfered fragments into `relint_sum`, on a different axis.
+
+**Key: `(stripped_seq, charge, run)`** with `run` = basename = physical acquisition. Collapse searches
+*before* summing.
+
+**Collapse rule: best-q per peptide.** Decided on measurement, not preference. The coherent
+alternative — one winning search per whole run — costs **15.7% of coverage** (7.9–19.9% across six
+multi-search runs, 12,712 of 80,949 observations). FRAN's product is a per-peptide consensus, so
+paying 15.7% for within-run calibration coherence its main consumer does not need is the wrong trade.
+Averaging across searches was rejected outright: it blends different libraries' iRT conventions
+*inside* one acquisition, re-creating at run level the exact problem `irt_calibration_source` exists
+to expose.
+
+**But the choice is not forced on consumers.** Each observation stores the winning `search_id`, so
+anything that later fits *within-run* structure (a run-level RT curve, where mixed provenance would
+bite) can filter to a single search and recover coherence at its own coverage cost. Store the
+provenance; don't impose the trade-off.
+
+**Also stored, because collapsing destroys it forever:** `n_searches` and the **cross-search spread**
+(sd/IQR) per observation. A peptide stable across 14 searches is more trustworthy than one varying by
+84 iRT units, and that distinction survives the collapse only if captured at build time — recovering
+it later is a 137 GB rescan. It doubles as a QC handle: a run whose peptides disagree wildly across
+searches is telling you something about that run.
+
    **Plus the per-fragment usability signal — cheap now, expensive to backfill.** Carry `n_used` and
    `n_total` per fragment key, sums and counts for `frg_mass_acc_ppm`, and precursor-level sums and
    counts for `int_corr_score` / `interference_ms1` / `interference_ms2`. Same additive rule, keyed

@@ -204,7 +204,13 @@ def scan_cohort(cohort, label, dedup_runs=False):
     cross-run comparability problem irt_calibration_source exists to expose.
     """
     acc = {}
-    best = {}   # (seq, charge, run) -> (q_value, irt)  when dedup_runs
+    # (seq, charge, run) -> {"q": best q, "irt": irt of the best-q search, "src": winning dataset,
+    #                        "vals": [irt from every search], }
+    # `vals` is kept so the CROSS-SEARCH SPREAD survives the collapse. It is a per-observation
+    # confidence signal nothing else can supply — a peptide whose iRT is stable across 14 searches is
+    # more trustworthy than one varying by 84 iRT units — and it is destroyed the moment you pick a
+    # winner. Capturing it costs one pass; recovering it later costs a 137 GB rescan.
+    best = {}
     n_ds = 0
     for p in sorted(cohort):
         keep_runs = cohort[p]
@@ -233,9 +239,14 @@ def scan_cohort(cohort, label, dedup_runs=False):
                 q = t["q_value"][i]
                 q = float(q) if q is not None else 1.0
                 rk = (k[0], k[1], run)
-                prev = best.get(rk)
-                if prev is None or q < prev[0]:
-                    best[rk] = (q, float(ie))
+                e = best.get(rk)
+                if e is None:
+                    best[rk] = {"q": q, "irt": float(ie), "src": os.path.basename(p),
+                                "vals": [float(ie)]}
+                else:
+                    e["vals"].append(float(ie))
+                    if q < e["q"]:          # best-q wins; see the granularity note below
+                        e["q"] = q; e["irt"] = float(ie); e["src"] = os.path.basename(p)
             else:
                 s, c = acc.get(k, (0.0, 0)); acc[k] = (s + float(ie), c + 1)
         n_ds += 1
@@ -243,11 +254,24 @@ def scan_cohort(cohort, label, dedup_runs=False):
             print(f"  [{label}] {n_ds}/{len(cohort)} datasets, "
                   f"{len(best) if dedup_runs else len(acc):,} seen")
     if dedup_runs:
-        for (seq, ch, _run), (_q, ie) in best.items():
+        spreads = []
+        multi = 0
+        for (seq, ch, _run), e in best.items():
             k = (seq, ch)
-            s, c = acc.get(k, (0.0, 0)); acc[k] = (s + ie, c + 1)
+            s, c = acc.get(k, (0.0, 0)); acc[k] = (s + e["irt"], c + 1)
+            if len(e["vals"]) > 1:
+                multi += 1
+                spreads.append(max(e["vals"]) - min(e["vals"]))
         print(f"  [{label}] dedup: {len(best):,} (seq,charge,run) observations "
               f"-> {len(acc):,} precursors")
+        if spreads:
+            spreads.sort(); n = len(spreads)
+            stable = sum(1 for s in spreads if s <= 1.0)
+            print(f"  [{label}] cross-search spread on the {multi:,} multi-search observations: "
+                  f"median {spreads[n // 2]:.3f}  p90 {spreads[int(n * 0.9)]:.3f}  "
+                  f"max {spreads[-1]:.3f}")
+            print(f"  [{label}]   within 1.0 iRT across searches: {stable:,}/{n:,} "
+                  f"({100 * stable / n:.1f}%)  <- the free confidence signal")
     print(f"  [{label}] done: {n_ds} datasets, {len(acc):,} covered precursors")
     return acc
 
