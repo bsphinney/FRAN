@@ -2672,45 +2672,55 @@ def _protein_coverage_peptides(pg: str, limit: int) -> dict[str, Any] | None:
         )
     except Exception:  # noqa: BLE001
         gene = None
-    # There is NO precursor->protein link in the schema (delimp_precursors has no protein_group),
-    # so we approximate the protein's peptides by ALL stripped sequences co-observed in the runs
-    # where this PG was reported, then api_protein keeps only those that map onto the canonical
-    # sequence (the real coverage set). IMPORTANT: do NOT sample precursors per-run (a per-run
-    # LIMIT grabs arbitrary co-eluting peptides and almost none belong to THIS protein -> 0 map ->
-    # "observed peptides = 0"). We must scan the full run-set so the protein's own peptides are
-    # included. CAP the number of runs + tight timeout + retry (db.query) + degrade to [] so a
-    # huge protein degrades to "coverage unavailable" (honest) instead of 503 or wrong data.
-    # THE REAL FIX is to store protein_group on delimp_precursors and filter WHERE protein_group=%s
-    # (exact + fast) — see FRAN_REINGEST_AUDIT.md; that lands with the re-ingest.
+    # EXACT: delimp_precursors.protein_group, indexed by idx_prec_protein_group (2026-07-30).
+    #
+    # This replaced a co-observation HEURISTIC that was biased by abundance. That version took 8
+    # arbitrary runs of however many reported the protein, collected every peptide co-observed in
+    # them, kept the top 4,000 by frequency, and only then mapped onto the canonical sequence. For
+    # P61278 (SST, 116 aa) those 8 runs held 123,432 distinct peptides and SST's own three ranked
+    # 8,065 / 21,541 / 72,197 — truncated before the mapping step, so the page reported
+    # "0 observed peptides" for a protein with 224 precursors across 164 runs. It worked for abundant
+    # proteins and silently returned 0 for low-abundance ones, which is indistinguishable from "not
+    # observed".
+    #
+    # The heuristic existed because the code believed there was no precursor->protein link. There
+    # was: the column existed and was 100% populated, it just had no index, so the exact filter
+    # seq-scanned 416M rows and timed out. With the index the same lookup is ~0.2 s.
     try:
         peps = query(
             """
-            WITH pg_runs AS (
-                SELECT DISTINCT search_id, raw_path
-                FROM delimp_proteins WHERE protein_group = %s
-                LIMIT 8
-            )
-            SELECT pr.stripped_seq,
-                   COUNT(*)                    AS n_precursors,
-                   COUNT(DISTINCT pr.charge)   AS n_charges,
-                   COUNT(DISTINCT pr.raw_path) AS n_runs,
-                   MIN(pr.q_value)             AS best_q_value,
-                   bool_or(pr.im IS NOT NULL)  AS has_im
-            FROM delimp_precursors pr
-            JOIN pg_runs r ON r.search_id = pr.search_id AND r.raw_path = pr.raw_path
-            GROUP BY pr.stripped_seq
+            SELECT stripped_seq,
+                   COUNT(*)                 AS n_precursors,
+                   COUNT(DISTINCT charge)   AS n_charges,
+                   COUNT(DISTINCT raw_path) AS n_runs,
+                   MIN(q_value)             AS best_q_value,
+                   bool_or(im IS NOT NULL)  AS has_im
+            FROM delimp_precursors
+            WHERE protein_group = %s
+            GROUP BY stripped_seq
             ORDER BY n_precursors DESC
             LIMIT %s
             """,
             (pg, min(int(limit), 8000)),
-            tables=["delimp_proteins", "delimp_precursors"],
-            timeout_ms=10000,
+            tables=["delimp_precursors"],
+            # 25s, not 10-15s: the exact query is ~0.05s for a normal protein but 12.2s for the
+            # worst contaminant (Cont_P02769, 340 peptides / 538,794 precursors). The result is
+            # cached, so this is paid once per TTL, and a correct slow answer beats a fast wrong one.
+            timeout_ms=25000,
         )
-    except Exception:  # noqa: BLE001 - high-run-count protein under load -> coverage unavailable, page still loads
-        peps = []
-    # empty peps == the scan timed out (a corpus protein always has co-observed precursors) ->
-    # return None so it is NOT cached and gets retried, rather than sticking a 0 for the cache TTL.
-    return {"gene": gene, "peptides": peps} if peps else None
+        ok = True
+    except Exception:  # noqa: BLE001 - degrade to "coverage unavailable" rather than 503
+        peps, ok = [], False
+    # Distinguish FAILED from GENUINELY EMPTY, which the previous version could not.
+    #
+    # Under the old co-observation heuristic, empty always meant "the scan timed out", because any
+    # corpus protein has *co-observed* precursors — so empty was treated as failure and deliberately
+    # not cached. The exact filter changes that: a protein group with no precursors assigned to it is
+    # now a correct, cacheable answer, and treating it as failure would re-run the query on every
+    # page load forever. So gate on whether the query SUCCEEDED, not on whether it returned rows.
+    if not ok:
+        return None            # falsy -> not cached by get_or_set -> retried next request
+    return {"gene": gene, "peptides": peps}
 
 
 def peptide_charge_distribution(stripped_seq: str) -> dict[str, Any]:
