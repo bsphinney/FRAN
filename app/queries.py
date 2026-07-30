@@ -297,12 +297,15 @@ def search_species(q: str, limit: int = 60) -> dict[str, Any]:
         params.append(common_hits)
     rows = query(
         f"""
-        SELECT organism_name AS organism, organism_taxon_id, COUNT(*) AS n_runs
+        SELECT organism_name AS organism, MAX(organism_taxon_id) AS organism_taxon_id,
+               COUNT(*) AS n_runs
         FROM delimp_sample_metadata m
         WHERE EXISTS (SELECT 1 FROM search_raw_files srf WHERE srf.raw_path = m.raw_path)
           AND {_REAL_ORG_PRED}
           AND (organism_name ILIKE %s{extra})
-        GROUP BY organism_name, organism_taxon_id
+        -- NAME only: organism_taxon_id is 58.7% populated, so grouping on it too listed the same
+        -- species twice (once with a taxon, once with NULL). See the note in protein_card.
+        GROUP BY organism_name
         ORDER BY n_runs DESC
         LIMIT %s
         """,
@@ -1207,11 +1210,21 @@ def protein_card_stats(protein_group: str) -> dict[str, Any]:
                     "sum_precursors", "best_pg_q", "mean_intensity", "any_contaminant")})
         try:
             species = query(
-                """SELECT m.organism_name AS organism, m.organism_taxon_id AS taxon_id,
+                # GROUP BY the NAME only, and take MAX(taxon) for display.
+                #
+                # Grouping by (organism_name, organism_taxon_id) split ONE species into TWO whenever
+                # some runs carry a taxon id and others do not: P61278 reported
+                # "2 species", both 'Homo sapiens' — 150 runs at taxon 9606 and 14 at NULL.
+                # organism_taxon_id is only 58.7% populated (11,670 of 19,874 raws), and five
+                # species appear both with and without it (Homo sapiens, Mus musculus, Sus scrofa,
+                # Rattus norvegicus, Canis lupus familiaris — 2,378 raws), so this inflated the
+                # organism count on ~369k protein groups. The name is the identity here; the taxon is
+                # an annotation that happens to be missing.
+                """SELECT m.organism_name AS organism, MAX(m.organism_taxon_id) AS taxon_id,
                           COUNT(DISTINCT p.raw_path) AS n_runs
                    FROM delimp_proteins p JOIN delimp_sample_metadata m ON m.raw_path = p.raw_path
                    WHERE p.protein_group = %s AND m.organism_name IS NOT NULL
-                   GROUP BY m.organism_name, m.organism_taxon_id ORDER BY n_runs DESC LIMIT 60""",
+                   GROUP BY m.organism_name ORDER BY n_runs DESC LIMIT 60""",
                 (pg,), tables=["delimp_proteins", "delimp_sample_metadata"]) or []
         except Exception:  # noqa: BLE001
             species = []
