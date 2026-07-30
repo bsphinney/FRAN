@@ -3016,6 +3016,29 @@ def gene_detail(gene: str) -> dict[str, Any]:
         """,
         (g, MAX_PAGE), tables=["delimp_proteins"],
     )
+    # TRUE distinct peptide count per protein group.
+    #
+    # `sum_unique_peptides` is SUM(n_unique_peptides) over (protein x search x run) rows — a sum of
+    # PER-RUN counts, not a distinct count, and the UI was rendering it as "Unique peptides". For
+    # P61278 (SST, 116 aa) that read 224 against a true 4 — a 56x overstatement, and exactly equal to
+    # its precursor count, which is the tell. Measured: F6TIY2 58 vs 2, P26917 5 vs 1.
+    #
+    # One indexed query covers every protein on the page (idx_prec_protein_group, 2026-07-30), so the
+    # honest number is now as cheap as the misleading one.
+    if proteins:
+        try:
+            pgs = [r["protein_group"] for r in proteins if r.get("protein_group")]
+            dist = query(
+                """SELECT protein_group, COUNT(DISTINCT stripped_seq) AS n_peptides
+                   FROM delimp_precursors WHERE protein_group = ANY(%s)
+                   GROUP BY protein_group""",
+                (pgs,), tables=["delimp_precursors"], timeout_ms=20000) or []
+            dmap = {r["protein_group"]: int(r["n_peptides"] or 0) for r in dist}
+            for r in proteins:
+                r["n_peptides"] = dmap.get(r.get("protein_group"))
+        except Exception:  # noqa: BLE001 — leave n_peptides absent; the UI degrades to "—"
+            for r in proteins:
+                r.setdefault("n_peptides", None)
     totals = query(
         """SELECT COUNT(DISTINCT protein_group) AS n_groups,
                   COUNT(DISTINCT search_id) AS n_searches,

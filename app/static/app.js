@@ -472,7 +472,7 @@ async function srTab(which){
       const d=await api(`/api/search/proteins?q=${encodeURIComponent(q)}&limit=100`);
       if(!d.rows.length){ body.innerHTML=empty('No proteins or genes match.'); return; }
       body.innerHTML = `<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} matching protein groups</div>`+table(
-        ['Protein group','Gene','Searches','Runs','Unique peptides','Precursors','Contaminant'],
+        ['Protein group','Gene','Searches','Runs','Peptide detections','Precursors','Contaminant'],
         d.rows.map(r=>[`<span class="font-mono text-white">${esc(r.protein_group)}</span>`,geneCell(r.gene),fmt(r.n_searches),fmt(r.n_runs),fmt(r.sum_unique_peptides),fmt(r.sum_precursors),r.any_contaminant?'<span class="text-rose-400">yes</span>':'—']),
         d.rows.map(r=>`go('protein','${encodeURIComponent(r.protein_group)}')`));
     }
@@ -1543,7 +1543,7 @@ async function loadProtCard(pg){
       ${tr.intensity!=null?` · intensity ${sci(tr.intensity)}`:''}</div>`:'';
     const mini=`<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3">
       ${stat('Searches',fmt(c.n_searches))}${stat('Runs',fmt(c.n_runs))}
-      ${stat('Unique peptides',fmt(c.max_unique_peptides))}${stat('Best PG q',sci(c.best_pg_q))}</div>`;
+      ${stat('Peptides (best run)',fmt(c.max_unique_peptides))}${stat('Best PG q',sci(c.best_pg_q))}</div>`;
     const contam=c.contaminant?`<div class="mt-3 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20">
       <div class="text-[11px] uppercase tracking-wider text-rose-300 font-semibold mb-0.5">⚠ ${esc(c.contaminant.kind||'contaminant')}</div>
       <p class="text-sm text-rose-100/90">${esc(c.contaminant.note||'')}</p></div>`:'';
@@ -1705,8 +1705,8 @@ async function renderGene(gene){
     <div id="genesumbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-24 rounded-xl"></div></div>
     <div class="glass card p-5 fade-in mb-5"><h3 class="font-bold text-white mb-1">Proteins for this gene (${d.proteins.length})</h3>
     <p class="text-[11px] text-slate-500 mb-3">Every protein group in the corpus annotated with ${esc(d.gene)} — click through to the protein page.</p>
-    ${table(['Protein group','Searches','Runs','Precursors','Unique peptides','Contaminant'],
-      d.proteins.map(p=>[`<span class="font-mono text-accent-400 hover:underline">${esc(p.protein_group)}</span>`,fmt(p.n_searches),fmt(p.n_runs),fmt(p.sum_precursors),fmt(p.sum_unique_peptides),p.any_contaminant?'<span class="text-rose-400">yes</span>':'—']),
+    ${table(['Protein group','Searches','Runs','Precursors','Distinct peptides','Contaminant'],
+      d.proteins.map(p=>[`<span class="font-mono text-accent-400 hover:underline">${esc(p.protein_group)}</span>`,fmt(p.n_searches),fmt(p.n_runs),fmt(p.sum_precursors),(p.n_peptides!=null?fmt(p.n_peptides):'—'),p.any_contaminant?'<span class="text-rose-400">yes</span>':'—']),
       d.proteins.map(p=>`go('protein','${encodeURIComponent(p.protein_group)}')`))}</div>
     ${(d.organisms&&d.organisms.length)?`<div class="glass card p-5 fade-in mb-5"><h3 class="font-bold text-white mb-3">Where it's seen</h3>
       <div class="flex flex-wrap gap-2">${d.organisms.map(o=>`<span class="px-2.5 py-1 rounded-lg text-xs bg-white/5 text-slate-300">${esc(o.organism)} <span class="text-slate-500">${fmt(o.n_runs)} runs</span></span>`).join('')}</div></div>`:''}

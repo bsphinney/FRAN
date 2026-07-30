@@ -23,7 +23,8 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.16.3"  # 0.16.3: protein coverage uses the exact protein_group filter, not a heuristic
+APP_VERSION = "0.16.4"  # 0.16.4: "unique peptides" was a SUM of per-run counts (56x over); now a true distinct count
+# 0.16.3: protein coverage uses the exact protein_group filter, not a heuristic
 # 0.16.2: species count no longer splits one organism in two on a NULL taxon
 # 0.16.1: predicted-spectrum overlay names the REAL engine, not always DIA-NN
 # 0.16.0: measured-spectrum panel picks the MODAL charge's most intense
