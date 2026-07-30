@@ -181,7 +181,33 @@ def compare(a):
           "and is deliberately not printed here; see this function's docstring.")
 
 
-def scan_cohort(cohort, label, dedup_runs=False):
+# Collapse selectors. q is MINIMISED, the physical measures are MAXIMISED.
+#
+# Measured 2026-07-30, five multi-search runs: best-q's top winner takes a mean 54.0% of a run's
+# peptides where an even split would be 10.2% — 5.3x concentrated, so it IS substantially selecting a
+# search rather than an observation. BUT the proposed mechanism, bigger library => more permissive =>
+# lower q, is NOT supported: in 5 of 5 runs the best-q winner was not the largest library (winners sat
+# mid-range, 61k-72k, against a 24k-110k spread).
+#
+# The selectors also disagree materially — a physical measure picked a different winning search in 13
+# of 15 comparisons, while signal_to_noise and int_corr_score usually agreed with EACH OTHER. So the
+# choice changes which observation is kept and is not cosmetic. Rather than argue it, make it a flag
+# and let the benchmark decide.
+SELECTORS = {
+    "q":   ("q_value",         False),   # statistical: relative to each search's own FDR model
+    "sn":  ("signal_to_noise", True),    # physical: property of the measurement
+    "ics": ("int_corr_score",  True),    # physical: Spectronaut's own correlation score
+    "nf":  ("fragment_count",  True),    # physical: how much evidence was present
+}
+_BASE_COLS = ["stripped_seq", "charge", "run", "q_value", "irt_empirical", "is_decoy"]
+
+
+def _cols_for(selector):
+    col = SELECTORS[selector][0]
+    return _BASE_COLS if col in _BASE_COLS else _BASE_COLS + [col]
+
+
+def scan_cohort(cohort, label, dedup_runs=False, selector="q"):
     """Build the (seq, charge) -> (irt_sum, n) consensus for one cohort.
 
     dedup_runs=False reproduces fran_scoped.py exactly: every Lance row is one observation.
@@ -212,13 +238,14 @@ def scan_cohort(cohort, label, dedup_runs=False):
     # winner. Capturing it costs one pass; recovering it later costs a 137 GB rescan.
     best = {}
     n_ds = 0
+    sel_col, sel_max = SELECTORS[selector]
     for p in sorted(cohort):
         keep_runs = cohort[p]
         if not os.path.exists(p):
             continue
         try:
             t = lance.dataset(p).scanner(
-                columns=["stripped_seq", "charge", "run", "q_value", "irt_empirical", "is_decoy"],
+                columns=_cols_for(selector),
                 filter="q_value <= 0.01").to_table().to_pydict()
         except Exception as e:  # noqa: BLE001
             print(f"  skip {os.path.basename(p)}: {str(e)[:60]}")
@@ -236,17 +263,18 @@ def scan_cohort(cohort, label, dedup_runs=False):
                 continue
             k = (str(t["stripped_seq"][i]), int(ch))
             if dedup_runs:
-                q = t["q_value"][i]
-                q = float(q) if q is not None else 1.0
+                sc = t[sel_col][i]
+                sc = float(sc) if sc is not None else (1.0 if not sel_max else -1.0)
+                score = -sc if sel_max else sc     # normalise to "lower is better"
                 rk = (k[0], k[1], run)
                 e = best.get(rk)
                 if e is None:
-                    best[rk] = {"q": q, "irt": float(ie), "src": os.path.basename(p),
+                    best[rk] = {"score": score, "irt": float(ie), "src": os.path.basename(p),
                                 "vals": [float(ie)]}
                 else:
                     e["vals"].append(float(ie))
-                    if q < e["q"]:          # best-q wins; see the granularity note below
-                        e["q"] = q; e["irt"] = float(ie); e["src"] = os.path.basename(p)
+                    if score < e["score"]:
+                        e["score"] = score; e["irt"] = float(ie); e["src"] = os.path.basename(p)
             else:
                 s, c = acc.get(k, (0.0, 0)); acc[k] = (s + float(ie), c + 1)
         n_ds += 1
