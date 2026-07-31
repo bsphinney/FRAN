@@ -11,3 +11,13 @@ app/service_customer_aliases.json
 
 # oh-my-claudecode session/agent state — machine-local, never committed
 .omc/
+
+# CONFIDENTIAL working documents — live here for convenience, MUST NOT be published.
+# This repo is PUBLIC (github.com/bsphinney/FRAN). These two name the private-tier tables
+# (coreomics_*, delimp_search_provenance, delimp_pi_profile), explain that a direct psycopg2
+# connection bypasses the app's tier model entirely, point at the credential's location on Hive,
+# and list which "public" columns leak customer identity (raw_path, run_overview_json).
+# Publishing them would hand someone with network access a roadmap. If you WANT them versioned,
+# put them in a private repo — do not un-ignore them here.
+FRAN_ANALYST_GUIDE.md
+FRAN_TISSUE_PLAN.md
