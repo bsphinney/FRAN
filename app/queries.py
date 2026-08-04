@@ -3056,7 +3056,14 @@ def gene_detail(gene: str) -> dict[str, Any]:
                 """SELECT protein_group, COUNT(DISTINCT stripped_seq) AS n_peptides
                    FROM delimp_precursors WHERE protein_group = ANY(%s)
                    GROUP BY protein_group""",
-                (pgs,), tables=["delimp_precursors"], timeout_ms=20000) or []
+                (pgs,), tables=["delimp_precursors"],
+                # The cost here is a SORT SPILLING TO DISK, not I/O: the index gives rows already
+                # ordered by protein_group, so only stripped_seq is sorted per group, but the 4MB
+                # server default forces an external merge. Measured on ALB (45 groups, 1.74M
+                # precursor rows): 4MB 31.6s, 64MB 10.6s, 256MB 3.3s — identical plan and rows.
+                # At 20s/4MB this timed out and every row degraded to None, so the page rendered
+                # "—" for all 45 groups with no error surfaced. Bounded by maxconn (6).
+                work_mem="256MB", timeout_ms=15000) or []
             dmap = {r["protein_group"]: int(r["n_peptides"] or 0) for r in dist}
             for r in proteins:
                 r["n_peptides"] = dmap.get(r.get("protein_group"))

@@ -334,6 +334,7 @@ def query(
     tables: Iterable[str],
     fetch: str = "all",
     timeout_ms: int | None = None,
+    work_mem: str | None = None,
 ) -> Any:
     """Run a parameterized, read-only SELECT.
 
@@ -351,6 +352,14 @@ def query(
               timeout — which is what exhausts the pool and 503s the dashboard
               when PG Farm's bulk heap reads are degraded. Reset afterwards so the
               pooled connection's default (30s) is never contaminated.
+      work_mem: optional per-statement work_mem (e.g. "256MB") for a query whose cost is
+              dominated by a SORT SPILLING TO DISK rather than by I/O. The server default is
+              4MB, which is right for ordinary reads and catastrophic for a big
+              COUNT(DISTINCT ...) GROUP BY: measured on gene ALB (45 protein groups,
+              1.74M precursor rows) 4MB took 31.6s, 64MB 10.6s, 256MB 3.3s — same plan, same
+              rows, the difference is entirely external merge vs in-memory quicksort.
+              Use SPARINGLY: this is memory on the SHARED PG Farm cluster, and the bound is
+              maxconn (6) x this value. Reset afterwards, exactly like statement_timeout.
     """
     _assert_allowlisted(tables)
     stripped = sql.lstrip().lower()
@@ -372,6 +381,8 @@ def query(
             with _POOL.connection() as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute("SET statement_timeout = %s", (int(eff_timeout),))
+                    if work_mem:
+                        cur.execute("SET work_mem = %s", (work_mem,))
                     try:
                         cur.execute(sql, params)
                         if fetch == "all":
@@ -387,6 +398,8 @@ def query(
                     finally:
                         try:
                             cur.execute("SET statement_timeout = 30000")
+                            if work_mem:
+                                cur.execute("RESET work_mem")
                         except Exception:  # noqa: BLE001 - conn returns to pool either way
                             pass
         except (psycopg2.errors.QueryCanceled, psycopg2.OperationalError,
