@@ -289,6 +289,48 @@ if db is not None:
 
 
 # ============================================================================
+# 3c. STRAY % IN A SQL BODY.
+#
+# psycopg2 does `sql % args` whenever a query binds parameters, so ANY % in the SQL text that is
+# not a placeholder is a landmine: '58.7% populated' in a comment raises
+#   ValueError: unsupported format character 'p'
+# BEFORE the statement ever reaches Postgres, so the endpoint 500s on every input including ones
+# that match nothing — which is what killed species search site-wide. A literal LIKE 'foo%' pattern
+# written into the SQL breaks the same way (that is why _REAL_ORG_PRED uses starts_with()).
+#
+# Legal: %s, %(name)s, and an escaped %%. Everything else blocks the deploy.
+_PLACEHOLDER_RE = re.compile(r'%(?:s|\([a-zA-Z_][a-zA-Z0-9_]*\)s|%)')
+
+n_pct = 0
+for f in py_files:
+    rel = f.relative_to(ROOT)
+    try:
+        tree = ast.parse(f.read_text(), filename=str(f))
+    except SyntaxError:
+        continue
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        fn = node.func
+        name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+        if name not in ("query", "query_one", "execute", "query_scalar"):
+            continue
+        sql = _sql_literal(node.args[0])
+        if not sql or "%" not in sql:
+            continue
+        n_pct += 1
+        leftover = _PLACEHOLDER_RE.sub("", sql)
+        if "%" in leftover:
+            for i, line in enumerate(sql.splitlines(), 1):
+                if "%" in _PLACEHOLDER_RE.sub("", line):
+                    block(f"[3c sql-%] {rel}:{node.lineno} (+{i}) stray '%' in a SQL body: "
+                          f"{line.strip()[:80]!r} -- psycopg2 will raise ValueError before the "
+                          f"query runs. Move prose comments into Python; use %% or starts_with().")
+                    break
+print(f"  [3c] SQL bodies scanned for stray '%': {n_pct}")
+
+
+# ============================================================================
 # 4. TEMPLATE PLACEHOLDERS (advisory only).
 #    The BLOCKING version of this check lives in step 5: it scans the RENDERED page
 #    for leftover __X__ tokens, which is behavioural and immune to how main.py spells

@@ -295,6 +295,12 @@ def search_species(q: str, limit: int = 60) -> dict[str, Any]:
     if common_hits:
         extra = " OR organism_name = ANY(%s)"
         params.append(common_hits)
+    # GROUP BY NAME only: organism_taxon_id is ~70.7% populated, so grouping on it too listed the
+    # same species twice (once with a taxon, once with NULL). MAX(taxon_id) keeps the resolved id.
+    # This comment MUST stay in Python, NOT in the SQL string: the literal % in "70.7%" collides
+    # with psycopg2's %s parameter parsing (this query binds ILIKE %s and LIMIT %s), raising
+    # ValueError: unsupported format character before the statement ever reaches Postgres. That is
+    # exactly what 500'd every species search site-wide, including ones matching nothing.
     rows = query(
         f"""
         SELECT organism_name AS organism, MAX(organism_taxon_id) AS organism_taxon_id,
@@ -303,8 +309,6 @@ def search_species(q: str, limit: int = 60) -> dict[str, Any]:
         WHERE EXISTS (SELECT 1 FROM search_raw_files srf WHERE srf.raw_path = m.raw_path)
           AND {_REAL_ORG_PRED}
           AND (organism_name ILIKE %s{extra})
-        -- NAME only: organism_taxon_id is 58.7% populated, so grouping on it too listed the same
-        -- species twice (once with a taxon, once with NULL). See the note in protein_card.
         GROUP BY organism_name
         ORDER BY n_runs DESC
         LIMIT %s
