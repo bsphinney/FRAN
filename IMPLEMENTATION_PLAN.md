@@ -37,7 +37,7 @@ There is a `raw_files` table, 19,874 rows, 41 columns, keyed on `raw_path`:
 | `lc_method` | column exists | **0 rows** |
 | `column_id`, `column_age_injections` | — | **absent** |
 | `library_type` | — | **absent** |
-| `irt_calibration_source` | RunSummaries | **40.7% (8,091/19,874), measured 2026-08-03** |
+| `irt_calibration_source` | RunSummaries | **40.7% (8,091/19,874) — CLOSED, see §3.2** |
 
 **The dominant term in RT comparability — gradient — is 98.7% populated today.** The doc's own
 example query (`instrument='timsTOF HT' AND gradient_min BETWEEN 18 AND 22`) is answerable right now
@@ -633,3 +633,26 @@ edit, `xic_extractor.py` was docstring-only with byte-identical code) — but no
 that, which is the actual problem. See **`ingest/HIVE_SYNC.md`** for the audit command and for the
 target state: replace Hive's loose `scp`-populated copy with a real git clone, so "what is running"
 and "what is committed" stop being separate questions.
+
+
+### 3.2 `irt_calibration_source` is CLOSED at 40.7% — it is a data limit, not an unfinished job
+
+Measured 2026-08-04, because the 40.7% looked like a half-run backfill and is not:
+
+| | |
+|---|---|
+| `*RunOverview.tsv` files in the archive | **8,633** |
+| distinct run names they cover | **6,389** (files repeat a run across exports) |
+| distinct `raw_basename` in the corpus | 11,671 |
+| `raw_files` rows filled | **8,091** — the 6,389 runs, times ~1.27 paths per basename |
+
+So the harvester consumed essentially everything on disk. The remaining 11,783 rows are runs with
+**no `RunOverview.tsv` anywhere in the archive**, not runs it failed to read.
+
+It is not an engine split either — Spectronaut raws are only 43% covered (7,603/17,785) and DIA-NN
+22% (450/2,025). Spectronaut writes `RunSummaries/` only when the export requests it, and many
+archived exports did not.
+
+**Do not re-run this expecting more.** To raise the number you must re-export from the `.sne` files
+with RunSummaries enabled — a different job, and one worth folding into the single report re-parse
+(§5.1) rather than doing on its own.
