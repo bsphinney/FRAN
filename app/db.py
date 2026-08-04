@@ -82,6 +82,11 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # delimp_precursor_xic.fragments flattened to one row per fragment with a btree on mz, so the
         # shared-transition panel is an index range scan instead of a 264k-row jsonb explosion.
         "delimp_xic_fragment",
+        # exact COUNT(DISTINCT stripped_seq) per protein_group, precomputed offline. Live, this
+        # costs 3.5s for ALB but 27.4s for KRT1 (heap locality, not row count), so it timed out and
+        # the gene page rendered "—" for every protein group. Built by
+        # ingest/build_protein_peptide_counts.py; top up after each ingest.
+        "delimp_protein_peptide_count",
     }
 )
 

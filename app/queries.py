@@ -3052,7 +3052,18 @@ def gene_detail(gene: str) -> dict[str, Any]:
     if proteins:
         try:
             pgs = [r["protein_group"] for r in proteins if r.get("protein_group")]
-            dist = query(
+            # Precomputed first: one indexed PK lookup per group instead of aggregating the
+            # precursor heap. Covers whatever the offline builder has stored.
+            pre = query(
+                """SELECT protein_group, n_peptides
+                   FROM delimp_protein_peptide_count WHERE protein_group = ANY(%s)""",
+                (pgs,), tables=["delimp_protein_peptide_count"], timeout_ms=5000) or []
+            dmap = {r["protein_group"]: int(r["n_peptides"] or 0) for r in pre}
+
+            # Anything the builder has not reached yet (a fresh ingest, or a batch it skipped)
+            # still gets a live answer, so the page is never wrong -- only sometimes slower.
+            pgs = [p for p in pgs if p not in dmap]
+            dist = [] if not pgs else query(
                 """SELECT protein_group, COUNT(DISTINCT stripped_seq) AS n_peptides
                    FROM delimp_precursors WHERE protein_group = ANY(%s)
                    GROUP BY protein_group""",
@@ -3064,7 +3075,7 @@ def gene_detail(gene: str) -> dict[str, Any]:
                 # At 20s/4MB this timed out and every row degraded to None, so the page rendered
                 # "—" for all 45 groups with no error surfaced. Bounded by maxconn (6).
                 work_mem="256MB", timeout_ms=15000) or []
-            dmap = {r["protein_group"]: int(r["n_peptides"] or 0) for r in dist}
+            dmap.update({r["protein_group"]: int(r["n_peptides"] or 0) for r in dist})
             for r in proteins:
                 r["n_peptides"] = dmap.get(r.get("protein_group"))
         except Exception:  # noqa: BLE001 — leave n_peptides absent; the UI degrades to "—"
