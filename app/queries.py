@@ -53,6 +53,26 @@ _REAL_ORG_PRED = (
     # dashboard species doughnut. starts_with avoids the % entirely.
     "AND NOT starts_with(lower(trim(organism_name)), 'translate_table')"
 )
+
+# One species, one row. organism_name is stored as UniProt writes it, so the SAME organism arrives
+# under several spellings — "Saccharomyces cerevisiae" and "Saccharomyces cerevisiae (strain ATCC
+# 204508 / S288c)" are both 4932, and Toxoplasma gondii arrives three ways. Grouping by NAME (which
+# is what this did while organism_taxon_id was only 70.7% populated, to stop a species splitting into
+# a with-taxid row and a NULL row) therefore listed 8 species twice, over 346 runs.
+#
+# organism_taxon_id is now 96.8% populated — every row that has a name has a taxid except one parse
+# artifact, which _REAL_ORG_PRED already excludes — so the taxid is the safe grouping key and the
+# original split hazard is gone. Rows with no taxid still fall back to grouping by their own name.
+_ORG_GROUP = "COALESCE(organism_taxon_id::text, 'name:' || organism_name)"
+
+# Display label for a merged group: the name with strain/serotype/subspecies detail removed, so the
+# heading reads "Oryza sativa" rather than whichever of subsp. indica / japonica sorted first. MIN()
+# only picks between spellings that already agree after stripping. No % anywhere in these patterns —
+# see the note above query() calls about psycopg2 parameter binding.
+_ORG_LABEL = (
+    r"MIN(regexp_replace(organism_name, "
+    r"'\s*\(.*$|\s+subsp\..*$|\s+serotype\s.*$|\s+serovar\s.*$|\s+str\.\s.*$', ''))"
+)
 # Complement: a run whose organism is NOT identified (NULL/empty/sentinel) — counted as
 # "pending species ID", never shown as a species.
 _UNIDENTIFIED_ORG_PRED = (
@@ -235,13 +255,13 @@ def species_distribution(limit: int = 15) -> list[dict[str, Any]]:
         # which is exactly what silently emptied the dashboard species doughnut.)
         rows = query(
             f"""
-            SELECT organism_name AS organism,
+            SELECT {_ORG_LABEL} AS organism,
                    MAX(organism_taxon_id) AS organism_taxon_id,
                    COUNT(*) AS n_runs
             FROM delimp_sample_metadata m
             WHERE EXISTS (SELECT 1 FROM search_raw_files srf WHERE srf.raw_path = m.raw_path)
               AND {_REAL_ORG_PRED}
-            GROUP BY organism_name
+            GROUP BY {_ORG_GROUP}
             ORDER BY n_runs DESC
             LIMIT {int(limit)}
             """,
@@ -303,13 +323,13 @@ def search_species(q: str, limit: int = 60) -> dict[str, Any]:
     # exactly what 500'd every species search site-wide, including ones matching nothing.
     rows = query(
         f"""
-        SELECT organism_name AS organism, MAX(organism_taxon_id) AS organism_taxon_id,
+        SELECT {_ORG_LABEL} AS organism, MAX(organism_taxon_id) AS organism_taxon_id,
                COUNT(*) AS n_runs
         FROM delimp_sample_metadata m
         WHERE EXISTS (SELECT 1 FROM search_raw_files srf WHERE srf.raw_path = m.raw_path)
           AND {_REAL_ORG_PRED}
           AND (organism_name ILIKE %s{extra})
-        GROUP BY organism_name
+        GROUP BY {_ORG_GROUP}
         ORDER BY n_runs DESC
         LIMIT %s
         """,
