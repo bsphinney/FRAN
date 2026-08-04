@@ -139,7 +139,60 @@ def main():
             print(f"{mv}: refreshed in {time.time()-t:.0f}s ({cur.fetchone()[0]} rows)")
         except Exception as e:  # noqa: BLE001
             print(f"{mv}: {type(e).__name__}: {str(e)[:120]}")
+
+    _topup_peptide_counts(cur)
     con.close()
+
+
+def _topup_peptide_counts(cur, budget_s: int = 1800, batch: int = 250):
+    """Fill delimp_protein_peptide_count for protein groups a new ingest introduced.
+
+    NOT a materialized view on purpose: REFRESH would recompute all ~522k groups off a 138 GB heap
+    (~1.5 h), while a top-up only touches what is new. Runs LAST because its work list is
+    delimp_mv_protein_agg, which must be refreshed first.
+
+    Bounded by budget_s so a weekly refresh can never run away -- anything left over is simply
+    picked up next week, or by ingest/build_protein_peptide_counts.py directly. Missing rows are
+    harmless: app/queries.py falls back to the live aggregate for any group not stored.
+    """
+    t0 = time.time()
+    try:
+        cur.execute("""SELECT a.protein_group FROM delimp_mv_protein_agg a
+                       WHERE NOT EXISTS (SELECT 1 FROM delimp_protein_peptide_count c
+                                         WHERE c.protein_group = a.protein_group)""")
+        todo = [r[0] for r in cur.fetchall()]
+    except Exception as e:  # noqa: BLE001 — table absent on a fresh DB; the builder creates it
+        print(f"peptide_counts: skipped ({type(e).__name__}: {str(e)[:80]})")
+        return
+    if not todo:
+        print("peptide_counts: up to date")
+        return
+    done = 0
+    for i in range(0, len(todo), batch):
+        if time.time() - t0 > budget_s:
+            print(f"peptide_counts: budget reached, {len(todo)-done:,} groups left for next run")
+            break
+        try:
+            cur.execute("SET work_mem = '256MB'")
+            cur.execute("""
+                INSERT INTO delimp_protein_peptide_count
+                       (protein_group, n_peptides, n_precursor_rows)
+                SELECT protein_group, COUNT(DISTINCT stripped_seq), COUNT(*)
+                FROM delimp_precursors WHERE protein_group = ANY(%s)
+                GROUP BY protein_group
+                ON CONFLICT (protein_group) DO UPDATE
+                  SET n_peptides=EXCLUDED.n_peptides,
+                      n_precursor_rows=EXCLUDED.n_precursor_rows, computed_at=now()""",
+                (todo[i:i + batch],))
+            done += len(todo[i:i + batch])
+        except Exception as e:  # noqa: BLE001 — one bad batch must not fail the weekly refresh
+            print(f"peptide_counts: batch skipped ({type(e).__name__}: {str(e)[:70]})")
+        finally:
+            try:
+                cur.execute("RESET work_mem")
+            except Exception:  # noqa: BLE001
+                pass
+    print(f"peptide_counts: topped up {done:,} of {len(todo):,} in {time.time()-t0:.0f}s")
 
 
 if __name__ == "__main__":
