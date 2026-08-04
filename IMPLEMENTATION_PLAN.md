@@ -635,6 +635,40 @@ target state: replace Hive's loose `scp`-populated copy with a real git clone, s
 and "what is committed" stop being separate questions.
 
 
+
+### 5.1a The report re-parse is SCOPED — all four payloads confirmed present (2026-08-04)
+
+Measured before committing to the job, because "add a column and re-parse" hides the cost:
+
+| | |
+|---|---|
+| report parquets in `FRAN_reports` | **2,024** |
+| total size | **464 GB** |
+| rows in an 80-report sample | 107,089,415 (=> order 2.7 billion overall) |
+
+Column availability in that sample — **every one present in 80/80 reports**, so nothing here is
+conditional on export settings:
+
+| payload | column | present |
+|---|---|---|
+| fragment exclusion verdict | `F.ExcludedFromQuantification` | 100% |
+| normalised area (fixes `frg_norm_area`, 100% NULL in Lance) | `F.NormalizedPeakArea` | 100% |
+| experimental group | `R.Condition` | 100% |
+| replicate | `R.Replicate` | 100% |
+| channel interference | `F.HasChannelInterference` | 100% |
+| peptide-quant usage | `EG.UsedForPeptideQuantity` | 100% |
+
+**Do it as ONE pass.** Each payload alone would cost the same 464 GB scan, and three of them are
+already required: `frg_excluded` gates Phase 2's aggregates (§5), `R_Condition` is the only per-run
+experimental-design metadata anywhere in the corpus (all nine design columns are 0/19,874), and
+`F.NormalizedPeakArea` decides whether `frg_norm_area` is a bug or a column to drop.
+
+**Fold in the RunSummaries re-export** (§3.2): `irt_calibration_source` is capped at 40.7% only
+because many archived exports omit `RunSummaries/`. Re-exporting from the `.sne` files is the one way
+to raise it, and it touches the same archive.
+
+Not started; needs to be scheduled deliberately, not run alongside other jobs.
+
 ### 3.2 `irt_calibration_source` is CLOSED at 40.7% — it is a data limit, not an unfinished job
 
 Measured 2026-08-04, because the 40.7% looked like a half-run backfill and is not:
