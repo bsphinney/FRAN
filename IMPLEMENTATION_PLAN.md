@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29
 **Inputs:** `STORAGE_DESIGN.md` (2026-07-29), `LANCE_PRIORS_AND_XIC_SPEC.md` (2026-07-28, partly superseded).
-**Status:** plan, nothing built yet.
+**Status (2026-08-03, measured):** Phase 0 DONE. Phase 1 gate PASSED; step 3 partial. Phase 2 and 3 open. Verify against the DB before trusting any claim below -- several were stale.
 
 `STORAGE_DESIGN.md` says up front: *"What I did not inspect: the Postgres schema."* I inspected it —
 live, against PG Farm — plus the Lance writers in `ingest/`. The design's **reasoning holds
@@ -37,7 +37,7 @@ There is a `raw_files` table, 19,874 rows, 41 columns, keyed on `raw_path`:
 | `lc_method` | column exists | **0 rows** |
 | `column_id`, `column_age_injections` | — | **absent** |
 | `library_type` | — | **absent** |
-| `irt_calibration_source` | — | **absent** |
+| `irt_calibration_source` | RunSummaries | **40.7% (8,091/19,874), measured 2026-08-03** |
 
 **The dominant term in RT comparability — gradient — is 98.7% populated today.** The doc's own
 example query (`instrument='timsTOF HT' AND gradient_min BETWEEN 18 AND 22`) is answerable right now
