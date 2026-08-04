@@ -153,7 +153,11 @@ def main():
             """INSERT INTO delimp_spectrum_lane_runs (lance_path, run, raw_path, n_precursors, search_id)
                VALUES %s
                ON CONFLICT (lance_path, run) DO UPDATE SET
-                 raw_path=EXCLUDED.raw_path, n_precursors=EXCLUDED.n_precursors,
+                 -- COALESCE, never a bare assignment: the Lance `raw_path` column is NULL in every
+                 -- dataset, so re-running this used to overwrite a resolved path back to NULL and
+                 -- silently undo backfill_lane_run_raw_path.py. Keep what we already resolved.
+                 raw_path=COALESCE(EXCLUDED.raw_path, delimp_spectrum_lane_runs.raw_path),
+                 n_precursors=EXCLUDED.n_precursors,
                  search_id=EXCLUDED.search_id, indexed_at=now()""",
             [(path, r, rp, n, str(sid) if sid else None) for r, rp, n in pairs], page_size=500)
         conn.commit()  # §8.1: checkpoint per dataset, so a wall-clock kill keeps everything so far
@@ -164,8 +168,25 @@ def main():
             print(f"  [{i:,}/{len(todo):,}] {n_ds:,} datasets, {n_pairs:,} (dataset,run) pairs, "
                   f"{el/60:.1f} min, {rate:.1f} ds/s, eta {((len(todo)-i)/rate)/60 if rate else 0:.0f} min")
 
+    # Resolve raw_path for anything still NULL. Lance carries `run` (a basename) and no path, and a
+    # basename alone is ambiguous -- 4,534 of them appear at more than one path. The PAIR
+    # (search_id, run) is not: measured 13,639 pairs, zero resolving to more than one raw_path.
+    # Without this the bridge can only be joined to raw_files by name, which fans out ~1.8x and
+    # silently multiplies any COUNT(*). See ingest/backfill_lane_run_raw_path.py for the standalone
+    # version and the full rationale.
+    cur.execute("""
+        UPDATE delimp_spectrum_lane_runs lr
+        SET raw_path = rf.raw_path
+        FROM search_raw_files srf
+        JOIN raw_files rf ON rf.raw_path = srf.raw_path
+        WHERE srf.search_id = lr.search_id
+          AND rf.raw_basename = lr.run
+          AND lr.raw_path IS NULL""")
+    print(f"resolved raw_path for {cur.rowcount:,} rows from (search_id, run)")
+    conn.commit()
+
     import versions as V
-    V.record_run(cur, "lane_run_index", "1.0.0", notes=f"{n_ds} datasets, {n_pairs} pairs")
+    V.record_run(cur, "lane_run_index", "1.1.0", notes=f"{n_ds} datasets, {n_pairs} pairs")
     conn.commit()
 
     cur.execute("SELECT count(*), count(DISTINCT run), count(DISTINCT lance_path) FROM delimp_spectrum_lane_runs")
