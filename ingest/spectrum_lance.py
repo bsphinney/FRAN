@@ -44,6 +44,15 @@ SCHEMA = pa.schema([
     ("frg_mz", _lf), ("frg_type", _ls), ("frg_num", _li), ("frg_ion", _ls), ("frg_charge", _li),
     ("frg_loss", _ls), ("frg_peak_area", _lf), ("frg_norm_area", _lf),
     ("frg_measured_relint", _lf), ("frg_predicted_relint", _lf), ("frg_mass_acc_ppm", _lf),
+    # Added 2026-08-10 (writer 1.2.0). APPENDED, never inserted: verify() reconstructs an older
+    # dataset's write-time schema by filtering SCHEMA to the fields that dataset actually has, which
+    # is only correct while new fields go on the END and existing ones are untouched.
+    #
+    # frg_excluded is Spectronaut's own per-fragment verdict on whether the fragment was used for
+    # quantification (31-48% True). Phase 2's fragment aggregates are WRONG without it — they would
+    # average intensities Spectronaut itself discarded.
+    ("frg_excluded", pa.list_(pa.bool_())),
+    ("frg_chan_interference", pa.list_(pa.bool_())),
 ])
 
 REGISTRY_DDL = """
@@ -123,7 +132,17 @@ def ensure_registry(conn):
 
 def verify(lance_path, expected_md5) -> bool:
     """Re-read a Lance dataset and confirm its content md5 matches the registry (loss/corruption
-    check). Returns True iff intact."""
+    check). Returns True iff intact.
+
+    Casts to the schema THIS dataset was written with, not the current global SCHEMA: a dataset
+    written before a field was appended has fewer columns, and casting it to today's SCHEMA raises
+    — which would turn every pre-existing dataset from "intact" into "unverifiable" the moment a
+    column is added. Filtering SCHEMA down to the fields actually present reproduces the original
+    write-time schema exactly, so the stored md5 still matches. Only valid because new fields are
+    APPENDED and existing ones never change type or order."""
     import lance
-    tbl = lance.dataset(lance_path).to_table().cast(SCHEMA)
+    ds = lance.dataset(lance_path)
+    have = set(ds.schema.names)
+    sub = pa.schema([f for f in SCHEMA if f.name in have])
+    tbl = ds.to_table().cast(sub)
     return content_md5(tbl) == expected_md5

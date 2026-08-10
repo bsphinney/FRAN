@@ -45,7 +45,7 @@ SCHEMA_VERSION = "1.0.0"
 # Semver. Bump patch for fixes that cannot change output, minor for output-affecting changes, major
 # for a format change that makes old artefacts unreadable.
 CORPUS_INGEST_VERSION = "1.1.0"          # 1.1.0: raw_metadata restored; instrument block no longer silently NULL
-SPECTRUM_LANE_WRITER_VERSION = "1.1.0"   # 1.1.0: content_md5 combine_chunks fix (2026-07-27)
+SPECTRUM_LANE_WRITER_VERSION = "1.2.0"   # 1.2.0: frg_excluded + frg_chan_interference appended   # 1.1.0: content_md5 combine_chunks fix (2026-07-27)
 XIC_LANE_WRITER_VERSION = "1.0.0"        # Spectronaut All-XIC -> Lance
 XIC_TRACE_LANE_WRITER_VERSION = "0.2.0"  # pilot; still the [9,32] layout, pre-corpus-scale
 RAW_METADATA_VERSION = "1.0.0"           # Bruker analysis.tdf + Thermo TRFP readers

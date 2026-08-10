@@ -43,6 +43,10 @@ FRAG_MAP = {
     "frg_norm_area": ["F.NormalizedPeakArea"], "frg_measured_relint": ["F.MeasuredRelativeIntensity"],
     "frg_predicted_relint": ["F.PredictedRelativeIntensity"],
     "frg_mass_acc_ppm": ["F.CalibratedMassAccuracy (PPM)", "F.CalibratedMassAccuracy_(PPM)"],
+    # _resolve() normalises punctuation, so the dotted spelling here matches the underscored
+    # F_ExcludedFromQuantification the parquets actually use.
+    "frg_excluded": ["F.ExcludedFromQuantification"],
+    "frg_chan_interference": ["F.HasChannelInterference"],
 }
 PREC_MAP = {
     "run": ["R.FileName", "R.Raw File Name"], "stripped_seq": ["PEP.StrippedSequence"],
@@ -72,8 +76,22 @@ _NUM = {"charge", "q_value", "frg_mz", "frg_num", "frg_charge", "frg_peak_area",
         "global_q_value", "pg_q_value", "signal_to_noise", "int_corr_score", "missed_cleavages"}
 _FRAG_LIST = ["frg_mz", "frg_type", "frg_num", "frg_ion", "frg_charge", "frg_loss",
               "frg_peak_area", "frg_norm_area", "frg_measured_relint", "frg_predicted_relint",
-              "frg_mass_acc_ppm"]
+              "frg_mass_acc_ppm", "frg_excluded", "frg_chan_interference"]
 _KEYS = ["run", "modified_seq", "charge"]
+
+
+def _bool(v):
+    """Spectronaut booleans arrive as the strings 'True'/'False'. NULL must stay NULL: for
+    frg_excluded, False means "Spectronaut kept this fragment", so coercing unknown to False would
+    assert something the data never said."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("true", "1", "1.0", "yes"):
+        return True
+    if s in ("false", "0", "0.0", "no"):
+        return False
+    return None
 
 
 def _safe(n): return re.sub(r"[^A-Za-z0-9._-]+", "_", n or "search")
@@ -214,6 +232,11 @@ def _assemble_table(fdf, pdf):
         "frg_measured_relint": pa.array(flist("frg_measured_relint", float), sln.SCHEMA.field("frg_measured_relint").type),
         "frg_predicted_relint": pa.array(flist("frg_predicted_relint", float), sln.SCHEMA.field("frg_predicted_relint").type),
         "frg_mass_acc_ppm": pa.array(flist("frg_mass_acc_ppm", float), sln.SCHEMA.field("frg_mass_acc_ppm").type),
+        # Spectronaut writes these as the strings "True"/"False"; _bool keeps NULL as NULL rather
+        # than silently collapsing an unknown verdict to False, which would look like "was used".
+        "frg_excluded": pa.array(flist("frg_excluded", _bool), sln.SCHEMA.field("frg_excluded").type),
+        "frg_chan_interference": pa.array(flist("frg_chan_interference", _bool),
+                                          sln.SCHEMA.field("frg_chan_interference").type),
     }
     tbl = pa.table({k: cols[k] for k in sln.SCHEMA.names}).cast(sln.SCHEMA)
     n_frag = int(sum(len(x) for x in flist("frg_mz", float) if x))
@@ -299,12 +322,37 @@ def main():
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--no-resume", action="store_true", help="reprocess every report even if its Lance dataset already exists")
+    ap.add_argument("--upgrade", action="store_true",
+                    help="re-parse datasets written by an OLDER writer, skip ones already at the "
+                         "current SPECTRUM_LANE_WRITER_VERSION. Resumable across job restarts, "
+                         "unlike --no-resume which starts from zero every time.")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     resume = not a.no_resume
     reports = ([a.report] if a.report else []) + (list(_find_reports(a.scan)) if a.scan else [])
     if not reports:
         sys.exit("give a report path or --scan <dir>")
+    # --upgrade: skip what is ALREADY at the current writer version, re-parse everything else.
+    # A full re-parse is a many-hour job, and --no-resume restarts from zero if the wall clock
+    # kills it; keying on the registry's writer_version instead makes it resumable, because every
+    # dataset is stamped as it completes. Consulted BEFORE the expensive parse.
+    if a.upgrade:
+        from versions import SPECTRUM_LANE_WRITER_VERSION as WV
+        resume = False                       # the version check replaces the exists-on-disk check
+        try:
+            c2 = _pg_conn(); cu = c2.cursor()
+            cu.execute("SELECT lance_path FROM delimp_spectrum_lane WHERE writer_version = %s", (WV,))
+            current = {r[0] for r in cu.fetchall()}
+            c2.close()
+        except Exception as e:                                    # noqa: BLE001
+            sys.exit(f"--upgrade needs the registry to decide what to skip: {type(e).__name__}: {e}")
+        before = len(reports)
+        reports = [p for p in reports
+                   if os.path.join(a.out_dir, f"{_safe(_strip_ts(report_name(p)))}.lance")
+                   not in current]
+        print(f"--upgrade: {len(current):,} datasets already at writer {WV}; "
+              f"{before - len(reports):,} reports skipped, {len(reports):,} to re-parse")
+
     if a.limit:
         reports = reports[:a.limit]
     if not a.dry_run:
