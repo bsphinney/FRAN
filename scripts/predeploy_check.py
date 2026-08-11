@@ -331,6 +331,36 @@ print(f"  [3c] SQL bodies scanned for stray '%': {n_pct}")
 
 
 # ============================================================================
+# 3d. COLUMN-LESS INSERT in the ingest writers.
+#
+# `INSERT INTO t VALUES (...)` with no column list binds POSITIONALLY. Postgres accepts fewer values
+# than columns and fills the rest with defaults, so the statement keeps working after the table grows
+# -- silently writing NULL into every new column. That is exactly how delimp_precursor_xic ended up
+# with is_consensus / n_runs_averaged / modified_seq / trace_rt_basis unset for a whole ingest, and
+# it is invisible until a consumer trusts the missing field.
+#
+# Scans ingest/ (not app/, which is read-only) for INSERTs that name no columns.
+_INS_RE = re.compile(r'INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+VALUES', re.I)
+
+n_ins = 0
+for f in sorted((ROOT / "ingest").rglob("*.py")):
+    if "__pycache__" in f.parts:
+        continue
+    try:
+        text = f.read_text()
+    except Exception:  # noqa: BLE001
+        continue
+    for i, line in enumerate(text.splitlines(), 1):
+        m = _INS_RE.search(line)
+        if m:
+            n_ins += 1
+            block(f"[3d insert] {f.relative_to(ROOT)}:{i} INSERT INTO {m.group(1)} with no column "
+                  f"list -- binds positionally and silently NULLs any column added later. "
+                  f"Name the columns explicitly.")
+print(f"  [3d] column-less INSERTs in ingest/: {n_ins}")
+
+
+# ============================================================================
 # 4. TEMPLATE PLACEHOLDERS (advisory only).
 #    The BLOCKING version of this check lives in step 5: it scans the RENDERED page
 #    for leftover __X__ tokens, which is behavioural and immune to how main.py spells

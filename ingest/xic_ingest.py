@@ -411,7 +411,15 @@ def main():
     # precursor_id, stripped_seq, charge, precursor_mz, raw_path, search_id, rt_apex, ms1_apex, ms1, fragments, n_fragments_total
     meas = [(r["precursor_id"], r["stripped_seq"], r["charge"], r["precursor_mz"], r["raw_path"],
              r["search_id"], engine, engine_version, r["rt_apex"], r["ms1_apex"], json.dumps(r["ms1"]),
-             json.dumps(r["fragments"]), r["n_fragments_total"]) for r in recs]
+             json.dumps(r["fragments"]), r["n_fragments_total"],
+                 # These four are DERIVED AT WRITE TIME and must never be left to a later
+                 # backfill: an engine-side consumer joined this table on stripped_seq, extracted at
+                 # rt_apex, and got a 388 s error precisely because none of them existed. The INSERT
+                 # below now names its columns -- it used to be positional with no column list, which
+                 # silently left every new column NULL the moment the table grew.
+                 True, r.get("n_runs_averaged"),
+                 re.sub(r"[0-9]+$", "", str(r["precursor_id"])), "relative_to_apex")
+            for r in recs]
     # QUANT overlay rows: search_id, precursor_id, stripped_seq, charge, quant_labels
     quant = [(r["search_id"], r["precursor_id"], r["stripped_seq"], r["charge"],
               json.dumps(r["quant_labels"])) for r in recs]
@@ -426,16 +434,24 @@ def main():
             con.execute(ddl)
         # upsert measurement: keep the higher-MS1-apex representative (dedup across searches/DBs)
         con.executemany(
-            """INSERT INTO delimp_precursor_xic VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """INSERT INTO delimp_precursor_xic
+               (precursor_id, stripped_seq, charge, precursor_mz, raw_path, search_id, engine,
+                engine_version, rt_apex, ms1_apex, ms1, fragments, n_fragments_total,
+                is_consensus, n_runs_averaged, modified_seq, trace_rt_basis)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT (precursor_id) DO UPDATE SET
                  stripped_seq=excluded.stripped_seq, charge=excluded.charge, precursor_mz=excluded.precursor_mz,
                  raw_path=excluded.raw_path, search_id=excluded.search_id, engine=excluded.engine,
                  engine_version=excluded.engine_version, rt_apex=excluded.rt_apex,
                  ms1_apex=excluded.ms1_apex, ms1=excluded.ms1, fragments=excluded.fragments,
-                 n_fragments_total=excluded.n_fragments_total
+                 n_fragments_total=excluded.n_fragments_total,
+                 is_consensus=excluded.is_consensus,
+                 n_runs_averaged=excluded.n_runs_averaged,
+                 modified_seq=excluded.modified_seq,
+                 trace_rt_basis=excluded.trace_rt_basis
                WHERE excluded.ms1_apex > delimp_precursor_xic.ms1_apex""", meas)
         con.execute("DELETE FROM delimp_xic_quant WHERE search_id = ?", [a.search_id])
-        con.executemany("INSERT INTO delimp_xic_quant VALUES (?,?,?,?,?)", quant)
+        con.executemany("INSERT INTO delimp_xic_quant (search_id, precursor_id, stripped_seq, charge, quant_labels) VALUES (?,?,?,?,?)", quant)
         con.execute("DELETE FROM delimp_search_sources WHERE search_id = ?", [a.search_id])
         con.executemany(
             "INSERT INTO delimp_search_sources (search_id,file_role,path,host,bytes,extracted,available_features) "
@@ -458,16 +474,24 @@ def main():
         for ddl in (DDL, QUANT_DDL, SOURCES_DDL):
             cur.execute(ddl.replace("JSON", "JSONB").replace("DOUBLE", "DOUBLE PRECISION"))
         psycopg2.extras.execute_values(cur,
-            """INSERT INTO delimp_precursor_xic VALUES %s
+            """INSERT INTO delimp_precursor_xic
+               (precursor_id, stripped_seq, charge, precursor_mz, raw_path, search_id, engine,
+                engine_version, rt_apex, ms1_apex, ms1, fragments, n_fragments_total,
+                is_consensus, n_runs_averaged, modified_seq, trace_rt_basis)
+               VALUES %s
                ON CONFLICT (precursor_id) DO UPDATE SET
                  stripped_seq=excluded.stripped_seq, charge=excluded.charge, precursor_mz=excluded.precursor_mz,
                  raw_path=excluded.raw_path, search_id=excluded.search_id, engine=excluded.engine,
                  engine_version=excluded.engine_version, rt_apex=excluded.rt_apex,
                  ms1_apex=excluded.ms1_apex, ms1=excluded.ms1, fragments=excluded.fragments,
-                 n_fragments_total=excluded.n_fragments_total
+                 n_fragments_total=excluded.n_fragments_total,
+                 is_consensus=excluded.is_consensus,
+                 n_runs_averaged=excluded.n_runs_averaged,
+                 modified_seq=excluded.modified_seq,
+                 trace_rt_basis=excluded.trace_rt_basis
                WHERE excluded.ms1_apex > delimp_precursor_xic.ms1_apex""", meas, page_size=500)
         cur.execute("DELETE FROM delimp_xic_quant WHERE search_id = %s", (a.search_id,))
-        psycopg2.extras.execute_values(cur, "INSERT INTO delimp_xic_quant VALUES %s", quant, page_size=500)
+        psycopg2.extras.execute_values(cur, "INSERT INTO delimp_xic_quant (search_id, precursor_id, stripped_seq, charge, quant_labels) VALUES %s", quant, page_size=500)
         cur.execute("DELETE FROM delimp_search_sources WHERE search_id = %s", (a.search_id,))
         psycopg2.extras.execute_values(cur,
             "INSERT INTO delimp_search_sources (search_id,file_role,path,host,bytes,extracted,available_features) VALUES %s",
