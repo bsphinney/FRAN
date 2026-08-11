@@ -116,7 +116,15 @@ def register(conn, search_id, search_name, lance_path, n_prec, n_frag, md5, vers
                       lance_version, writer_version, updated_at)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
                    ON CONFLICT (lance_path) DO UPDATE SET
-                     search_id=EXCLUDED.search_id, search_name=EXCLUDED.search_name,
+                     -- COALESCE, never a bare assignment. A re-parse re-resolves search_id by name,
+                     -- and when that lookup fails it passes NULL -- which under a bare assignment
+                     -- OVERWRITES a link that was established earlier by a richer mechanism. The
+                     -- 2026-08-10 re-parse did exactly that: the lane's link rate fell 92.8% -> 55.1%
+                     -- before this fix, and 577 datasets had to be restored from
+                     -- delimp_spectrum_lane_runs. Same bug class as build_lane_run_index.py's
+                     -- raw_path clobber. A fresh NULL means "could not resolve", never "unlink".
+                     search_id=COALESCE(EXCLUDED.search_id, delimp_spectrum_lane.search_id),
+                     search_name=EXCLUDED.search_name,
                      n_precursors=EXCLUDED.n_precursors, n_fragments=EXCLUDED.n_fragments,
                      content_md5=EXCLUDED.content_md5, lance_version=EXCLUDED.lance_version,
                      writer_version=EXCLUDED.writer_version,
