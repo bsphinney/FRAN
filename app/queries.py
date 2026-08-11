@@ -2892,7 +2892,8 @@ def peptide_search_library(stripped_seq: str, charge: int | None = None) -> dict
     seq = (stripped_seq or "").strip().upper()
     try:
         rows = query(
-            "SELECT charge, engine, engine_version, ms1_apex, fragments FROM delimp_precursor_xic WHERE stripped_seq = %s",
+            "SELECT charge, engine, engine_version, ms1_apex, fragments FROM delimp_precursor_xic "
+            "WHERE stripped_seq = %s AND trace_rt_basis IS DISTINCT FROM 'absolute'",
             (seq,), tables=["delimp_precursor_xic"], timeout_ms=6000,
         )
     except Exception:  # noqa: BLE001 - not ingested yet / unindexed scan timed out
@@ -2930,7 +2931,14 @@ def peptide_interference(stripped_seq: str, mz_tol: float = 0.01,
     seq = (stripped_seq or "").strip().upper()
     try:
         meas = query(
-            "SELECT precursor_id, charge, rt_apex, fragments FROM delimp_precursor_xic WHERE stripped_seq = %s",
+            # trace_rt_basis IS DISTINCT FROM 'absolute': the per-run rows added 2026-08-11 carry
+            # ABSOLUTE retention times, while every consensus row's trace rt is RELATIVE to its apex
+            # ([-0.5,+0.5]). Rendering both on one axis would be meaningless, and 6,038 peptides now
+            # have both. The site shows the consensus lane, as it always has; the per-run rows exist
+            # for engine-side trace validation. IS DISTINCT FROM (not <>) so a NULL basis from a
+            # future ingest is treated as the legacy relative convention rather than dropped.
+            "SELECT precursor_id, charge, rt_apex, fragments FROM delimp_precursor_xic "
+            "WHERE stripped_seq = %s AND trace_rt_basis IS DISTINCT FROM 'absolute'",
             (seq,), tables=["delimp_precursor_xic"], timeout_ms=6000,
         )
     except Exception:  # noqa: BLE001 - no XIC ingested yet / unindexed scan timed out
@@ -3133,7 +3141,9 @@ def peptide_xic(stripped_seq: str, top_n: int = 6) -> dict[str, Any]:
         meas = query(
             """SELECT precursor_id, charge, raw_path, rt_apex, ms1_apex, ms1, fragments,
                       engine, engine_version
-               FROM delimp_precursor_xic WHERE stripped_seq = %s ORDER BY charge""",
+               FROM delimp_precursor_xic
+               WHERE stripped_seq = %s AND trace_rt_basis IS DISTINCT FROM 'absolute'
+               ORDER BY charge""",
             (seq,), tables=["delimp_precursor_xic"], timeout_ms=6000,
         )
     except Exception:  # noqa: BLE001 - table not created until first XIC ingest / unindexed scan timed out
