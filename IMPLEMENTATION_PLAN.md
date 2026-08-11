@@ -669,6 +669,50 @@ to raise it, and it touches the same archive.
 
 Not started; needs to be scheduled deliberately, not run alongside other jobs.
 
+
+### 5.1b The fragment re-parse is DONE (2026-08-10) — Phase 2 is unblocked
+
+Job 20298763, 9h18m, exit 0. **1,927 reports -> 1,538 datasets at writer 1.2.0**, 353M precursors /
+2.09 billion fragments.
+
+Validated on 40 RANDOMLY SAMPLED datasets (not the 3 used during development):
+
+| | |
+|---|---|
+| datasets carrying `frg_excluded` | **40/40** |
+| `frg_excluded` True | **37.3%** (26,017 of 69,678) — inside Spectronaut's expected 31-48% |
+| `frg_norm_area` populated | **70.0%** — was 100% NULL |
+
+`frg_norm_area` needed no code change: `FRAG_MAP` always mapped it and `_resolve` always matched the
+underscored `F_NormalizedPeakArea`. The datasets were simply written before that mapping existed.
+
+**Phase 2 can now filter on `delimp_spectrum_lane.writer_version = '1.2.0'`** to select datasets that
+carry the exclusion verdict. Do that rather than assuming corpus-wide coverage — see below.
+
+**Three things that are NOT covered, and will stay that way:**
+
+1. **15 datasets remain at the old writer** (194,729 precursors, 0.055% of the corpus). Their source
+   reports live outside `FRAN_reports` — in `FRAN_SNE_export/`, `mt1test/` and `sn21/` — so the
+   `--upgrade` scan never saw them. Mostly method-test data (MT1/MT2/MT3, Experiment1). Re-scanning
+   the parent `Data/` directory to catch them would sweep in reports that were never part of the
+   corpus, which is a worse trade than leaving 0.055% behind.
+2. **55 report parquets are unreadable** — 49 zero-byte, 6 with corrupt footers. An archive problem,
+   not a code one, and worth a separate look: a zero-byte report means that search's evidence is gone.
+3. **The Azure blob copy is now STALE relative to Hive.** The site reads the blob and selects an
+   explicit column list, so nothing is broken today — but blob and Hive have diverged, and anything
+   reading `frg_excluded` through the website will not find it until the lane is re-uploaded.
+
+**Operational lesson, the expensive one.** `register()` upserted `search_id=EXCLUDED.search_id`, so
+every dataset whose name failed to re-resolve had its link OVERWRITTEN with NULL: the lane's link
+rate fell 92.8% -> 55.1%, 577 datasets silently unlinked. Same bug class as
+`build_lane_run_index.py`'s `raw_path` clobber four days earlier. **Any UPSERT that re-derives a
+field must COALESCE, because a fresh NULL means "could not resolve", never "unlink".**
+
+And the check that missed it was circular: it asked whether the registration query could match the
+NULL rows, using the registration query. Verify against an INDEPENDENT source --
+`delimp_spectrum_lane_runs` carried the same fact derived a different way, and showed 577 recoverable
+with 0 ambiguous.
+
 ### 3.2 `irt_calibration_source` is CLOSED at 40.7% — it is a data limit, not an unfinished job
 
 Measured 2026-08-04, because the 40.7% looked like a half-run backfill and is not:
