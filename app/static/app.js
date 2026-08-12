@@ -138,9 +138,49 @@ async function renderDashboard(){
               <div class="text-slate-400">Across species, tissues and sample types — including inferred tissue for human runs, with the evidence behind each call.</div>
             </div>
           </div>
+          <div class="mt-4 rounded-lg border border-plum/30 bg-plum/5 p-3">
+            <div class="font-semibold text-plum text-[13px] mb-1">Built from the ground up for AI training</div>
+            <p class="text-[12px] text-slate-300 leading-relaxed">
+              The corpus is not a website with a database behind it — the measurements live in
+              <b class="text-white">Lance</b>, the columnar Arrow format ML pipelines actually train from,
+              with the relational layer kept for browsing and provenance. Today that is
+              <b class="text-white">${fmt(353544132)}</b> precursors and
+              <b class="text-white">${fmt(2095825477)}</b> fragments across 1,553 datasets.
+            </p>
+            <ul class="text-[11px] text-slate-400 mt-2 space-y-1 list-disc pl-4 leading-relaxed">
+              <li><b class="text-slate-200">Shaped for a DataLoader.</b> One row per precursor, with the whole
+                  observed MS2 spectrum and MS1 isotope envelope as parallel list columns — a training example
+                  is one indexed row, not a join.</li>
+              <li><b class="text-slate-200">Measured, with the prediction beside it.</b> Every fragment carries its
+                  real relative intensity <em>and</em> the search engine's predicted one, plus mass accuracy —
+                  a supervised pair, not a library lookup.</li>
+              <li><b class="text-slate-200">The engine's own verdicts are kept, not discarded.</b> Whether each
+                  fragment was used for quantification, whether it showed interference, decoy status,
+                  proteotypicity — so a model can learn from what was rejected as well as what was kept.</li>
+              <li><b class="text-slate-200">Reproducible by construction.</b> Every dataset is content-checksummed
+                  and stamped with the version of the code that wrote it, so a training set can be regenerated
+                  exactly and a stale one is detectable rather than silent.</li>
+              <li><b class="text-slate-200">Leakage is designed against.</b> Observations are keyed to their run,
+                  so whole acquisitions can be held out rather than random rows; and inferred values are stored
+                  separately from curated ones and never overwrite them.</li>
+            </ul>
+          </div>
+          <!-- The origin story, in the core director's words. It is the honest answer to "why does
+               this exist", and it explains the corpus's real advantage: it was never assembled for a
+               study, so it is not selected for one. -->
+          <blockquote class="mt-4 border-l-2 border-accent-500/40 pl-3 text-[12px] text-slate-300 italic leading-relaxed">
+            "I never delete anything — so what else was I going to do with all these Spectronaut and
+            DIA-NN searches?"
+            <span class="not-italic text-slate-500">— Brett Phinney, UC Davis Proteomics Core</span>
+          </blockquote>
           <p class="text-[11px] text-slate-500 mt-3">
-            Built from the UC Davis Proteomics Core's own searches. Read-only, and everything shown is
-            traceable to the runs it came from — inferred values are always labelled as inferred.
+            That is not a joke about hoarding, it is the point: <b class="text-slate-300">1,892 Spectronaut</b>
+            and <b class="text-slate-300">71 DIA-NN</b> searches spanning
+            <b class="text-slate-300">October 2018 to June 2026</b>, kept because a core facility keeps
+            everything. Nothing here was collected to prove a hypothesis, so nothing here is selected for
+            one — which is exactly what makes it usable as a reference and as training data.
+            Read-only, and everything shown is traceable to the runs it came from; inferred values are
+            always labelled as inferred.
           </p>
         </div>
       </div>
