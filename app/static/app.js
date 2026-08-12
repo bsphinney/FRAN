@@ -148,23 +148,6 @@ async function renderDashboard(){
               <b class="text-white"><span id="cfFrag">…</span></b> fragments across
               <span id="cfDs">…</span> datasets.
             </p>
-            <ul class="text-[11px] text-slate-400 mt-2 space-y-1 list-disc pl-4 leading-relaxed">
-              <li><b class="text-slate-200">Shaped for a DataLoader.</b> One row per precursor, with the whole
-                  observed MS2 spectrum and MS1 isotope envelope as parallel list columns — a training example
-                  is one indexed row, not a join.</li>
-              <li><b class="text-slate-200">Measured, with the prediction beside it.</b> Every fragment carries its
-                  real relative intensity <em>and</em> the search engine's predicted one, plus mass accuracy —
-                  a supervised pair, not a library lookup.</li>
-              <li><b class="text-slate-200">The engine's own verdicts are kept, not discarded.</b> Whether each
-                  fragment was used for quantification, whether it showed interference, decoy status,
-                  proteotypicity — so a model can learn from what was rejected as well as what was kept.</li>
-              <li><b class="text-slate-200">Reproducible by construction.</b> Every dataset is content-checksummed
-                  and stamped with the version of the code that wrote it, so a training set can be regenerated
-                  exactly and a stale one is detectable rather than silent.</li>
-              <li><b class="text-slate-200">Leakage is designed against.</b> Observations are keyed to their run,
-                  so whole acquisitions can be held out rather than random rows; and inferred values are stored
-                  separately from curated ones and never overwrite them.</li>
-            </ul>
           </div>
           <!-- The origin story, in the core director's words. It is the honest answer to "why does
                this exist", and it explains the corpus's real advantage: it was never assembled for a
