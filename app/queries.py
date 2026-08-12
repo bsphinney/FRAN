@@ -510,7 +510,38 @@ def species_detail(name: str) -> dict[str, Any]:
                         (name,), tables=["delimp_sample_metadata"], fetch="val")
         except Exception:  # noqa: BLE001
             tax = None
+        # MEASURED coverage: resolve every observed symbol through HGNC (approved + alias +
+        # previous) and count DISTINCT approved protein-coding genes. Without this the numerator is
+        # "distinct strings we saw" — for human ~25,200 against a 19,297-gene proteome, because 31%
+        # of those symbols are non-coding, pseudogene, IG/TCR variable, contaminant or non-human,
+        # and obsolete spellings of one gene counted as several. Species with no reference loaded
+        # keep the estimate.
+        covered = None
+        if tax:
+            try:
+                covered = query(
+                    """WITH obs AS (
+                         SELECT DISTINCT upper(btrim(g)) AS sym
+                         FROM delimp_mv_species_proteins, unnest(string_to_array(gene, ';')) g
+                         WHERE organism_name = %s AND gene IS NOT NULL AND btrim(g) <> '')
+                       SELECT COUNT(DISTINCT r.approved_symbol) AS n_covered,
+                              (SELECT COUNT(DISTINCT approved_symbol) FROM delimp_gene_reference
+                                WHERE taxon_id = %s) AS n_reference
+                       FROM obs JOIN delimp_gene_reference r
+                         ON r.taxon_id = %s AND r.symbol_upper = obs.sym""",
+                    (name, tax, tax),
+                    tables=["delimp_mv_species_proteins", "delimp_gene_reference"],
+                    fetch="one", timeout_ms=15000)
+            except Exception:  # noqa: BLE001 — reference absent for this species
+                covered = None
         pct_proteome = _pct_proteome(n_genes, tax)
+        if covered and covered.get("n_covered") and covered.get("n_reference"):
+            nc, nr = int(covered["n_covered"]), int(covered["n_reference"])
+            pct_proteome = {"pct": round(100 * nc / nr), "ref_genes": nr, "measured": True,
+                            "n_covered": nc, "n_observed_symbols": n_genes,
+                            "reviewed": (pct_proteome or {}).get("reviewed"),
+                            "reviewed_isoforms": (pct_proteome or {}).get("reviewed_isoforms"),
+                            "isoform_pct": (pct_proteome or {}).get("isoform_pct")}
         # n_proteins stays the SAMPLE size (it drives the cool-stats), but n_protein_groups is the
         # exact corpus figure -- reporting the cap (a flat 25,000 for human) as a count was the same
         # bug as n_genes.

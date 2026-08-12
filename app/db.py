@@ -92,6 +92,9 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # delimp_sample_metadata, whose ontology columns remain 0% populated.
         "delimp_tissue_prediction",
         "delimp_tissue_marker_panel",
+        # HGNC approved/alias/previous symbols -> approved protein-coding gene. Makes
+        # "% of proteome identified" a real intersection instead of observed-symbols/count.
+        "delimp_gene_reference",
     }
 )
 

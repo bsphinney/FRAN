@@ -104,6 +104,48 @@ function kpi(label, id, sub, accent, link){ return `
 
 async function renderDashboard(){
   view.innerHTML = `
+  <!-- What this is. A visitor landing here sees counts before they see a purpose; this says why
+       the counts matter. The GPMDB comparison is the fastest way to place FRAN for a proteomics
+       audience — same idea (what has actually been observed, across many experiments), different
+       era (DIA rather than DDA). -->
+  <section class="mb-6 fade-in">
+    <div class="glass card p-6 border border-accent-500/20">
+      <div class="flex items-start gap-4 flex-wrap">
+        <div class="text-4xl leading-none select-none">🧬</div>
+        <div class="min-w-0 flex-1">
+          <h2 class="text-lg font-bold text-white mb-1">A searchable record of what DIA proteomics has actually seen</h2>
+          <p class="text-sm text-slate-300 leading-relaxed">
+            FRAN is to <a href="https://gpmdb.thegpm.org" target="_blank" rel="noopener" class="text-accent-400 hover:underline">GPMDB</a>
+            what DIA is to DDA. GPMDB answered "has anyone ever observed this peptide?" for a generation of
+            data-dependent experiments. FRAN answers it for <b class="text-white">data-independent acquisition</b> —
+            and because DIA records every fragment of every precursor in every run, it can answer more:
+            not just <em>whether</em> a peptide was seen, but its
+            <b class="text-white">measured fragment intensities</b>, <b class="text-white">retention time</b>,
+            <b class="text-white">ion mobility</b> and <b class="text-white">chromatographic peak shape</b>,
+            aggregated over every run that ever saw it.
+          </p>
+          <div class="grid sm:grid-cols-3 gap-3 mt-4 text-[12px]">
+            <div class="rounded-lg bg-white/5 p-3">
+              <div class="font-semibold text-teal mb-0.5">Is my peptide detectable?</div>
+              <div class="text-slate-400">See whether it has ever been observed, in how many runs, on which instruments — before you commit an assay to it.</div>
+            </div>
+            <div class="rounded-lg bg-white/5 p-3">
+              <div class="font-semibold text-teal mb-0.5">What should its spectrum look like?</div>
+              <div class="text-slate-400">Real measured fragment patterns and peak shapes from the corpus, not predictions — useful for building and checking targeted methods.</div>
+            </div>
+            <div class="rounded-lg bg-white/5 p-3">
+              <div class="font-semibold text-teal mb-0.5">Where has this protein been found?</div>
+              <div class="text-slate-400">Across species, tissues and sample types — including inferred tissue for human runs, with the evidence behind each call.</div>
+            </div>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-3">
+            Built from the UC Davis Proteomics Core's own searches. Read-only, and everything shown is
+            traceable to the runs it came from — inferred values are always labelled as inferred.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
   <section class="mb-6 fade-in">
     <div class="flex items-end justify-between flex-wrap gap-3">
       <div>
