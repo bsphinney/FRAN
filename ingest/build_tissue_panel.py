@@ -49,6 +49,22 @@ CREATE TABLE IF NOT EXISTS delimp_tissue_marker_panel (
 );
 CREATE INDEX IF NOT EXISTS idx_tmp_gene   ON delimp_tissue_marker_panel (gene_upper);
 CREATE INDEX IF NOT EXISTS idx_tmp_tissue ON delimp_tissue_marker_panel (tissue);
+
+-- THE FULL z MATRIX, not just each protein's argmax tissue. Supplementary Table 5A is 1,717 x 64
+-- z-scores spanning -7.23..+7.88 with 59.3% of cells off-baseline -- that is quantitative evidence
+-- about how strongly each protein marks each tissue, and collapsing it to "which tissue is highest"
+-- throws almost all of it away. A protein at z=7.9 in Brain is far stronger evidence than one at
+-- z=0.4, and the argmax panel treats them identically.
+-- Only positive cells are stored: a negative z means "depleted here", which is not evidence FOR any
+-- tissue and would other add noise to a weighted sum.
+CREATE TABLE IF NOT EXISTS delimp_tissue_marker_z (
+    tissue      text NOT NULL,
+    gene_upper  text NOT NULL,
+    z_score     double precision NOT NULL,
+    source      text NOT NULL,
+    PRIMARY KEY (source, tissue, gene_upper)
+);
+CREATE INDEX IF NOT EXISTS idx_tmz_gene ON delimp_tissue_marker_z (gene_upper);
 """
 
 
@@ -78,6 +94,7 @@ def parse(xlsx):
         except (TypeError, ValueError):
             return None
 
+    zrows = []      # the full matrix (positive cells only)
     out = []
     for r in rows[1:]:
         uniprot, gene = r[0], r[1]
@@ -93,7 +110,10 @@ def parse(xlsx):
         g = str(gene).strip()
         out.append((best_t, g, g.upper(), str(uniprot).strip() if uniprot else None,
                     best_z, runner, SOURCE))
-    return out, tissues
+        for t, z in vals:
+            if z > 0:
+                zrows.append((t, g.upper(), float(z), SOURCE))
+    return out, tissues, zrows
 
 
 def main():
@@ -104,7 +124,7 @@ def main():
     if not os.path.exists(a.xlsx):
         sys.exit(f"no such file: {a.xlsx}")
 
-    rows, tissues = parse(a.xlsx)
+    rows, tissues, zrows = parse(a.xlsx)
     by_t = {}
     for t, *_ in rows:
         by_t[t] = by_t.get(t, 0) + 1
@@ -128,8 +148,14 @@ def main():
         INSERT INTO delimp_tissue_marker_panel
           (tissue, gene, gene_upper, uniprot, z_score, runner_up_z, source)
         VALUES %s ON CONFLICT (source, tissue, gene) DO NOTHING""", rows, page_size=500)
+    cur.execute("DELETE FROM delimp_tissue_marker_z WHERE source = %s", (SOURCE,))
+    psycopg2.extras.execute_values(cur, """
+        INSERT INTO delimp_tissue_marker_z (tissue, gene_upper, z_score, source)
+        VALUES %s ON CONFLICT (source, tissue, gene_upper) DO UPDATE
+          SET z_score = EXCLUDED.z_score""", zrows, page_size=1000)
     conn.commit()
-    print(f"stored {len(rows):,} markers")
+    print(f"stored {len(rows):,} markers and {len(zrows):,} positive z cells "
+          f"({len(zrows)/max(len(rows),1):.1f} tissues per protein on average)")
 
     # Observability is NOT checked here. It needs a gene-level join over delimp_proteins, the
     # service account cannot CREATE TEMP TABLE on this database, and the scorer has to do that join

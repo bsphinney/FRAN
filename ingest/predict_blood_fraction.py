@@ -65,35 +65,42 @@ CREATE INDEX IF NOT EXISTS idx_bloodpred_matrix ON delimp_blood_prediction (pred
     WHERE predicted_matrix IS NOT NULL;
 """
 
+# WHY TWO STATEMENTS. The first version tested every protein row with
+# `EXISTS (SELECT 1 FROM unnest(string_to_array(gene,';')) ...)`, i.e. it unnested and scanned the
+# gene string of every row of delimp_proteins for every marker. That ran past 30 minutes without
+# returning. Marker membership is a property of the PROTEIN GROUP, not of the row, so resolve the
+# groups once (a few thousand, with a regex prefilter that the planner can restrict on) and then
+# join on plain equality. Same answer, seconds instead of tens of minutes.
+RESOLVE_SQL = """
+SELECT DISTINCT protein_group,
+  EXISTS (SELECT 1 FROM unnest(string_to_array(upper(gene), ';')) g
+          WHERE btrim(g) = ANY(%(core)s)) AS is_core,
+  EXISTS (SELECT 1 FROM unnest(string_to_array(upper(gene), ';')) g
+          WHERE btrim(g) = ANY(%(fib)s))  AS is_fib
+FROM delimp_proteins
+WHERE gene IS NOT NULL
+  AND upper(gene) ~ ('(^|;)(' || array_to_string(%(all)s::text[], '|') || ')(;|$)')
+"""
+
 SQL = """
 WITH human_runs AS (
   SELECT DISTINCT rf.raw_basename AS bn, rf.raw_path
   FROM raw_files rf JOIN delimp_sample_metadata m ON m.raw_path = rf.raw_path
   WHERE m.organism_taxon_id = %(human)s
 ),
--- one intensity per (run, protein group): the same group appears once per search, and summing
--- across searches would weight a protein by how many times its run was re-searched.
 pg AS (
-  SELECT hr.bn, p.protein_group, max(upper(p.gene)) AS gene,
+  SELECT hr.bn, p.protein_group,
          max(coalesce(p.normalized_intensity, p.intensity)) AS inten
   FROM delimp_proteins p JOIN human_runs hr ON hr.raw_path = p.raw_path
   WHERE coalesce(p.normalized_intensity, p.intensity) IS NOT NULL
   GROUP BY 1, 2
-),
-tagged AS (
-  SELECT bn, inten,
-         EXISTS (SELECT 1 FROM unnest(string_to_array(gene, ';')) g
-                 WHERE btrim(g) = ANY(%(core)s)) AS is_blood,
-         EXISTS (SELECT 1 FROM unnest(string_to_array(gene, ';')) g
-                 WHERE btrim(g) = ANY(%(fib)s))  AS is_fib
-  FROM pg
 )
 SELECT bn,
-       sum(inten)                                    AS total_int,
-       sum(inten) FILTER (WHERE is_blood)            AS blood_int,
-       sum(inten) FILTER (WHERE is_fib)              AS fib_int,
-       count(*)   FILTER (WHERE is_blood)            AS n_blood
-FROM tagged GROUP BY 1
+       sum(inten)                                              AS total_int,
+       sum(inten) FILTER (WHERE protein_group = ANY(%(cg)s))   AS blood_int,
+       sum(inten) FILTER (WHERE protein_group = ANY(%(fg)s))   AS fib_int,
+       count(*)   FILTER (WHERE protein_group = ANY(%(cg)s))   AS n_blood
+FROM pg GROUP BY 1 HAVING sum(inten) > 0
 """
 
 
@@ -132,8 +139,16 @@ def main():
     cur.execute("SET LOCAL lock_timeout = '10s'")
     cur.execute("SET work_mem = '256MB'")
 
+    print("resolving marker protein groups (once, not per row)...")
+    cur.execute(RESOLVE_SQL, {"core": PLASMA_CORE, "fib": FIBRINOGEN,
+                              "all": PLASMA_CORE + FIBRINOGEN})
+    res = cur.fetchall()
+    core_g = [g for g, c, f in res if c]
+    fib_g = [g for g, c, f in res if f]
+    print(f"  {len(core_g):,} plasma-core groups, {len(fib_g):,} fibrinogen groups")
+
     print("computing blood fraction per human acquisition...")
-    cur.execute(SQL, {"human": HUMAN, "core": PLASMA_CORE, "fib": FIBRINOGEN})
+    cur.execute(SQL, {"human": HUMAN, "cg": core_g, "fg": fib_g})
     rows = cur.fetchall()
     print(f"{len(rows):,} runs with usable intensity")
 

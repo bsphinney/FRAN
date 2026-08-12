@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.16.4"  # 0.16.4: "unique peptides" was a SUM of per-run counts (56x over); now a true distinct count
+APP_VERSION = "0.17.0"  # 0.17.0: inferred tissue map on the human species page (Yue et al. 2026 markers)
 # 0.16.3: protein coverage uses the exact protein_group filter, not a heuristic
 # 0.16.2: species count no longer splits one organism in two on a NULL taxon
 # 0.16.1: predicted-spectrum overlay names the REAL engine, not always DIA-NN

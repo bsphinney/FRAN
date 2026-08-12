@@ -92,6 +92,17 @@ CREATE INDEX IF NOT EXISTS idx_tispred_status ON delimp_tissue_prediction (statu
 # cannot change which tissue wins or the margin between them, only the absolute enrichment scale.
 # So depth uses count(DISTINCT protein_group), which needs no unnest, and the unnest is confined to
 # rows that actually match a panel gene.
+# QUANT-WEIGHTED. The panel is not a list of yes/no markers: Supplementary Table 5A is a
+# 1,717 x 64 z-score matrix (16,298 positive cells, 9.5 tissues per protein). A protein at z=7.9 in
+# Brain is far stronger evidence than one at z=0.4, and the earlier argmax-only version treated them
+# identically -- it discarded almost all the quantitative information the paper provides.
+#
+# So each tissue now gets TWO numbers per run:
+#   * a hypergeometric p on marker COUNTS, which stays the significance gate because it is what
+#     killed the small-panel bias (Cowper's gland, 6 markers, was winning 233 runs on a bare ratio);
+#   * a z-WEIGHTED enrichment, sum of z over detected markers against the sum expected at this run's
+#     own detection rate, which decides the ranking among tissues that pass the gate.
+# Negative z cells are excluded upstream: "depleted here" is not evidence FOR a tissue.
 SCORE_SQL = """
 WITH human_runs AS (
   SELECT DISTINCT rf.raw_basename AS bn, rf.raw_path
@@ -104,25 +115,41 @@ depth AS (
   FROM delimp_proteins p JOIN human_runs hr ON hr.raw_path = p.raw_path
   GROUP BY 1
 ),
-panel AS (
-  SELECT DISTINCT tissue, gene_upper
-  FROM delimp_tissue_marker_panel WHERE source = %(source)s
+zpanel AS (
+  SELECT tissue, gene_upper, z_score
+  FROM delimp_tissue_marker_z WHERE source = %(source)s
+),
+-- resolve marker protein GROUPS once, then join on equality. Testing every protein row with an
+-- EXISTS+unnest is what made an earlier version of this run for tens of minutes.
+mg AS (
+  SELECT DISTINCT p.protein_group, upper(btrim(g)) AS gene_upper
+  FROM delimp_proteins p
+  CROSS JOIN LATERAL unnest(string_to_array(p.gene, ';')) AS g
+  WHERE p.gene IS NOT NULL
+    AND upper(btrim(g)) IN (SELECT DISTINCT gene_upper FROM zpanel)
 ),
 hit_genes AS (
-  SELECT hr.bn, pn.tissue, pn.gene_upper
+  SELECT hr.bn, mg.gene_upper
   FROM delimp_proteins p
   JOIN human_runs hr ON hr.raw_path = p.raw_path
-  CROSS JOIN LATERAL unnest(string_to_array(p.gene, ';')) AS g
-  JOIN panel pn ON pn.gene_upper = upper(btrim(g))
-  WHERE p.gene IS NOT NULL
-  GROUP BY 1, 2, 3
+  JOIN mg ON mg.protein_group = p.protein_group
+  GROUP BY 1, 2
 ),
-hits AS (SELECT bn, tissue, count(*) AS n_hit FROM hit_genes GROUP BY 1, 2),
+hits AS (
+  SELECT h.bn, z.tissue,
+         count(*)      AS n_hit,
+         sum(z.z_score) AS z_hit
+  FROM hit_genes h JOIN zpanel z ON z.gene_upper = h.gene_upper
+  GROUP BY 1, 2
+),
+-- panel totals over markers the corpus can actually detect anywhere
 observable AS (
-  SELECT tissue, count(DISTINCT gene_upper) AS n_panel
-  FROM hit_genes GROUP BY 1 HAVING count(DISTINCT gene_upper) >= %(min_obs)s
+  SELECT z.tissue, count(*) AS n_panel, sum(z.z_score) AS z_panel
+  FROM zpanel z
+  WHERE EXISTS (SELECT 1 FROM hit_genes h WHERE h.gene_upper = z.gene_upper)
+  GROUP BY 1 HAVING count(*) >= %(min_obs)s
 )
-SELECT h.bn, h.tissue, h.n_hit, o.n_panel, d.n_groups
+SELECT h.bn, h.tissue, h.n_hit, o.n_panel, d.n_groups, h.z_hit, o.z_panel
 FROM hits h
 JOIN observable o ON o.tissue = h.tissue
 JOIN depth d ON d.bn = h.bn
@@ -182,22 +209,29 @@ def main():
     import math
     from collections import defaultdict
     per_run = defaultdict(list)
-    for bn, tissue, n_hit, n_panel, n_groups in raw:
-        per_run[bn].append((tissue, n_hit, n_panel, n_groups))
+    for bn, tissue, n_hit, n_panel, n_groups, z_hit, z_panel in raw:
+        per_run[bn].append((tissue, n_hit, n_panel, n_groups, z_hit, z_panel))
 
     out = []
     for bn, cands in per_run.items():
         scored = []
-        for tissue, n_hit, n_panel, n_groups in cands:
+        for tissue, n_hit, n_panel, n_groups, z_hit, z_panel in cands:
             n = min(int(n_groups), universe)
             K = min(int(n_panel), universe)
             k = int(n_hit)
             sf = float(hypergeom.sf(k - 1, universe, K, n))
             logp = -math.log10(max(sf, 1e-300))
+            # z-weighted enrichment: observed z mass vs the z mass expected if this run's markers
+            # were drawn at its own detection rate. Falls back to the count ratio if z is missing.
+            z_exp = (float(z_panel or 0) * n / universe) if z_panel else 0
+            z_enr = (float(z_hit or 0) / z_exp) if z_exp > 0 else None
             exp = K * n / universe
             enr = (k / exp) if exp > 0 else None
-            scored.append((tissue, k, K, n_groups, enr, logp))
-        scored.sort(key=lambda x: -x[5])          # most significant first
+            scored.append((tissue, k, K, n_groups, z_enr if z_enr is not None else enr, logp))
+        # gate on significance, then rank by the QUANT-weighted score among those that pass
+        sig = [x for x in scored if x[5] >= -__import__("math").log10(MAX_PVALUE)]
+        (sig if sig else scored).sort(key=lambda x: -x[4])
+        scored = (sig + [x for x in scored if x not in sig]) if sig else scored
         top = scored[0]
         nxt = scored[1] if len(scored) > 1 else None
         logp_margin = (top[5] - nxt[5]) if nxt else None
