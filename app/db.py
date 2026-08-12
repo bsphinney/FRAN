@@ -87,6 +87,11 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # the gene page rendered "—" for every protein group. Built by
         # ingest/build_protein_peptide_counts.py; top up after each ingest.
         "delimp_protein_peptide_count",
+        # INFERRED sample tissue per human acquisition (marker enrichment vs the Yue et al. 2026
+        # atlas) and blood-matrix calls. Predicted only — never curated, never asserted onto
+        # delimp_sample_metadata, whose ontology columns remain 0% populated.
+        "delimp_tissue_prediction",
+        "delimp_tissue_marker_panel",
     }
 )
 

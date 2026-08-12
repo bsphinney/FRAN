@@ -1665,6 +1665,7 @@ async function renderSpecies(name){
         (d.top_seen||[]).map(p=>[esc(p.gene||'—'),`<span class="font-mono text-accent-400 hover:underline">${esc(p.protein_group)}</span>`,fmt(p.n_runs),fmt(p.n_searches),fmt(p.sum_prec),fmt(p.max_pep)]),
         (d.top_seen||[]).map(p=>`go('protein','${encodeURIComponent(p.protein_group)}')`))}</div>`;
     loadSpeciesWiki(name, cm);
+    loadTissueMap(name);
   }catch(e){
     if(e.status===404){ view.innerHTML=`${crumb([['Dashboard','dashboard'],[name,null]])}`
       +`<div class="glass card p-8 text-center fade-in"><div class="text-4xl mb-2">🔬</div>
@@ -2059,3 +2060,128 @@ api('/api/me').then(applyAuth).catch(()=>{});
 route(); pollHealth(); refreshFooterCounts();
 setInterval(pollHealth, 15000);
 setInterval(refreshFooterCounts, 30000); // watch it populate
+
+
+/* ---------- TISSUE MAP (human only) ----------
+   Sample tissue is INFERRED, never curated: delimp_sample_metadata's ontology block is 0%
+   populated corpus-wide. Calls come from marker-protein enrichment against the Yue et al. 2026
+   human proteome atlas, and every surface here says so — a predicted label rendered as if it were
+   curated is exactly the confusion this corpus already suffers from elsewhere.
+
+   Coordinates are anatomical positions on a schematic figure drawn here (not reproduced from the
+   paper). viewBox 0 0 200 420. */
+const TISSUE_XY = {
+  'Brain':[100,30], 'Spinal cord':[100,70], 'Eye-corneal':[86,26], 'Eye-iris':[114,26],
+  'Eye-crystalline lens':[114,20], 'Eye-sclera':[86,20], 'Nose-turbinate':[100,42],
+  'Nose-sinus':[92,38], 'Nose-olfactory eplithelium':[108,38], 'Salivary gland':[80,52],
+  'Tongue':[100,50], 'Throat':[100,62], 'Tonsil':[112,56], 'Thyroid':[100,74],
+  'Parathyroid gland':[110,76], 'Trachea':[100,84], 'Esophagus':[92,88], 'Epiglottis':[108,66],
+  'Ear-cochlea':[70,34], 'External ear':[62,32], 'Ear-tympanic membrane':[74,30],
+  'Ear-semicircular canal':[68,26], 'Ear-otosteon':[64,38],
+  'Heart':[92,116], 'Lung':[118,112], 'Artery':[78,110], 'Vein':[126,124], 'Lymph vessel':[132,140],
+  'Thymus':[100,100], 'Mammary gland':[76,120], 'Breast':[76,120],
+  'Liver':[80,150], 'Gall bladder':[86,158], 'Stomach':[112,148], 'Spleen':[124,146],
+  'Pancreas':[104,160], 'Kidney':[128,164], 'Adrenal gland':[128,152],
+  'Small intestine':[100,182], 'Large intestine':[116,176], 'Appendix':[84,196],
+  'Omentum':[100,170], 'Bladder':[100,214], 'Ureter':[112,196],
+  'Prostate':[100,226], 'Testis':[92,244], 'Epididymis':[84,246], 'Seminal vesicle':[110,222],
+  'Seminiferous duct':[96,250], "Cowper's gland":[108,232],
+  'Ovary':[84,206], 'Uterus':[100,208], 'Fallopian tube':[116,204], 'Vagina':[100,232],
+  'Bone marrow':[62,180], 'Bone':[54,196], 'Bone union':[48,210], 'Cartilage':[144,196],
+  'Skeletal muscle':[150,250], 'Smooth muscle':[136,236], 'Tendon':[156,300],
+  'Skin':[40,150], 'Fat':[46,168], 'Nerve':[160,214], 'Lymph node':[70,140],
+};
+
+async function loadTissueMap(name){
+  let d; try{ d = await api(`/api/species/${encodeURIComponent(name)}/tissues`); }catch(e){ return; }
+  if(!d || !d.available || !(d.rows||[]).length) return;
+  const rows=d.rows, src=d.source||{};
+  const max=Math.max(...rows.map(r=>r.n_runs));
+  const dots=rows.map(r=>{
+    const xy=TISSUE_XY[r.tissue]; if(!xy) return '';
+    const rad=4+10*Math.sqrt(r.n_runs/max);
+    return `<g class="cursor-pointer" onclick="showTissueRuns('${encodeURIComponent(r.tissue)}')">
+      <circle cx="${xy[0]}" cy="${xy[1]}" r="${rad+4}" fill="#22d3ee" opacity="0.10"><animate attributeName="opacity" values="0.10;0.22;0.10" dur="3s" repeatCount="indefinite"/></circle>
+      <circle cx="${xy[0]}" cy="${xy[1]}" r="${rad}" fill="#22d3ee" opacity="0.85"><title>${esc(r.tissue)} — ${fmt(r.n_runs)} run${r.n_runs===1?'':'s'} (mean ${r.mean_enrichment}x enrichment)</title></circle>
+    </g>`;}).join('');
+  const unplotted=rows.filter(r=>!TISSUE_XY[r.tissue]);
+  const list=rows.map(r=>`<div onclick="showTissueRuns('${encodeURIComponent(r.tissue)}')"
+      class="flex items-center justify-between gap-2 px-2 py-1.5 rounded hover:bg-white/5 cursor-pointer">
+      <span class="text-sm text-white truncate">${esc(r.tissue)}</span>
+      <span class="text-[11px] text-slate-400 shrink-0">${fmt(r.n_runs)} run${r.n_runs===1?'':'s'} · ${r.mean_enrichment}x · ${r.mean_markers_hit}/${r.n_panel} markers</span>
+    </div>`).join('');
+  const html=`
+  <div class="glass card p-5 fade-in mb-5 border border-cyan-500/20" id="tissueCard">
+    <div class="flex items-start justify-between gap-3 flex-wrap mb-1">
+      <h3 class="font-bold text-white">🧭 Tissue map <span class="text-[10px] font-normal text-amber-300 align-middle ml-1 px-1.5 py-0.5 rounded bg-amber-400/10 border border-amber-400/30">INFERRED — not curated</span></h3>
+      <div class="text-[11px] text-slate-500">${fmt(d.n_labelled)} of ${fmt(d.n_scored)} human acquisitions labelled</div>
+    </div>
+    <p class="text-[11px] text-slate-500 mb-3 leading-relaxed">
+      FRAN records no curated tissue — the ontology columns are empty corpus-wide. These calls are inferred
+      from tissue-enriched marker proteins and are shown with the evidence behind each one. A run is only
+      labelled when its top tissue is significant <em>and</em> clearly beats the runner-up; ${fmt(d.n_scored-d.n_labelled)}
+      abstain. Click a tissue for its datasets.
+    </p>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="flex items-center justify-center">
+        <svg viewBox="0 0 200 420" class="w-full max-w-[260px]" role="img" aria-label="schematic human body map of inferred tissues">
+          <g fill="none" stroke="#94a3b8" stroke-width="1.4" opacity="0.45" stroke-linejoin="round">
+            <circle cx="100" cy="32" r="22"/>
+            <path d="M100 54 L100 70"/>
+            <path d="M72 78 Q100 68 128 78 L134 150 Q100 158 66 150 Z"/>
+            <path d="M72 80 L44 108 L36 168"/><path d="M128 80 L156 108 L164 168"/>
+            <path d="M70 150 L64 250 L58 340 L54 396"/><path d="M130 150 L136 250 L142 340 L146 396"/>
+            <path d="M84 152 L82 250"/><path d="M116 152 L118 250"/>
+          </g>
+          ${dots}
+        </svg>
+      </div>
+      <div><div class="max-h-[320px] overflow-auto pr-1 divide-y divide-white/5">${list}</div>
+        ${unplotted.length?`<div class="text-[10px] text-slate-600 mt-2">${unplotted.length} tissue${unplotted.length===1?'':'s'} not placed on the figure (listed above)</div>`:''}
+      </div>
+    </div>
+    <div id="tissueRuns" class="mt-4"></div>
+    <div class="mt-4 pt-3 border-t border-white/5 text-[11px] text-slate-500 leading-relaxed">
+      Marker reference: <a href="${esc(src.url||'#')}" target="_blank" rel="noopener" class="text-accent-400 hover:underline">${esc(src.authors||'')} — <em>${esc(src.title||'')}</em></a>,
+      ${esc(src.journal||'')}, doi:${esc(src.doi||'')}. ${esc(src.note||'')}.
+      The figure here is a schematic drawn for FRAN, not reproduced from that paper.
+    </div>
+  </div>`;
+  const anchor=document.getElementById('spWiki');
+  const card=document.createElement('div'); card.innerHTML=html;
+  const host=anchor?anchor.closest('.glass.card'):null;
+  if(host && host.parentNode) host.parentNode.insertBefore(card.firstElementChild, host.nextSibling);
+  else view.insertAdjacentHTML('beforeend', html);
+}
+
+async function showTissueRuns(tissueEnc){
+  const tissue=decodeURIComponent(tissueEnc);
+  const box=document.getElementById('tissueRuns'); if(!box) return;
+  box.innerHTML=`<div class="skeleton h-20 rounded-lg"></div>`;
+  try{
+    const d=await api(`/api/tissue/${encodeURIComponent(tissue)}/runs`);
+    const rows=d.rows||[];
+    if(!rows.length){ box.innerHTML=`<div class="text-sm text-slate-500">No datasets for ${esc(tissue)}.</div>`; return; }
+    box.innerHTML=`
+      <div class="rounded-lg bg-white/5 p-3">
+        <div class="flex items-center justify-between mb-2">
+          <div class="font-semibold text-white text-sm">${esc(tissue)} · ${fmt(rows.length)} acquisition${rows.length===1?'':'s'}</div>
+          <button onclick="document.getElementById('tissueRuns').innerHTML=''" class="text-[11px] text-slate-400 hover:text-white">close ✕</button>
+        </div>
+        <div class="max-h-64 overflow-auto text-[11px]">
+          <table class="w-full"><thead class="text-slate-500 sticky top-0 bg-[#0b1220]">
+            <tr><th class="text-left py-1">acquisition</th><th class="text-left">search</th>
+            <th class="text-right">enrichment</th><th class="text-right">markers</th><th class="text-left pl-3">runner-up</th></tr></thead>
+          <tbody class="text-slate-300">
+          ${rows.map(r=>`<tr class="border-t border-white/5">
+            <td class="py-1 pr-2 font-mono text-[10px] text-slate-400">${esc(r.raw_basename||'')}</td>
+            <td class="pr-2 truncate max-w-[180px]">${r.search_id?`<span class="text-accent-400 hover:underline cursor-pointer" onclick="go('run','${encodeURIComponent(r.search_id)}')">${esc(r.search_name||'search')}</span>`:esc(r.search_name||'—')}</td>
+            <td class="text-right text-teal">${r.enrichment==null?'—':(+r.enrichment).toFixed(1)}x</td>
+            <td class="text-right">${r.n_markers_hit}/${r.n_markers_panel}</td>
+            <td class="pl-3 text-slate-500">${esc(r.runner_up_tissue||'—')}</td></tr>`).join('')}
+          </tbody></table>
+        </div>
+      </div>`;
+    box.scrollIntoView({behavior:'smooth', block:'nearest'});
+  }catch(e){ box.innerHTML=`<div class="text-sm text-rose-400">Could not load datasets.</div>`; }
+}

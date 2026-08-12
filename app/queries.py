@@ -3299,3 +3299,65 @@ def search_detail(search_id: str) -> dict[str, Any]:
             (sid, MAX_PAGE),
             tables=["search_raw_files", "raw_files", "delimp_sample_metadata"])
     return {"summary": summary, "runs": runs}
+
+
+# ---------------------------------------------------------------------------------------------
+# TISSUE — inferred, never curated.
+# ---------------------------------------------------------------------------------------------
+# delimp_sample_metadata's ontology block (tissue_name, disease_name, cell_line_name, ...) is 0%
+# populated corpus-wide, so FRAN cannot answer "show me the liver datasets" from curation. These
+# come from marker-protein enrichment against the Yue et al. 2026 human proteome atlas
+# (Nature 656:227, doi 10.1038/s41586-026-10660-y), scored per acquisition with an emit-or-abstain
+# rule. Predicted values only — they are reported as inferred everywhere they surface.
+def species_tissues(organism: str, limit: int = 40) -> dict:
+    """Tissue calls for one organism. Empty for anything but human: the reference atlas is human."""
+    if (organism or "").strip().lower() not in ("homo sapiens", "human"):
+        return {"available": False, "reason": "the reference atlas is human-only"}
+
+    def _producer():
+        rows = query(
+            """SELECT tp.predicted_tissue AS tissue, COUNT(*) AS n_runs,
+                      ROUND(AVG(tp.enrichment)::numeric, 1) AS mean_enrichment,
+                      MAX(tp.n_markers_panel) AS n_panel,
+                      ROUND(AVG(tp.n_markers_hit)) AS mean_markers_hit
+               FROM delimp_tissue_prediction tp
+               WHERE tp.predicted_tissue IS NOT NULL
+               GROUP BY 1 ORDER BY 2 DESC LIMIT %s""",
+            (int(limit),), tables=["delimp_tissue_prediction"], timeout_ms=8000) or []
+        tot = query("SELECT COUNT(*) AS n FROM delimp_tissue_prediction",
+                    tables=["delimp_tissue_prediction"], fetch="one", timeout_ms=8000) or {}
+        em = query("""SELECT COUNT(*) AS n FROM delimp_tissue_prediction
+                      WHERE status = 'emitted'""",
+                   tables=["delimp_tissue_prediction"], fetch="one", timeout_ms=8000) or {}
+        return {"available": True, "rows": rows,
+                "n_scored": int(tot.get("n") or 0), "n_labelled": int(em.get("n") or 0),
+                "source": {
+                    "title": "Spatial distribution of the proteome in the human body and in cancers",
+                    "authors": "Yue, Jiang, Li, Luo et al.",
+                    "journal": "Nature 656:227 (2026)",
+                    "doi": "10.1038/s41586-026-10660-y",
+                    "url": "https://www.nature.com/articles/s41586-026-10660-y",
+                    "note": "1,717 tissue-enriched proteins across 64 tissues, DIA-MS"}}
+    return CACHE.get_or_set(f"species_tissues_{organism}_{limit}", _producer)
+
+
+def tissue_runs(tissue: str, limit: int = 60) -> dict:
+    """The acquisitions called for one tissue, with the search that produced each — this is the
+    'show me the liver datasets' answer the curated columns cannot give."""
+    def _producer():
+        rows = query(
+            """SELECT tp.raw_basename, tp.enrichment, tp.n_markers_hit, tp.n_markers_panel,
+                      tp.margin, tp.runner_up_tissue,
+                      MIN(s.search_name) AS search_name, MIN(s.id::text) AS search_id
+               FROM delimp_tissue_prediction tp
+               LEFT JOIN raw_files rf ON rf.raw_basename = tp.raw_basename
+               LEFT JOIN search_raw_files srf ON srf.raw_path = rf.raw_path
+               LEFT JOIN delimp_searches s ON s.id = srf.search_id
+               WHERE tp.predicted_tissue = %s
+               GROUP BY 1,2,3,4,5,6
+               ORDER BY tp.enrichment DESC NULLS LAST LIMIT %s""",
+            (tissue, int(limit)), tables=["delimp_tissue_prediction", "raw_files",
+                                          "search_raw_files", "delimp_searches"],
+            timeout_ms=12000) or []
+        return {"tissue": tissue, "rows": rows, "n": len(rows)}
+    return CACHE.get_or_set(f"tissue_runs_{tissue}_{limit}", _producer)

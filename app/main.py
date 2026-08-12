@@ -814,6 +814,18 @@ def api_gene(gene: str):
     return ok(res)
 
 
+@app.get("/api/tissue/{tissue:path}/runs")
+def api_tissue_runs(tissue: str, limit: int = 60):
+    """Acquisitions inferred to be this tissue. INFERRED, not curated — see /api/species/{n}/tissues."""
+    return ok(_safe(lambda: queries.tissue_runs(tissue, limit), {"tissue": tissue, "rows": []}))
+
+
+@app.get("/api/species/{name:path}/tissues")
+def api_species_tissues(name: str, limit: int = 40):
+    """Inferred tissue breakdown for a species (human only — the reference atlas is human)."""
+    return ok(_safe(lambda: queries.species_tissues(name, limit), {"available": False}))
+
+
 @app.get("/api/species/{name:path}")
 def api_species(name: str):
     """Species detail 'trading card': protein cool-stats (counts, most/least abundant, function
