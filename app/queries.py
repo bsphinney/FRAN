@@ -427,7 +427,8 @@ def species_detail(name: str) -> dict[str, Any]:
         try:
             rows = query(
                 """SELECT protein_group, gene, n_runs, n_searches, sum_prec, max_pep, mean_int, contam
-                   FROM delimp_mv_species_proteins WHERE organism_name = %s LIMIT 25000""",
+                   FROM delimp_mv_species_proteins WHERE organism_name = %s
+                   ORDER BY sum_prec DESC NULLS LAST LIMIT 25000""",
                 (name,), tables=["delimp_mv_species_proteins"])
         except Exception:  # noqa: BLE001
             rows = []
@@ -444,7 +445,8 @@ def species_detail(name: str) -> dict[str, Any]:
                               AVG(NULLIF(p.intensity,0)) AS mean_int, bool_or(p.is_contaminant) AS contam
                        FROM delimp_proteins p JOIN delimp_sample_metadata m ON m.raw_path = p.raw_path
                        WHERE m.organism_name = %s AND p.protein_group IS NOT NULL AND p.protein_group <> ''
-                       GROUP BY p.protein_group LIMIT 25000""",
+                       GROUP BY p.protein_group
+                       ORDER BY SUM(p.n_precursors) DESC NULLS LAST LIMIT 25000""",
                     (name,), tables=["delimp_proteins", "delimp_sample_metadata"], timeout_ms=20000)
             except Exception:  # noqa: BLE001
                 rows = []
@@ -489,7 +491,19 @@ def species_detail(name: str) -> dict[str, Any]:
                                        "max_pep": r["max_pep"], "mean_int": r.get("mean_int")}
         # distinct CLEAN genes = honest proteome depth: dedup semicolon multi-gene + drop
         # accessions-as-genes (raw was impossibly high — human ~29k vs ~20k proteome). See _clean_gene_symbol.
-        n_genes = len({cg for r in rows if (cg := _clean_gene_symbol(r.get("gene")))})
+        # n_genes and n_protein_groups are EXACT, computed uncapped in SQL. They must never come
+        # from `rows`, which is capped at 25,000 for the cool-stats sample: for human that cap took
+        # an arbitrary 25,000 of 73,820 groups and reported 8,301 genes = 41% of the proteome, while
+        # the species showcase — same metric, no cap — said 97%. A LIMIT may bound a SAMPLE; it must
+        # never bound a COUNT.
+        exact = query(
+            f"""SELECT {_N_GENES_SQL} AS n_genes,
+                       COUNT(DISTINCT protein_group) AS n_protein_groups
+                FROM delimp_mv_species_proteins WHERE organism_name = %s""",
+            (name,), tables=["delimp_mv_species_proteins"], fetch="one", timeout_ms=15000) or {}
+        n_genes = int(exact.get("n_genes") or 0)
+        if not n_genes:      # matview miss (species newer than the last refresh) -> sample fallback
+            n_genes = len({cg for r in rows if (cg := _clean_gene_symbol(r.get("gene")))})
         # % of proteome identified — resolve this species' taxon, then clean_genes / NCBI protein-coding.
         try:
             tax = query("SELECT MAX(organism_taxon_id) FROM delimp_sample_metadata WHERE organism_name=%s",
@@ -497,7 +511,12 @@ def species_detail(name: str) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             tax = None
         pct_proteome = _pct_proteome(n_genes, tax)
-        return {"organism": name, "n_proteins": len(rows), "n_protein_groups": len({r["protein_group"] for r in rows}),
+        # n_proteins stays the SAMPLE size (it drives the cool-stats), but n_protein_groups is the
+        # exact corpus figure -- reporting the cap (a flat 25,000 for human) as a count was the same
+        # bug as n_genes.
+        return {"organism": name, "n_proteins": len(rows),
+                "n_protein_groups": int(exact.get("n_protein_groups") or 0)
+                                    or len({r["protein_group"] for r in rows}),
                 "n_genes": n_genes, "pct_proteome": pct_proteome, "organism_taxon_id": tax,
                 "n_runs": n_runs, "n_searches": n_searches, "n_contaminants": sum(1 for r in rows if r.get("contam")),
                 "function_breakdown": func, "top_seen": [_slim(r) for r in top_seen],
