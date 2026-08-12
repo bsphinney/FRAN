@@ -3411,3 +3411,36 @@ def tissue_runs(tissue: str, limit: int = 60) -> dict:
             timeout_ms=12000) or []
         return {"tissue": tissue, "rows": rows, "n": len(rows)}
     return CACHE.get_or_set(f"tissue_runs_{tissue}_{limit}", _producer)
+
+
+def corpus_facts() -> dict:
+    """The numbers the landing page quotes about itself.
+
+    These were hardcoded into app.js when the intro panel was written, which meant they were correct
+    for exactly one day: the corpus grows with every ingest, and a stale number on the front page is
+    the kind of error nobody notices because nothing breaks. They are read live here instead, cached
+    like every other dashboard figure."""
+    def _p():
+        lane = query(
+            """SELECT COUNT(*) AS n_datasets,
+                      COALESCE(SUM(n_precursors), 0) AS n_precursors,
+                      COALESCE(SUM(n_fragments), 0)  AS n_fragments
+               FROM delimp_spectrum_lane""",
+            tables=["delimp_spectrum_lane"], fetch="one", timeout_ms=8000) or {}
+        engines = query(
+            """SELECT COALESCE(search_engine, 'unrecorded') AS engine, COUNT(*) AS n
+               FROM delimp_searches GROUP BY 1 ORDER BY 2 DESC""",
+            tables=["delimp_searches"], timeout_ms=8000) or []
+        span = query(
+            """SELECT MIN(acquisition_date)::date AS first_run,
+                      MAX(acquisition_date)::date AS last_run
+               FROM raw_files WHERE acquisition_date IS NOT NULL""",
+            tables=["raw_files"], fetch="one", timeout_ms=8000) or {}
+        return {
+            "lane": {"n_datasets": int(lane.get("n_datasets") or 0),
+                     "n_precursors": int(lane.get("n_precursors") or 0),
+                     "n_fragments": int(lane.get("n_fragments") or 0)},
+            "engines": [{"engine": r["engine"], "n": int(r["n"] or 0)} for r in engines],
+            "span": {"first": str(span.get("first_run") or ""), "last": str(span.get("last_run") or "")},
+        }
+    return CACHE.get_or_set("corpus_facts", _p)

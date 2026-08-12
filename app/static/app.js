@@ -144,8 +144,9 @@ async function renderDashboard(){
               The corpus is not a website with a database behind it — the measurements live in
               <b class="text-white">Lance</b>, the columnar Arrow format ML pipelines actually train from,
               with the relational layer kept for browsing and provenance. Today that is
-              <b class="text-white">${fmt(353544132)}</b> precursors and
-              <b class="text-white">${fmt(2095825477)}</b> fragments across 1,553 datasets.
+              <b class="text-white"><span id="cfPrec">…</span></b> precursors and
+              <b class="text-white"><span id="cfFrag">…</span></b> fragments across
+              <span id="cfDs">…</span> datasets.
             </p>
             <ul class="text-[11px] text-slate-400 mt-2 space-y-1 list-disc pl-4 leading-relaxed">
               <li><b class="text-slate-200">Shaped for a DataLoader.</b> One row per precursor, with the whole
@@ -174,9 +175,8 @@ async function renderDashboard(){
             <span class="not-italic text-slate-500">— Brett Phinney, UC Davis Proteomics Core</span>
           </blockquote>
           <p class="text-[11px] text-slate-500 mt-3">
-            That is not a joke about hoarding, it is the point: <b class="text-slate-300">1,892 Spectronaut</b>
-            and <b class="text-slate-300">71 DIA-NN</b> searches spanning
-            <b class="text-slate-300">October 2018 to June 2026</b>, kept because a core facility keeps
+            That is not a joke about hoarding, it is the point: <b class="text-slate-300"><span id="cfEngines">…</span></b>
+            spanning <b class="text-slate-300"><span id="cfSpan">…</span></b>, kept because a core facility keeps
             everything. Nothing here was collected to prove a hypothesis, so nothing here is selected for
             one — which is exactly what makes it usable as a reference and as training data.
             Read-only, and everything shown is traceable to the runs it came from; inferred values are
@@ -252,6 +252,7 @@ async function renderDashboard(){
     animateCount($('#k_raw'), c.raw_files); animateCount($('#k_org'), c.organisms);
     animateCount($('#k_im'), c.im_bearing_precursors); animateCount($('#k_protrows'), c.proteins);
 
+    loadCorpusFacts();
     drawCharge(d.charges); drawSpecies(d.species); drawPlatform(d.platforms); drawEngine(d.engines);
     { const pe=$('#speciesPending'); const u=c.unidentified_runs;
       if(pe) pe.textContent = u ? `+ ${fmt(u)} run${u===1?'':'s'} pending species ID (awaiting the DIAMOND-nr predictor)` : ''; }
@@ -2143,6 +2144,26 @@ route(); pollHealth(); refreshFooterCounts();
 setInterval(pollHealth, 15000);
 setInterval(refreshFooterCounts, 30000); // watch it populate
 
+
+/* Fill the intro panel's self-description from the API. Hardcoding these was wrong: the corpus
+   grows with every ingest, so a number baked into the page is correct for about a day and then
+   quietly lies. Failure is silent by design — the panel still reads fine with "…" if the DB is
+   down, which is better than a landing page that errors. */
+async function loadCorpusFacts(){
+  try{
+    const r = await api('/api/corpus_facts'); const d = r.data || r;
+    const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.textContent=v; };
+    if(d.lane){ set('cfPrec', fmt(d.lane.n_precursors)); set('cfFrag', fmt(d.lane.n_fragments));
+                set('cfDs', fmt(d.lane.n_datasets)); }
+    const eng=(d.engines||[]).filter(e=>e.engine && e.engine!=='unrecorded');
+    if(eng.length) set('cfEngines', eng.map(e=>`${fmt(e.n)} ${e.engine==='diann'?'DIA-NN':e.engine.replace(/^./,c=>c.toUpperCase())}`).join(' and ')+' searches');
+    if(d.span && d.span.first){
+      const M=['January','February','March','April','May','June','July','August','September','October','November','December'];
+      const f=(iso)=>{ const p=String(iso).split('-'); return p.length>2?`${M[+p[1]-1]} ${p[0]}`:iso; };
+      set('cfSpan', `${f(d.span.first)} to ${f(d.span.last)}`);
+    }
+  }catch(e){ /* leave the ellipses */ }
+}
 
 /* ---------- TISSUE MAP (human only) ----------
    Sample tissue is INFERRED, never curated: delimp_sample_metadata's ontology block is 0%

@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.17.2"  # 0.17.2: intro explains the ML-training design (Lance lane, measured+predicted pairs)
+APP_VERSION = "0.17.3"  # 0.17.3: intro numbers read live from /api/corpus_facts, not hardcoded
 # 0.16.3: protein coverage uses the exact protein_group filter, not a heuristic
 # 0.16.2: species count no longer splits one organism in two on a NULL taxon
 # 0.16.1: predicted-spectrum overlay names the REAL engine, not always DIA-NN
@@ -625,6 +625,13 @@ def api_peptides_showcase():
     hunt. All computed over bounded precomputed matviews (never a live precursor
     GROUP BY), so it's fast and never trips the 30s timeout."""
     return ok(_safe(queries.peptides_showcase, {"available": False, "pool_size": 0}))
+
+
+@app.get("/api/corpus_facts")
+def api_corpus_facts():
+    """Self-description numbers for the landing page (lane size, engines, date span). Live, so the
+    intro panel cannot quote a figure that stopped being true after the next ingest."""
+    return ok(_safe(queries.corpus_facts, {}))
 
 
 @app.get("/api/counts")
