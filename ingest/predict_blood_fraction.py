@@ -16,9 +16,18 @@ intensity share can.
 
     blood_fraction(run) = sum(intensity of plasma-core proteins) / sum(intensity of all proteins)
 
-PLASMA vs SERUM comes free from the same numbers. Serum is plasma after clotting, and clotting
-consumes fibrinogen -- so FGA/FGB/FGG are abundant in plasma and strongly depleted in serum. The
-fibrinogen share of the blood signal separates them without any extra measurement.
+PLASMA vs SERUM IS NOT CLAIMED. The textbook rule -- serum is plasma after clotting, so FGA/FGB/FGG
+are consumed -- predicts that fibrinogen share separates them. IT DOES NOT SEPARATE THEM HERE, and
+the reason is worth recording rather than rediscovering:
+
+  * FRAN has ZERO serum ground truth. All 23 human runs whose CoreOmics text names a blood matrix
+    say PLASMA. There is nothing to calibrate a serum threshold against.
+  * Those 23 known-plasma runs span fibrinogen 0.070% .. 29.6% of blood signal, a 400x range
+    straddling any threshold. A first version called 15 of them "serum" on a 2% cut -- an
+    unvalidated label applied to 929 runs corpus-wide.
+
+Fibrinogen share is therefore REPORTED as evidence and never used as a label. Resolving plasma vs
+serum needs serum samples with known provenance; until those exist, calling it is guessing.
 
 Nothing here is asserted onto delimp_sample_metadata; this writes its own predicted_* table.
 
@@ -47,8 +56,6 @@ FIBRINOGEN = ["FGA", "FGB", "FGG"]
 
 # Thresholds. A tissue lysate carries some blood; these separate "contains blood" from "is blood".
 MIN_BLOOD_FRACTION = 0.30    # below this the run is not blood-derived
-FIB_SERUM_MAX = 0.005        # fibrinogen share of blood signal: serum is depleted by clotting
-FIB_PLASMA_MIN = 0.02        # plasma retains it
 
 DDL = """
 CREATE TABLE IF NOT EXISTS delimp_blood_prediction (
@@ -116,18 +123,15 @@ def _conn():
 
 
 def classify(frac, fib_share, n_blood):
+    """Blood-derived or not. Deliberately does NOT split plasma vs serum -- see the module
+    docstring: fibrinogen share does not separate them on this corpus, and there is no serum
+    ground truth to calibrate against. fibrinogen_share is stored so the call can be revisited
+    the moment serum samples with known provenance exist."""
     if frac is None or n_blood < 5:
         return None, "abstained_too_few_blood_proteins"
     if frac < MIN_BLOOD_FRACTION:
         return None, "not_blood_derived"
-    if fib_share is None:
-        return "blood_derived_unresolved", "emitted"
-    if fib_share <= FIB_SERUM_MAX:
-        return "serum", "emitted"
-    if fib_share >= FIB_PLASMA_MIN:
-        return "plasma", "emitted"
-    # between the two: blood-derived for certain, plasma-vs-serum genuinely undecidable
-    return "blood_derived_unresolved", "emitted"
+    return "blood_derived", "emitted"
 
 
 def main():
