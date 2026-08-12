@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.17.4"  # 0.17.4: trimmed the AI-training bullets; intro numbers live from the API
+APP_VERSION = "0.17.5"  # 0.17.5: intro trimmed to the pitch, the ML line and the quote
 # 0.16.3: protein coverage uses the exact protein_group filter, not a heuristic
 # 0.16.2: species count no longer splits one organism in two on a NULL taxon
 # 0.16.1: predicted-spectrum overlay names the REAL engine, not always DIA-NN

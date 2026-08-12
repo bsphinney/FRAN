@@ -157,14 +157,6 @@ async function renderDashboard(){
             DIA-NN searches?"
             <span class="not-italic text-slate-500">— Brett Phinney, UC Davis Proteomics Core</span>
           </blockquote>
-          <p class="text-[11px] text-slate-500 mt-3">
-            That is not a joke about hoarding, it is the point: <b class="text-slate-300"><span id="cfEngines">…</span></b>
-            spanning <b class="text-slate-300"><span id="cfSpan">…</span></b>, kept because a core facility keeps
-            everything. Nothing here was collected to prove a hypothesis, so nothing here is selected for
-            one — which is exactly what makes it usable as a reference and as training data.
-            Read-only, and everything shown is traceable to the runs it came from; inferred values are
-            always labelled as inferred.
-          </p>
         </div>
       </div>
     </div>
@@ -2138,13 +2130,6 @@ async function loadCorpusFacts(){
     const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.textContent=v; };
     if(d.lane){ set('cfPrec', fmt(d.lane.n_precursors)); set('cfFrag', fmt(d.lane.n_fragments));
                 set('cfDs', fmt(d.lane.n_datasets)); }
-    const eng=(d.engines||[]).filter(e=>e.engine && e.engine!=='unrecorded');
-    if(eng.length) set('cfEngines', eng.map(e=>`${fmt(e.n)} ${e.engine==='diann'?'DIA-NN':e.engine.replace(/^./,c=>c.toUpperCase())}`).join(' and ')+' searches');
-    if(d.span && d.span.first){
-      const M=['January','February','March','April','May','June','July','August','September','October','November','December'];
-      const f=(iso)=>{ const p=String(iso).split('-'); return p.length>2?`${M[+p[1]-1]} ${p[0]}`:iso; };
-      set('cfSpan', `${f(d.span.first)} to ${f(d.span.last)}`);
-    }
   }catch(e){ /* leave the ellipses */ }
 }
 
