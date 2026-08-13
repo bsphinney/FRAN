@@ -258,6 +258,7 @@ def spectronaut_trace_label(ion: str, charge: int = 1, loss: str = "noloss") -> 
 
 # ── the extractor ─────────────────────────────────────────────────────────────────────────────
 class Cache:
+    ms2_rt_corrected = False
     """Memory-mapped view of one run's cached spectra."""
 
     def __init__(self, d: str):
@@ -273,6 +274,25 @@ class Cache:
         last = int(np.asarray(self.m_cyc).max())
         first_frame = np.clip(np.arange(last + 1) * self.frames_per_cycle, 0, len(self.rt) - 1)
         self.cycle_rt = self.rt[first_frame]
+        # OPTIONAL OVERRIDE — cycle_rt_ms2.npy, written by build_thermo_xic_cache.py.
+        #
+        # The line above is the -0.295 s MS2 defect in one expression: every event in a cycle is
+        # stamped with the time of that cycle's FIRST frame, which is the MS1 frame, so fragment
+        # traces are labelled early by however long the MS2 scans take. On diaPASEF that is about a
+        # quarter cycle. On the Thermo cache it is FAR worse -- measured 1.176 s on a 50-scan K562
+        # cycle -- because a long DIA cycle spends most of its time in MS2.
+        #
+        # Where the cache can state the real per-cycle MS2 time (mzparquet gives every scan its own
+        # rt), use it. Fragments are what this extractor exists to produce and what any XIC
+        # comparison is about, so the trace axis follows MS2. The MS1 isotope channels in the same
+        # tensor are then stamped late by the same lag; that is a known consequence of one shared
+        # time axis, not a second bug, and it is why this is opt-in per cache rather than assumed.
+        _ms2_rt = f"{d}/cycle_rt_ms2.npy"
+        if os.path.exists(_ms2_rt):
+            cr2 = np.load(_ms2_rt)
+            if len(cr2) >= len(self.cycle_rt):
+                self.cycle_rt = cr2[:len(self.cycle_rt)]
+                self.ms2_rt_corrected = True
         # A gradient in MINUTES never reaches 200; in SECONDS it always does.
         self.rt_in_seconds = float(self.cycle_rt.max()) > 200.0
         self._ev_off, self._ms1_off = self._cycle_offsets(d)
