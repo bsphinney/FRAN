@@ -30,6 +30,10 @@ from collections import defaultdict
 
 import numpy as np
 
+# np.trapezoid is NumPy >= 2.0; Hive's analysis env still ships the older np.trapz. Bind once
+# rather than sprinkling getattr calls through the scoring loop.
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 print = functools.partial(print, flush=True)   # noqa: A001
 
@@ -44,9 +48,9 @@ def load_reference(xic_parquet, want_prs):
     rt = t.column("rt").to_numpy(); val = t.column("value").to_numpy()
     ref = defaultdict(lambda: ([], []))
     for i, (p, f) in enumerate(zip(pr, ft)):
-        if f in ("ms1", "index") or p not in want_prs:
+        if f == "index" or p not in want_prs:
             continue
-        if not LABEL_RE.match(f):
+        if f != "ms1" and not LABEL_RE.match(f):
             continue
         r, v = ref[(p, f)]
         r.append(rt[i]); v.append(val[i])
@@ -97,11 +101,20 @@ def main():
         label = ("cycle_rt_ms2  (measured MS2 time)" if corrected
                  else "MS1-frame time (Bruker convention)")
         rs, apex_d, areas, n_empty = [], [], [], 0
+        ms1_rs, ms1_areas = [], []
         for p, feats in by_pr.items():
             seq, ch, mz, rt_min = meta[p]
-            feats = feats[:X.N_FRAG_CHANNELS]        # extract() returns this many fragment channels
+            # Compare EVERY fragment DIA-NN traced (12 per precursor here), not an arbitrary 6.
+            # FRAN_XIC_FRAG_CHANNELS must be >= that; capping silently compared half the evidence
+            # and, worse, a different half per class (median intensity rank 1 for low-area traces
+            # vs 2 for agreeing ones), which confounds the comparison with fragment selection.
+            frag_feats = sorted(f for f in feats if f != "ms1")
+            if len(frag_feats) > X.N_FRAG_CHANNELS:
+                print(f"  WARNING {p}: {len(frag_feats)} fragments but only "
+                      f"{X.N_FRAG_CHANNELS} channels — raise FRAN_XIC_FRAG_CHANNELS")
+                frag_feats = frag_feats[:X.N_FRAG_CHANNELS]
             fmz, keep = [], []
-            for f in feats:
+            for f in frag_feats:
                 m = LABEL_RE.match(f)
                 ion, fz = m.group(1), int(m.group(2) or 1)
                 v = X.ion_mz(seq, ion, fz)
@@ -112,28 +125,57 @@ def main():
             rt_native = cache.rt_to_native(rt_min)
             try:
                 T = cache.extract(mz, ch, fmz, rt_native, im=0.0, normalize=False)
-                ax = cache.rt_axis(rt_native, minutes=True)
+                ax = cache.rt_axis(rt_native, minutes=True, channel="ms2")
+                ax_ms1 = cache.rt_axis(rt_native, minutes=True, channel="ms1")
             except Exception:
                 continue
             if T is None or ax is None:
                 continue
-            for j, f in enumerate(keep):
+            if ax_ms1 is None:
+                ax_ms1 = ax
+            # MS1: DIA-NN exports ONE ms1 trace (info=0, monoisotopic). Ours is channel
+            # N_FRAG_CHANNELS (the M isotope); the M+1..M+4 channels have no counterpart to
+            # compare against, so they stay unvalidated here rather than being silently summed in.
+            pairs = [(j, f) for j, f in enumerate(keep)]
+            if "ms1" in feats:
+                pairs.append((X.N_FRAG_CHANNELS, "ms1"))
+            for j, f in pairs:
+                if j >= T.shape[0]:
+                    continue
                 ours = np.asarray(T[j], float)
+                ax_use = ax_ms1 if f == "ms1" else ax     # fragments and isotopes are sampled apart
                 if ours.max() <= 0:
                     n_empty += 1
                     continue
                 r_rt, r_v = ref[(p, f)]
                 if r_v.max() <= 0:
                     continue
-                v_on_ref = np.interp(r_rt, ax, ours, left=0.0, right=0.0)
+                o_rt_lo, o_rt_hi = float(ax_use.min()), float(ax_use.max())
+                v_on_ref = np.interp(r_rt, ax_use, ours, left=0.0, right=0.0)
                 if v_on_ref.max() <= 0:
                     n_empty += 1
                     continue
                 cc = np.corrcoef(v_on_ref, r_v)[0, 1]
+                if np.isfinite(cc) and f == "ms1":
+                    lo, hi = o_rt_lo, o_rt_hi
+                    mr = (r_rt >= lo) & (r_rt <= hi)
+                    ms1_rs.append(cc)
+                    if mr.sum() > 1:
+                        ar = _trapz(r_v[mr], r_rt[mr])
+                        if ar > 0:
+                            ms1_areas.append(_trapz(ours, ax_use) / ar)
+                    continue
                 if np.isfinite(cc):
                     rs.append(cc)
                     apex_d.append(abs(r_rt[v_on_ref.argmax()] - r_rt[r_v.argmax()]) * 60.0)
-                    areas.append(v_on_ref.sum() / max(r_v.sum(), 1e-9))
+                    # integrate over the window WE cover, on each grid's own spacing. Summing
+                    # resampled points compares different densities; and dividing by DIA-NN's full
+                    # 60 s integral counts neighbouring peaks we never claimed to extract.
+                    mr = (r_rt >= o_rt_lo) & (r_rt <= o_rt_hi)
+                    if mr.sum() > 1:
+                        ar = _trapz(r_v[mr], r_rt[mr])
+                        if ar > 0:
+                            areas.append(_trapz(ours, ax_use) / ar)
         if not rs:
             print(f"\n{label}: 0 comparable traces ({n_empty} empty) — extraction returned nothing")
             continue
@@ -143,7 +185,11 @@ def main():
         print(f"   median r        {np.median(rs):.4f}")
         print(f"   r > 0.8         {100*(rs > 0.8).mean():.1f}%")
         print(f"   apex |d| median {np.median(apex_d):.2f} s")
-        print(f"   area ours/DIANN {np.median(areas):.3f}x")
+        print(f"   area ours/DIANN {np.median(areas):.3f}x  (integrated over OUR window)")
+        if ms1_rs:
+            print(f"   MS1 monoisotopic: n {len(ms1_rs):,}  median r {np.median(ms1_rs):.4f}  "
+                  f"r>0.8 {100*(np.asarray(ms1_rs) > 0.8).mean():.1f}%"
+                  + (f"  area {np.median(ms1_areas):.3f}x" if ms1_areas else ""))
 
 
 if __name__ == "__main__":

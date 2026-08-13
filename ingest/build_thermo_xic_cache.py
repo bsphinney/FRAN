@@ -7,15 +7,26 @@ to be forked. Two vendors, one extractor.
     ThermoRawFileParser -i run.raw -f 3 -o dir/     ->  run.mzparquet   (44 s for 0.76 GB)
     python ingest/build_thermo_xic_cache.py run.mzparquet <cache_dir>
 
-VALIDATED 2026-08-12 against DIA-NN 2.6.0's own chromatograms for the same acquisition
-(k562_200ng_30min_DIA, Exploris 480, 1,182 fragment traces):
+VALIDATED 2026-08-13 against DIA-NN 2.6.0 across NINE acquisitions -- 3 instruments (Exploris 120,
+Exploris 480, Fusion Lumos), gradients 26-174 min, all 12 fragments DIA-NN traces plus the
+monoisotopic MS1, ~17k traces:
 
-    median r 0.8872   r>0.8 60.5%   apex |d| 0.00 s   area ours/DIA-NN 0.730x
+    MEDIAN across runs:  MS2 r 0.955   r>0.8 74.4%   MS2 area 1.003x
+                         MS1 r 0.972                 MS1 area 1.039x
 
-For reference the diaPASEF arm scores median r 0.879 against Spectronaut 21 -- so shape agreement
-survives the loss of the mobility axis. Two things are NOT yet validated: 34% of traces come back
-empty from our side, and areas run 27% low (the diaPASEF arm is 1.028x). Neither is a timing
-problem -- both are identical with and without the RT correction.
+Seven of the nine are clean (MS2 r 0.93-0.97, area 0.996-1.05; MS1 r 0.91-0.995, area 1.01-1.12).
+The earlier single-run figure of 0.887 was pessimistic: that K562 method had a 2.15 s cycle against
+a 2.14 s median peak FWHM, i.e. about one sample per peak, which is the worst case for a shape
+comparison rather than a typical one.
+
+TWO RUNS DISAGREE AND THE CAUSE IS NOT YET KNOWN -- do not quote these as extractor quality:
+  * Ex010222_DiaBoxcar_60m_1 -- MS1 r 0.241, MS1 area 2.79x, MS2 area 0.328x. Ruled out: it is not
+    BoxCar-style boxed MS1 (its MS1 scans carry no isolation windows) and not segmented MS1 (one
+    m/z range). Its MS1 is unusually sparse, 137 peaks/scan against ~570 elsewhere.
+  * FL010424_He50ng-DiaW22_90m -- MS2 area 1.883x while its MS1 is normal (r 0.979, area 1.019).
+
+Because such runs are detectable as outliers on their own agreement metrics, the safe way to use
+this is to SCORE EACH RUN and store the score, not to assume the extractor is uniformly good.
 
 WHY NOT alpharaw. It is installed and its pythonnet bridge works, but it bundles Thermo's
 .NET-Framework RawFileReader, which calls System.Security.AccessControl.MutexSecurity during

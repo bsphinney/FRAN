@@ -131,7 +131,10 @@ N_POINTS = int(os.environ.get("FRAN_XIC_POINTS", "32"))
 # the tensor's first dimension is N_FRAG + N_MS1; downstream code with a hard-coded row count must
 # be updated in step (the Lance trace lane stores n_frag/n_ms1/n_points, so readers can adapt).
 N_MS1_CHANNELS = int(os.environ.get("FRAN_XIC_MS1_CHANNELS", "5"))
-N_FRAG_CHANNELS = 6
+# Configurable like the other extraction constants. Default stays 6 so existing caches and the
+# trace lane keep their shape, but DIA-NN traces 12 fragments per precursor on this data, so any
+# comparison against it that caps at 6 is only seeing half the evidence.
+N_FRAG_CHANNELS = int(os.environ.get("FRAN_XIC_FRAG_CHANNELS", "6"))
 C13 = 1.0033548378
 
 # monoisotopic residue masses (Da)
@@ -287,11 +290,25 @@ class Cache:
         # comparison is about, so the trace axis follows MS2. The MS1 isotope channels in the same
         # tensor are then stamped late by the same lag; that is a known consequence of one shared
         # time axis, not a second bug, and it is why this is opt-in per cache rather than assumed.
-        _ms2_rt = f"{d}/cycle_rt_ms2.npy"
+        # PER-CHANNEL TIME BASES. Within a cycle the MS1 scan happens FIRST and the MS2 windows
+        # follow, so the two channel groups are genuinely sampled at different times -- by a median
+        # 1.176 s on this K562 method, and 0.795-1.679 s across methods. One shared axis therefore
+        # cannot be right for both: measured against DIA-NN, stamping everything with the MS2 time
+        # gives MS2 r 0.843 / MS1 r 0.803, while stamping everything with the MS1 frame time gives
+        # MS2 r 0.739 / MS1 r 0.951. Neither is a good trade; keeping both axes gets 0.843 and 0.951
+        # at once. `cycle_rt` stays the MS2/default axis so existing callers are unchanged.
+        self.cycle_rt_ms1 = self.cycle_rt
+        self.cycle_rt_ms2 = self.cycle_rt
+        _ms1_rt, _ms2_rt = f"{d}/cycle_rt_ms1.npy", f"{d}/cycle_rt_ms2.npy"
+        if os.path.exists(_ms1_rt):
+            c1a = np.load(_ms1_rt)
+            if len(c1a) >= len(self.cycle_rt):
+                self.cycle_rt_ms1 = c1a[:len(self.cycle_rt)]
         if os.path.exists(_ms2_rt):
             cr2 = np.load(_ms2_rt)
             if len(cr2) >= len(self.cycle_rt):
-                self.cycle_rt = cr2[:len(self.cycle_rt)]
+                self.cycle_rt_ms2 = cr2[:len(self.cycle_rt)]
+                self.cycle_rt = self.cycle_rt_ms2
                 self.ms2_rt_corrected = True
         # A gradient in MINUTES never reaches 200; in SECONDS it always does.
         self.rt_in_seconds = float(self.cycle_rt.max()) > 200.0
@@ -335,13 +352,20 @@ class Cache:
         c = np.where(np.abs(self.cycle_rt - rt_native) <= RT_HALF)[0]
         return (int(c.min()), int(c.max())) if len(c) else (None, None)
 
-    def rt_axis(self, rt_native: float, n: int = N_POINTS, minutes: bool = True):
-        """RT values of the resampled trace returned by `extract` — needed to compare against any
-        other tool's chromatogram."""
+    def rt_axis(self, rt_native: float, n: int = N_POINTS, minutes: bool = True,
+                channel: str = "ms2"):
+        """RT values of the resampled trace returned by `extract`.
+
+        `channel` selects the time base: 'ms2' for the fragment rows (0 .. N_FRAG_CHANNELS-1) and
+        'ms1' for the isotope rows that follow them. They differ by however long a cycle spends in
+        MS2 before the next MS1 -- about 1.2 s on a 50-window Orbitrap method. Asking for the wrong
+        one costs ~0.15 in correlation, which is larger than most differences this tool is used to
+        measure."""
         c0, c1 = self.cycle_window(rt_native)
         if c0 is None:
             return None
-        ax = np.linspace(self.cycle_rt[c0], self.cycle_rt[c1], n)
+        base = self.cycle_rt_ms1 if channel == "ms1" else self.cycle_rt_ms2
+        ax = np.linspace(base[c0], base[c1], n)
         return ax / 60.0 if (minutes and self.rt_in_seconds) else ax
 
     def extract(self, precursor_mz: float, charge: int, fragment_mz, rt_native: float,
