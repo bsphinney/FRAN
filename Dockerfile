@@ -1,5 +1,5 @@
 # DE-LIMP Corpus Browser — Hugging Face Space (Docker SDK)
-# HF Spaces serve on port 7860.
+# Serves on port 7860 (used by INSTALL.md's `docker run -p 7860:7860`).
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \

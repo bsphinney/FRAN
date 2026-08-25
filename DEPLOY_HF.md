@@ -1,3 +1,11 @@
+> **RETIRED — 2026-08-24.** FRAN is no longer deployed to Hugging Face Spaces. The live app is on
+> Azure App Service at <https://fran.stan-proteomics.org>, deployed automatically from `main` by
+> `.github/workflows/deploy.yml`. The HF metadata header was removed from `README.md` (GitHub cannot
+> hide YAML frontmatter, so it rendered as a table above the README).
+>
+> This file is kept for history. To self-host, see [INSTALL.md](INSTALL.md) — the `Dockerfile` still
+> works and is what `docker run -p 7860:7860` in that guide uses.
+
 # Push to Hugging Face Spaces
 
 The app is a **Docker Space** (`README.md` carries the HF metadata header:

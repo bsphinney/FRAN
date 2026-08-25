@@ -1,15 +1,3 @@
----
-title: FRAN — Proteomics Corpus Browser
-emoji: 🧬
-colorFrom: indigo
-colorTo: purple
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
-short_description: FRAN — browse a live DIA proteomics corpus (peptides, proteins, species, ion mobility).
----
-
 # FRAN — Fragment Reference & ANnotation
 
 <p align="center">
