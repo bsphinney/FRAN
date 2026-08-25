@@ -250,34 +250,68 @@ def scan_sne(roots, paths, names, bases, max_depth=12, limit=0):
                         for dp, _, fs in os.walk(full) for f in fs)
                 except OSError:
                     size = -1
+                rep = _find_report(dirpath, stem, full)
                 found.append({"sne": full, "name": stem, "bytes": size,
-                              "has_report": _report_nearby(dirpath, stem)})
+                              "has_report": bool(rep), "report": rep})
                 if limit and len(found) >= limit:
                     return found, seen
     return found, seen
 
 
-def _report_nearby(d: str, stem: str) -> bool:
-    """Is a Spectronaut report already sitting next to this .sne (or in FRAN_reports under its
-    name)? If so it does not need a Windows round trip -- it needs ingesting."""
+def _find_report(d: str, stem: str, sne_path: str):
+    """Path to an existing Spectronaut report for this .sne, or None.
+
+    Worth being thorough: a hit here means the search can be ingested ON HIVE right now, and a miss
+    means shipping tens of GB to a Windows box to re-export it. Four places, most to least specific:
+
+      1. INSIDE the .sne, when it is a directory (Spectronaut writes exports there)
+      2. beside the .sne, filename carrying the stem  -- unambiguous when several .sne share a dir
+      3. FRAN_reports/<stem>/<timestamp>/            -- where the archive pull puts them
+      4. beside the .sne, any report at all          -- only when this is the ONLY .sne in the
+                                                        directory, so it cannot be misattributed
+    """
+    def _reports_in(path, depth=1):
+        try:
+            entries = os.listdir(path)
+        except OSError:
+            return None
+        for e in entries:
+            if _SN_REPORT.search(e):
+                full = os.path.join(path, e)
+                try:
+                    if os.path.getsize(full) > 1024:
+                        return full
+                except OSError:
+                    continue
+        if depth > 0:
+            for e in entries:
+                sub = os.path.join(path, e)
+                if os.path.isdir(sub):
+                    got = _reports_in(sub, depth - 1)
+                    if got:
+                        return got
+        return None
+
+    if os.path.isdir(sne_path):
+        got = _reports_in(sne_path)
+        if got:
+            return got
     try:
-        for f in os.listdir(d):
-            if _SN_REPORT.search(f) and stem.lower() in f.lower():
-                return True
+        siblings = os.listdir(d)
     except OSError:
-        pass
-    for cand in (os.path.join(REPORTS_ROOT, stem), os.path.join(d, stem)):
-        if os.path.isdir(cand):
-            try:
-                for sub in os.listdir(cand):
-                    if _SN_REPORT.search(sub):
-                        return True
-                    if os.path.isdir(os.path.join(cand, sub)) and any(
-                            _SN_REPORT.search(x) for x in os.listdir(os.path.join(cand, sub))):
-                        return True
-            except OSError:
-                pass
-    return False
+        siblings = []
+    for e in siblings:
+        if _SN_REPORT.search(e) and stem.lower() in e.lower():
+            return os.path.join(d, e)
+    got = _reports_in(os.path.join(REPORTS_ROOT, stem))
+    if got:
+        return got
+    n_sne = sum(1 for e in siblings if e.lower().endswith(".sne"))
+    if n_sne == 1:
+        for e in siblings:
+            if _SN_REPORT.search(e):
+                return os.path.join(d, e)
+    return None
 
 
 def main():
@@ -309,7 +343,9 @@ def main():
         print(f"  {len(need_win)} have no report -> ship to a Windows box for manageSNE -rs FRAN.rs")
         for f in sorted(found, key=lambda x: -x["bytes"])[:40]:
             gb = f["bytes"] / 1e9
-            print(f"  {'REPORT' if f['has_report'] else 'NEEDS-WIN':<10} {gb:>8.1f} GB  {f['sne']}")
+            print(f"  {'INGESTABLE' if f['has_report'] else 'NEEDS-WIN':<11} {gb:>8.1f} GB  {f['sne']}")
+            if f.get("report"):
+                print(f"  {'':>11} {'':>8}     report: {f['report']}")
         if len(found) > 40:
             print(f"  ... and {len(found)-40} more")
         if a.json_out:
