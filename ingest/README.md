@@ -8,33 +8,168 @@ repo so it stays with the app it feeds, not scattered in the DE-LIMP repo. The F
 > verified writeup of how Spectronaut searches become FRAN rows (the `.sne` → report → corpus
 > pipeline, the coordination tables, and the fragment story).
 
-## The two ingest streams
+## The three ingest streams
 
 | engine | source | command / script |
 |---|---|---|
 | **Spectronaut** (~96% of the corpus) | `.sne` experiment → CLI export | `spectronaut manageSNE -sne <f.sne> -n <name> -o <out> -rs FRAN.rs` → `<name>_Report_FRAN (Normal).parquet` → `corpus_ingest.py --engine spectronaut` |
-| **DIA-NN** | `out/report.parquet` | `corpus_ingest.py --engine diann <searchdir>` |
+| **DIA-NN** (by hand) | `out/report.parquet` | `corpus_ingest.py --engine diann <searchdir>` |
+| **DIA-NN / FragPipe / Radiant, automatic** | any search the Core's Claude Code skill runs on Hive | the skill symlinks it into **`/quobyte/proteomics-grp/fran/incoming/`**; the ingest cron picks it up — see [The drop directory](#the-drop-directory-quobyteproteomics-grpfranincoming) |
 
-## Scripts
+## The drop directory: `/quobyte/proteomics-grp/fran/incoming/`
 
-| script | role |
-|---|---|
-| `sne_export.py` | finds every `.sne`, runs the `manageSNE` export against `FRAN.rs`, zips + archives to Flinders, optionally `--ingest`. `--dry-run` / `--columns`. |
-| `spectronaut_to_corpus.py` | Spectronaut→FRAN column adapter (fuzzy-resolves `R./PG./PEP./EG./FG./F.` columns, parquet or TSV, streams chunks, parses fragments). |
-| `corpus_ingest.py` | the ingester — writes `delimp_searches / raw_files / search_raw_files / delimp_sample_metadata / delimp_proteins / delimp_precursors`, **plus the observed-spectrum Lance lane** (see below). `--engine`, `--bulk-copy`, `--no-fragments`, `--lance-dir`. |
-| `backfill_fragments.py` | corpus-wide recovery: archived FRAN report → per-search **Lance** dataset (fragments + MS1 envelope + extras) + registry. `--scan`, `--workers`, `--register`. |
-| `spectrum_lance.py` | the Lance schema (48 cols, fragments as list columns) + `delimp_spectrum_lane` registry helpers. |
-| `verify_spectrum_lane.py` | walk the registry, confirm each Lance dataset exists + content-md5 matches (durability / loss check). |
-| `plan_spectrum_backfill.py` | coverage: which searches' reports are on Hive (backfill now) vs missing (Windows). Writes worklists; `--enqueue` fills `delimp_spectrum_regen_queue`. |
-| `pull_reports_to_hive.py` | **run on a Windows ingestor** — copies every `C:\fran_sne_export\*_Report_FRAN*.parquet` onto Flinders so no report is trapped on Windows. Idempotent. |
-| `backfill_spectra.sbatch` | submit the corpus Lance backfill on a **compute node** (parallel Arrow/Lance OOM-kills the login node). |
-| `provenance.py` | writes **`delimp_search_provenance`** — the ingest coordination table (source `.sne`, exported report path, every raw file, LIMS linkage). |
-| `write_submission_service_dir.py` | writes `delimp_submission_service_dir` (submission → service folder ledger). |
-| `backfill_protein_counts.py` | one-time corpus fix: splits `n_proteins_total` into **proteins vs protein groups** (see below). `--dry-run`, `--revert`. |
-| `organism.py` | canonical organism/species normalization (single source of truth). |
-| `refresh_leaderboards.py` | PG-Farm auth (`_token`) + leaderboard refresh; imported by the others. |
-| `sne_xic_ingest.py`, `xic_ingest.py` | ingest the GUI-exported **All-XIC SQLite** dbs → `delimp_precursor_xic` for the peptide-page chromatogram viewer (minority of runs). |
-| `db_to_spectronaut_report.py` | reverse: reconstruct a Spectronaut-style report from the DB for a `search_id`. |
+**This is where the Core's Claude Code pipeline skill hands over finished Hive searches, and what
+the ingest cron should scan.** (DE-LIMP repo, `skill/ucdavis-proteomics-core-pipeline`, v2.3.0+;
+entry point `scripts/fran_deposit.py`.) The skill does not ingest anything and needs no corpus
+credential — it stages, the cron ingests.
+
+### What an entry looks like
+
+```
+/quobyte/proteomics-grp/fran/incoming/
+  out_q__a7416fdc/                 <- a REAL directory, name = <search dir>__<8 hex of its real path>
+    fran_manifest.json             <- a real file: the facts the cron cannot derive
+    report.parquet   -> /quobyte/proteomics-grp/brett/poplar_test/diann/out_q/report.parquet
+    report.log.txt   -> ...
+    report_xic/                    <- a real dir of symlinks to every *.xic.parquet (see below)
+      run1.xic.parquet -> .../out/xic/t0_xic/run1.xic.parquet
+      run2.xic.parquet -> .../out/xic/t1_xic/run2.xic.parquet
+```
+
+Everything except the manifest is a **symlink**. Nothing is copied — a search directory is tens of
+GB. Three things about this shape are load-bearing:
+
+- **The entry is a real directory, not a symlink to the search dir.** `find_uningested.py` walks
+  with `os.walk(..., followlinks=False)`, which never descends into a symlinked *directory*. A bare
+  symlink would be silently invisible and the search would never be ingested. A real directory is
+  walked normally, and `os.path.exists()` follows the links inside it, so `detect_engine()` works
+  unchanged.
+- **The entry name is deterministic.** Re-staging the same search reuses the same path instead of
+  presenting a second candidate that would ingest as a duplicate search.
+- **`search_provenance.json` is deliberately NOT linked** — see the bug below.
+
+### Chromatograms are always there for DIA-NN, and always in `report_xic/`
+
+Every DIA-NN search from the skill now extracts XICs (`--xic 10 --mobilograms` is forced into the
+cfg), so `diann_xic_to_lance.py --dir <entry>` has input for **every** staged DIA-NN search — its
+default `<dir>/report_xic` is exactly where the entry puts them.
+
+That normalisation is doing real work. DIA-NN names the XIC directory after `--out`, and the
+skill's 5-step parallel chain (its default above 5 files) runs step 4 **per file**, so a 399-run
+cohort leaves chromatograms in **399 directories** named `xic/t<N>_xic/` with *nothing* at
+`report_xic/`. The entry flattens them into one directory of symlinks — safe because DIA-NN names
+each file after its run. Measured on a real 399-run cohort: 399 files, no basename collisions,
+27 GB of chromatograms handed over as 201 KB of links.
+
+`fran_manifest.json`'s `xic` field reports `present`, `n_files`, and the source directories.
+
+### What the cron should do with `fran_manifest.json`
+
+```json
+{
+  "output_dir": "/quobyte/proteomics-grp/brett/poplar_test/diann/out_q",
+  "engine": "diann", "engine_version": "2.6.0",
+  "organism": "Populus trichocarpa", "taxon": 3694,
+  "search_name": "poplar_qcol_test",
+  "xic": {"present": false, "n_files": 0, "dirs": []},
+  "suggested_ingest": ["--engine","diann","--output-dir","/quobyte/.../out_q",
+                       "--organism-name","Populus trichocarpa","--taxon","3694"],
+  "suggested_ingest_shell": "--engine diann --output-dir /quobyte/.../out_q ...",
+  "search_provenance": { ...run_search.py's full record: exact command, files, params... }
+}
+```
+
+Ingest the entry with those arguments — verified working end to end (402,522 precursors parsed
+through the symlinks, 2026-08-25):
+
+```python
+cmd = [PY, "corpus_ingest.py", entry] + manifest["suggested_ingest"]      # argv LIST
+subprocess.run(cmd)
+```
+
+Two of those fields matter more than they look:
+
+- **`output_dir`** — pass it as `--output-dir`. Without it the corpus records the *drop path* as
+  the search's location: provenance points at the handover instead of the search, and
+  `corpus_ingest`'s `.d`-lookup for platform/SPD detection (which resolves raw files relative to
+  `output_dir`) misses.
+- **`organism` / `taxon`** — **a DIA-NN report has no organism column.** Ingest without these and
+  the row is `NULL` and the search never appears on FRAN's species page. The skill has them because
+  the user *confirmed* the organism during the run; nothing downstream can recover them. They are
+  absent from the manifest rather than guessed when genuinely unknown.
+
+Use `suggested_ingest` (the array) with `subprocess`, or `suggested_ingest_shell` if it has to go
+through a shell. **Never `" ".join(suggested_ingest)`** — every species name contains a space, so
+that fails on the first real ingest with `unrecognized arguments: sapiens`.
+
+### 🔴 What the cron still needs: read the manifest for identity + organism
+
+As of `2a58b3e` the scanner takes `os.path.realpath(dirpath)` as a dropped search's identity.
+That is the right idea, but it does not fire for these entries: **the entry is a real directory,
+so `realpath()` returns the entry itself.** Measured on Hive against a real staged search:
+
+```
+entry           : /quobyte/proteomics-grp/fran/incoming/out_q__a7416fdc
+engine detected : diann                                    <- correct
+realpath()      : /quobyte/proteomics-grp/fran/incoming/out_q__a7416fdc
+manifest says   : /quobyte/proteomics-grp/brett/poplar_test/diann/out_q
+MATCH?          : False
+```
+
+Two consequences, both silent — the ingest succeeds either way:
+
+1. `--output-dir` records the **drop box** as the search's location. `search_id` is
+   `uuid5(namespace, output_dir)`, so when a later scan reaches the same search at its real path
+   under `/quobyte/proteomics-grp/brett` it looks un-ingested and is ingested **a second time**
+   under a different id — exactly the duplicate `2a58b3e` set out to prevent.
+2. The **organism is lost**. A DIA-NN report has no organism column, so the row lands `NULL`
+   and the search never appears on FRAN's species page. The skill knows it (the user confirmed
+   it during the run) and puts it in the manifest; nothing else can recover it.
+
+The fix is to prefer the manifest wherever one exists — it is authoritative for both:
+
+```python
+man = os.path.join(dirpath, "fran_manifest.json")
+if os.path.isfile(man):
+    m = json.load(open(man))
+    identity = m["output_dir"]                 # the real search dir, not the drop entry
+    extra = m["suggested_ingest"]              # includes --organism-name/--taxon/--engine
+else:
+    identity = os.path.realpath(dirpath)       # existing behaviour, for bare symlinks
+```
+
+(The entry is a real directory of links rather than a bare symlink on purpose — see the
+engine-marker bug below, which a bare symlink would walk straight into.)
+
+### 🔴 A bug in `find_uningested.py` this handover has to work around
+
+`ENGINE_MARKERS` lists **`search_provenance.json` as a Radiant marker**, and Radiant is tested
+before DIA-NN. But `run_search.py` writes that file into **every** search directory it produces,
+whatever the engine. So any directory from the Core pipeline skill — DIA-NN, FragPipe, Radiant —
+is detected as **Radiant**. That is not specific to the drop directory: it already mislabels
+skill-produced DIA-NN searches under `/quobyte/proteomics-grp/brett`, which is a default scan root.
+
+The skill works around it by not linking that file (its contents are in the manifest instead), and
+by writing the true engine into the manifest. **The real fix belongs here**: drop
+`search_provenance.json` from Radiant's marker list — Radiant is already identified by
+`radiant_results/fulcrum-results` and `fulcrum-results/_SUCCESS` — or read the `engine` key out of
+it instead of treating its existence as a marker.
+
+Verified with the current `detect_engine()` against real staged entries on Hive (2026-08-25):
+DIA-NN → `diann`, FragPipe → `fragpipe`, Radiant → `radiant`. All three route correctly **because**
+the provenance file is withheld.
+
+### Telling the skill an entry is done (optional)
+
+`fran_deposit.py verify` reports a search as ingested if either the corpus holds it *or* the entry
+contains **`fran_ingested.json`**. If the cron writes that marker (any JSON; `search_id` and
+`n_precursors` are useful), then Core members with no corpus credential can still confirm the
+hand-over landed. Without it, `verify` falls back to querying the corpus, which needs a token.
+Removing or moving an ingested entry is also fine — `verify` then reports it from the corpus.
+
+### If you change `corpus_ingest.py`'s CLI, this lane is a caller
+The manifest emits `--engine`, `--output-dir`, `--name`, `--organism-name`, `--taxon`. Renaming any
+of them breaks automatic ingests.
 
 ## Observed-spectrum lane (the DIA-CLIP fix, 2026-07-17) — **Lance + DB registry**
 
