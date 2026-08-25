@@ -47,19 +47,34 @@ def _conn():
         options="-c statement_timeout=600000")
 
 
-def build_rows(ds_path, limit=0):
-    """Lance -> rows shaped like delimp_precursor_xic, keeping absolute RTs."""
+def build_rows(ds_path, limit=0, keys=None, runs=None):
+    """Lance -> rows shaped like delimp_precursor_xic, keeping absolute RTs.
+
+    `keys`, when given, is a set of (stripped_seq, charge, run) to keep -- the CURATED path used by
+    the cross-engine page, which needs a few hundred specific precursors rather than a prefix of the
+    dataset. `limit` alone takes whichever rows Lance scans first, which is a fine smoke test and the
+    wrong tool for choosing what to display.
+
+    `runs` is pushed down as a Lance filter. It matters: allDog holds 3.49M rows over 220 runs, and
+    the dog cross-engine comparison uses 9 of them, so the filter is a ~24x read reduction."""
     import lance
     ds = lance.dataset(ds_path)
     cols = ["search_id", "search_name", "run", "raw_path", "stripped_seq", "modified_seq", "charge",
             "precursor_mz", "rt", "q_value", "is_decoy", "n_ms1", "n_ms2",
             "trace_label", "trace_ms_level", "trace_rt", "trace_intensity"]
     have = [c for c in cols if c in ds.schema.names]
-    t = ds.scanner(columns=have, limit=limit or None).to_table().to_pylist()
+    filt = None
+    if runs:
+        quoted = ", ".join("'" + str(r).replace("'", "''") + "'" for r in sorted(runs))
+        filt = f"run IN ({quoted})"
+    t = ds.scanner(columns=have, filter=filt, limit=limit or None).to_table().to_pylist()
     rows = []
     for r in t:
         if r.get("is_decoy"):
             continue                      # decoys must never leak into a public lane
+        if keys is not None and (r.get("stripped_seq"), int(r.get("charge") or 0),
+                                 r.get("run")) not in keys:
+            continue
         run = r.get("run")
         mseq = r.get("modified_seq") or r.get("stripped_seq")
         ch = int(r.get("charge") or 0)
