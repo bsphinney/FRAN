@@ -203,11 +203,64 @@ def _truthy(x):
     return str(x).strip().lower() in ("true", "1", "1.0")
 
 
+def _report_columns(path):
+    """Header names of a Spectronaut report — parquet OR tsv."""
+    if str(path).lower().endswith(".parquet"):
+        import pyarrow.parquet as pq
+        return list(pq.read_schema(path).names)
+    import pandas as pd
+    return list(pd.read_csv(path, sep="\t", nrows=0).columns)
+
+
+def _iter_report_batches(path, cols, chunksize=500_000):
+    """Yield {column: [values]} batches from a Spectronaut report, parquet OR tsv.
+
+    TSV is not a fallback curiosity: manageSNE exports TSV whenever the operator avoids the parquet
+    writer (win-2 hit parquet corruption on very large .sne, so the Taha allDog 128-column report was
+    deliberately exported as a 34 GB TSV). report_index used to call pq.read_schema() unconditionally
+    and died with "Parquet magic bytes not found in footer" on exactly those reports.
+
+    Batched on purpose: a fragment-level report is tens of millions of rows and the index only ever
+    keeps ONE entry per XICDBID, so streaming keeps peak memory at a chunk rather than the file.
+    """
+    if str(path).lower().endswith(".parquet"):
+        import pyarrow.parquet as pq
+        for b in pq.ParquetFile(path).iter_batches(batch_size=chunksize, columns=list(cols)):
+            yield b.to_pydict()
+    else:
+        import pandas as pd
+        for ch in pd.read_csv(path, sep="\t", usecols=list(cols), chunksize=chunksize,
+                              low_memory=False):
+            # NaN -> None. pandas represents an EMPTY TSV cell as float('nan'), while the parquet
+            # reader yields None, so without this the two formats disagree on what "missing" is and
+            # a blank PG.Genes arrives at an Arrow string column as a float:
+            # "ArrowTypeError: Expected bytes, got a 'float' object", 50 minutes into the build.
+            # Normalise at the source so every consumer sees one missing-value convention; _num()
+            # and _truthy() already treat None correctly.
+            ch = ch.astype(object).where(pd.notna(ch), None)
+            yield {c: ch[c].tolist() for c in ch.columns}
+
+
 def report_index(report_path, q_max=0.01, keep_decoys=False):
-    """{xicdbid -> identity dict} for the precursors we want traces for (targets at q<=q_max).
-    Decoys are excluded by default: the XIC lane mirrors the public corpus population."""
-    import pyarrow.parquet as pq
-    names = set(pq.read_schema(report_path).names)
+    """{run -> {xicdbid -> identity dict}} for the (precursor, run) pairs we want traces for.
+
+    KEYED BY RUN, and that is load-bearing (fixed 2026-08-21). FG.XICDBID is GLOBAL across the
+    experiment, not per-file: every run's .xic.db holds a trace for EVERY library precursor -- on the
+    Taha allDog set all 220 dbs carry the identical 43,952 FGIDs (measured, jaccard 1.000). So a
+    flat {fgid -> record} index, deduped by fgid, kept ONE arbitrary run's record and handed it to
+    all 220 dbs. Two things broke:
+
+      * `run`, `rt`, `im` and `q_value` on a trace came from whichever run happened to appear first
+        in the report -- wrong for 219 dbs out of 220.
+      * per-run FDR was lost. Every db contributed all 43,952 FGIDs, so the lane would emit
+        220 x 43,952 = 9.67M rows when only 3,493,169 (precursor, run) pairs actually pass q<=0.01;
+        roughly two thirds of the lane would have been traces for precursors NOT identified in that
+        run, wearing another run's identity.
+
+    Keying by (run, fgid) makes each trace carry its own run's measurements and restores the FDR
+    filter, so the lane population matches the corpus. Decoys are excluded by default for the same
+    reason: the XIC lane mirrors the public corpus population."""
+    names = set(_report_columns(report_path))
     use, col = {}, {}
     for field, cands in _COLS.items():
         hit = next((c for c in cands if c in names), None)
@@ -216,27 +269,33 @@ def report_index(report_path, q_max=0.01, keep_decoys=False):
             use[hit] = field
     if "xicdbid" not in col:
         return {}, "report has no FG.XICDBID column — cannot link traces to peptides"
-    t = pq.read_table(report_path, columns=list(use)).to_pydict()
-    n = len(t[col["xicdbid"]])
+    if "run" not in col:
+        return {}, "report has no R.FileName column — cannot key traces per run"
     out = {}
-    for i in range(n):
-        if not keep_decoys and "is_decoy" in col and _truthy(t[col["is_decoy"]][i]):
-            continue
-        q = _num(t[col["q_value"]][i]) if "q_value" in col else None
-        if q is None or q > q_max:
-            continue
-        fg = t[col["xicdbid"]][i]
-        if fg is None:
-            continue
-        try:
-            fg = int(fg)
-        except (TypeError, ValueError):
-            continue
-        if fg in out:
-            continue                       # fragment-level report: one row per fragment
-        rec = {f: (t[c][i] if c in t else None) for c, f in use.items()}
-        rec["xicdbid"] = fg
-        out[fg] = rec
+    for t in _iter_report_batches(report_path, list(use)):
+        n = len(t[col["xicdbid"]])
+        for i in range(n):
+            if not keep_decoys and "is_decoy" in col and _truthy(t[col["is_decoy"]][i]):
+                continue
+            q = _num(t[col["q_value"]][i]) if "q_value" in col else None
+            if q is None or q > q_max:
+                continue
+            fg = t[col["xicdbid"]][i]
+            if fg is None:
+                continue
+            try:
+                fg = int(fg)
+            except (TypeError, ValueError):
+                continue
+            run = str(t[col["run"]][i] or "")
+            if not run:
+                continue
+            per_run = out.setdefault(run, {})
+            if fg in per_run:
+                continue                   # fragment-level report: one row per fragment
+            rec = {f: (t[c][i] if c in t else None) for c, f in use.items()}
+            rec["xicdbid"] = fg
+            per_run[fg] = rec
     return out, None
 
 
@@ -249,13 +308,46 @@ def process_one(report_path, xic_dir, out_dir, search_id=None, search_name=None,
     if not idx:
         return (None, 0, 0, None, None)
     dbs = sorted(_glob.glob(os.path.join(xic_dir, "*.xic.db")) + _glob.glob(os.path.join(xic_dir, "*.sqlite")))
+    # Drop macOS AppleDouble stubs BY NAME before trying to open anything. These shares are mounted
+    # by Macs, so every real file can have a 4 KB "._<name>" sibling that matches the glob exactly.
+    # One sits next to the Taha allDog XIC dbs (._…_VER_1_….xic.db). It is a resource fork, not a
+    # database, and it is not a corrupt db either -- so skipping it by name is correct, not a
+    # tolerance for bad data.
+    dbs = [d for d in dbs if not os.path.basename(d).startswith("._")]
     if not dbs:
         raise ValueError(f"no *.xic.db / *.sqlite under {xic_dir}")
-    keep = set(idx)
     rows, n_traces = [], 0
+    bad, unmatched = [], []
     for db in dbs:
-        for fg, traces in read_xic_db(db, keep):
-            r = idx.get(fg)
+        # Which run is this db? Spectronaut names each All-XIC db "<R.FileName>.xic.db", so the
+        # basename IS the run key. Taking the run from the FILE rather than from the report record
+        # is the whole point of the (run, fgid) index: the db is ground truth for which run these
+        # traces were measured in.
+        run = os.path.basename(db)
+        for _suf in (".xic.db", ".sqlite"):
+            if run.endswith(_suf):
+                run = run[: -len(_suf)]
+                break
+        idx_run = idx.get(run)
+        if not idx_run:
+            # No FDR-passing precursors for this run -- or the db basename does not match any
+            # R.FileName. Either way say so; a silently skipped run is missing data.
+            unmatched.append(os.path.basename(db))
+            continue
+        keep = set(idx_run)
+        # One unreadable db must not cost the whole search its chromatogram lane. read_xic_db opens
+        # SQLite and streams, so a truncated/locked/non-db file raises HERE, mid-iteration, and used
+        # to propagate out of process_one -- corpus_ingest catches that best-effort, so the lane
+        # silently produced NOTHING for the search. Skip the file, keep the rest, and say so loudly:
+        # a skipped db is real missing data and must never look like a clean run.
+        try:
+            db_rows = list(read_xic_db(db, keep))
+        except (sqlite3.Error, OSError) as e:
+            bad.append((db, str(e)[:80]))
+            print(f"  [xic] SKIPPED unreadable db {os.path.basename(db)}: {str(e)[:80]}", flush=True)
+            continue
+        for fg, traces in db_rows:
+            r = idx_run.get(fg)
             if not r:
                 continue
             ms1 = sum(1 for t in traces if t["ms_level"] == 1)
@@ -263,7 +355,7 @@ def process_one(report_path, xic_dir, out_dir, search_id=None, search_name=None,
                 "search_id": str(search_id) if search_id else None,
                 "search_name": search_name,
                 "raw_path": db,
-                "run": str(r.get("run") or ""),
+                "run": run,
                 "xicdbid": fg,
                 "stripped_seq": r.get("stripped_seq"),
                 "modified_seq": r.get("modified_seq"),
@@ -285,6 +377,14 @@ def process_one(report_path, xic_dir, out_dir, search_id=None, search_name=None,
                 "trace_intensity": [t["i"] for t in traces],
             })
             n_traces += len(traces)
+    if unmatched:
+        print(f"  [xic] {len(unmatched)} of {len(dbs)} dbs had no FDR-passing precursors in the "
+              f"report (or the basename matched no R.FileName): "
+              f"{', '.join(unmatched[:5])}{' …' if len(unmatched) > 5 else ''}", flush=True)
+    if bad:
+        print(f"  [xic] WARNING: {len(bad)} of {len(dbs)} XIC dbs were unreadable and are NOT in the "
+              f"lane: {', '.join(os.path.basename(b) for b, _ in bad[:5])}"
+              f"{' …' if len(bad) > 5 else ''}", flush=True)
     if not rows:
         return (None, 0, 0, None, None)
     tbl = pa.Table.from_pylist(rows, schema=SCHEMA)

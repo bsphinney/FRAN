@@ -44,6 +44,38 @@ def _acq_for(engine, platform):
     return "diaPASEF" if platform == "timstof" else "DIA"
 
 
+def _platform_from_disk(output_dir, runs):
+    """Ground-truth platform from the raws actually on disk, for reports that settle it no other way.
+
+    A Spectronaut BGS-schema export carries no EG.IonMobility column, and the adapter strips the
+    vendor extension off R.FileName -- so BOTH signals used below go blank and a diaPASEF search
+    silently lands as 'orbitrap'. That is not cosmetic: it picks the wrong extension for every
+    synthetic raw_path (<dir>/<run>.raw for what is really a .d), and labels the acquisition 'DIA'
+    instead of 'diaPASEF'. The files themselves are unambiguous -- Bruker is a .d FOLDER, Thermo a
+    .raw file -- and resolve_raw_hive_paths treats that physical format as ground truth, so use it
+    here too. Looks beside output_dir (the same place the raw-metadata index below reads) and counts
+    only names matching a run in THIS search. Returns None for "no opinion", never a guess.
+    """
+    import glob as _g
+    base = os.path.dirname((output_dir or "").rstrip("/"))
+    if not base or not os.path.isdir(base):
+        return None
+    want, n_d, n_raw = set(runs), 0, 0
+    try:
+        for pat, is_d in (("*.d", True), ("*/*.d", True), ("*.raw", False), ("*/*.raw", False)):
+            for _p in _g.glob(os.path.join(base, pat)):
+                if os.path.splitext(os.path.basename(_p))[0] in want:
+                    if is_d:
+                        n_d += 1
+                    else:
+                        n_raw += 1
+    except OSError:
+        return None
+    if n_d and n_d >= n_raw:
+        return "timstof"
+    return "orbitrap" if n_raw else None
+
+
 def _conn():
     import psycopg2
     # Use _token() so a token FILE holding the service-account SECRET (not a JWT) is exchanged
@@ -243,8 +275,13 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
     looks_raw = any(r.endswith((".raw", ".mzml")) for r in ext_hits)
     if has_real_im or (looks_dotd and not looks_raw):
         platform = "timstof"
-    else:
+    elif looks_raw:
         platform = "orbitrap"
+    else:
+        # Neither signal fired: no real IM anywhere AND the run names carry no extension -- which is
+        # exactly what a Spectronaut BGS-schema export looks like. Silence is not evidence of an
+        # Orbitrap, so ask the filesystem before falling back (see _platform_from_disk).
+        platform = _platform_from_disk(output_dir, runs) or "orbitrap"
     # protein aggregation per (run, protein_group). Protein-level abundance = SUM of the protein's
     # precursor intensities (DIA-NN/Spectronaut give no per-PG quant column here, but each precursor
     # carries Precursor.Quantity + protein_group, so summing is a faithful protein-quant proxy).
@@ -300,6 +337,42 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         _V.record_run(cur, "corpus_ingest", CORPUS_INGEST_VERSION,
                       notes=f"schema={SCHEMA_VERSION}")
         conn.commit()
+
+        # ── DUPLICATE GUARD ───────────────────────────────────────────────────────────────────
+        # The idempotency key is output_dir, so THE SAME SEARCH AT TWO PATHS BECOMES TWO SEARCHES.
+        # That is not hypothetical: the same .sne routinely sits on a project drive and in
+        # S:\sne_storage, and an audit on 2026-08-24 found 184 duplicate groups / 41.8M redundant
+        # precursors, most from the original bulk load.
+        #
+        # Matching on search_name does NOT work -- the name comes from the .sne folder in one place
+        # and from the raw-file prefix in another, so the SAME result arrives as "OI07152026" and
+        # "20260717_102207_07152026". The stable identity is the SET OF RAW FILES plus the precursor
+        # count, which no naming or drive-letter difference can change.
+        #
+        # Narrow on (n_raw_files, n_precursors_total) in SQL -- both exact and indexed-cheap -- then
+        # compare basename SETS in Python rather than trusting a DB-side string_agg ordering to match
+        # Python's sorted(). Re-ingesting the SAME output_dir is untouched: that is the intended
+        # delete-then-insert. Override with --allow-duplicate for a deliberate second copy.
+        if not ALLOW_DUPLICATE:
+            cur.execute("""SELECT id, search_name, output_dir, ingested_at FROM delimp_searches
+                           WHERE n_raw_files=%s AND n_precursors_total=%s AND output_dir<>%s""",
+                        (len(runs), len(recs), output_dir))
+            mine = {str(r) for r in runs}
+            for _id, _nm, _od, _at in cur.fetchall():
+                cur.execute("""SELECT rf.raw_basename FROM search_raw_files f
+                               JOIN raw_files rf ON rf.raw_path=f.raw_path
+                               WHERE f.search_id=%s""", (_id,))
+                if {r[0] for r in cur.fetchall()} == mine:
+                    print(f"  SKIPPED — DUPLICATE of an already-ingested search.\n"
+                          f"    this : {output_dir}\n"
+                          f"    exists: {_od}\n"
+                          f"    match : same {len(mine)} raw files AND same {len(recs):,} precursors "
+                          f"(search_name {_nm!r}, ingested {_at:%Y-%m-%d})\n"
+                          f"    Nothing was written. Record this path against the existing search in\n"
+                          f"    delimp_search_sources (file_role 'sne') instead, or re-run with "
+                          f"--allow-duplicate if it is genuinely a separate result.", flush=True)
+                    conn.rollback(); conn.close()
+                    return
         # auto-add the cross-run-comparable columns (not in v1 schema) so the uploader
         # can store iRT/iIM straight from the report — the path to a TRUE iRT axis.
         # IMPORTANT: never run ALTER TABLE unconditionally here. `ADD COLUMN` takes an
@@ -585,6 +658,25 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                 if lpath:
                     sln.register(conn, search_id, search_name, lpath, n_prec, n_frag, md5, ver)
                     print(f"  spectrum lane: {lpath}  ({n_prec:,} prec / {n_frag:,} frag, registered)")
+            except Exception as e:  # noqa: BLE001 - spectrum lane best-effort, never fail the ingest
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                # Print the TRACEBACK, not just str(e). This handler used to log `str(e)[:120]`, so
+                # a "tuple index out of range" from somewhere inside a 34 GB parse arrived with no
+                # file, no line and no frame — undiagnosable after the fact, and the run costs hours
+                # to reproduce. An error you cannot locate is barely better than a silent one.
+                import traceback as _tb
+                print(f"  [warn] spectrum lane not written: {e!r}", flush=True)
+                _tb.print_exc()
+
+            # SEPARATE try: the XIC lane reads the .xic.db files and shares nothing with the
+            # spectrum lane but the report path. It used to live inside the block above, so the
+            # allDog spectrum-lane failure skipped the chromatogram lane entirely — the lane was
+            # never attempted, and the log said nothing about it. Independent lanes, independent
+            # failure domains.
+            try:
                 # OBSERVED-CHROMATOGRAM LANE: if this export also dumped the "All XIC" SQLite dbs
                 # (--setXICExportDirectory), store the full elution profiles in their own Lance
                 # dataset + delimp_xic_lane registry. Same best-effort contract as the spectrum lane.
@@ -604,19 +696,22 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                         print(f"  XIC lane: {xpath}  ({xn_prec:,} prec / {xn_tr:,} traces, registered)")
                     else:
                         print("  [warn] XIC lane: no traces matched the report's precursors")
-            except Exception as e:  # noqa: BLE001 - spectrum lane best-effort, never fail the ingest
+            except Exception as e:  # noqa: BLE001 - XIC lane best-effort, never fail the ingest
                 try:
                     conn.rollback()
                 except Exception:  # noqa: BLE001
                     pass
-                print(f"  [warn] spectrum lane not written: {str(e)[:120]}")
+                import traceback as _tb
+                print(f"  [warn] XIC lane not written: {e!r}", flush=True)
+                _tb.print_exc()
     except Exception as e:
         conn.rollback(); raise
     finally:
         conn.close()
 
 
-BULK_COPY = False  # set by --bulk-copy; uses COPY for the big precursor insert (fast on HIVE)
+BULK_COPY = False         # set by --bulk-copy; uses COPY for the big precursor insert (fast on HIVE)
+ALLOW_DUPLICATE = False   # set by --allow-duplicate; bypasses the raw-set duplicate guard in ingest()
 WRITE_FRAGMENTS = True    # write the observed-spectrum Lance lane (Spectronaut fragment-level reports)
 SPECTRUM_LANCE_DIR = None # dir for per-search Lance datasets (set by --lance-dir); None disables the lane
 XIC_DIR = None            # dir of Spectronaut *.xic.db All-XIC dbs (set by --xic-dir); None disables the XIC lane
@@ -704,6 +799,9 @@ if __name__ == "__main__":
     ap.add_argument("--name", default=None)
     ap.add_argument("--output-dir", default=None, help="stable provenance/idempotency key (e.g. the archived zip path) — use when the report is a temp extract")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--allow-duplicate", action="store_true",
+                    help="ingest even if another output_dir already has the same raw-file set and "
+                         "precursor count (default: skip, see the duplicate guard)")
     ap.add_argument("--bulk-copy", action="store_true", help="use COPY for the precursor insert (much faster on a fast PG link, e.g. HIVE)")
     ap.add_argument("--no-fragments", action="store_true", help="skip the observed-spectrum Lance lane (precursors only)")
     ap.add_argument("--lance-dir", default=None, help="dir for per-search Lance spectrum datasets (enables the observed-spectrum lane)")
@@ -711,6 +809,7 @@ if __name__ == "__main__":
     ap.add_argument("--xic-lance-dir", default=None, help="where to write .xic.lance datasets (default: a sibling 'xic_lance' dir next to --lance-dir)")
     a = ap.parse_args()
     BULK_COPY = a.bulk_copy
+    ALLOW_DUPLICATE = a.allow_duplicate
     WRITE_FRAGMENTS = not a.no_fragments
     SPECTRUM_LANCE_DIR = a.lance_dir
     XIC_DIR = a.xic_dir

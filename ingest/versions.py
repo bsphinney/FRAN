@@ -44,10 +44,30 @@ SCHEMA_VERSION = "1.0.0"
 # --- component (code) versions ---------------------------------------------------------------
 # Semver. Bump patch for fixes that cannot change output, minor for output-affecting changes, major
 # for a format change that makes old artefacts unreadable.
-CORPUS_INGEST_VERSION = "1.1.0"          # 1.1.0: raw_metadata restored; instrument block no longer silently NULL
-SPECTRUM_LANE_WRITER_VERSION = "1.2.0"   # 1.2.0: frg_excluded + frg_chan_interference appended   # 1.1.0: content_md5 combine_chunks fix (2026-07-27)
-XIC_LANE_WRITER_VERSION = "1.0.0"        # Spectronaut All-XIC -> Lance
-XIC_TRACE_LANE_WRITER_VERSION = "0.2.0"  # pilot; still the [9,32] layout, pre-corpus-scale
+CORPUS_INGEST_VERSION = "1.2.0"          # 1.2.0: _platform_from_disk — a Spectronaut BGS-schema report
+                                         # (no EG.IonMobility, extension stripped off R.FileName) used to
+                                         # fall through to platform="orbitrap", which picks .raw for every
+                                         # synthetic raw_path and labels acquisition DIA not diaPASEF.
+                                         # Output-affecting, hence minor.   # 1.1.0: raw_metadata restored;
+                                         # instrument block no longer silently NULL
+SPECTRUM_LANE_WRITER_VERSION = "1.2.1"   # 1.2.1: register() SQL carried a literal "%" in a comment;
+                                         # psycopg2 read it as a conversion specifier and EVERY
+                                         # registration raised IndexError from 2026-08-11 to 08-21.   # 1.2.0: frg_excluded + frg_chan_interference appended   # 1.1.0: content_md5 combine_chunks fix (2026-07-27)
+XIC_LANE_WRITER_VERSION = "1.1.0"        # 1.1.0: index keyed by (run, fgid). FG.XICDBID is GLOBAL
+                                         # and every run's db holds every precursor, so the old flat
+                                         # index gave 219/220 dbs another run's identity and lost the
+                                         # per-run FDR filter (9.67M rows vs 3.49M real pairs).        # 1.0.3: normalise pandas NaN -> None on the TSV path
+                                         # (empty cell reached an Arrow string column as a float).        # 1.0.2: read TSV reports too (report_index called
+                                         # pq.read_schema unconditionally, so a TSV FRAN.rs export
+                                         # died on "Parquet magic bytes not found"); index streamed.        # 1.0.1: skip AppleDouble "._*" stubs and survive an
+                                         # unreadable .xic.db instead of aborting the lane (one bad
+                                         # file used to yield NO lane at all for the search).
+                                         # 1.0.0: Spectronaut All-XIC -> Lance
+XIC_TRACE_LANE_WRITER_VERSION = "1.0.0"  # 1.0.0: out of pilot. Per-channel RT (fragments on the
+                                         # measured MS2 cycle time, isotopes on the MS1 frame time),
+                                         # Thermo caches supported, and every run scored against
+                                         # DIA-NN before its traces are trusted. Datasets written by
+                                         # 0.x carry the shared-axis MS2 time shift.
 RAW_METADATA_VERSION = "1.0.0"           # Bruker analysis.tdf + Thermo TRFP readers
 
 

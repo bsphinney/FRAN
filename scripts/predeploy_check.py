@@ -360,6 +360,38 @@ for f in sorted((ROOT / "ingest").rglob("*.py")):
 print(f"  [3d] column-less INSERTs in ingest/: {n_ins}")
 
 
+# ----------------------------------------------------------------------------
+# [3e] DDL that is split on ';' in Python, while carrying a ';' inside a '--' comment.
+#
+#      Postgres parses '--' comments correctly, so `cur.execute(WHOLE_DDL)` is safe no matter what
+#      the prose contains. A Python-side `DDL.split(";")` is not: a semicolon in a sentence ends the
+#      chunk early, leaving a fragment that is pure comment text -- truthy in Python, an empty query
+#      to Postgres. On 2026-08-13 this raised "can't execute an empty query" in ensure_registry and
+#      killed every writer AFTER it had computed its result: 141 runs scored, none recorded.
+#
+#      Flagged only when BOTH appear in the same module, so the safe whole-block executors
+#      (spectrum_lance.py) are not false-positived for having prose in their DDL.
+# ----------------------------------------------------------------------------
+n_ddl = 0
+for f in sorted((ROOT / "ingest").rglob("*.py")):
+    src = f.read_text(encoding="utf-8", errors="replace")
+    if not re.search(r'\.split\(\s*["\'];["\']\s*\)', src):
+        continue
+    for m in re.finditer(r'(\w+)\s*=\s*"""(.*?)"""', src, re.S):
+        name, body = m.group(1), m.group(2)
+        if not re.search(r'\b(CREATE|ALTER)\s+TABLE|\bCREATE\s+INDEX', body, re.I):
+            continue
+        base = src[: m.start()].count("\n")
+        for i, ln in enumerate(body.splitlines(), 1):
+            s = ln.lstrip()
+            if s.startswith("--") and ";" in s:
+                n_ddl += 1
+                block(f"[3e ddl] {f.relative_to(ROOT)}:{base + i + 1} ';' inside a comment in "
+                      f"{name}, and this module splits SQL on ';' -- the split will cut the comment "
+                      f"and emit an empty query. Drop the semicolon, or execute the block whole.")
+print(f"  [3e] DDL comment/semicolon collisions: {n_ddl}")
+
+
 # ============================================================================
 # 4. TEMPLATE PLACEHOLDERS (advisory only).
 #    The BLOCKING version of this check lives in step 5: it scans the RENDERED page

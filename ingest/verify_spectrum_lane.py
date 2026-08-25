@@ -9,6 +9,13 @@ backfill and on a schedule.
     python verify_spectrum_lane.py                 # check every registered dataset
     python verify_spectrum_lane.py --limit 100     # spot check
     python verify_spectrum_lane.py --missing-only  # only report problems
+    python verify_spectrum_lane.py --shard 3/8     # this shard only (SLURM array task 3 of 8)
+
+SHARDING: verification re-reads the whole dataset to recompute the md5, so a full pass is bounded by
+I/O over the entire lane (282 GB / 1,553 datasets as of 2026-08-21, ~3-4 h serial). --shard i/n takes
+every n-th row, which also spreads the big datasets across shards rather than piling them into one.
+Run it as a SLURM array so one dataset large enough to exhaust memory cannot take the whole pass with
+it. Aggregate the per-shard "DONE:" lines for the overall result.
 """
 from __future__ import annotations
 
@@ -33,13 +40,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int)
     ap.add_argument("--missing-only", action="store_true")
+    ap.add_argument("--shard", help="i/n — verify only every n-th registered dataset (0-based i)")
     a = ap.parse_args()
+    shard_i = shard_n = None
+    if a.shard:
+        shard_i, shard_n = (int(x) for x in a.shard.split("/"))
+        if not (0 <= shard_i < shard_n):
+            ap.error(f"--shard {a.shard}: need 0 <= i < n")
     conn = _conn(); cur = conn.cursor()
     cur.execute(f"""SELECT search_name, lance_path, content_md5, n_precursors, n_fragments
                     FROM delimp_spectrum_lane ORDER BY ingested_at DESC
                     {'LIMIT %d' % a.limit if a.limit else ''}""")
     rows = cur.fetchall()
-    print(f"{len(rows)} registered Lance dataset(s)")
+    total = len(rows)
+    if shard_n:
+        # Stride, not a contiguous block: the registry is ordered by ingest time and dataset sizes
+        # cluster by campaign, so contiguous slicing would hand one shard all the big ones.
+        rows = [r for k, r in enumerate(rows) if k % shard_n == shard_i]
+        print(f"shard {shard_i}/{shard_n}: {len(rows)} of {total} registered Lance dataset(s)")
+    else:
+        print(f"{total} registered Lance dataset(s)")
     ok = missing = corrupt = 0
     for name, path, md5, npc, nf in rows:
         if not path or not os.path.exists(path):

@@ -67,9 +67,19 @@ SCHEMA = pa.schema([
 
 
 def content_md5(tbl):
-    """Kept local and identical to the pilot's, so md5s recorded by the original run still verify.
-    Note it lacks the combine_chunks() canonicalisation that spectrum_lance.content_md5 needed —
-    harmless at 6,000 rows (single chunk), but it WILL mis-verify at corpus scale. Fix when scaling."""
+    """Content checksum, canonicalised to a single chunk.
+
+    The pilot version omitted combine_chunks() with a note that it was "harmless at 6,000 rows
+    (single chunk), but it WILL mis-verify at corpus scale. Fix when scaling." We are now scaling,
+    so it is fixed. The IPC stream encodes each record batch separately, so the same rows split
+    differently hash differently: a table is one chunk when built in memory but Lance hands back
+    several when reading anything large, which made the integrity check fail open on exactly the
+    biggest datasets — the same defect spectrum_lance.content_md5 was fixed for on 2026-07-27.
+
+    CONSEQUENCE: md5s recorded by writer 0.x (the pilot) no longer verify against this function.
+    That is correct rather than unfortunate — those datasets also carry the shared-axis MS2 time
+    shift and need rebuilding regardless, and writer_version distinguishes them."""
+    tbl = tbl.combine_chunks()
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, tbl.schema) as w:
         w.write_table(tbl)

@@ -25,6 +25,15 @@ flyability, cross-tool (DIA-NN + Spectronaut) provenance, a queryable **MCP**
 endpoint for AI agents, server-side aggregation, and a hard public-layer security
 boundary. Part of **STAN** (stan-proteomics.org).
 
+## Run your own FRAN
+FRAN is not UC-Davis-specific: **[INSTALL.md](INSTALL.md)** stands up your own instance — your
+PostgreSQL, your data, your deployment. `schema/fran_schema.sql` creates the corpus schema (36
+tables, generated from a live instance by `scripts/dump_schema.py` so it cannot drift, and verified
+by applying it to an empty PostgreSQL 16 and writing a first ingest).
+
+Instances can also **federate**: see **[FEDERATION.md](FEDERATION.md)** to connect your node to
+others, and [FEDERATION_DESIGN.md](FEDERATION_DESIGN.md) for the design. Sharing is off by default.
+
 ## Stack
 - **Backend:** FastAPI + psycopg2 (reuses the project's PG Farm connection
   pattern), a connection pool with **read-only** sessions and a **table
