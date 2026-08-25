@@ -144,6 +144,7 @@ DEFAULT_EXCLUDES = [
     "/quobyte/proteomics-grp/hela_qcs/",       # QC watcher output
     "/quobyte/proteomics-grp/brett/v1_smoke",  # smoke tests
     "/quobyte/proteomics-grp/brett/glendon/",  # our scratch/working dir
+    "/Data/lab/ToFEvoQC/",                     # instrument QC series, not customer searches
 ]
 
 
