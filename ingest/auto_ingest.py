@@ -159,12 +159,21 @@ def main():
             print(f"      TIMEOUT after {a.timeout}s", flush=True); fail += 1; continue
         tail = ((r.stdout or "") + "\n--- stderr ---\n" + (r.stderr or ""))[-2500:]
         el = time.time() - t0
-        if r.returncode == 0:
-            ok += 1
-            print(f"      OK in {el:.0f}s", flush=True)
-        elif "duplicate" in (r.stdout + r.stderr).lower():
+        # ORDER MATTERS. The duplicate guard `return`s rather than sys.exit(1), so a refused
+        # ingest exits 0 -- checking returncode first would log it as "OK" and the run summary would
+        # claim it ingested searches it did not touch. Match the guard's own message, and match it
+        # narrowly: the substring "duplicate" alone also appears in corpus_ingest's --allow-duplicate
+        # help text.
+        blob = (r.stdout or "") + (r.stderr or "")
+        if "DUPLICATE of an already-ingested search" in blob:
             dup += 1
             print(f"      SKIPPED-DUPLICATE in {el:.0f}s (guard refused — not a failure)", flush=True)
+            for line in blob.splitlines():
+                if line.strip().startswith("exists:"):
+                    print(f"      {line.strip()}", flush=True)
+        elif r.returncode == 0:
+            ok += 1
+            print(f"      OK in {el:.0f}s", flush=True)
         else:
             fail += 1
             print(f"      FAILED rc={r.returncode} in {el:.0f}s", flush=True)
