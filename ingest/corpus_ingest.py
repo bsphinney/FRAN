@@ -31,6 +31,33 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from versions import CORPUS_INGEST_VERSION, SCHEMA_VERSION  # noqa: E402
 
+
+def _versions():
+    """versions module, or a stand-in that reports 'unknown' rather than raising.
+
+    A module-scope `from versions import ...` is what broke the shared copy on 2026-08-20 (win-1
+    #57): versions.py is not guaranteed to sit beside every deployment of this file. An ingester
+    that refuses to start because it cannot name its own version is worse than one that admits it
+    does not know."""
+    class _Unknown:
+        CORPUS_INGEST_VERSION = SCHEMA_VERSION = "unknown"
+        DUPLICATE_GUARD_VERSION = "unknown"
+        @staticmethod
+        def pipeline_stamp():
+            return "corpus_ingest/unknown guard/unknown"
+    try:
+        import versions as _v
+    except ImportError:                      # pragma: no cover - depends on deployment layout
+        return _Unknown
+    # A STALE versions.py is the likelier failure, and it is nastier: the module imports fine and
+    # then AttributeErrors deep inside the ingest. That is exactly how the first FragPipe run died --
+    # the shared copy had been updated but this deployment's had not. Verify the surface we use.
+    if not hasattr(_v, "pipeline_stamp"):
+        print("  [warn] versions.py is present but predates pipeline_stamp(); "
+              "this deployment is not fully synced — recording versions as 'unknown'", flush=True)
+        return _Unknown
+    return _v
+
 _UNIMOD = {"UniMod:4": 4, "UniMod:35": 35, "UniMod:1": 1, "UniMod:21": 21, "UniMod:7": 7}
 
 
@@ -138,18 +165,35 @@ def _calc_prec_mz(modseq, charge):
 
 
 def _records(report_path, engine):
-    """Yield normalized per-precursor dicts from DIA-NN parquet or Spectronaut."""
+    """Yield normalized per-precursor dicts from a DIA-NN / FragPipe / Radiant / Spectronaut report.
+
+    FragPipe DIA is DIA-NN-shaped by construction (diaTracer -> MSFragger -> ... -> DIA-NN 1.8.2b8
+    writes report.tsv), so it needs no adapter -- only its own report discovery and version string.
+    Radiant/Fulcrum is close but not close enough and goes through radiant_to_corpus first.
+    """
     if engine == "spectronaut":
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from spectronaut_to_corpus import iter_records
         yield from iter_records(report_path)
         return
     import pandas as pd
-    # DIA-NN 1.8/1.9 wrote report.tsv (tab-separated); 2.0+ writes parquet. Read either.
+    if engine == "radiant":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from radiant_to_corpus import to_diann_frame
+        df = to_diann_frame(report_path)
+        yield from _diann_rows(df)
+        return
+    # DIA-NN 1.8/1.9 (and FragPipe's bundled 1.8.2b8) write report.tsv; 2.0+ writes parquet.
     if str(report_path).lower().endswith((".tsv", ".txt", ".csv")):
         df = pd.read_csv(report_path, sep="\t", low_memory=False)
     else:
         df = pd.read_parquet(report_path)
+    yield from _diann_rows(df)
+
+
+def _diann_rows(df):
+    """Walk a DIA-NN-shaped DataFrame -> per-precursor dicts. Shared by diann, fragpipe and radiant."""
+    import pandas as pd
     def c(*names):
         for n in names:
             if n in df.columns:
@@ -192,9 +236,26 @@ def _records(report_path, engine):
 def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
     report = searchdir
     if os.path.isdir(searchdir):
-        # DIA-NN 2.0+ -> report.parquet; 1.8/1.9 -> report.tsv. Prefer parquet if both exist.
-        cand = [os.path.join(searchdir, f) for f in ("report.parquet", "report.tsv")
-                if os.path.exists(os.path.join(searchdir, f))]
+        if engine == "fragpipe":
+            # FragPipe 24 bundles DIA-NN 1.8.2b8, which HAS NO PARQUET WRITER -- globbing for
+            # report.parquet finds nothing. The precursor report is report.tsv under
+            # dia-quant-output/. combined_protein.tsv is IonQuant over pseudo-spectra and is
+            # explicitly NOT the quant of record.
+            cand = [os.path.join(searchdir, f) for f in
+                    ("dia-quant-output/report.tsv", "report.tsv",
+                     "out/dia-quant-output/report.tsv")
+                    if os.path.exists(os.path.join(searchdir, f))]
+        elif engine == "radiant":
+            # Prefer the RAW Spark partition directory over any pre-converted parquet: the
+            # converted file still carries decoys and FASTA-header protein groups.
+            cand = [os.path.join(searchdir, f) for f in
+                    ("radiant_results/fulcrum-results", "fulcrum-results",
+                     "out/radiant_results/fulcrum-results", "delimp_report.parquet")
+                    if os.path.exists(os.path.join(searchdir, f))]
+        else:
+            # DIA-NN 2.0+ -> report.parquet; 1.8/1.9 -> report.tsv. Prefer parquet if both exist.
+            cand = [os.path.join(searchdir, f) for f in ("report.parquet", "report.tsv")
+                    if os.path.exists(os.path.join(searchdir, f))]
         report = cand[0] if cand else searchdir
     # output_dir is the idempotency key (delete-then-insert by it) AND the stored provenance
     # raw_path base. Allow an explicit STABLE value so ingesting from a temp-extracted report
@@ -273,7 +334,13 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
     ext_hits = [str(x.get("run", "")).lower() for x in recs[:2000]]
     looks_dotd = any(r.endswith(".d") for r in ext_hits)
     looks_raw = any(r.endswith((".raw", ".mzml")) for r in ext_hits)
-    if has_real_im or (looks_dotd and not looks_raw):
+    if engine == "radiant":
+        # Radiant/Fulcrum reads mzML/Parquet only -- feeding it Bruker .d fails outright
+        # (FunctionNotImplemented in MsReaderPointerAcc.cpp). Every Radiant row is therefore
+        # Thermo, and the corpus raw file is <name>.raw. Do not let the generic sniffing below
+        # guess otherwise from an absent IM column.
+        platform = "orbitrap"
+    elif has_real_im or (looks_dotd and not looks_raw):
         platform = "timstof"
     elif looks_raw:
         platform = "orbitrap"
@@ -327,6 +394,11 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         print("  (no DB writes)")
         return
 
+    # Say out loud which code is running. The 2026-08-25 guard failure was invisible partly because
+    # nothing in the log distinguished a run WITH a working guard from one without.
+    print(f"  code: {_versions().pipeline_stamp()}"
+          f"{'' if not ALLOW_DUPLICATE else '  [--allow-duplicate: guard BYPASSED]'}", flush=True)
+
     import psycopg2.extras
     conn = _conn(); conn.autocommit = False
     try:
@@ -337,6 +409,28 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         _V.record_run(cur, "corpus_ingest", CORPUS_INGEST_VERSION,
                       notes=f"schema={SCHEMA_VERSION}")
         conn.commit()
+
+        # ENGINE WHITELIST PRE-FLIGHT. delimp_searches.search_engine carries a CHECK constraint
+        # listing the permitted engines. Adding a new engine therefore fails with a bare
+        # CheckViolation AFTER the whole report has been parsed -- 16 s on the poplar Radiant set,
+        # but an hour on a 34 GB Spectronaut report. Fail here instead, with the fix in the message.
+        cur.execute("""SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                       WHERE conrelid='delimp_searches'::regclass
+                         AND conname='delimp_searches_search_engine_check'""")
+        _row = cur.fetchone()
+        if _row and f"'{engine}'" not in _row[0]:
+            allowed = re.findall(r"'([a-z_]+)'", _row[0])
+            conn.rollback(); conn.close()
+            raise SystemExit(
+                f"engine {engine!r} is not permitted by delimp_searches_search_engine_check.\n"
+                f"  allowed: {', '.join(allowed)}\n"
+                f"  fix:     ALTER TABLE delimp_searches DROP CONSTRAINT "
+                f"delimp_searches_search_engine_check;\n"
+                f"           ALTER TABLE delimp_searches ADD CONSTRAINT "
+                f"delimp_searches_search_engine_check\n"
+                f"             CHECK (search_engine = ANY (ARRAY["
+                f"{', '.join(repr(a) for a in allowed + [engine])}]));\n"
+                f"  (and add it to schema/fran_schema.sql so new installs get it too)")
 
         # ── DUPLICATE GUARD ───────────────────────────────────────────────────────────────────
         # The idempotency key is output_dir, so THE SAME SEARCH AT TWO PATHS BECOMES TWO SEARCHES.
@@ -456,17 +550,17 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         print(f"  engine version: {engine_ver or 'not found (no setup.txt/log beside the report)'}")
         if has_npg:
             cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
-                           search_engine_version,pipeline_id,n_raw_files,n_precursors_total,
+                           search_engine_version,pipeline_id,pipeline_version,n_raw_files,n_precursors_total,
                            n_proteins_total,n_protein_groups_total,status,ingested_schema_version)
-                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,'completed',%s)""",
-                        (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader",
+                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,'completed',%s)""",
+                        (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader", _versions().pipeline_stamp(),
                          len(runs), len(recs), n_proteins, n_protein_groups, SCHEMA_VERSION))
         else:  # column not there yet — keep the OLD semantics rather than silently mixing the two
             cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
-                           search_engine_version,pipeline_id,n_raw_files,n_precursors_total,
+                           search_engine_version,pipeline_id,pipeline_version,n_raw_files,n_precursors_total,
                            n_proteins_total,status,ingested_schema_version)
-                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,'completed',%s)""",
-                        (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader",
+                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,'completed',%s)""",
+                        (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader", _versions().pipeline_stamp(),
                          len(runs), len(recs), n_protein_groups, SCHEMA_VERSION))
         # per-run max RT (≈ gradient length) for gradient_minutes
         run_max_rt = {}
@@ -793,7 +887,8 @@ def _irt(v):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("searchdir")
-    ap.add_argument("--engine", default="diann", choices=["diann", "spectronaut"])
+    ap.add_argument("--engine", default="diann",
+                    choices=["diann", "spectronaut", "fragpipe", "radiant"])
     ap.add_argument("--organism-name", default=None)
     ap.add_argument("--taxon", type=int, default=None)
     ap.add_argument("--name", default=None)

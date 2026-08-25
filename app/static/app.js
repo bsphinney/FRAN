@@ -57,6 +57,8 @@ function route(){
     case 'proteins': return renderProteinsShowcase();
     case 'peptides': return renderPeptidesShowcase();
     case 'allspecies': return renderSpeciesShowcase();
+    case 'engines': return renderEngines(param);
+    case 'enginerun': return renderEngineRun(param);
     case 'collaborators': return renderCollaborators();
     case 'mydata': return renderMyData();
     case 'collab': return renderCollaborator(param);
@@ -2255,4 +2257,273 @@ async function showTissueRuns(tissueEnc){
       </div>`;
     box.scrollIntoView({behavior:'smooth', block:'nearest'});
   }catch(e){ box.innerHTML=`<div class="text-sm text-rose-400">Could not load datasets.</div>`; }
+}
+
+/* ================= CROSS-ENGINE COMPARISON =================================================
+   Two engines over the SAME raw file: sample, instrument and gradient held constant, so the
+   software is the only variable. The page is built around the four ways this comparison is
+   normally got wrong — intensity scale, protein-group packaging, charge state, and I/L —
+   because each one turns a methodological artifact into a fake biological finding.
+   ========================================================================================= */
+
+const ECOL = {a:'#00B5E2', b:'#FFBF00', both:'#6CCA98'};
+
+// A three-part bar: only-A | shared | only-B. Reads as one population split three ways, which is
+// what it is — far easier to judge than two separate totals.
+function eSplit(onlyA, both, onlyB, la, lb){
+  const t = (onlyA+both+onlyB)||1, pc = n => (100*n/t).toFixed(1);
+  return `<div>
+    <div class="flex h-7 rounded-lg overflow-hidden border border-white/10 text-[10px] font-semibold">
+      <div style="width:${pc(onlyA)}%;background:${ECOL.a}" class="flex items-center justify-center text-ink-900" title="${esc(la)} only: ${fmt(onlyA)}">${onlyA/t>0.07?fmt(onlyA):''}</div>
+      <div style="width:${pc(both)}%;background:${ECOL.both}" class="flex items-center justify-center text-ink-900" title="both: ${fmt(both)}">${both/t>0.07?fmt(both):''}</div>
+      <div style="width:${pc(onlyB)}%;background:${ECOL.b}" class="flex items-center justify-center text-ink-900" title="${esc(lb)} only: ${fmt(onlyB)}">${onlyB/t>0.07?fmt(onlyB):''}</div>
+    </div>
+    <div class="flex justify-between text-[10px] text-slate-500 mt-1">
+      <span>only ${esc(la)} ${fmt(onlyA)}</span><span class="text-emerald-300">shared ${fmt(both)}</span><span>only ${esc(lb)} ${fmt(onlyB)}</span>
+    </div></div>`;
+}
+
+async function renderEngines(){
+  view.innerHTML=`<div class="skeleton h-64 rounded-xl"></div>`;
+  try{
+    const [runs, species] = await Promise.all([api('/api/engines/runs?limit=300'), api('/api/engines/species')]);
+    const R = runs.rows||[], S = species.rows||[];
+    if(!R.length){ view.innerHTML = crumb([['Dashboard','dashboard'],['Engine comparison',null]]) + empty('No acquisition has been searched by more than one engine yet.'); return; }
+    const badge = e => `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-white/10 text-slate-200">${esc(e)}</span>`;
+    view.innerHTML = `
+    ${crumb([['Dashboard','dashboard'],['Engine comparison',null]])}
+    <div class="glass card p-6 mb-5 fade-in">
+      <h1 class="text-2xl font-extrabold text-white">Cross-engine comparison</h1>
+      <p class="text-slate-300 mt-2 max-w-3xl">Acquisitions searched by more than one engine. Because the raw file is identical, sample,
+      instrument and gradient are held constant — the differences below are the software, and nothing else.</p>
+      <p class="text-slate-500 text-sm mt-2 max-w-3xl">A protein count is a peptide count passed through an inference rule, so the honest
+      comparison is at the peptide level. Every view here shows both, and flags the four traps that make engines look more different than they are.</p>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4">
+        ${stat('Multi-engine runs', fmt(R.length))}
+        ${stat('Max engines on one run', fmt(Math.max(...R.map(r=>r.n_engines))))}
+        ${stat('Organisms', fmt(S.length))}
+        ${stat('Engines in corpus', fmt(new Set(R.flatMap(r=>r.engines)).size))}
+      </div>
+    </div>
+
+    ${S.length?`<div class="glass card p-5 mb-5">
+      <h2 class="font-bold text-white mb-3">By species</h2>
+      <div class="flex flex-wrap gap-2">
+        ${S.map(s=>`<button onclick="document.getElementById('eFilter').value='${esc(s.organism)}';eFilterRuns()"
+          class="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-sm">
+          <span class="italic text-white">${esc(s.organism)}</span>
+          <span class="text-slate-400 ml-2">${fmt(s.n_runs)} runs</span>
+          <span class="text-slate-500 ml-1">· ${s.engines.map(esc).join(', ')}</span></button>`).join('')}
+      </div></div>`:''}
+
+    <div class="glass card p-5">
+      <div class="flex items-center gap-3 mb-3 flex-wrap">
+        <h2 class="font-bold text-white">Acquisitions</h2>
+        <input id="eFilter" oninput="eFilterRuns()" placeholder="filter by run or organism…"
+          class="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm flex-1 min-w-[220px]">
+      </div>
+      <div id="eRuns">${table(['Run','Engines','Organism','Instrument','Precursors'],
+        R.map(r=>[`<span class="font-mono text-xs">${esc(r.raw_basename)}</span>`,
+                  r.engines.map(badge).join(' '),
+                  `<span class="italic">${esc(r.organism||'—')}</span>`,
+                  esc(r.instrument||r.platform||'—'), fmt(r.sum_precursors)]),
+        R.map(r=>`go('enginerun','${encodeURIComponent(r.raw_basename)}')`))}</div>
+    </div>`;
+    window.__eRows = R;
+  }catch(e){ view.innerHTML = crumb([['Dashboard','dashboard'],['Engine comparison',null]]) + empty('Could not load: '+e.message); }
+}
+
+function eFilterRuns(){
+  const q=($('#eFilter').value||'').toLowerCase(), R=window.__eRows||[];
+  const f=R.filter(r=>!q || r.raw_basename.toLowerCase().includes(q) || (r.organism||'').toLowerCase().includes(q));
+  const badge = e => `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-white/10 text-slate-200">${esc(e)}</span>`;
+  $('#eRuns').innerHTML = f.length? table(['Run','Engines','Organism','Instrument','Precursors'],
+    f.map(r=>[`<span class="font-mono text-xs">${esc(r.raw_basename)}</span>`, r.engines.map(badge).join(' '),
+              `<span class="italic">${esc(r.organism||'—')}</span>`, esc(r.instrument||r.platform||'—'), fmt(r.sum_precursors)]),
+    f.map(r=>`go('enginerun','${encodeURIComponent(r.raw_basename)}')`)) : empty('No run matches that filter.');
+}
+
+async function renderEngineRun(rb){
+  view.innerHTML=`<div class="skeleton h-96 rounded-xl"></div>`;
+  try{
+    const sel = window.__ePair||{};
+    const qs = (sel.a&&sel.b)?`?a=${encodeURIComponent(sel.a)}&b=${encodeURIComponent(sel.b)}`:'';
+    const d = await api(`/api/engines/run/${encodeURIComponent(rb)}${qs}`);
+    const A=d.engine_a, B=d.engine_b, la=A.engine, lb=B.engine;
+    const all = await api(`/api/engines/runs?limit=300`).catch(()=>({rows:[]}));
+    const mine = (all.rows||[]).find(r=>r.raw_basename===rb) || {engines:[la,lb]};
+
+    // Search-scope warning. A search over 220 runs brings a much larger spectral library to this
+    // acquisition than one over 9 — a real advantage, but not an ENGINE difference. Say so, or the
+    // deeper engine gets credit for the library.
+    const scope = (A.n_raw_files!==B.n_raw_files) ? `
+      <div class="mt-3 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-sm text-amber-200">
+        <b>Not a like-for-like search.</b> ${esc(la)} searched ${fmt(A.n_raw_files)} run(s); ${esc(lb)} searched ${fmt(B.n_raw_files)}.
+        The wider search brings a larger library to this same acquisition, which raises its depth independently of the engine.
+      </div>` : '';
+
+    const q=d.quant, fold=q.fold_offset;
+    const foldTxt = (fold==null)?'—':(fold>=1?`${fmtF(fold,1)}×`:`${fmtF(1/fold,1)}× (other way)`);
+    const p=d.precursor, pe=d.peptide, ch=d.charge, pr=d.protein;
+    const prof = k => { const x=d.profile[k]; return x? `${fmtF(x.median_log10_intensity,2)}` : '—'; };
+    const profQ = k => { const x=d.profile[k]; return x&&x.median_q!=null? Number(x.median_q).toExponential(1) : '—'; };
+    const profN = k => { const x=d.profile[k]; return x? fmt(x.n) : '—'; };
+    const drop = (a,b)=> (a&&b)? `<span class="text-emerald-300">−${fmtF(100*(a-b)/a,0)}%</span>` : '';
+
+    view.innerHTML = `
+    ${crumb([['Dashboard','dashboard'],['Engine comparison','engines'],[rb,null]])}
+    <div class="glass card p-6 mb-5 fade-in">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div class="min-w-0">
+          <h1 class="text-xl font-extrabold text-white font-mono break-all">${esc(rb)}</h1>
+          <div class="text-slate-400 text-sm mt-1">One acquisition · sample, instrument and gradient identical · only the software differs</div>
+        </div>
+        <div class="flex gap-2 flex-wrap">
+          ${(mine.engines||[]).map(e=>`<button onclick="ePick('${esc(rb)}','${esc(e)}')"
+            class="px-2.5 py-1 rounded-lg text-xs font-semibold border ${e===la?'border-cyan-400 text-cyan-300':e===lb?'border-amber-400 text-amber-300':'border-white/15 text-slate-400'}">${esc(e)}</button>`).join('')}
+        </div>
+      </div>
+      <div class="grid sm:grid-cols-2 gap-4 mt-4">
+        ${[[A,la,'cyan'],[B,lb,'amber']].map(([S,l,c])=>`
+          <div class="rounded-xl border border-${c}-400/25 bg-${c}-400/5 p-4">
+            <div class="font-bold text-${c}-300">${esc(l)}</div>
+            <div class="text-xs text-slate-400 mt-0.5">${esc(S.search_engine_version||'version not recorded')}</div>
+            <div class="text-xs text-slate-500 mt-1 font-mono break-all">${esc(S.search_name||'')}</div>
+            <div class="text-xs text-slate-400 mt-2">${fmt(S.n_in_this_run)} precursors in this run · search covered ${fmt(S.n_raw_files)} run(s)</div>
+          </div>`).join('')}
+      </div>
+      ${scope}
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-5 mb-5">
+      <div class="glass card p-5">
+        <h2 class="font-bold text-white">Agreement</h2>
+        <p class="text-xs text-slate-500 mb-4">A protein count is a peptide count passed through an inference rule. Watch the agreement
+        change as the unit changes — that movement <em>is</em> the inference, not the data.</p>
+        <div class="space-y-4">
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-slate-300">Precursors <span class="text-slate-500">(sequence + charge)</span></span><span class="font-mono text-white">J = ${fmtF(p.jaccard,3)}</span></div>
+            ${eSplit(p.only_a,p.both,p.only_b,la,lb)}</div>
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-slate-300">Peptides <span class="text-slate-500">(sequence only)</span></span><span class="font-mono text-white">J = ${fmtF(pe.jaccard,3)}</span></div>
+            ${eSplit(pe.only_a,pe.both,pe.only_b,la,lb)}</div>
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-slate-300">Protein groups <span class="text-slate-500">(accession-matched, ≥2 peptides)</span></span><span class="font-mono text-white">J = ${fmtF(pr.by_accession_min2.jaccard,3)}</span></div>
+            ${eSplit(pr.by_accession_min2.only_a,pr.by_accession_min2.both,pr.by_accession_min2.only_b,la,lb)}</div>
+        </div>
+      </div>
+
+      <div class="glass card p-5">
+        <h2 class="font-bold text-white">Quantitation</h2>
+        <p class="text-xs text-slate-500 mb-4">Correlation and scale are different questions. Engines can track each other almost perfectly
+        while reporting numbers an order of magnitude apart.</p>
+        <div class="grid grid-cols-2 gap-3">
+          ${stat('r² (log₁₀ intensity)', q.r2!=null?fmtF(q.r2,3):'—')}
+          ${stat('Shared precursors', fmt(q.n))}
+          ${stat('Median scale offset', `<span class="${fold&&(fold>2||fold<0.5)?'text-amber-300':'text-emerald-300'}">${foldTxt}</span>`)}
+          ${stat('Same molecule?', '<span class="text-emerald-300">yes</span>')}
+        </div>
+        ${(fold&&(fold>2||fold<0.5))?`<div class="mt-3 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-sm text-amber-200">
+          <b>Do not compare these intensities directly.</b> ${esc(la)} reports ~${foldTxt} ${esc(lb)} for the same precursors.
+          That is a unit difference, not biology. Compare ratios within an engine, never absolute values across engines.</div>`:''}
+        <div class="grid grid-cols-2 gap-3 mt-4">
+          ${d.rt?stat('RT median Δ', `${fmtF(d.rt.median_delta,3)} min <span class="text-xs text-slate-500">(${fmtF(d.rt.within_tol_pct,1)}% within ±1)</span>`):''}
+          ${d.im?stat('Ion mobility median Δ', `${fmtF(d.im.median_delta,4)} <span class="text-xs text-slate-500">(${fmtF(d.im.within_tol_pct,1)}% within ±0.05)</span>`):''}
+        </div>
+        <p class="text-xs text-slate-500 mt-2">Retention time and ion mobility are physical properties of the molecule — engines agreeing here
+        is evidence they found the same thing; disagreeing would mean one of them picked a different peak.</p>
+      </div>
+    </div>
+
+    <div class="glass card p-5 mb-5">
+      <h2 class="font-bold text-white">Is the extra depth real, or is it noise?</h2>
+      <p class="text-xs text-slate-500 mb-4">The most useful question about the identifications only one engine claims. If they sit at the
+      same intensity and confidence as the shared ones, they are simply found. If they cluster near the noise floor, the engine is reaching deeper —
+      which is a legitimate choice, but not the same claim.</p>
+      ${table(['Population','Precursors','Median log₁₀ intensity','Median q-value'],
+        [['<span class="text-emerald-300">Found by both</span>', profN('shared'), prof('shared'), profQ('shared')],
+         [`<span class="text-cyan-300">Only ${esc(la)}</span>`, profN('only_a'), prof('only_a'), profQ('only_a')],
+         [`<span class="text-amber-300">Only ${esc(lb)}</span>`, profN('only_b'), prof('only_b'), profQ('only_b')]])}
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-5 mb-5">
+      <div class="glass card p-5">
+        <h2 class="font-bold text-white">Protein groups are not a shared unit</h2>
+        <p class="text-xs text-slate-500 mb-3">Engines package groups differently — some join every member with <code>;</code>, some name one
+        representative. Matching those strings compares different objects. Matching accessions is the like-for-like question.</p>
+        ${table(['Matching','Both','Only '+esc(la),'Only '+esc(lb),'Jaccard'],
+          [['by group string <span class="text-slate-500">(naïve)</span>', fmt(pr.by_group_string_min1.both), fmt(pr.by_group_string_min1.only_a), fmt(pr.by_group_string_min1.only_b), fmtF(pr.by_group_string_min1.jaccard,3)],
+           ['<b>by accession</b>', fmt(pr.by_accession_min1.both), fmt(pr.by_accession_min1.only_a)+' '+drop(pr.by_group_string_min1.only_a,pr.by_accession_min1.only_a), fmt(pr.by_accession_min1.only_b)+' '+drop(pr.by_group_string_min1.only_b,pr.by_accession_min1.only_b), fmtF(pr.by_accession_min1.jaccard,3)],
+           ['by accession, ≥2 peptides', fmt(pr.by_accession_min2.both), fmt(pr.by_accession_min2.only_a), fmt(pr.by_accession_min2.only_b), fmtF(pr.by_accession_min2.jaccard,3)]])}
+        <p class="text-xs text-slate-500 mt-2">The drop from the first row to the second is uniqueness that was never real — it was naming.</p>
+      </div>
+
+      <div class="glass card p-5">
+        <h2 class="font-bold text-white">Two ways a match gets miscounted</h2>
+        <div class="grid grid-cols-2 gap-3 mb-3">
+          ${stat('Charge sets differ', fmt(ch.charge_sets_differ)+` <span class="text-xs text-slate-500">of ${fmt(ch.peptides_found_by_both)}</span>`)}
+          ${stat('No charge in common', `<span class="${ch.no_shared_charge?'text-amber-300':''}">${fmt(ch.no_shared_charge)}</span>`)}
+        </div>
+        <p class="text-xs text-slate-500">Both engines found those peptides. A <code>(sequence, charge)</code> key scores the second group as
+        misses anyway — a charge-state preference reading as a detection failure.</p>
+        <div class="grid grid-cols-2 gap-3 mt-4 mb-2">
+          ${stat('Peptides shared (as spelled)', fmt(pe.both))}
+          ${stat('Rescued by I/L collapse', `<span class="${pe.rescued_by_il?'text-emerald-300':''}">+${fmt(pe.rescued_by_il)}</span>`)}
+        </div>
+        <p class="text-xs text-slate-500">Isoleucine and leucine are identical in mass, so engines can spell the same molecule differently —
+        and the two spellings can belong to different proteins, one real and one a contaminant.</p>
+      </div>
+    </div>
+
+    <div class="glass card p-5">
+      <div class="flex items-center gap-2 mb-3 flex-wrap">
+        <h2 class="font-bold text-white">The peptides themselves</h2>
+        <div class="flex gap-1 flex-wrap ml-auto text-xs">
+          ${[['only_a','Only '+la],['only_b','Only '+lb],['shared','Shared'],['charge','Charge disagreement'],['il','I/L spelling']]
+            .map(([m,l])=>`<button id="eb_${m}" onclick="eLoadPeps('${esc(rb)}','${m}')"
+              class="px-2.5 py-1 rounded-lg border border-white/15 text-slate-300 hover:text-white">${esc(l)}</button>`).join('')}
+        </div>
+      </div>
+      <div id="ePeps"><div class="skeleton h-40 rounded-xl"></div></div>
+    </div>`;
+    eLoadPeps(rb,'only_a');
+  }catch(e){ view.innerHTML = crumb([['Dashboard','dashboard'],['Engine comparison','engines'],[rb,null]]) + empty('Could not load: '+e.message); }
+}
+
+function ePick(rb, engine){
+  const s = window.__ePair || {};
+  // click cycles: first click sets A, second sets B, third resets
+  if(!s.a || (s.a && s.b)) window.__ePair = {a:engine};
+  else if(engine!==s.a) window.__ePair = {a:s.a, b:engine};
+  if(window.__ePair.a && window.__ePair.b) renderEngineRun(rb);
+  else toast(`A = ${engine} — now pick the engine to compare against`);
+}
+
+async function eLoadPeps(rb, mode){
+  const box=$('#ePeps'); if(!box) return;
+  document.querySelectorAll('[id^=eb_]').forEach(b=>b.classList.remove('tab-active'));
+  const btn=$('#eb_'+mode); if(btn) btn.classList.add('tab-active');
+  box.innerHTML=`<div class="skeleton h-40 rounded-xl"></div>`;
+  try{
+    const sel=window.__ePair||{};
+    const qs=(sel.a&&sel.b)?`&a=${encodeURIComponent(sel.a)}&b=${encodeURIComponent(sel.b)}`:'';
+    const d=await api(`/api/engines/run/${encodeURIComponent(rb)}/peptides?mode=${mode}&limit=200${qs}`);
+    const rows=d.rows||[];
+    if(!rows.length){ box.innerHTML=empty('Nothing in this category — which is itself a result.'); return; }
+    const pep = s => `<span onclick="event.stopPropagation();go('peptide','${encodeURIComponent(s)}')" class="font-mono text-xs cursor-pointer text-accent-400 hover:underline">${esc(s)}</span>`;
+    let html;
+    if(mode==='charge'){
+      html = table(['Peptide','Charges '+esc(d.engine_a),'Charges '+esc(d.engine_b),'Shares a charge?','Protein','RT'],
+        rows.map(r=>[pep(r.stripped_seq), r.charges_a.join(', '), r.charges_b.join(', '),
+          r.shared_charge?'<span class="text-slate-400">yes</span>':'<span class="text-amber-300 font-semibold">no — scored as a miss</span>',
+          esc(r.protein_group||'—'), fmtF(r.rt,2)]));
+    } else if(mode==='il'){
+      html = table(['I/L-collapsed','Spelled by '+esc(d.engine_a),'Spelled by '+esc(d.engine_b)],
+        rows.map(r=>[`<span class="font-mono text-xs">${esc(r.collapsed)}</span>`, pep(r.spelling_a), pep(r.spelling_b)]));
+    } else {
+      const shared = mode==='shared';
+      html = table(['Peptide','z','m/z','RT','1/K₀','q-value','Intensity'].concat(shared?['Intensity (other)']:[]).concat(['Protein']),
+        rows.map(r=>[pep(r.stripped_seq), r.charge, fmtF(r.precursor_mz,4), fmtF(r.rt,2),
+          r.im!=null?fmtF(r.im,4):'—', r.q_value!=null?Number(r.q_value).toExponential(1):'—', sci(r.intensity)]
+          .concat(shared?[sci(r.intensity_b)]:[]).concat([esc(r.protein_group||'—')])));
+    }
+    box.innerHTML = `<div class="text-xs text-slate-500 mb-2">${fmt(d.total)} in this category${d.total>rows.length?` · showing the ${fmt(rows.length)} most intense`:''}. Click a peptide to open its corpus page.</div>` + html;
+  }catch(e){ box.innerHTML=empty('Could not load: '+e.message); }
 }

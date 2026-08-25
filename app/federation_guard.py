@@ -45,6 +45,14 @@ NOVELTY_MAX_RATIO = float(os.environ.get("FRAN_FED_NOVELTY_MAX_RATIO", "0.98"))
 
 _AA = re.compile(r"^[ACDEFGHIKLMNPQRSTVWY]+$")
 
+# Versioned so "does this node have working extraction limits?" is answerable from the node
+# descriptor rather than by reading its source. Every denial is also written to
+# delimp_federation_access_log, so the enforcing version is recoverable after the fact.
+try:
+    from ingest.versions import FEDERATION_GUARD_VERSION as __version__
+except Exception:                                                        # noqa: BLE001
+    __version__ = "0.1.0"
+
 
 class Denied(Exception):
     """Refusal, with a machine-readable reason so an honest peer can adapt instead of retrying."""

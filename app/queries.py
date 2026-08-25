@@ -3444,3 +3444,356 @@ def corpus_facts() -> dict:
             "span": {"first": str(span.get("first_run") or ""), "last": str(span.get("last_run") or "")},
         }
     return CACHE.get_or_set("corpus_facts", _p)
+
+
+# ── CROSS-ENGINE COMPARISON ──────────────────────────────────────────────────────────────────────
+# When two search engines run over the SAME raw files, the differences between them are one of the
+# most informative things the corpus holds -- and one of the easiest to misread. Four traps, all
+# measured on real corpus data (FragPipe vs Spectronaut, dog plasma, 9 timsTOF runs) rather than
+# assumed:
+#
+#   1. INTENSITY SCALE. r2 = 0.84 between the engines, but the median log10 ratio is +1.66 -- a 45x
+#      offset. Engines do not share a quantitation scale. Correlation is meaningful; the absolute
+#      values are not, and plotting them together without saying so invites a 45-fold "biological"
+#      conclusion that is pure unit mismatch.
+#   2. PROTEIN GROUP STRINGS ARE NOT COMPARABLE. Spectronaut ';'-joins every member of a group
+#      (36.6% of its rows); FragPipe names a single representative (0%). Matching those strings
+#      moved FragPipe's "unique" proteins from 573 to 211 -- 63% of its apparent uniqueness was a
+#      naming artifact. Compare ACCESSIONS.
+#   3. CHARGE STATE. 17.8% of peptide-runs found by both engines disagree on the charge set, and
+#      368 shared no charge at all -- a (sequence, charge) key scores those as misses even though
+#      the peptide was found twice.
+#   4. I/L. Isoleucine and leucine are identical in mass; engines genuinely spell them differently
+#      (TLLDLDNTR vs TLLDIDNTR -- the same molecule, credited to dog keratin by one engine and to
+#      the human contaminant by another). Small here (3 peptides) but free to correct.
+#
+# The queries below are deliberately scoped to ONE raw file at a time. delimp_precursors is 416M
+# rows; an unscoped cross-engine join is not a web request, it is a batch job.
+
+
+def multi_engine_runs(limit: int = 200) -> list[dict[str, Any]]:
+    """Acquisitions searched by two or more ENGINES -- the input list for the comparison page.
+
+    Keyed off search_raw_files (17 MB) and delimp_searches (1.6 MB), never delimp_precursors, so it
+    stays a cheap lookup no matter how large the corpus gets.
+    """
+    def _p() -> list[dict[str, Any]]:
+        rows = query(
+            """SELECT rf.raw_basename,
+                      COUNT(DISTINCT s.search_engine)                       AS n_engines,
+                      COUNT(DISTINCT s.id)                                  AS n_searches,
+                      ARRAY_AGG(DISTINCT s.search_engine)                   AS engines,
+                      MAX(m.organism_name)                                  AS organism,
+                      MAX(rf.platform)                                      AS platform,
+                      MAX(rf.instrument_model)                              AS instrument,
+                      SUM(f.n_precursors)                                   AS sum_precursors
+                 FROM search_raw_files f
+                 JOIN raw_files rf ON rf.raw_path = f.raw_path
+                 JOIN delimp_searches s ON s.id = f.search_id
+                 LEFT JOIN delimp_sample_metadata m ON m.raw_path = f.raw_path
+                GROUP BY rf.raw_basename
+               HAVING COUNT(DISTINCT s.search_engine) > 1
+                ORDER BY COUNT(DISTINCT s.search_engine) DESC, SUM(f.n_precursors) DESC
+                LIMIT %s""",
+            (min(int(limit), 500),),
+            tables=["search_raw_files", "raw_files", "delimp_searches", "delimp_sample_metadata"])
+        return [dict(r) for r in rows]
+    return SLOW_CACHE.get_or_set(f"multi_engine_runs:{limit}", _p)
+
+
+def resolve_run_key(key: str) -> str:
+    """Accept either a real raw_basename or its public pseudonym (run-a3f2c1) and return the real one.
+
+    The public layer sanitises raw_basename before it reaches a browser (app/privacy.py), so the
+    identifier a public user clicks is the pseudonym -- and a drill-down keyed on the real name would
+    404 for exactly the audience the page is for. raw_files.raw_name_anonymized stores the same
+    hash corpus_ingest computed at write time, so the round trip is a lookup, not a reversal: the
+    real filename still never leaves the server.
+    """
+    if not key:
+        return key
+    if not str(key).startswith("run-"):
+        return key
+    row = query("SELECT raw_basename FROM raw_files WHERE raw_name_anonymized = %s LIMIT 1",
+                (key,), tables=["raw_files"], fetch="one")
+    # query() yields dict rows, not tuples.
+    return (row["raw_basename"] if row else key)
+
+
+def engine_run_searches(raw_basename: str) -> list[dict[str, Any]]:
+    """Every search that covers one acquisition, with the context needed to compare them fairly.
+
+    n_raw_files matters and is easy to miss: a search over 220 runs brings a far larger spectral
+    library to the same acquisition than a search over 9. That is a real advantage but it is not an
+    ENGINE difference, so the page shows it rather than letting it masquerade as one.
+    """
+    rows = query(
+        """SELECT s.id::text AS search_id, s.search_name, s.search_engine,
+                  s.search_engine_version, s.pipeline_version, s.n_raw_files,
+                  s.n_precursors_total, s.n_protein_groups_total, f.n_precursors AS n_in_this_run,
+                  s.ingested_at
+             FROM search_raw_files f
+             JOIN raw_files rf ON rf.raw_path = f.raw_path
+             JOIN delimp_searches s ON s.id = f.search_id
+            WHERE rf.raw_basename = %s
+            ORDER BY s.search_engine, s.ingested_at""",
+        (raw_basename,),
+        tables=["search_raw_files", "raw_files", "delimp_searches"])
+    return [dict(r) for r in rows]
+
+
+def _engine_precursors(search_id: str, raw_basename: str, limit: int = 400000):
+    """One search's precursors for ONE acquisition. Indexed on (search_id) then filtered by run."""
+    return query(
+        """SELECT p.stripped_seq, p.charge, p.precursor_mz, p.rt, p.im, p.q_value,
+                  p.intensity, p.protein_group, p.modified_seq_proforma
+             FROM delimp_precursors p
+             JOIN raw_files rf ON rf.raw_path = p.raw_path
+            WHERE p.search_id = %s::uuid AND rf.raw_basename = %s
+            LIMIT %s""",
+        (search_id, raw_basename, limit),
+        tables=["delimp_precursors", "raw_files"], timeout_ms=60000)
+
+
+def _il(seq: str) -> str:
+    """I/L-collapsed sequence. Isoleucine and leucine are isobaric -- no mass spectrometer can tell
+    them apart -- so two engines can legitimately spell the same molecule differently."""
+    return (seq or "").replace("I", "L")
+
+
+def _accessions(pg: str) -> set[str]:
+    """Protein group string -> its accession set. See trap 2 above: engines package groups
+    differently, so accessions are the only comparable unit."""
+    return {a.strip() for a in str(pg or "").split(";") if a.strip()}
+
+
+def engine_comparison(raw_basename: str, engine_a: str = "", engine_b: str = "") -> dict[str, Any]:
+    """Full two-engine comparison for ONE acquisition: agreement at every level, quantitative
+    correlation, physical-measurement agreement, and a profile of what each engine uniquely claims.
+
+    Everything is computed on the SAME raw file, so sample, instrument and gradient are held
+    constant and the only variable left is the software.
+    """
+    def _p() -> dict[str, Any]:
+        import math
+        searches = engine_run_searches(resolve_run_key(raw_basename))
+        if len(searches) < 2:
+            return {"raw_basename": raw_basename, "error": "fewer than two searches cover this run"}
+        by_engine: dict[str, dict] = {}
+        for s in searches:                       # newest search wins per engine
+            by_engine[s["search_engine"]] = s
+        names = sorted(by_engine)
+        a_name = engine_a if engine_a in by_engine else names[0]
+        b_name = engine_b if engine_b in by_engine else next(n for n in names if n != a_name)
+        A, B = by_engine[a_name], by_engine[b_name]
+
+        real_rb = resolve_run_key(raw_basename)
+        ra = _engine_precursors(A["search_id"], real_rb)
+        rb = _engine_precursors(B["search_id"], real_rb)
+        if not ra or not rb:
+            return {"raw_basename": raw_basename, "error": "no precursors for one of the searches"}
+
+        da = {(r["stripped_seq"], r["charge"]): r for r in ra}
+        db_ = {(r["stripped_seq"], r["charge"]): r for r in rb}
+        ka, kb = set(da), set(db_)
+        both = ka & kb
+
+        pa, pb = {k[0] for k in ka}, {k[0] for k in kb}
+        pa_il, pb_il = {_il(x) for x in pa}, {_il(x) for x in pb}
+
+        # charge disagreement among peptides BOTH engines found
+        cha: dict[str, set] = {}
+        chb: dict[str, set] = {}
+        for sq, ch in ka:
+            cha.setdefault(sq, set()).add(ch)
+        for sq, ch in kb:
+            chb.setdefault(sq, set()).add(ch)
+        common = set(cha) & set(chb)
+        diff_charge = sum(1 for k in common if cha[k] != chb[k])
+        no_shared_charge = sum(1 for k in common if not (cha[k] & chb[k]))
+
+        # quantitation: correlation AND scale offset, reported separately on purpose
+        xs, ys = [], []
+        for k in both:
+            ia, ib = da[k]["intensity"], db_[k]["intensity"]
+            if ia and ib and ia > 0 and ib > 0:
+                xs.append(math.log10(ia)); ys.append(math.log10(ib))
+        r = None
+        if len(xs) > 10:
+            n = len(xs); mx = sum(xs)/n; my = sum(ys)/n
+            cov = sum((x-mx)*(y-my) for x, y in zip(xs, ys))
+            vx = math.sqrt(sum((x-mx)**2 for x in xs)); vy = math.sqrt(sum((y-my)**2 for y in ys))
+            r = cov/(vx*vy) if vx and vy else None
+        ratios = sorted(x-y for x, y in zip(xs, ys))
+        med_ratio = ratios[len(ratios)//2] if ratios else None
+
+        def _phys(field, tol):
+            ds = sorted(da[k][field] - db_[k][field] for k in both
+                        if da[k][field] is not None and db_[k][field] is not None)
+            if len(ds) < 10:
+                return None
+            return {"n": len(ds), "median_delta": ds[len(ds)//2],
+                    "within_tol_pct": 100.0*sum(1 for x in ds if abs(x) < tol)/len(ds), "tol": tol}
+
+        def _profile(keys, src):
+            ints = [src[k]["intensity"] for k in keys if src[k]["intensity"]]
+            qs = [src[k]["q_value"] for k in keys if src[k]["q_value"] is not None]
+            if not keys:
+                return None
+            ints.sort(); qs.sort()
+            return {"n": len(keys),
+                    "median_log10_intensity": (math.log10(ints[len(ints)//2]) if ints else None),
+                    "median_q": (qs[len(qs)//2] if qs else None),
+                    "median_length": sorted(len(k[0]) for k in keys)[len(keys)//2],
+                    "pct_charge_2": 100.0*sum(1 for k in keys if k[1] == 2)/len(keys)}
+
+        # proteins: naive string match vs accession match, so the artifact is visible not hidden
+        def _prot(rows, by_acc):
+            m: dict[str, set] = {}
+            for r_ in rows:
+                pg = r_["protein_group"]
+                if not pg:
+                    continue
+                for key in (_accessions(pg) if by_acc else {pg}):
+                    m.setdefault(key, set()).add(r_["stripped_seq"])
+            return m
+        prot = {}
+        for label, by_acc in (("by_group_string", False), ("by_accession", True)):
+            ma, mb = _prot(ra, by_acc), _prot(rb, by_acc)
+            for minpep in (1, 2):
+                sa = {k for k, v in ma.items() if len(v) >= minpep}
+                sb = {k for k, v in mb.items() if len(v) >= minpep}
+                prot[f"{label}_min{minpep}"] = {
+                    "both": len(sa & sb), "only_a": len(sa - sb), "only_b": len(sb - sa),
+                    "jaccard": (len(sa & sb)/len(sa | sb)) if (sa | sb) else 0.0}
+
+        return {
+            "raw_basename": raw_basename,
+            "engine_a": {**A, "engine": a_name}, "engine_b": {**B, "engine": b_name},
+            "precursor": {"both": len(both), "only_a": len(ka - kb), "only_b": len(kb - ka),
+                          "jaccard": len(both)/len(ka | kb) if (ka | kb) else 0.0},
+            "peptide": {"both": len(pa & pb), "only_a": len(pa - pb), "only_b": len(pb - pa),
+                        "jaccard": len(pa & pb)/len(pa | pb) if (pa | pb) else 0.0,
+                        "both_il": len(pa_il & pb_il),
+                        "rescued_by_il": len(pa_il & pb_il) - len(pa & pb)},
+            "charge": {"peptides_found_by_both": len(common), "charge_sets_differ": diff_charge,
+                       "no_shared_charge": no_shared_charge},
+            "quant": {"n": len(xs), "pearson_r": r, "r2": (r*r if r is not None else None),
+                      "median_log10_ratio": med_ratio,
+                      "fold_offset": (10**med_ratio if med_ratio is not None else None)},
+            "rt": _phys("rt", 1.0), "im": _phys("im", 0.05),
+            "profile": {"shared": _profile(both, da), "only_a": _profile(ka - kb, da),
+                        "only_b": _profile(kb - ka, db_)},
+            "protein": prot,
+        }
+    return SLOW_CACHE.get_or_set(f"engine_comparison:{raw_basename}:{engine_a}:{engine_b}", _p)
+
+
+def engine_disagreement_peptides(raw_basename: str, engine_a: str = "", engine_b: str = "",
+                                 mode: str = "only_a", limit: int = 200) -> dict[str, Any]:
+    """The peptides themselves, not just the counts.
+
+    mode:
+      only_a / only_b  -- claimed by one engine and not the other. The interesting question is not
+                          that they differ but WHETHER THE UNIQUE ONES ARE WEAKER: on the dog set
+                          the shared precursors sit at median log10 intensity 4.15 while
+                          Spectronaut-only sit at 1.90, i.e. the extra depth is at the noise floor.
+                          Each row carries its own intensity and q so that is checkable per peptide.
+      charge           -- found by both engines but at DIFFERENT charge states. These read as
+                          misses under a (sequence, charge) key while actually being agreement.
+      il               -- same molecule, different I/L spelling. Rare but it can move a peptide
+                          between a real protein and a contaminant.
+      shared           -- found by both, for reference.
+    """
+    def _p() -> dict[str, Any]:
+        searches = engine_run_searches(resolve_run_key(raw_basename))
+        by_engine = {s["search_engine"]: s for s in searches}
+        names = sorted(by_engine)
+        if len(names) < 2:
+            return {"rows": [], "total": 0}
+        a_name = engine_a if engine_a in by_engine else names[0]
+        b_name = engine_b if engine_b in by_engine else next(n for n in names if n != a_name)
+        real_rb = resolve_run_key(raw_basename)
+        ra = _engine_precursors(by_engine[a_name]["search_id"], real_rb)
+        rb = _engine_precursors(by_engine[b_name]["search_id"], real_rb)
+        da = {(r["stripped_seq"], r["charge"]): r for r in ra}
+        db_ = {(r["stripped_seq"], r["charge"]): r for r in rb}
+        ka, kb = set(da), set(db_)
+        rows: list[dict[str, Any]] = []
+
+        if mode in ("only_a", "only_b", "shared"):
+            keys = {"only_a": ka - kb, "only_b": kb - ka, "shared": ka & kb}[mode]
+            src = db_ if mode == "only_b" else da
+            other = db_ if mode == "shared" else None
+            for k in keys:
+                r_ = src[k]
+                row = {"stripped_seq": k[0], "charge": k[1],
+                       "modified_seq": r_.get("modified_seq_proforma"),
+                       "precursor_mz": r_.get("precursor_mz"), "rt": r_.get("rt"),
+                       "im": r_.get("im"), "q_value": r_.get("q_value"),
+                       "intensity": r_.get("intensity"), "protein_group": r_.get("protein_group")}
+                if other is not None and k in other:
+                    row["intensity_b"] = other[k]["intensity"]
+                    row["rt_b"] = other[k]["rt"]
+                    row["q_value_b"] = other[k]["q_value"]
+                rows.append(row)
+            rows.sort(key=lambda r_: (r_["intensity"] or 0), reverse=True)
+
+        elif mode == "charge":
+            cha: dict[str, set] = {}
+            chb: dict[str, set] = {}
+            for sq, ch in ka:
+                cha.setdefault(sq, set()).add(ch)
+            for sq, ch in kb:
+                chb.setdefault(sq, set()).add(ch)
+            for sq in set(cha) & set(chb):
+                if cha[sq] != chb[sq]:
+                    best = max((da[(sq, c)] for c in cha[sq]), key=lambda r_: r_["intensity"] or 0)
+                    rows.append({"stripped_seq": sq,
+                                 "charges_a": sorted(cha[sq]), "charges_b": sorted(chb[sq]),
+                                 "shared_charge": bool(cha[sq] & chb[sq]),
+                                 "protein_group": best.get("protein_group"),
+                                 "rt": best.get("rt"), "intensity": best.get("intensity")})
+            # the ones with NO shared charge first: those are the ones a naive key miscounts
+            rows.sort(key=lambda r_: (r_["shared_charge"], -(r_["intensity"] or 0)))
+
+        elif mode == "il":
+            ia = {_il(sq): sq for sq, _ in ka}
+            ib = {_il(sq): sq for sq, _ in kb}
+            for coll in set(ia) & set(ib):
+                if ia[coll] != ib[coll]:
+                    rows.append({"collapsed": coll, "spelling_a": ia[coll], "spelling_b": ib[coll]})
+
+        total = len(rows)
+        return {"rows": rows[:min(int(limit), MAX_PAGE)], "total": total,
+                "engine_a": a_name, "engine_b": b_name, "mode": mode}
+    return SLOW_CACHE.get_or_set(
+        f"engine_disagree:{raw_basename}:{engine_a}:{engine_b}:{mode}:{limit}", _p)
+
+
+def engine_species_summary(limit: int = 60) -> list[dict[str, Any]]:
+    """Multi-engine coverage grouped by ORGANISM -- the entry point for 'which species do we have
+    cross-engine evidence for?'. Cheap: search_raw_files + sample_metadata only."""
+    def _p() -> list[dict[str, Any]]:
+        rows = query(
+            """WITH per_run AS (
+                 SELECT rf.raw_basename,
+                        MAX(m.organism_name) AS organism,
+                        COUNT(DISTINCT s.search_engine) AS n_engines,
+                        ARRAY_AGG(DISTINCT s.search_engine) AS engines
+                   FROM search_raw_files f
+                   JOIN raw_files rf ON rf.raw_path = f.raw_path
+                   JOIN delimp_searches s ON s.id = f.search_id
+                   LEFT JOIN delimp_sample_metadata m ON m.raw_path = f.raw_path
+                  GROUP BY rf.raw_basename)
+               SELECT organism, COUNT(*) AS n_runs, MAX(n_engines) AS max_engines,
+                      ARRAY_AGG(DISTINCT e) AS engines
+                 FROM per_run, UNNEST(engines) AS e
+                WHERE n_engines > 1 AND organism IS NOT NULL
+                GROUP BY organism
+                ORDER BY COUNT(*) DESC
+                LIMIT %s""",
+            (min(int(limit), 200),),
+            tables=["search_raw_files", "raw_files", "delimp_searches", "delimp_sample_metadata"])
+        return [dict(r) for r in rows]
+    return SLOW_CACHE.get_or_set(f"engine_species_summary:{limit}", _p)

@@ -843,6 +843,45 @@ def api_species(name: str):
     return ok(res)
 
 
+# ── cross-engine comparison ──────────────────────────────────────────────────────────────────────
+# Two engines over the SAME raw file is the only fair comparison: sample, instrument and gradient
+# are held constant, so the software is the only variable left. These endpoints exist because the
+# comparison is easy to get wrong -- see the traps documented above queries.multi_engine_runs().
+
+
+@app.get("/api/engines/runs")
+def api_engine_runs(limit: int = Query(200, ge=1, le=500)):
+    """Acquisitions searched by 2+ engines — the list the comparison page opens on."""
+    return ok({"rows": _safe(lambda: queries.multi_engine_runs(limit), [])})
+
+
+@app.get("/api/engines/species")
+def api_engine_species(limit: int = Query(60, ge=1, le=200)):
+    """The same coverage grouped by organism, so you can ask 'what do we have cross-engine
+    evidence for in mouse?' rather than hunting through run names."""
+    return ok({"rows": _safe(lambda: queries.engine_species_summary(limit), [])})
+
+
+@app.get("/api/engines/run/{raw_basename}")
+def api_engine_run(raw_basename: str, a: str = Query(""), b: str = Query("")):
+    """Full two-engine comparison for one acquisition."""
+    res = _safe(lambda: queries.engine_comparison(raw_basename, a, b), {})
+    if not res or res.get("error"):
+        raise HTTPException(404, (res or {}).get("error") or "No multi-engine comparison for that run.")
+    return ok(res)
+
+
+@app.get("/api/engines/run/{raw_basename}/peptides")
+def api_engine_peptides(raw_basename: str, a: str = Query(""), b: str = Query(""),
+                        mode: str = Query("only_a"), limit: int = Query(200, ge=1, le=200)):
+    """The peptides behind the counts: unique to either engine, charge-state disagreements, or
+    I/L spelling differences."""
+    if mode not in ("only_a", "only_b", "shared", "charge", "il"):
+        raise HTTPException(400, "mode must be one of only_a, only_b, shared, charge, il")
+    return ok(_safe(lambda: queries.engine_disagreement_peptides(raw_basename, a, b, mode, limit),
+                    {"rows": [], "total": 0}))
+
+
 @app.get("/api/wiki")
 def api_wiki(title: str = Query(...)):
     """Cached Wikipedia summary (extract + image + url) for fun facts — used by the species page

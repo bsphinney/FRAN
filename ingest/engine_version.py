@@ -78,6 +78,59 @@ def detect(engine: str, report_path: str | None, search_dir: str | None = None) 
                     m = _SN.search(_head(p))
                     if m:
                         return m.group(1)
+        elif (engine or "").lower() == "fragpipe":
+            # FragPipe DIA is a CHAIN: diaTracer -> MSFragger -> MSBooster -> Percolator ->
+            # ProteinProphet -> EasyPQP -> DIA-NN. The IDs come from MSFragger but the QUANT comes
+            # from the bundled DIA-NN, two major versions behind the DIA-NN rows already in the
+            # corpus. Recording only "24.0" lets a FRAN user compare a FragPipe search against
+            # DIA-NN 2.6 with no way to see that, so name every component we can actually read.
+            fp = dn = dt = None
+            for root in roots:
+                for p in _first(["*.workflow.provenance.json",
+                                 os.path.join("..", "*.workflow.provenance.json"),
+                                 os.path.join("..", "..", "*.workflow.provenance.json")], root):
+                    m = re.search(r"FragPipe[ v]*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", _head(p), re.I)
+                    if m:
+                        fp = m.group(1); break
+                for p in _first(["report.log.txt",
+                                 os.path.join("dia-quant-output", "report.log.txt")], root):
+                    # DIA-NN's own banner, line 1: "DIA-NN 1.8.2 beta 8 (...)". The beta suffix is
+                    # part of the version -- 1.8.2b8 is not 1.8.2 -- so capture it.
+                    m = re.search(r"DIA-NN\s+([0-9][0-9.]*(?:\s+beta\s+[0-9]+)?)", _head(p, 400), re.I)
+                    if m:
+                        dn = re.sub(r"\s+beta\s+", "b", m.group(1).strip()); break
+                for p in _first([os.path.join("..", "dt", "diatracer*.log"),
+                                 os.path.join("dt", "diatracer*.log"),
+                                 os.path.join("..", "..", "dt", "diatracer*.log")], root):
+                    m = re.search(r"diaTracer[- ]v?([0-9]+\.[0-9]+\.[0-9]+)", _head(p, 2000), re.I)
+                    if m:
+                        dt = m.group(1); break
+            parts = [f"diaTracer {dt}"] if dt else []
+            if dn:
+                parts.append(f"DIA-NN {dn}")
+            if fp and parts:
+                return f"{fp} ({', '.join(parts)})"
+            return fp or (", ".join(parts) or None)
+        elif (engine or "").lower() == "radiant":
+            # Radiant/Fulcrum ships as a container, so there is no in-file banner. The pipeline
+            # writes search_provenance.json next to the results; parse it rather than guessing from
+            # an image filename that may have been renamed.
+            import json as _json
+            for root in roots:
+                for p in _first(["search_provenance.json",
+                                 os.path.join("..", "search_provenance.json")], root):
+                    try:
+                        d = _json.loads(_head(p, 4000))
+                        if str(d.get("engine", "")).lower().startswith("radiant") and d.get("version"):
+                            return f"{d['version']} (Fulcrum)"
+                    except Exception:      # noqa: BLE001 - fall through to the filename sniff
+                        pass
+                for p in _first(["*.radiantConfig", "*.log", "*.sif"], root):
+                    m = re.search(r"radiant[-_](?:fulcrum[-_])?v?([0-9]+\.[0-9]+\.[0-9]+)",
+                                  _head(p), re.I)
+                    if m:
+                        return f"{m.group(1)} (Fulcrum)"
+            return None
         else:
             for root in roots:
                 for p in _first(["report.log.txt", "*.log.txt", "*.log"], root):

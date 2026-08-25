@@ -38,6 +38,15 @@ NODE_CITATION = os.environ.get("FRAN_NODE_CITATION", "").strip()
 # The JSON contract version this node speaks (design §5). Bump only when response SHAPES change.
 CONTRACT_VERSION = "fran-public-1"
 
+# CODE version of this module, deliberately separate from CONTRACT_VERSION: a bug fix here must not
+# imply that peers are talking to a different wire format, and a contract change must not be hidden
+# inside a patch release. Both are reported in the node descriptor so a peer (and an operator) can
+# tell which is which.
+try:
+    from ingest.versions import FEDERATION_VERSION as __version__       # single source of truth
+except Exception:                                                        # noqa: BLE001
+    __version__ = "0.1.0"
+
 # Sharing is OPT-IN. A fresh install federates nothing until an operator sets a policy.
 #   closed      — refuse every federation request (default)
 #   counts-only — presence and additive aggregates, no per-observation detail
@@ -161,13 +170,20 @@ def node_descriptor(corpus: dict[str, Any] | None = None,
     caps = ["search.peptide", "search.protein"]
     if SHARE_POLICY in ("counts-only", "public-tier"):
         caps += ["presence.filter", "aggregate.additive"]
+    try:
+        from .federation_guard import __version__ as guard_version
+    except Exception:                                                    # noqa: BLE001
+        guard_version = "unknown"
     return {
         "node_id": NODE_ID,
         "display_name": NODE_DISPLAY_NAME or NODE_ID,
         "base_url": NODE_BASE_URL,
         "contact": NODE_CONTACT,
         "fran_version": fran_version,
-        "schema_version": CONTRACT_VERSION,
+        "schema_version": CONTRACT_VERSION,      # the WIRE CONTRACT a peer can rely on
+        # CODE versions, so an operator can tell a stale node from a stale contract. Peers must key
+        # compatibility off schema_version/capabilities, never off these.
+        "code_versions": {"federation": __version__, "federation_guard": guard_version},
         "share_policy": SHARE_POLICY,
         "capabilities": caps,
         "corpus": corpus or {},

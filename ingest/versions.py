@@ -44,7 +44,9 @@ SCHEMA_VERSION = "1.0.0"
 # --- component (code) versions ---------------------------------------------------------------
 # Semver. Bump patch for fixes that cannot change output, minor for output-affecting changes, major
 # for a format change that makes old artefacts unreadable.
-CORPUS_INGEST_VERSION = "1.2.0"          # 1.2.0: _platform_from_disk — a Spectronaut BGS-schema report
+CORPUS_INGEST_VERSION = "1.3.0"          # 1.3.0: duplicate guard moved BEFORE the writes (it ran
+                                         # after the precursor COPY and blocked nothing); per-search
+                                         # pipeline_version stamping.          # 1.2.0: _platform_from_disk — a Spectronaut BGS-schema report
                                          # (no EG.IonMobility, extension stripped off R.FileName) used to
                                          # fall through to platform="orbitrap", which picks .raw for every
                                          # synthetic raw_path and labels acquisition DIA not diaPASEF.
@@ -69,6 +71,33 @@ XIC_TRACE_LANE_WRITER_VERSION = "1.0.0"  # 1.0.0: out of pilot. Per-channel RT (
                                          # DIA-NN before its traces are trusted. Datasets written by
                                          # 0.x carry the shared-axis MS2 time shift.
 RAW_METADATA_VERSION = "1.0.0"           # Bruker analysis.tdf + Thermo TRFP readers
+
+# The duplicate guard is versioned SEPARATELY from corpus_ingest even though it lives inside it,
+# because the question you actually need to answer is "did the code that ingested this search have a
+# working guard?" -- and on 2026-08-25 the answer was no while corpus_ingest still called itself
+# 1.2.0. A port had placed the guard AFTER the precursor COPY, where refusing writes nothing; syntax,
+# import and standalone query tests all passed and 9 duplicate groups / 5.48M redundant precursors
+# went in anyway. 1.0.0 is the first placement that actually blocks, proven by scripts/prove_guard.py.
+DUPLICATE_GUARD_VERSION = "1.0.0"
+
+# Federation. CONTRACT_VERSION in app/federation.py versions the WIRE FORMAT (what a peer promises);
+# these version the CODE. They move independently: a bug fix here must not imply a contract change.
+FEDERATION_VERSION = "0.1.0"             # node identity, registry, egress allowlist + pseudonyms
+FEDERATION_GUARD_VERSION = "0.1.0"       # shape / response-cap / durable budget / novelty controls
+
+
+def pipeline_stamp() -> str:
+    """Compact per-artefact code stamp, written to delimp_searches.pipeline_version.
+
+    delimp_component_version answers "what has touched this database"; it does NOT answer "which code
+    produced THIS search", because it is a log of tool RUNS, not a property of the row. That gap is
+    what made the 2026-08-25 guard failure slow to diagnose: 30 searches arrived with no way to ask
+    which of them had been ingested by guard-bearing code.
+
+    Greppable on purpose:  WHERE pipeline_version LIKE '%guard/1.%'
+    A NULL means the search predates per-search stamping (all 2,002 rows before 2026-08-25).
+    """
+    return f"corpus_ingest/{CORPUS_INGEST_VERSION} guard/{DUPLICATE_GUARD_VERSION}"
 
 
 def fran_app_version():
