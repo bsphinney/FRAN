@@ -23,7 +23,11 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.17.5"  # 0.17.5: intro trimmed to the pitch, the ML line and the quote
+APP_VERSION = "0.18.0"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
+                        # quant r2 vs scale offset, accession-level protein matching, charge/IL
+                        # miscounts, and the shared-vs-unique depth profile. Four engines now in
+                        # the corpus (Spectronaut, DIA-NN, FragPipe, Radiant).
+                        # 0.17.5: intro trimmed to the pitch, the ML line and the quote
 # 0.16.3: protein coverage uses the exact protein_group filter, not a heuristic
 # 0.16.2: species count no longer splits one organism in two on a NULL taxon
 # 0.16.1: predicted-spectrum overlay names the REAL engine, not always DIA-NN
