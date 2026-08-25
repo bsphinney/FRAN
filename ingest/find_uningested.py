@@ -49,6 +49,11 @@ DRIVE_MAP = {
 }
 
 DEFAULT_ROOTS = [
+    # The drop box: the proteomics skill SYMLINKS finished search results here. Entries are links
+    # to the real output dirs, which is why the walk below sets followlinks=True -- os.walk does NOT
+    # descend into a symlinked directory by default, so without it every dropped result would be
+    # listed and never looked inside.
+    "/quobyte/proteomics-grp/fran/incoming",
     "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports",
     "/quobyte/proteomics-grp/brett",
 ]
@@ -137,7 +142,10 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0):
             print(f"  [skip] no such root: {root}", flush=True)
             continue
         base_depth = root.rstrip("/").count("/")
-        for dirpath, dirnames, _ in os.walk(root):
+        # followlinks=True is required for the incoming/ drop box (see DEFAULT_ROOTS). Safe here
+        # only because max_depth bounds the walk -- following links without a depth cap can loop
+        # forever on a link that points at an ancestor.
+        for dirpath, dirnames, _ in os.walk(root, followlinks=True):
             if dirpath.count("/") - base_depth >= max_depth:
                 dirnames[:] = []
             seen += 1
@@ -146,15 +154,22 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0):
                 continue
             dirnames[:] = []                      # a search dir's children are its own outputs
             n = norm_path(dirpath)
+            # A dropped result is reachable by two names: the symlink in incoming/ and the real
+            # directory. Match on BOTH, and record the real one as the identity -- otherwise the
+            # same search ingested via the link would look un-ingested when the scan later reaches
+            # its real location, and would be ingested a second time under a different output_dir.
+            real = os.path.realpath(dirpath)
+            rn = norm_path(real)
             leaf = n.rsplit("/", 1)[-1]
             parent = n.rsplit("/", 2)[-2] if n.count("/") >= 2 else ""
-            lk, pk = name_keys(leaf), name_keys(parent)
-            hit = ("path" if n in paths else
+            lk, pk = name_keys(leaf) | name_keys(rn.rsplit("/", 1)[-1]), name_keys(parent)
+            hit = ("path" if n in paths or rn in paths else
                    "leaf-name" if lk & (bases | names) else
                    "parent-name" if pk & (bases | names) else None)
             if hit:
                 continue
-            found.append({"dir": dirpath, "engine": engine})
+            found.append({"dir": dirpath, "engine": engine,
+                          "real": real if real != dirpath else None})
             if limit and len(found) >= limit:
                 return found, seen
     return found, seen

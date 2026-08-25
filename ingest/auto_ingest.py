@@ -118,6 +118,7 @@ def select(candidates, skip_failed=True):
             skipped.append((name, f"no usable report in {len(dirs)} export(s) — empty/failed"))
             continue
         chosen.append({"search": name, "engine": engine, "dir": best,
+                       "identity": os.path.realpath(best),
                        "n_exports": len(dirs), "n_usable": sum(1 for d in dirs if usable(d, engine))})
     return chosen, skipped
 
@@ -167,6 +168,9 @@ def main():
         else:
             print(f"\n{tag}", flush=True)
         print(f"      {c['dir']}", flush=True)
+        if c.get("identity") and c["identity"] != c["dir"]:
+            # symlinked in via the drop box; the real path is the search's identity
+            print(f"      -> {c['identity']}", flush=True)
         if not a.apply:
             print("      DRY RUN — not ingesting", flush=True); continue
         target = resolve_input(c["dir"], c["engine"])
@@ -178,7 +182,7 @@ def main():
             print(f"      report: {os.path.basename(target)}", flush=True)
         cmd = [a.python, os.path.join(HERE, "corpus_ingest.py"), target,
                "--engine", c["engine"], "--name", c["search"],
-               "--output-dir", c["dir"], "--bulk-copy"]
+               "--output-dir", c.get("identity") or c["dir"], "--bulk-copy"]
         t0 = time.time()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
