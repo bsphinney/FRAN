@@ -248,7 +248,7 @@ function drawRecent(rows){
       <span class="px-2 py-1 rounded-md text-[10px] font-bold ${engBadge(s.search_engine)}">${esc((s.search_engine||'?').toUpperCase())}</span>
       <div class="min-w-0 flex-1">
         <div class="font-medium text-white truncate">${esc(s.search_name||'(unnamed)')}</div>
-        <div class="text-[11px] text-slate-500">${esc(s.pipeline_id||'')} · v${esc(s.delimp_version||'?')} · ${s.ingested_at?new Date(s.ingested_at).toLocaleString():''}</div>
+        <div class="text-[11px] text-slate-500">${esc(s.pipeline_id||'')}${s.search_engine_version?' · v'+esc(s.search_engine_version):''} · ${s.ingested_at?new Date(s.ingested_at).toLocaleString():''}</div>
       </div>
       <div class="text-right hidden sm:block"><div class="text-sm font-semibold text-white kpi-num">${fmt(s.n_precursors_total)}</div><div class="text-[10px] text-slate-500">precursors</div></div>
       <div class="text-right"><div class="text-sm font-semibold text-white kpi-num">${fmt(s.n_raw_files)}</div><div class="text-[10px] text-slate-500">runs</div></div>
@@ -432,7 +432,7 @@ async function renderSearchDetail(id){
     <div class="glass card p-6 fade-in mb-5">
       <div class="flex items-start justify-between flex-wrap gap-3">
         <div><h1 class="text-2xl font-extrabold text-white">${esc(s.search_name||'(unnamed)')}</h1>
-        <div class="text-sm text-slate-400 mt-1">${esc(s.pipeline_id||'')} ${s.pipeline_version?'· '+esc(s.pipeline_version):''} · DE-LIMP v${esc(s.delimp_version||'?')}</div></div>
+        <div class="text-sm text-slate-400 mt-1">${esc(s.pipeline_id||'')} ${s.pipeline_version?'· '+esc(s.pipeline_version):''}</div></div>
         <div class="flex gap-2 items-center"><span class="px-3 py-1 rounded-lg text-xs font-bold ${engBadge(s.search_engine)}">${esc((s.search_engine||'?').toUpperCase())} ${esc(s.search_engine_version||'')}</span>
         <span class="px-3 py-1 rounded-lg text-xs ${statusBadge(s.status)}">${esc(s.status||'?')}</span>
         ${window.__FRAN_TIER__&&window.__FRAN_TIER__!=='public'?`<button onclick="exportReport('${esc(id)}',this,'report')" class="px-3 py-1 rounded-lg text-xs font-semibold bg-accent/20 text-accent-400 hover:bg-accent/30" title="Download a DIA-NN report.parquet for this search, ready to upload into DE-LIMP (LIMPA) on Hugging Face or locally">⬇ report.parquet → DE-LIMP</button>
