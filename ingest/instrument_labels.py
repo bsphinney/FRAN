@@ -30,6 +30,12 @@ from __future__ import annotations
 SERIAL_CANON = {
     "1854399.153": "1854399.00153",   # timsTOF Pro, zero-padding variant
     "FSN20215": "fsn20215",           # Fusion Lumos, case variant
+    # Not a spelling variant of fsn20215 -- it looks like a machine/computer name rather than a
+    # serial, the same way 'Orbitrap Exploris Slot #10354' was a machine name. 59 runs, 2019-11..
+    # 2020-10, wholly inside the fsn20215 date span, all under our OWN service directories
+    # (on_campus/Tassone and UCSF client work). Brett confirmed the core runs exactly one Fusion
+    # Lumos, so it is that instrument under a second identifier.
+    "EXRCA2-MP08": "fsn20215",
 }
 
 # Serial -> the instrument it actually is. Only for serials whose identity is established.
