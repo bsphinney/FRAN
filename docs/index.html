@@ -7,6 +7,10 @@
   <meta name="description" content="FRAN is a live, read-only browser onto a growing DIA mass-spectrometry proteomics corpus: peptides, proteins, genes, MS2 spectra, XIC chromatograms, ion mobility, and predicted fragment intensities & flyability." />
   <meta property="og:title" content="FRAN — Fragment Reference & ANnotation" />
   <meta property="og:description" content="A live, DIA-only proteomics corpus browser: spectra, XICs, ion mobility, predicted flyability." />
+  <meta property="og:image" content="https://bsphinney.github.io/FRAN/fran-mascot.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://bsphinney.github.io/FRAN/fran-mascot.png" />
+  <link rel="icon" href="fran-mascot.png" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = { theme: { extend: { colors: {
@@ -39,9 +43,11 @@
   <!-- hero -->
   <section class="max-w-6xl mx-auto px-6 pt-10 pb-14 text-center">
     <div class="inline-flex items-center gap-2 text-[11px] uppercase tracking-wider text-teal bg-teal/10 border border-teal/20 rounded-full px-3 py-1 mb-6">DIA, not DDA · live corpus</div>
+    <img src="fran-mascot.png" alt="FRAN the mascot: a glamorous drag queen in a purple sequinned gown and FRAN sash, holding a bubbling flask beside a mass spectrometer, giving a thumbs up" class="mx-auto mb-6 w-40 sm:w-56 drop-shadow-2xl" />
     <h1 class="text-4xl sm:text-6xl font-extrabold text-white tracking-tight leading-[1.05]">
       A living reference of<br><span class="text-accent-400">DIA mass-spec</span> peptides &amp; spectra
     </h1>
+    <p class="mt-3 text-accent-400 font-semibold italic text-lg">&ldquo;Fast, Robust Analysis, darling!&rdquo;</p>
     <p class="mt-6 max-w-2xl mx-auto text-slate-300 text-lg">
       FRAN is a read-only window onto a growing data-independent-acquisition proteomics corpus —
       browse by <b class="text-white">peptide, protein, gene, organism, or run</b> and see real

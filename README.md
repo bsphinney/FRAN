@@ -12,6 +12,12 @@ short_description: FRAN — browse a live DIA proteomics corpus (peptides, prote
 
 # FRAN — Fragment Reference & ANnotation
 
+<p align="center">
+  <img src="docs/fran-mascot.png" alt="FRAN the mascot — a glamorous drag queen in a purple sequinned gown and FRAN sash, holding a bubbling Erlenmeyer flask beside a mass spectrometer and a whiteboard of equations, giving a thumbs up and saying &quot;Fast, Robust Analysis, darling!&quot;" width="380">
+</p>
+
+<p align="center"><em><b>Fast, Robust Analysis, darling!</b></em></p>
+
 **Live app: https://fran.stan-proteomics.org** (free, no login)
 
 A read-only public window onto the live PG Farm `delimp` proteomics corpus — a
