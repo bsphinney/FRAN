@@ -134,6 +134,22 @@ def known_keys(conn):
 _PRUNE_SUFFIX = (".d", ".raw", ".wiff", ".wiff2", ".mzml", ".mzxml", ".lance")
 _PRUNE_NAME = {".snapshot", ".git", "__pycache__", ".Trash", "lost+found", ".ipynb_checkpoints"}
 
+# Whole subtrees that produce engine output which is NOT a corpus search. Without these a full-tree
+# sweep returns 4,493 "candidates", of which 4,427 are these: STAN writes a DIA-NN report.parquet
+# for EVERY QC run (3,147 under STAN/processing alone, plus per-instrument trees), and smoke-test
+# and scratch directories look identical to a real search from the outside. Ingesting QC runs as
+# customer searches would corrupt every corpus count.
+DEFAULT_EXCLUDES = [
+    "/quobyte/proteomics-grp/STAN/",           # STAN QC — a separate system with its own database
+    "/quobyte/proteomics-grp/hela_qcs/",       # QC watcher output
+    "/quobyte/proteomics-grp/brett/v1_smoke",  # smoke tests
+    "/quobyte/proteomics-grp/brett/glendon/",  # our scratch/working dir
+]
+
+
+def excluded(path: str, patterns) -> bool:
+    return any(pat in path for pat in patterns)
+
 
 def prune(dirnames: list[str]) -> None:
     """Drop directories os.walk should not descend into. Mutates in place, as os.walk requires."""
@@ -168,8 +184,9 @@ def detect_engine(d: str, dirnames=None, filenames=None):
     return None
 
 
-def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None):
+def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None, excludes=None):
     found, seen = [], 0
+    excludes = DEFAULT_EXCLUDES if excludes is None else excludes
     for root in roots:
         if not os.path.isdir(root):
             print(f"  [skip] no such root: {root}", flush=True)
@@ -185,6 +202,9 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None):
             seen += 1
             if seen % 200000 == 0:
                 print(f"  ...{seen:,} dirs walked, {len(found)} candidates", flush=True)
+            if excluded(dirpath, excludes):
+                dirnames[:] = []
+                continue
             engine = detect_engine(dirpath, dirnames, filenames)
             if not engine or (engines and engine not in engines):
                 continue
@@ -211,7 +231,7 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None):
     return found, seen
 
 
-def scan_sne(roots, paths, names, bases, max_depth=12, limit=0):
+def scan_sne(roots, paths, names, bases, max_depth=12, limit=0, excludes=None):
     """Find Spectronaut .sne EXPERIMENTS with no corresponding search in the corpus.
 
     A different problem from scan(): an .sne is the experiment archive itself, not an output
@@ -235,6 +255,9 @@ def scan_sne(roots, paths, names, bases, max_depth=12, limit=0):
             if dirpath.count("/") - base_depth >= max_depth:
                 dirnames[:] = []
             seen += 1
+            if excluded(dirpath, excludes or []):
+                dirnames[:] = []
+                continue
             # .sne appears as a FILE in most layouts and as a DIRECTORY in some, so check both.
             for entry in list(filenames) + [d for d in dirnames if d.lower().endswith(".sne")]:
                 if not entry.lower().endswith(".sne"):
@@ -321,6 +344,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--json-out", help="write candidates as JSON (the cron's input)")
     ap.add_argument("--engines", default="", help="comma-separated engines to keep (default: all)")
+    ap.add_argument("--exclude", nargs="*", default=None,
+                    help="path substrings to skip (default: STAN QC, smoke and scratch trees)")
     ap.add_argument("--find-sne", action="store_true",
                     help="find .sne experiments with no search in the corpus (needs a Windows "
                          "export before it can be ingested)")
@@ -332,7 +357,8 @@ def main():
     print(f"corpus knows {len(paths):,} paths, {len(names):,} names, {len(bases):,} dir basenames")
 
     if a.find_sne:
-        found, seen = scan_sne(a.roots, paths, names, bases, a.max_depth, a.limit)
+        found, seen = scan_sne(a.roots, paths, names, bases, a.max_depth, a.limit,
+                               DEFAULT_EXCLUDES if a.exclude is None else a.exclude)
         print(f"walked {seen:,} directories under {len(a.roots)} root(s)")
         need_win = [f for f in found if not f["has_report"]]
         have_rep = [f for f in found if f["has_report"]]
@@ -358,7 +384,9 @@ def main():
     want = {e.strip() for e in a.engines.split(",") if e.strip()} or None
     if want:
         print(f"engines: {sorted(want)}")
-    found, seen = scan(a.roots, paths, names, bases, a.max_depth, a.limit, want)
+    ex = DEFAULT_EXCLUDES if a.exclude is None else a.exclude
+    print(f"excluding {len(ex)} subtree(s): {ex}")
+    found, seen = scan(a.roots, paths, names, bases, a.max_depth, a.limit, want, ex)
     print(f"walked {seen:,} directories under {len(a.roots)} root(s)")
     print(f"\n=== {len(found)} candidate(s) not matched by path OR name ===")
     by_engine = {}
