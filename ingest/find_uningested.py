@@ -48,6 +48,8 @@ DRIVE_MAP = {
     "r:": "/nfs/lssc0/flinders/proteomics",
 }
 
+REPORTS_ROOT = "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports"
+
 DEFAULT_ROOTS = [
     # The drop box: the proteomics skill SYMLINKS finished search results here. Entries are links
     # to the real output dirs, which is why the walk below sets followlinks=True -- os.walk does NOT
@@ -121,21 +123,52 @@ def known_keys(conn):
     return paths, names, bases
 
 
-def detect_engine(d: str):
-    try:
-        entries = set(os.listdir(d))
-    except OSError:
-        return None
+# Directory names never worth descending into. Bruker .d and Thermo .raw "files" are DIRECTORIES
+# holding hundreds of entries each, and there are ~21,000 of them: walking inside is pure cost, and
+# a search output never lives within one. Without this a full-tree sweep spends most of its time in
+# raw data.
+# NOT pruned: ".sne". A Spectronaut experiment folder IS a legitimate search location -- the corpus
+# records output_dirs like S:\sne_storage\<name>.sne -- and pruning it would remove it from
+# dirnames, so os.walk would never yield it and detect_engine would never see it. Silently losing a
+# whole engine's layout is a worse cost than descending into a few of them.
+_PRUNE_SUFFIX = (".d", ".raw", ".wiff", ".wiff2", ".mzml", ".mzxml", ".lance")
+_PRUNE_NAME = {".snapshot", ".git", "__pycache__", ".Trash", "lost+found", ".ipynb_checkpoints"}
+
+
+def prune(dirnames: list[str]) -> None:
+    """Drop directories os.walk should not descend into. Mutates in place, as os.walk requires."""
+    dirnames[:] = [d for d in dirnames
+                   if d not in _PRUNE_NAME and not d.lower().endswith(_PRUNE_SUFFIX)]
+
+
+def detect_engine(d: str, dirnames=None, filenames=None):
+    """Which engine's output this directory is, or None.
+
+    Takes os.walk's own dirnames/filenames when available. That matters at full-tree scale: calling
+    os.listdir() again per directory doubles the metadata traffic over a network filesystem holding
+    millions of entries, for information the walk already has."""
+    if filenames is None or dirnames is None:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            return None
+        filenames = entries
+        dirnames = entries
+    files, dirs = set(filenames), set(dirnames)
     for engine, markers in ENGINE_MARKERS:
         for mk in markers:
-            if os.path.exists(os.path.join(d, mk)):
+            if "/" in mk:                       # nested marker, e.g. dia-quant-output/report.tsv
+                head = mk.split("/", 1)[0]
+                if head in dirs and os.path.exists(os.path.join(d, mk)):
+                    return engine
+            elif mk in files or mk in dirs:
                 return engine
-    if any(_SN_REPORT.search(e) for e in entries):
+    if any(_SN_REPORT.search(e) for e in files):
         return "spectronaut"
     return None
 
 
-def scan(roots, paths, names, bases, max_depth=3, limit=0):
+def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None):
     found, seen = [], 0
     for root in roots:
         if not os.path.isdir(root):
@@ -145,12 +178,15 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0):
         # followlinks=True is required for the incoming/ drop box (see DEFAULT_ROOTS). Safe here
         # only because max_depth bounds the walk -- following links without a depth cap can loop
         # forever on a link that points at an ancestor.
-        for dirpath, dirnames, _ in os.walk(root, followlinks=True):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+            prune(dirnames)
             if dirpath.count("/") - base_depth >= max_depth:
                 dirnames[:] = []
             seen += 1
-            engine = detect_engine(dirpath)
-            if not engine:
+            if seen % 200000 == 0:
+                print(f"  ...{seen:,} dirs walked, {len(found)} candidates", flush=True)
+            engine = detect_engine(dirpath, dirnames, filenames)
+            if not engine or (engines and engine not in engines):
                 continue
             dirnames[:] = []                      # a search dir's children are its own outputs
             n = norm_path(dirpath)
@@ -175,12 +211,85 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0):
     return found, seen
 
 
+def scan_sne(roots, paths, names, bases, max_depth=12, limit=0):
+    """Find Spectronaut .sne EXPERIMENTS with no corresponding search in the corpus.
+
+    A different problem from scan(): an .sne is the experiment archive itself, not an output
+    directory, so no engine-marker test will ever see one. It is also not directly ingestable --
+    corpus_ingest needs a REPORT, and only Spectronaut on Windows can export one
+    (`manageSNE -rs FRAN.rs`). So this reports candidates to SHIP to a Windows node, and checks
+    whether a report already exists before recommending that.
+
+    Matching is by name, because that is what survives the round trip: the corpus records a search
+    by its .sne basename (e.g. "20260824_123640_sn1 Taha entrapment.sne" -> search_name
+    "20260824_123640_sn1 Taha entrapment"), while the .sne itself may sit on a different mount
+    entirely from where it was ingested."""
+    found, seen = [], 0
+    for root in roots:
+        if not os.path.isdir(root):
+            print(f"  [skip] no such root: {root}", flush=True)
+            continue
+        base_depth = root.rstrip("/").count("/")
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+            prune(dirnames)
+            if dirpath.count("/") - base_depth >= max_depth:
+                dirnames[:] = []
+            seen += 1
+            # .sne appears as a FILE in most layouts and as a DIRECTORY in some, so check both.
+            for entry in list(filenames) + [d for d in dirnames if d.lower().endswith(".sne")]:
+                if not entry.lower().endswith(".sne"):
+                    continue
+                full = os.path.join(dirpath, entry)
+                stem = entry[:-4]
+                if name_keys(stem) & (names | bases) or norm_path(full) in paths:
+                    continue
+                try:
+                    st = os.stat(full)
+                    size = st.st_size if os.path.isfile(full) else sum(
+                        os.path.getsize(os.path.join(dp, f))
+                        for dp, _, fs in os.walk(full) for f in fs)
+                except OSError:
+                    size = -1
+                found.append({"sne": full, "name": stem, "bytes": size,
+                              "has_report": _report_nearby(dirpath, stem)})
+                if limit and len(found) >= limit:
+                    return found, seen
+    return found, seen
+
+
+def _report_nearby(d: str, stem: str) -> bool:
+    """Is a Spectronaut report already sitting next to this .sne (or in FRAN_reports under its
+    name)? If so it does not need a Windows round trip -- it needs ingesting."""
+    try:
+        for f in os.listdir(d):
+            if _SN_REPORT.search(f) and stem.lower() in f.lower():
+                return True
+    except OSError:
+        pass
+    for cand in (os.path.join(REPORTS_ROOT, stem), os.path.join(d, stem)):
+        if os.path.isdir(cand):
+            try:
+                for sub in os.listdir(cand):
+                    if _SN_REPORT.search(sub):
+                        return True
+                    if os.path.isdir(os.path.join(cand, sub)) and any(
+                            _SN_REPORT.search(x) for x in os.listdir(os.path.join(cand, sub))):
+                        return True
+            except OSError:
+                pass
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--roots", nargs="*", default=DEFAULT_ROOTS)
     ap.add_argument("--max-depth", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--json-out", help="write candidates as JSON (the cron's input)")
+    ap.add_argument("--engines", default="", help="comma-separated engines to keep (default: all)")
+    ap.add_argument("--find-sne", action="store_true",
+                    help="find .sne experiments with no search in the corpus (needs a Windows "
+                         "export before it can be ingested)")
     a = ap.parse_args()
 
     import corpus_ingest as ci
@@ -188,7 +297,32 @@ def main():
     paths, names, bases = known_keys(conn)
     print(f"corpus knows {len(paths):,} paths, {len(names):,} names, {len(bases):,} dir basenames")
 
-    found, seen = scan(a.roots, paths, names, bases, a.max_depth, a.limit)
+    if a.find_sne:
+        found, seen = scan_sne(a.roots, paths, names, bases, a.max_depth, a.limit)
+        print(f"walked {seen:,} directories under {len(a.roots)} root(s)")
+        need_win = [f for f in found if not f["has_report"]]
+        have_rep = [f for f in found if f["has_report"]]
+        tot = sum(f["bytes"] for f in found if f["bytes"] > 0)
+        print(f"\n=== {len(found)} .sne experiment(s) with no search in the corpus "
+              f"({tot/1e12:.2f} TB) ===")
+        print(f"  {len(have_rep)} already have a report on disk -> INGEST, no Windows trip needed")
+        print(f"  {len(need_win)} have no report -> ship to a Windows box for manageSNE -rs FRAN.rs")
+        for f in sorted(found, key=lambda x: -x["bytes"])[:40]:
+            gb = f["bytes"] / 1e9
+            print(f"  {'REPORT' if f['has_report'] else 'NEEDS-WIN':<10} {gb:>8.1f} GB  {f['sne']}")
+        if len(found) > 40:
+            print(f"  ... and {len(found)-40} more")
+        if a.json_out:
+            with open(a.json_out, "w") as fh:
+                json.dump(found, fh, indent=1)
+            print(f"\nwrote {a.json_out}")
+        conn.close()
+        return
+
+    want = {e.strip() for e in a.engines.split(",") if e.strip()} or None
+    if want:
+        print(f"engines: {sorted(want)}")
+    found, seen = scan(a.roots, paths, names, bases, a.max_depth, a.limit, want)
     print(f"walked {seen:,} directories under {len(a.roots)} root(s)")
     print(f"\n=== {len(found)} candidate(s) not matched by path OR name ===")
     by_engine = {}
