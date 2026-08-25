@@ -39,6 +39,60 @@ there is a queryable **MCP endpoint** so an AI agent can ask the corpus question
 
 FRAN is part of **[STAN](https://github.com/bsphinney/stan)** (stan-proteomics.org).
 
+## Using FRAN in a core facility
+
+The public site is anonymised: filenames become `run-3c5f57`, search names become `search-f0313c`.
+That is the *public* face of the same deployment. Logged in, FRAN is also a **core-facility
+instrument** — the corpus you already generated, with the customer names put back.
+
+Access is **per request** and **fails closed**, in three tiers:
+
+| Tier | Who | Sees |
+|---|---|---|
+| `public` | anyone, no login | anonymised corpus — the website |
+| `lab` | a PI / collaborator | **only their own submissions**, real names |
+| `full` | core staff | everything, plus the cross-lab directory |
+
+In production the gate is Azure Easy Auth + Microsoft Entra: a caller is authorised only if the
+platform-verified principal carries one Entra security-group object id (`FRAN_REQUIRED_GROUP`).
+Membership in that group *is* the entire access list — managed in Entra, no redeploy. No principal,
+no configured group, or group absent → public. Self-hosted instances can instead use a shared
+internal key (`DELIMP_INTERNAL_KEY`, sent as `X-Internal-Key`).
+
+**Keeping track of customer samples.** The collaborator directory keys on the actual
+service-directory customer folder rather than a free-text `client` field — which matters, because
+grouping on `client` collapsed all 453 on-campus searches into one generic "UC Davis" while the real
+lab was sitting in `pi`. From there: labs grouped by canonical institution (UC Davis spelling
+variants merged, deduped by PI, annotated with college/department), each lab's submissions, and each
+submission's searches and runs. Crucially it shows the **full customer base, not just the corpus** —
+labs whose data is on the share but *not yet ingested* appear with an "on-share / un-ingested"
+status, so a sample that never got analysed is visible instead of silently absent.
+
+**Writing support letters.** FRAN does not write the letter, but it answers the questions a letter
+needs, per PI, in one place: how many submissions and searches, over what period, how many runs and
+on which instruments, how many proteins and peptides were identified, and which projects they belong
+to. `/api/internal/lab/{pi}` is that page. For a grant renewal or a letter of support this is the
+difference between "we have worked with this lab for years" and a number you can stand behind.
+
+**Querying across collaborators.** At `full` tier the directory is cross-lab: search people by name,
+list every collaborator with their search / PI / project counts and LIMS linkage, or pivot by
+institution. This is the query that is genuinely hard to do any other way — "which labs have we run
+timsTOF phospho for, and how much", "who else submitted this organism", "which of our collaborators
+has data we could reuse for a method comparison".
+
+**Handing work back.** Three exports, gated by the same tiers (a `lab` caller can only export their
+own submissions):
+
+| Export | What it is |
+|---|---|
+| `/api/export/diann_report/{search_id}` | the search as a DIA-NN-shaped report |
+| `/api/export/research_brief/{search_id}` | a markdown packet pre-filled for re-searching + analysing a search |
+| `/api/export/resubmit_brief/{submission_id}` | the same, for a submission whose raw data is on the service directory but not yet in FRAN |
+
+> **Before you enable any of this**, read [INSTALL.md §9](INSTALL.md). The confidential tables hold
+> real customer and PI names, file paths and submission provenance. The public layer is safe because
+> those tables are not in its allowlist — that property is what you are switching off.
+
 > ### 🔎 Just want to look something up?
 > **You do not need to install anything.** The public instance is free and needs no login:
 > **[fran.stan-proteomics.org](https://fran.stan-proteomics.org)**
@@ -156,6 +210,9 @@ Enforced in `app/db.py` and `app/privacy.py`:
 4. **Identity sanitisation.** Filenames, search names and project strings are anonymised in
    the public layer.
 5. **Credentials via environment only** — never committed.
+6. **Confidential access is per-request and fails closed.** Three tiers (`public` / `lab` / `full`);
+   absent or unverifiable authorization always resolves to `public`. See
+   [Using FRAN in a core facility](#using-fran-in-a-core-facility).
 
 > **⚠️ Before you expose an instance:** do not point a public deployment at a database
 > credential that can read your internal layer, even if this app never queries it — the
@@ -186,6 +243,9 @@ small queries. See **[FEDERATION.md](FEDERATION.md)**, design notes in
 | `DELIMP_PG_PASSWORD` | — | set via environment / deployment secret |
 | `DELIMP_PG_TOKEN_FILE` | — | alternative: path to a token file (local dev) |
 | `DELIMP_CACHE_TTL` | `20` | seconds to cache dashboard aggregates |
+| `FRAN_REQUIRED_GROUP` | — | Entra security-group object id that grants the confidential tier |
+| `DELIMP_INTERNAL_KEY` | — | shared key for self-hosted internal access (`X-Internal-Key`) |
+| `FRAN_DEV_AUTH` | — | `1` enables local dev auth shortcuts — **never set in production** |
 
 ## Implementation status
 
