@@ -35,6 +35,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 _TS = re.compile(r"^(\d{8}_\d{4,6})_")
+_SN_REPORT = re.compile(r"_Report.*\.(tsv|parquet)$", re.I)
+
+
+def resolve_input(d: str, engine: str) -> str | None:
+    """What to pass to corpus_ingest as its positional `searchdir`.
+
+    Spectronaut is the exception and it is documented (INSTALL.md step 5): it takes the report
+    FILE, not the directory. Handing it the directory dies with
+    `IsADirectoryError` inside pandas.read_csv. Every other engine takes the directory.
+
+    --output-dir stays the DIRECTORY regardless, because that is the search's identity
+    (search_id = uuid5(namespace, output_dir)) and must not change with the report's filename."""
+    if engine != "spectronaut":
+        return d
+    try:
+        cands = [f for f in os.listdir(d) if _SN_REPORT.search(f)]
+    except OSError:
+        return None
+    if not cands:
+        return None
+    # Prefer the FRAN.rs schema export when a directory holds more than one report: a BGS report has
+    # no genes, no ion mobility and no fragment columns. See ingest/SPECTRONAUT_FRAN_INGEST.md.
+    cands.sort(key=lambda f: (0 if "fran" in f.lower() else 1, -len(f)))
+    return os.path.join(d, cands[0])
 
 
 def search_key(path: str) -> str:
@@ -118,7 +142,14 @@ def main():
         print(f"      {c['dir']}", flush=True)
         if not a.apply:
             print("      DRY RUN — not ingesting", flush=True); continue
-        cmd = [a.python, os.path.join(HERE, "corpus_ingest.py"), c["dir"],
+        target = resolve_input(c["dir"], c["engine"])
+        if not target:
+            fail += 1
+            print("      FAILED: no report file found in the directory", flush=True)
+            continue
+        if target != c["dir"]:
+            print(f"      report: {os.path.basename(target)}", flush=True)
+        cmd = [a.python, os.path.join(HERE, "corpus_ingest.py"), target,
                "--engine", c["engine"], "--name", c["search"],
                "--output-dir", c["dir"], "--bulk-copy"]
         t0 = time.time()
@@ -126,7 +157,7 @@ def main():
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
         except subprocess.TimeoutExpired:
             print(f"      TIMEOUT after {a.timeout}s", flush=True); fail += 1; continue
-        tail = (r.stdout or "")[-1500:]
+        tail = ((r.stdout or "") + "\n--- stderr ---\n" + (r.stderr or ""))[-2500:]
         el = time.time() - t0
         if r.returncode == 0:
             ok += 1
@@ -138,7 +169,7 @@ def main():
             fail += 1
             print(f"      FAILED rc={r.returncode} in {el:.0f}s", flush=True)
             print("      --- last output ---", flush=True)
-            for line in tail.splitlines()[-12:]:
+            for line in [x for x in tail.splitlines() if x.strip()][-14:]:
                 print("      | " + line, flush=True)
     print(f"\n===== done: {ok} ingested, {dup} duplicate-skipped, {fail} failed, "
           f"{len(chosen)-len(todo)} still queued — {time.strftime('%F %T')} =====", flush=True)

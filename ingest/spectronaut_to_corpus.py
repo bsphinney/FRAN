@@ -140,13 +140,17 @@ def iter_chunks(path: str, usecols: list, chunksize: int = 200_000):
 
 
 def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000):
-    """Yield normalized per-precursor records (dict) from a Spectronaut report (TSV/Parquet)."""
+    """Yield normalized per-precursor records (dict) from a Spectronaut report (TSV/Parquet).
+
+    Prints a summary of rows dropped for a non-numeric q-value; silence there means none."""
+    _skipped = {"non_numeric_q": 0, "values": set()}
     cols = resolve_columns(report_columns(report_path))
     need = ["run", "stripped_seq", "charge"]
     missing = [n for n in need if n not in cols]
     if missing:
         raise ValueError(f"Spectronaut report missing required columns for {missing}; resolved={cols}")
     usecols = list(dict.fromkeys(cols.values()))
+    yielded = 0
     for chunk in iter_chunks(report_path, usecols, chunksize):
         for _, r in chunk.iterrows():
             # Decoys are reversed/scrambled sequences, not identifications: drop them before the
@@ -156,8 +160,27 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
             if dv is not None and pd.notna(dv) and str(dv).strip().lower() in ("true", "1", "1.0"):
                 continue
             qv = r.get(cols["q_value"]) if "q_value" in cols else None
-            if qv is not None and pd.notna(qv) and float(qv) > q_max:
-                continue
+            if qv is not None and pd.notna(qv):
+                # EG.Qvalue is a STRING column and is not always a number. Spectronaut writes the
+                # literal "Profiled" for precursors it quantified by cross-run profiling rather than
+                # identified in this run -- 71,021 of 600,000 sampled values (12%) in
+                # 20191111_112559_diaPASEF_run_2. float() raised ValueError on those, which is why
+                # reports of this shape never ingested at all.
+                #
+                # They are DROPPED, not admitted with a NULL q-value, for two reasons. First, the
+                # same hazard the decoy comment above describes: a None q-value passes `> q_max`
+                # and would be waved through as a 1%-FDR identification on no evidence. Second,
+                # consistency of meaning -- every search already in the corpus was ingested by code
+                # that crashed on this value, so no existing row is a profiled one, and admitting
+                # them here would make this search's "identifications" mean something different
+                # from the other 434M.
+                try:
+                    if float(qv) > q_max:
+                        continue
+                except (TypeError, ValueError):
+                    _skipped["non_numeric_q"] += 1
+                    _skipped["values"].add(str(qv)[:24])
+                    continue
             modseq = r.get(cols["modified_seq"]) if "modified_seq" in cols else None
             # run NAME (matches the DIA-NN convention corpus_ingest expects); strip a trailing
             # vendor extension so corpus_ingest can build a clean raw_path.
@@ -205,8 +228,13 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
                     "measured_relint": _f(r, cols, "frg_measured_relint"),
                     "predicted_relint": _f(r, cols, "frg_predicted_relint"),
                 }
+            yielded += 1
             yield rec
 
+    if _skipped["non_numeric_q"]:
+        print(f"  [spectronaut] dropped {_skipped['non_numeric_q']:,} row(s) with a "
+              f"non-numeric q-value {sorted(_skipped['values'])} "
+              f"(kept {yielded:,}) -- see iter_records()", flush=True)
 
 def _f(row, cols, field):
     if field not in cols:
