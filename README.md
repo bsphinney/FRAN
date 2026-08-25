@@ -6,107 +6,253 @@
 
 <p align="center"><em><b>Fast, Robust Analysis, darling!</b></em></p>
 
-**Live app: https://fran.stan-proteomics.org** (free, no login)
+<p align="center">
+  <a href="https://fran.stan-proteomics.org"><img alt="live app" src="https://img.shields.io/badge/live%20app-fran.stan--proteomics.org-0E6F79"></a>
+  <img alt="python" src="https://img.shields.io/badge/python-3.11-blue">
+  <img alt="corpus" src="https://img.shields.io/badge/corpus-434M%20precursors-2E7346">
+  <img alt="ion mobility" src="https://img.shields.io/badge/ion%20mobility-92%25-A8681A">
+</p>
 
-A read-only public window onto the live PG Farm `delimp` proteomics corpus — a
-DIA-MS "field guide" you can browse by **peptide, protein, gene, organism, run,
-or lab**. As of mid-2026 the corpus holds roughly **335M precursor
-identifications · 3.1M distinct peptides · 560K protein groups · 112 organisms**,
-and **~90% of it carries ion mobility** (timsTOF / diaPASEF). GPMDB-inspired in
-*function*, but built for 2026: live counts that grow as ingest proceeds, an RT ×
-ion-mobility (1/K₀) showcase, per-species **% of proteome** coverage, predicted
-flyability, cross-tool (DIA-NN + Spectronaut) provenance, a queryable **MCP**
-endpoint for AI agents, server-side aggregation, and a hard public-layer security
-boundary. Part of **STAN** (stan-proteomics.org).
+## What it is
 
-## Run your own FRAN
-FRAN is not UC-Davis-specific: **[INSTALL.md](INSTALL.md)** stands up your own instance — your
-PostgreSQL, your data, your deployment. `schema/fran_schema.sql` creates the corpus schema (36
-tables, generated from a live instance by `scripts/dump_schema.py` so it cannot drift, and verified
-by applying it to an empty PostgreSQL 16 and writing a first ingest).
+When you identify a peptide in a DIA run, the obvious questions have no good public
+answer. *Has anyone ever seen this peptide before? At what retention time, what charge,
+what ion mobility? Does a different search engine find it in the same file? Is it worth
+building an assay around, or does it barely fly?* GPMDB answered a version of this for
+DDA twenty years ago. For DIA — and especially for diaPASEF, where every identification
+carries an ion-mobility coordinate — there is essentially nowhere to look.
 
-Instances can also **federate**: see **[FEDERATION.md](FEDERATION.md)** to connect your node to
-others, and [FEDERATION_DESIGN.md](FEDERATION_DESIGN.md) for the design. Sharing is off by default.
+FRAN is that place. It is a read-only public window onto a live proteomics corpus, browsable
+by **peptide, protein, gene, organism, run, or lab**. The corpus currently holds:
 
-## Stack
-- **Backend:** FastAPI + psycopg2 (reuses the project's PG Farm connection
-  pattern), a connection pool with **read-only** sessions and a **table
-  allowlist** so it is structurally impossible to query the internal/customer
-  layer.
-- **Frontend:** single-page app, Tailwind + Chart.js, no build step.
-- **Packaging:** Docker, deployable as a Hugging Face **Docker Space** (serves
-  on port 7860).
+| | |
+|---|---|
+| **434,154,365** precursor identifications | **3,238,768** distinct peptides |
+| **593,541** protein groups | **114** organisms |
+| **2,011** searches across **20,988** raw files | **92%** carry ion mobility (timsTOF / diaPASEF) |
 
-## Features
-- **Overview dashboard** — live counts (precursors / peptides / protein groups /
-  searches / raw files / organisms / IM-bearing precursors), species, platform,
-  engine and charge distributions, RT×IM density, and a *recently ingested
-  searches* panel. Counts auto-refresh so you can watch the corpus populate.
-- **Search** — peptide (substring or exact, trigram-indexed), protein group /
-  gene.
-- **Protein view** — observed peptides, per-search/run intensity, coverage.
-- **Peptide/precursor view** — modified forms (ProForma) × charge, per-run
-  RT / 1/K₀ / m/z / q-value / intensity, cross-engine consensus.
-- **Search/run browser** — every ingested search + per-run stats.
-- **Ion-mobility showcase** — full-screen RT × 1/K₀ scatter, colored by charge.
+What makes it different from a static database: counts are **live** and grow as ingest
+proceeds; every peptide carries its real measured **RT × 1/K₀** distribution rather than a
+single consensus value; searches from **four engines** (Spectronaut, DIA-NN, FragPipe,
+Radiant) sit side by side on the *same raw files*, so you can see where they disagree; and
+there is a queryable **MCP endpoint** so an AI agent can ask the corpus questions directly.
 
-## Security & governance (enforced in `app/db.py`)
-1. **Read-only.** Sessions open with `default_transaction_read_only=on`; only
-   `SELECT`/`WITH` statements are allowed. No INSERT/UPDATE/DELETE/DDL path.
-2. **Public-layer allowlist.** Every query declares which tables it reads; the
-   set is validated against `PUBLIC_TABLES`. The confidential tables (real
-   customer/PI names, file paths, submission provenance — `coreomics_*_cache`,
-   `delimp_search_provenance`, `delimp_submission_service_dir`, …) are excluded
-   from the public set and are reachable only when a request is authenticated
-   to the confidential ("full") tier — never from the anonymous public layer.
-3. **Parameterized queries only.** No raw user SQL; no string-interpolated SQL.
-4. **Credentials via env / HF Secrets** — never committed (see below).
+FRAN is part of **[STAN](https://github.com/bsphinney/stan)** (stan-proteomics.org).
 
-## Configuration (environment variables)
+> ### 🔎 Just want to look something up?
+> **You do not need to install anything.** The public instance is free and needs no login:
+> **[fran.stan-proteomics.org](https://fran.stan-proteomics.org)**
+>
+> Everything below is for running **your own** FRAN, on your own data.
+
+## Quick install — pick your mode
+
+| If you… | Use mode | Time | Guide |
+|---|---|---|---|
+| Just want to browse the public corpus | **None — use the website** | 0 min | [fran.stan-proteomics.org](https://fran.stan-proteomics.org) |
+| Want FRAN over **your own** data, on your laptop | **A — local** | ~30 min | [INSTALL.md](INSTALL.md) |
+| Want an instance your institution can use | **B — hosted** | 1–3 h | [INSTALL.md](INSTALL.md) + §9 |
+| Want your instance to exchange data with other FRANs | **C — federated** | +30 min | [FEDERATION.md](FEDERATION.md) |
+
+FRAN is **not UC-Davis-specific**. `schema/fran_schema.sql` creates the whole corpus schema —
+36 tables, 7 materialized views, 56 indexes — and it is *generated from a live instance* by
+`scripts/dump_schema.py` rather than hand-maintained, so it cannot drift from what the code
+expects. It has been verified by applying it to an empty PostgreSQL 16 and running a first
+ingest through to a served page.
+
+### Mode A — local, on your own data
+
+```bash
+git clone https://github.com/bsphinney/FRAN.git && cd FRAN
+pip install -r requirements.txt
+
+createdb fran                                   # any PostgreSQL 14+
+psql fran -f schema/fran_schema.sql             # 36 tables, 7 matviews, 56 indexes
+
+cp .env.example .env && $EDITOR .env            # point DELIMP_PG_* at YOUR database
+set -a; source .env; set +a                     # the app never auto-loads .env
+
+python ingest/corpus_ingest.py /path/to/searchdir --engine diann --dry-run
+python ingest/corpus_ingest.py /path/to/searchdir --engine diann --bulk-copy
+python ingest/refresh_leaderboards.py           # Highlights are matviews; refresh after ingest
+
+uvicorn app.main:app --reload --port 7860       # open http://localhost:7860
+```
+
+Or with Docker (serves on 7860):
+
+```bash
+docker build -t fran . && docker run -p 7860:7860 --env-file .env fran
+```
+
+Always `--dry-run` first — it parses the report and prints precursor / run / protein-group counts
+without writing, so you can check them against your search engine's own summary before committing.
+
+[INSTALL.md](INSTALL.md) walks through each step, including per-engine ingest commands (Spectronaut
+takes a report *file*, not a directory) and a verification pass. **Read §9 (Security) before
+exposing an instance to anyone.**
+
+## What you can browse
+
+- **Overview** — live counts, species, platform, engine and charge distributions, an RT×IM
+  density map, and recently ingested searches. Auto-refreshes as the corpus grows.
+- **Search** — peptide (substring or exact, trigram-indexed), protein group, or gene.
+- **Peptide / precursor view** — modified forms (ProForma) × charge, per-run RT / 1/K₀ / m/z /
+  q-value / intensity, predicted flyability, cross-engine consensus.
+- **Protein view** — observed peptides, per-search and per-run intensity, sequence coverage.
+- **Cross-engine comparison** (`#/engines`) — for any raw file searched by more than one
+  engine: agreement at precursor / peptide / protein level, quantitative correlation, and the
+  peptides each engine claims alone.
+- **Ion-mobility showcase** — full-screen RT × 1/K₀ scatter, coloured by charge.
+- **MCP endpoint** — the corpus as a tool an AI agent can query.
+
+## Architecture
+
+```
+  search engine output                 ingest (Python, offline)          serving (FastAPI)
+  ────────────────────────             ────────────────────────          ─────────────────
+  Spectronaut  .sne / FRAN.rs  ─┐
+  DIA-NN       report.parquet  ─┤                                        app/queries.py
+  FragPipe     report.tsv      ─┼──▶  ingest/corpus_ingest.py  ──▶ PostgreSQL ──▶ app/db.py
+  Radiant      fulcrum parquet ─┘        engine adapters          (delimp)      (read-only +
+                                         + duplicate guard            │          allowlist)
+                                                                      │              │
+  raw chromatograms ───────────▶  Lance lanes (columnar, on disk) ─────┘         app/static
+    Spectronaut .xic.db                spectrum · xic · xic-trace                 (SPA, no
+    DIA-NN --xic                       registered in PostgreSQL                  build step)
+```
+
+Bulk trace data lives in **Lance** (columnar, versioned, on disk), not in PostgreSQL — a
+3.5M-precursor chromatogram set costs ~13 GB as Lance against ~22 GB in PG. PostgreSQL holds
+the registry plus whatever curated subset a page actually serves.
+
+## Key design decisions
+
+- **Read-only is structural, not a convention.** Sessions open with
+  `default_transaction_read_only=on` and only `SELECT`/`WITH` is accepted. There is no
+  INSERT/UPDATE/DELETE/DDL code path in the serving app at all.
+- **Every query declares the tables it reads**, validated against a `PUBLIC_TABLES` allowlist.
+  Confidential tables (customer names, file paths, submission provenance) are simply not in
+  the public set, so a query that touches one fails rather than leaking.
+- **Filenames are sanitised, not trusted.** Raw filenames routinely contain PI names and
+  project codes, so the public layer renders them as `run-<sha1[:6]>`.
+- **The schema is generated, never hand-written.** `scripts/dump_schema.py` dumps it from a
+  live database, so `schema/fran_schema.sql` cannot silently drift from the code.
+- **Ingest refuses to duplicate.** A guard rejects a write when another `output_dir` already
+  holds the same raw-file set and precursor count — the corpus has 184 duplicate groups from
+  before it existed, and that is how they got there.
+- **Versions are recorded with the data.** Ingester, guard and lane-writer versions are
+  stamped on every search and Lance dataset, so "which code produced this row?" is answerable
+  after the fact rather than guessed.
+
+## Security & governance
+
+Enforced in `app/db.py` and `app/privacy.py`:
+
+1. **Read-only sessions.** No write path exists.
+2. **Public-layer allowlist.** Per-query table declarations validated against `PUBLIC_TABLES`.
+   Confidential tables are reachable only from an authenticated "full" tier, never anonymously.
+3. **Parameterized queries only.** No raw user SQL, no string-interpolated SQL.
+4. **Identity sanitisation.** Filenames, search names and project strings are anonymised in
+   the public layer.
+5. **Credentials via environment only** — never committed.
+
+> **⚠️ Before you expose an instance:** do not point a public deployment at a database
+> credential that can read your internal layer, even if this app never queries it — the
+> *credential* is the exposure, not the query. Use a role that can `SELECT` only the public
+> tables, or serve from a periodic read-only snapshot. [INSTALL.md §9](INSTALL.md) covers this.
+
+## Federation (optional, off by default)
+
+FRAN instances can share **precursor-level, de-identified** observations with each other, so a
+peptide you have never seen locally can still tell you "three other labs have observed this, at
+these retention times". Nothing is shared unless you turn it on: `federation_visibility`
+defaults to `hidden` on every row.
+
+Bulk extraction is defended against explicitly — per-query row caps, shape checks, durable
+per-peer budgets and novelty detection — so a peer cannot walk your corpus by issuing many
+small queries. See **[FEDERATION.md](FEDERATION.md)**, design notes in
+[FEDERATION_DESIGN.md](FEDERATION_DESIGN.md).
+
+## Configuration
+
 | Var | Default | Notes |
 |-----|---------|-------|
-| `DELIMP_PG_HOST` | `pgfarm.library.ucdavis.edu` | |
+| `DELIMP_PG_HOST` | `pgfarm.library.ucdavis.edu` | point at your own PostgreSQL |
 | `DELIMP_PG_PORT` | `5432` | |
 | `DELIMP_PG_DB` | `uc-davis-genome-center-proteomics-core/delimp` | |
-| `DELIMP_PG_USER` | `genome-proteomics-service-account` | |
+| `DELIMP_PG_USER` | `genome-proteomics-service-account` | use a read-only role |
 | `DELIMP_PG_SSLMODE` | `require` | not `verify-full` |
-| `DELIMP_PG_PASSWORD` | — | the 7-day PG Farm token (set as **HF Secret**) |
+| `DELIMP_PG_PASSWORD` | — | set via environment / deployment secret |
 | `DELIMP_PG_TOKEN_FILE` | — | alternative: path to a token file (local dev) |
 | `DELIMP_CACHE_TTL` | `20` | seconds to cache dashboard aggregates |
 
-## ⚠️ Public-hosting security decision (READ BEFORE PUSHING)
-Putting `DELIMP_PG_PASSWORD` (the live **service-account** token) into a public
-HF Space lets the running container reach the DB — but that account is the same
-one STAN uses daily and can see the **internal** layer at the DB level (this app
-won't query it, but the *credential* is broad). HF Secrets are not exposed to
-browsers, yet a public Space is a larger attack surface than an internal tool.
+## Implementation status
 
-**Recommendation — pick one before going public:**
-- **(a) Dedicated read-only credential** — ask PG Farm / Justin for a role that
-  can `SELECT` only the public tables (or only sees a public schema). Put *that*
-  token in the Space. Best option.
-- **(b) Periodic read-only snapshot** — dump the public tables to a separate
-  read-only DB (or SQLite/Parquet) on a schedule and point the Space at that.
-  Decouples the public app from the live service account entirely.
-- **(c) Keep it internal** — run as a private/internal Space or on the VPN with
-  the existing token, accepting the tradeoff.
+| Component | Status | Notes |
+|---|---|---|
+| Corpus browsing, search, peptide/protein views | ✅ shipped | |
+| Ingest: Spectronaut, DIA-NN, FragPipe, Radiant | ✅ shipped | four engines, `ingest/corpus_ingest.py` |
+| Cross-engine comparison page | ✅ shipped | v0.18.0, pairwise per raw file |
+| Installable schema + install guide | ✅ shipped | container-verified against empty PG 16 |
+| MCP endpoint | ✅ shipped | rate-limited |
+| Spectrum lane (observed MS2) | ✅ shipped | Lance, 1,553 datasets verified |
+| XIC lane — Spectronaut | ✅ shipped | from `.xic.db` |
+| XIC lane — DIA-NN | 🟡 in progress | adapter written + tested; traces being copied over |
+| XIC lane — FragPipe | ❌ not possible today | FragPipe's bundled DIA-NN runs without `--xic` |
+| Federation | 🟡 built, not wired | modules and tests exist; endpoints not mounted in `main.py` |
+| Fragment/peak viewer, USI links | ⛔ deferred | needs the spectra-extraction step |
+| LICENSE | ✅ shipped | FRAN Academic License — free for academic/non-profit, commercial use needs a licence |
 
-Do **not** ship the full live service-account secret to a *public* Space without
-consciously choosing (a) or (b). This is a decision for the owner, not a default.
+## Roadmap
 
-## Run locally
-```bash
-cd corpus_browser
-pip install -r requirements.txt
-# point at a token file (or export DELIMP_PG_PASSWORD)
-export DELIMP_PG_TOKEN_FILE=/Volumes/proteomics-grp/brett/.pgfarm_token
-uvicorn app.main:app --reload --port 7860
-# open http://localhost:7860
-```
+**High**
+- Wire the federation endpoints into `app/main.py` (the modules are inert today).
+- Finish the DIA-NN XIC lane and add per-engine chromatogram overlays to the comparison page.
+- Backfill `search_engine_version` for the ~650 archived Spectronaut searches whose sidecars
+  were never pulled off the Windows box.
 
-## Deferred
-- **Fragment-spectrum / peak viewer.** `delimp_precursors.peak_mz` /
-  `peak_intensity` are NULL until the separate spectra-extraction step runs
-  (DIA-NN's report.parquet carries coordinates, not fragment peak lists). Every
-  other view is live. A spectrum viewer slots in once peaks are populated.
-- **USI links** (also deferred until spectra extraction).
+**Medium**
+- Neutral chromatogram extraction from raw files, so a peptide *missed* by an engine can still
+  be shown — every engine's XIC export only covers what that engine reported.
+- Peptide-level `n_engines_confirming` and I/L normalisation across engines.
+- Resolve the remaining 162 duplicate search groups.
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [INSTALL.md](INSTALL.md) | Stand up your own instance, step by step |
+| [FEDERATION.md](FEDERATION.md) | Connect your node to other FRANs |
+| [FEDERATION_DESIGN.md](FEDERATION_DESIGN.md) | Why federation works the way it does |
+| [FRAN_ANALYST_GUIDE.md](FRAN_ANALYST_GUIDE.md) | Using FRAN as a working analyst |
+| [STORAGE_DESIGN.md](STORAGE_DESIGN.md) | Lance lanes, and what lives where |
+| [LANCE_PRIORS_AND_XIC_SPEC.md](LANCE_PRIORS_AND_XIC_SPEC.md) | Chromatogram storage spec |
+| [AGENTS.md](AGENTS.md) | Conventions for agents working in this repo |
+
+## Search engines
+
+| Engine | Ingest | Chromatograms | Notes |
+|---|---|---|---|
+| Spectronaut | ✅ `.sne` / FRAN.rs report | ✅ `.xic.db` | 15 through 21 |
+| DIA-NN | ✅ `report.parquet` / `.tsv` | 🟡 `--xic` | 1.7 through 2.6 |
+| FragPipe (DIA) | ✅ `report.tsv` | ❌ | diaTracer → MSFragger → DIA-NN 1.8.2b8 |
+| Radiant / Fulcrum | ✅ fulcrum-results parquet | ❌ | mzML/Parquet only — cannot read Bruker `.d` |
+
+## Contributing
+
+Issues and pull requests welcome. If you are adding an ingest adapter for another engine, the
+existing ones live in `ingest/` and each is a `_records()` dispatch plus a version detector —
+`ingest/radiant_to_corpus.py` is the smallest complete example.
+
+## License
+
+[FRAN Academic License](LICENSE) — the same licence STAN uses. Free for academic, non-profit,
+educational and personal research use, including fee-for-service work by academic core
+facilities. Commercial use requires prior written permission: bsphinney@ucdavis.edu.
+
+## Links
+
+- **Live app:** https://fran.stan-proteomics.org
+- **STAN:** https://github.com/bsphinney/stan · https://stan-proteomics.org
+- **UC Davis Proteomics Core:** https://proteomics.ucdavis.edu
