@@ -65,11 +65,80 @@ DEFAULT_ROOTS = [
 # would be ingested as DIA-NN and silently lose the diaTracer/MSFragger provenance.
 ENGINE_MARKERS = [
     ("fragpipe", ["dia-quant-output/report.tsv", "fragpipe.fp-manifest"]),
-    ("radiant", ["search_provenance.json", "radiant_results/fulcrum-results",
-                 "fulcrum-results/_SUCCESS"]),
+    # search_provenance.json is deliberately NOT in this list. It was, and that was wrong: the
+    # marker test is "does this file exist", but the file is a provenance record that names its own
+    # engine, and anything that writes one for a non-Radiant search would be detected as Radiant --
+    # and Radiant is tested before DIA-NN, so a DIA-NN result carrying one would be misread.
+    # engine_version.py already treats the same file correctly, by parsing it and checking
+    # d["engine"]. _provenance_engine() below does the same. These two markers are unambiguous.
+    ("radiant", ["radiant_results/fulcrum-results", "fulcrum-results/_SUCCESS"]),
     ("diann", ["report.parquet", "report.tsv"]),
     ("spectronaut", ["RunSummaries"]),
 ]
+
+_PROVENANCE = "search_provenance.json"
+MANIFEST = "fran_manifest.json"
+
+
+def _provenance_engine(d: str):
+    """The engine search_provenance.json CLAIMS, or None. Reads the file instead of inferring from
+    its presence."""
+    try:
+        with open(os.path.join(d, _PROVENANCE)) as fh:
+            eng = str(json.load(fh).get("engine", "")).strip().lower()
+    except Exception:  # noqa: BLE001 - a malformed provenance file must not stop a scan
+        return None
+    for known in ("radiant", "diann", "dia-nn", "fragpipe", "spectronaut"):
+        if eng.startswith(known):
+            return "diann" if known == "dia-nn" else known
+    return None
+
+
+def read_manifest(d: str):
+    """fran_manifest.json written by the proteomics skill, or None.
+
+    The drop box stages a search as a REAL DIRECTORY of symlinks, not a bare symlink, so
+    os.path.realpath() on the entry returns the entry itself and cannot recover where the search
+    really lives. That matters twice over: output_dir is the search's identity
+    (search_id = uuid5(namespace, output_dir)), so recording the drop box means the SAME search is
+    ingested again under a different id once a scan reaches its real path; and a DIA-NN report has
+    no organism column, so an organism the skill knows is lost unless it is read from here.
+
+    Key names are probed rather than assumed -- the manifest schema is the skill's, not ours, and
+    this must not hard-fail if it differs. What it actually found is logged."""
+    path = os.path.join(d, MANIFEST)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as fh:
+            m = json.load(fh)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] unreadable {MANIFEST} in {d}: {type(e).__name__}", flush=True)
+        return None
+    out = {}
+    for k in ("output_dir", "search_dir", "real_path", "source_dir", "search_path"):
+        if isinstance(m.get(k), str) and m[k]:
+            out["identity"] = m[k]; out["identity_key"] = k; break
+    for k in ("organism_name", "organism", "suggested_organism", "species"):
+        if isinstance(m.get(k), str) and m[k]:
+            out["organism"] = m[k]; break
+    for k in ("taxon", "taxon_id", "organism_taxon_id"):
+        if m.get(k):
+            out["taxon"] = str(m[k]); break
+    if isinstance(m.get("engine"), str) and m["engine"]:
+        out["engine"] = m["engine"].strip().lower().replace("dia-nn", "diann")
+    # suggested_ingest is an ARGV list. Values are read out of it rather than executed: running an
+    # argv from a file would be handing command construction to whatever wrote it. Never " ".join()
+    # it -- every species name contains a space, so the organism would split into stray arguments.
+    argv = m.get("suggested_ingest")
+    if isinstance(argv, list):
+        for flag, key in (("--output-dir", "identity"), ("--organism-name", "organism"),
+                          ("--engine", "engine"), ("--taxon", "taxon")):
+            if flag in argv:
+                i = argv.index(flag)
+                if i + 1 < len(argv) and key not in out:
+                    out[key] = str(argv[i + 1])
+    return out or None
 _SN_REPORT = re.compile(r"_Report.*\.(tsv|parquet)$", re.I)
 
 # A leading Spectronaut export timestamp, "20260402_103129_". The same search is spelled with and
@@ -163,6 +232,10 @@ def detect_engine(d: str, dirnames=None, filenames=None):
                     return engine
             elif mk in files or mk in dirs:
                 return engine
+    if _PROVENANCE in files:
+        got = _provenance_engine(d)
+        if got:
+            return got
     if any(_SN_REPORT.search(e) for e in files):
         return "spectronaut"
     return None
@@ -204,8 +277,16 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None):
                    "parent-name" if pk & (bases | names) else None)
             if hit:
                 continue
-            found.append({"dir": dirpath, "engine": engine,
-                          "real": real if real != dirpath else None})
+            man = read_manifest(dirpath)
+            rec = {"dir": dirpath, "engine": engine,
+                   "real": real if real != dirpath else None}
+            if man:
+                rec["manifest"] = man
+                if man.get("engine") and man["engine"] != engine:
+                    print(f"  [note] {dirpath}: detected {engine}, manifest says "
+                          f"{man['engine']} — trusting the manifest", flush=True)
+                    rec["engine"] = man["engine"]
+            found.append(rec)
             if limit and len(found) >= limit:
                 return found, seen
     return found, seen

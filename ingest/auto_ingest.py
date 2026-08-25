@@ -106,8 +106,10 @@ def pick_one(dirs: list[str], engine: str = "spectronaut") -> str | None:
 
 def select(candidates, skip_failed=True):
     by_search: dict[str, list[str]] = {}
+    by_dir: dict[str, dict] = {}
     for c in candidates:
         by_search.setdefault(search_key(c["dir"]), []).append(c["dir"])
+        by_dir[c["dir"]] = c
     chosen, skipped = [], []
     for name, dirs in sorted(by_search.items()):
         if skip_failed and name.lower().startswith(("fail_", "fail-")):
@@ -117,10 +119,64 @@ def select(candidates, skip_failed=True):
         if best is None:
             skipped.append((name, f"no usable report in {len(dirs)} export(s) — empty/failed"))
             continue
-        chosen.append({"search": name, "engine": engine, "dir": best,
-                       "identity": os.path.realpath(best),
-                       "n_exports": len(dirs), "n_usable": sum(1 for d in dirs if usable(d, engine))})
+        src = by_dir.get(best, {})
+        man = src.get("manifest") or {}
+        # The manifest's output_dir wins over realpath(). A drop-box entry is a real DIRECTORY of
+        # symlinks, so realpath() returns the entry itself and would record the drop box as the
+        # search's identity -- and since search_id = uuid5(namespace, output_dir), the same search
+        # would be ingested a second time under a different id once a scan reached its real path.
+        entry = {"search": name, "engine": src.get("engine") or engine, "dir": best,
+                 "identity": man.get("identity") or src.get("real") or os.path.realpath(best),
+                 "identity_from": ("manifest:" + man["identity_key"]) if man.get("identity_key")
+                 else ("symlink" if src.get("real") else "realpath"),
+                 "n_exports": len(dirs),
+                 "n_usable": sum(1 for d in dirs if usable(d, engine))}
+        if man.get("organism"):
+            entry["organism"] = man["organism"]
+        if man.get("taxon"):
+            entry["taxon"] = man["taxon"]
+        chosen.append(entry)
     return chosen, skipped
+
+
+_COMMITTED = re.compile(r"COMMITTED search_id=([0-9a-f-]{36}):\s*([\d,]+) precursors")
+
+
+def _write_receipt(c: dict, out: str) -> None:
+    """Drop fran_ingested.json into a drop-box entry after a successful ingest.
+
+    Lets the proteomics skill confirm the handover landed without a corpus token -- Core members who
+    run a search may have no database access at all, so "did FRAN take it?" is otherwise
+    unanswerable from their side.
+
+    Written ONLY into an entry that carried a manifest, i.e. one the skill staged. Never fails the
+    run: a read-only drop box is a reason to skip the receipt, not to call a good ingest bad."""
+    if not c.get("identity_from", "").startswith("manifest"):
+        return
+    sid = nprec = None
+    m = _COMMITTED.search(out or "")
+    if m:
+        sid, nprec = m.group(1), int(m.group(2).replace(",", ""))
+    else:
+        # corpus_ingest derives search_id deterministically from output_dir; reproduce it rather
+        # than leave the receipt without the one field that identifies the row.
+        try:
+            sys.path.insert(0, HERE)
+            from corpus_ingest import _SEARCH_NS
+            import uuid
+            sid = str(uuid.uuid5(_SEARCH_NS, str(c["identity"]).rstrip("/")))
+        except Exception:  # noqa: BLE001
+            pass
+    payload = {"search_id": sid, "n_precursors": nprec, "output_dir": c.get("identity"),
+               "search_name": c.get("search"), "engine": c.get("engine"),
+               "ingested_by": "auto_ingest.py", "ingested_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                                time.gmtime())}
+    try:
+        with open(os.path.join(c["dir"], "fran_ingested.json"), "w") as fh:
+            json.dump(payload, fh, indent=1)
+        print(f"      receipt: fran_ingested.json (search_id={sid})", flush=True)
+    except OSError as e:
+        print(f"      [warn] could not write receipt: {type(e).__name__}: {e}", flush=True)
 
 
 def main():
@@ -169,8 +225,10 @@ def main():
             print(f"\n{tag}", flush=True)
         print(f"      {c['dir']}", flush=True)
         if c.get("identity") and c["identity"] != c["dir"]:
-            # symlinked in via the drop box; the real path is the search's identity
-            print(f"      -> {c['identity']}", flush=True)
+            print(f"      identity ({c.get('identity_from', '?')}): {c['identity']}", flush=True)
+        if c.get("organism"):
+            print(f"      organism: {c['organism']}"
+                  f"{' (taxon ' + str(c['taxon']) + ')' if c.get('taxon') else ''}", flush=True)
         if not a.apply:
             print("      DRY RUN — not ingesting", flush=True); continue
         target = resolve_input(c["dir"], c["engine"])
@@ -183,6 +241,13 @@ def main():
         cmd = [a.python, os.path.join(HERE, "corpus_ingest.py"), target,
                "--engine", c["engine"], "--name", c["search"],
                "--output-dir", c.get("identity") or c["dir"], "--bulk-copy"]
+        # A DIA-NN report carries no organism column, so an organism the skill recorded is the only
+        # way this row reaches the species page. Passed as its own argv element -- never joined into
+        # a string, since every species name contains a space.
+        if c.get("organism"):
+            cmd += ["--organism-name", c["organism"]]
+        if c.get("taxon"):
+            cmd += ["--taxon", str(c["taxon"])]
         t0 = time.time()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
@@ -205,6 +270,7 @@ def main():
         elif r.returncode == 0:
             ok += 1
             print(f"      OK in {el:.0f}s", flush=True)
+            _write_receipt(c, blob)
         else:
             fail += 1
             print(f"      FAILED rc={r.returncode} in {el:.0f}s", flush=True)
