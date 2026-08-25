@@ -160,6 +160,60 @@ exposing an instance to anyone.**
 - **Ion-mobility showcase** — full-screen RT × 1/K₀ scatter, coloured by charge.
 - **MCP endpoint** — the corpus as a tool an AI agent can query.
 
+## Training on real data, not predictions
+
+Most deep-learning work in proteomics is trained on **predicted** fragment intensities, or on
+curated synthetic-peptide libraries. A predicted spectrum is a model's opinion about what an
+instrument would have measured. FRAN's Lance lanes hold what instruments **actually measured**, at a
+scale that is usually only available inside a vendor:
+
+| Lane | Contents |
+|---|---|
+| **Spectrum lane** | 1,545 datasets · **351,567,481** precursors · **2,084,278,701** annotated fragments |
+| **XIC lane** | **3,511,456** precursors · **37,686,542** chromatogram traces |
+
+Spread across **20,988 runs**, **114 organisms** and both major DIA platforms — timsTOF (13,737 runs)
+and Orbitrap (7,256) — so a model trained on it is not learning one instrument's quirks.
+
+**Measured and predicted sit in the same row.** Each precursor carries `frg_measured_relint`
+*and* `frg_predicted_relint`, `ms1_iso_rel_measured` *and* `ms1_iso_rel_predicted`, `rt` *and*
+`rt_predicted`, `irt_empirical` *and* `irt_predicted`. So the corpus is both a training set and its
+own benchmark: you can fit on what was measured and, in the same query, quantify where the existing
+predictor was wrong — per fragment, per peptide, per instrument.
+
+It also carries the things that make aggregates correct rather than merely large:
+`frg_excluded` is the engine's own verdict on whether a fragment was used for quantification (31–48%
+are `True`); averaging intensities the engine itself discarded produces a confidently wrong number.
+`frg_chan_interference`, `signal_to_noise`, `int_corr_score` and per-fragment `frg_mass_acc_ppm` are
+stored for the same reason. Decoys are excluded from the lanes entirely.
+
+**Why Lance and not the database.** One row per precursor, with the whole spectrum and its
+chromatograms as Arrow list columns — the shape a training `DataLoader` fetches by index. It is
+columnar, versioned and random-access, the same move `depthcharge`/Casanovo made for MS training
+data. Bulk traces in PostgreSQL cost roughly 6.1 KB/row, so the dog chromatogram set alone would be
+~22 GB there against ~13 GB as Lance. The database keeps the **registry**: every dataset is recorded
+with a content md5 and row counts, so a lost or corrupted dataset is *detectable* and re-derivable
+from the archived reports rather than quietly wrong. 1,545 datasets have been verified against those
+checksums.
+
+> ### ⚠️ Read this before training on it
+> These traces and spectra are **identification-conditioned**, not an unbiased sample of the raw
+> data. Every engine's export covers only the precursors that engine *reported* — DIA-NN's `--xic`
+> writes traces for its identification list, and Spectronaut's `.xic.db` has the same limitation.
+> A precursor absent from a lane means "this engine did not report it here", **never** "there was no
+> signal there".
+>
+> The practical consequence: you cannot learn what a *non-hit* looks like from this corpus, so it
+> does not by itself support training a discriminator on positives-vs-negatives. Neutral extraction
+> straight from the raw files is on the roadmap for exactly this reason. Everything else — intensity
+> prediction, RT and ion-mobility prediction, peak-shape and co-elution modelling, benchmarking a
+> predictor against measurement — is well served.
+
+**Current coverage.** The spectrum lane is broad. The XIC lane is Spectronaut-only today; DIA-NN
+chromatograms are in progress (`ingest/diann_xic_to_lance.py`), and FragPipe exports none at all.
+See [STORAGE_DESIGN.md](STORAGE_DESIGN.md) and
+[LANCE_PRIORS_AND_XIC_SPEC.md](LANCE_PRIORS_AND_XIC_SPEC.md).
+
 ## Architecture
 
 ```
