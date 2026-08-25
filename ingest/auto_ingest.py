@@ -72,14 +72,36 @@ def search_key(path: str) -> str:
     return parts[-1]
 
 
-def pick_one(dirs: list[str]) -> str:
-    """Newest export for a search. The export timestamp leads the directory name, so a plain
-    descending sort on it is chronological; directories without one sort last and are only chosen
-    when nothing else is available."""
-    def key(d):
-        m = _TS.match(os.path.basename(d.rstrip("/")))
-        return (1, m.group(1)) if m else (0, os.path.basename(d))
-    return sorted(dirs, key=key, reverse=True)[0]
+def _export_ts(d: str):
+    m = _TS.match(os.path.basename(d.rstrip("/")))
+    return (1, m.group(1)) if m else (0, os.path.basename(d))
+
+
+def usable(d: str, engine: str) -> bool:
+    """Does this export actually contain a report worth reading?
+
+    16 of the 60 searches in the first real scan resolve to a ZERO-BYTE report -- a failed export
+    that still left a stub file behind. They are not ingestable and there is nothing to retry, so
+    they must not consume the per-run limit every single run, forever."""
+    t = resolve_input(d, engine)
+    if not t:
+        return False
+    try:
+        return os.path.getsize(t) > 1024 if os.path.isfile(t) else os.path.isdir(t)
+    except OSError:
+        return False
+
+
+def pick_one(dirs: list[str], engine: str = "spectronaut") -> str | None:
+    """Newest USABLE export for a search, or None if none is usable.
+
+    Newest-overall is the wrong choice on its own: FRAN_reports keeps every attempt, and for
+    searches like 20241202_133750_22Feb2024_tryingBi2GAIN (6 exports) the NEWEST is the empty one
+    while an older export is fine. Filtering first rescues those instead of discarding the search."""
+    good = [d for d in dirs if usable(d, engine)]
+    if not good:
+        return None
+    return sorted(good, key=_export_ts, reverse=True)[0]
 
 
 def select(candidates, skip_failed=True):
@@ -91,8 +113,12 @@ def select(candidates, skip_failed=True):
         if skip_failed and name.lower().startswith(("fail_", "fail-")):
             skipped.append((name, "named fail*")); continue
         engine = next(c["engine"] for c in candidates if c["dir"] in dirs)
-        chosen.append({"search": name, "engine": engine, "dir": pick_one(dirs),
-                       "n_exports": len(dirs)})
+        best = pick_one(dirs, engine)
+        if best is None:
+            skipped.append((name, f"no usable report in {len(dirs)} export(s) — empty/failed"))
+            continue
+        chosen.append({"search": name, "engine": engine, "dir": best,
+                       "n_exports": len(dirs), "n_usable": sum(1 for d in dirs if usable(d, engine))})
     return chosen, skipped
 
 
@@ -136,7 +162,8 @@ def main():
     for i, c in enumerate(todo, 1):
         tag = f"[{i}/{len(todo)}] {c['engine']} {c['search'][:52]}"
         if c["n_exports"] > 1:
-            print(f"\n{tag}  (newest of {c['n_exports']} exports)", flush=True)
+            print(f"\n{tag}  (newest usable of {c['n_exports']} exports, "
+                  f"{c.get('n_usable', '?')} usable)", flush=True)
         else:
             print(f"\n{tag}", flush=True)
         print(f"      {c['dir']}", flush=True)
