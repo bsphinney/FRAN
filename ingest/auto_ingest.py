@@ -130,10 +130,25 @@ def main():
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--candidates", help="reuse a find_uningested.py --json-out instead of rescanning")
     ap.add_argument("--include-failed", action="store_true")
+    ap.add_argument("--direct", metavar="JOBS.json",
+                    help="ingest an explicit job list [{report, identity, name, engine}] instead "
+                         "of scanning — used for .sne experiments whose report is already on disk")
     ap.add_argument("--timeout", type=int, default=10800, help="per-search timeout, seconds")
     a = ap.parse_args()
 
     print(f"===== auto_ingest {time.strftime('%F %T')} on {os.uname().nodename} =====", flush=True)
+
+    if a.direct:
+        jobs = json.load(open(a.direct))
+        chosen = [{"search": j["name"], "engine": j.get("engine", "spectronaut"),
+                   "dir": os.path.dirname(j["report"]), "report": j["report"],
+                   "identity": j["identity"], "identity_from": "direct",
+                   "n_exports": 1, "n_usable": 1,
+                   **({"organism": j["organism"]} if j.get("organism") else {})}
+                  for j in jobs]
+        print(f"direct mode: {len(chosen)} job(s) from {a.direct}", flush=True)
+        skipped = []
+        return _run(a, chosen, skipped)
 
     if a.candidates and os.path.exists(a.candidates):
         candidates = json.load(open(a.candidates))
@@ -154,12 +169,16 @@ def main():
     for name, why in skipped:
         print(f"  SKIP {name[:60]}  ({why})", flush=True)
 
+    return _run(a, chosen, skipped)
+
+
+def _run(a, chosen, skipped):
+    ok = dup = fail = 0
     todo = chosen[:a.limit]
     if len(chosen) > a.limit:
         print(f"\nlimit={a.limit}: ingesting {len(todo)} now, {len(chosen)-a.limit} left for the "
               f"next run", flush=True)
 
-    ok = dup = fail = 0
     for i, c in enumerate(todo, 1):
         tag = f"[{i}/{len(todo)}] {c['engine']} {c['search'][:52]}"
         if c["n_exports"] > 1:
@@ -173,7 +192,7 @@ def main():
             print(f"      -> {c['identity']}", flush=True)
         if not a.apply:
             print("      DRY RUN — not ingesting", flush=True); continue
-        target = resolve_input(c["dir"], c["engine"])
+        target = c.get("report") or resolve_input(c["dir"], c["engine"])
         if not target:
             fail += 1
             print("      FAILED: no report file found in the directory", flush=True)

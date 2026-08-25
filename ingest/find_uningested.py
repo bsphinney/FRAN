@@ -265,6 +265,16 @@ def scan_sne(roots, paths, names, bases, max_depth=12, limit=0, excludes=None):
                     continue
                 full = os.path.join(dirpath, entry)
                 stem = entry[:-4]
+                if not stem:
+                    # The entry is a directory literally named ".sne" -- Spectronaut's internal
+                    # store INSIDE an experiment folder, not an experiment archive called
+                    # "<name>.sne". The experiment is the PARENT directory, and its name is what the
+                    # corpus knows. Matching on the empty stem compared "" against every search name
+                    # and reported 41 already-ingested experiments as missing.
+                    stem = os.path.basename(dirpath.rstrip("/"))
+                    full = dirpath
+                if not stem:
+                    continue
                 if name_keys(stem) & (names | bases) or norm_path(full) in paths:
                     continue
                 try:
@@ -294,6 +304,14 @@ def _find_report(d: str, stem: str, sne_path: str):
       4. beside the .sne, any report at all          -- only when this is the ONLY .sne in the
                                                         directory, so it cannot be misattributed
     """
+    # An empty stem is catastrophic here, not merely useless: os.path.join(REPORTS_ROOT, "")
+    # collapses to REPORTS_ROOT itself, so the archive-root probe returns an ARBITRARY report, and
+    # `stem in filename` is true for every file. A pre-fix scan produced 41 entries with an empty
+    # stem and 21 of them were assigned the SAME unrelated Mouse_Brains report -- which would have
+    # ingested one report 21 times under 21 different search identities. Refuse outright.
+    if not str(stem).strip():
+        return None
+
     def _reports_in(path, depth=1):
         try:
             entries = os.listdir(path)
