@@ -71,6 +71,37 @@ def _acq_for(engine, platform):
     return "diaPASEF" if platform == "timstof" else "DIA"
 
 
+def _resolve_platform(plat, model, mobility_min):
+    """Platform, with a model/platform contradiction resolved in the MODEL's favour.
+
+    Only when the run has no ion-mobility range. A genuine timsTOF acquisition always has one, so
+    "Orbitrap model + no mobility + platform=timstof" is not a judgement call -- it is the
+    file-extension inference having guessed from a Thermo file that happens to be named ".d", which
+    is how 29 runs (22 of them an external collaborator's Orbitrap) ended up on the wrong platform.
+    If the run DOES carry mobility, the existing platform wins and nothing is touched."""
+    try:
+        from instrument_labels import platform_for_model
+        want = platform_for_model(model)
+        if want and plat and want != plat and mobility_min is None:
+            return want
+    except Exception:  # noqa: BLE001 - metadata tidying must never fail an ingest
+        pass
+    return plat
+
+
+def _norm_instrument(model, serial):
+    """Canonical (model, serial). One physical instrument was reaching raw_files under several
+    labels -- a leading space, a zero-padding variant, a case variant, and a serial carrying three
+    different model names -- which silently splits every per-instrument aggregate. Normalising here
+    means a re-ingest cannot reintroduce what fix_instrument_labels.py cleaned up. Never raises: a
+    metadata problem must not fail an ingest."""
+    try:
+        from instrument_labels import normalize
+        return normalize(model, serial)
+    except Exception:  # noqa: BLE001
+        return model, serial
+
+
 def _platform_from_disk(output_dir, runs):
     """Ground-truth platform from the raws actually on disk, for reports that settle it no other way.
 
@@ -646,6 +677,8 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             # gradient: EvoSep map if SPD known, else the observed RT span as a proxy
             grad = (_SPD_GRAD.get(int(spd)) if (spd and int(spd) in _SPD_GRAD)
                     else (round(float(run_max_rt[run]), 2) if run_max_rt.get(run) else None))
+            _im, _is = _norm_instrument(md.get("instrument_model"), md.get("instrument_serial"))
+            _plat = _resolve_platform(md.get("platform") or platform, _im, md.get("mobility_min"))
             cur.execute("""INSERT INTO raw_files (raw_path,raw_basename,raw_name_anonymized,platform,
                            acquisition_method,samples_per_day,gradient_minutes,
                            instrument_model,instrument_serial,acquisition_date,
@@ -669,8 +702,8 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                            n_ms2_frames=COALESCE(EXCLUDED.n_ms2_frames, raw_files.n_ms2_frames),
                            file_size_bytes=COALESCE(EXCLUDED.file_size_bytes, raw_files.file_size_bytes),
                            instrument_metadata_json=COALESCE(EXCLUDED.instrument_metadata_json, raw_files.instrument_metadata_json)""",
-                        (rp, run, sanitize(run), md.get("platform") or platform, acq, spd, grad,
-                         md.get("instrument_model"), md.get("instrument_serial"), md.get("acquisition_date"),
+                        (rp, run, sanitize(run), _plat, acq, spd, grad,
+                         _im, _is, md.get("acquisition_date"),
                          md.get("mass_range_min"), md.get("mass_range_max"), md.get("mobility_min"), md.get("mobility_max"),
                          md.get("n_ms1_frames"), md.get("n_ms2_frames"), md.get("file_size_bytes"),
                          md.get("instrument_metadata_json"), SCHEMA_VERSION))

@@ -172,8 +172,8 @@ scale that is usually only available inside a vendor:
 | **Spectrum lane** | 1,545 datasets · **351,567,481** precursors · **2,084,278,701** annotated fragments |
 | **XIC lane** | **3,511,456** precursors · **37,686,542** chromatogram traces |
 
-Spread across **20,988 runs**, **114 organisms** and both major DIA platforms — timsTOF (13,737 runs)
-and Orbitrap (7,256) — so a model trained on it is not learning one instrument's quirks.
+Spread across **20,993 runs**, **114 organisms** and both major DIA platforms — timsTOF (13,708 runs)
+and Orbitrap (7,285) — so a model trained on it is not learning one instrument's quirks.
 
 **Measured and predicted sit in the same row.** Each precursor carries `frg_measured_relint`
 *and* `frg_predicted_relint`, `ms1_iso_rel_measured` *and* `ms1_iso_rel_predicted`, `rt` *and*
