@@ -39,6 +39,34 @@ REPORTS = "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports"
 SNE_EXPORT = "/nfs/lssc0/flinders/proteomics/Data/FRAN_SNE_export"
 _SIDECAR = re.compile(r"setup\.txt$|[Aa]nalysis.*[Ll]og.*\.txt$|RunOverview\.tsv$|\.log\.txt$")
 
+# Path translation across machines that mount the SAME shares under different names. An output_dir
+# is recorded as whatever the INGESTING machine called it: the Mac sees /Volumes/proteomics, Windows
+# sees R:\, Hive sees /nfs/lssc0/flinders/proteomics. Without this, 40 of the 45 version-less DIA-NN
+# searches look unreachable from Hive purely because of the prefix -- their report.log.txt has been
+# sitting next to the report the whole time. Verified 2026-08-25: 5/5 sampled /Volumes paths resolved
+# to real versions (1.8, 1.8.1, 1.8.2, 2.3.0) once translated.
+#
+# /Volumes/DataArchive is deliberately absent: it is a DIFFERENT share, not mounted on Hive.
+_PATH_MAP = [
+    ("/Volumes/proteomics", "/nfs/lssc0/flinders/proteomics"),
+    ("R:\\", "/nfs/lssc0/flinders/proteomics/"),
+    ("r:\\", "/nfs/lssc0/flinders/proteomics/"),
+]
+
+
+def _candidates(path):
+    """The path as recorded, plus the same location under this machine's names. The recorded path
+    is tried FIRST so running on the Mac (where /Volumes is real) keeps its native behaviour."""
+    if not path:
+        return []
+    out = [path]
+    for pre, rep in _PATH_MAP:
+        if path.startswith(pre):
+            cand = (rep + path[len(pre):]).replace("\\", "/")
+            if cand not in out:
+                out.append(cand)
+    return out
+
 
 def _scan_text(text, engine):
     pats = (_SN, _SN_ANALYSIS) if (engine or "").startswith("spectronaut") else (_DIANN,)
@@ -50,7 +78,21 @@ def _scan_text(text, engine):
 
 
 def _from_dir(d, engine):
-    if not d or not os.path.isdir(d):
+    for cand in _candidates(d):
+        v = _from_one_dir(cand, engine)
+        if v:
+            return v
+    return None
+
+
+def _from_one_dir(d, engine):
+    if not d:
+        return None
+    if not os.path.isdir(d):
+        # output_dir sometimes records the report FILE itself (".../DIA-NN_output/logs/4/
+        # report.parquet", ".../rush.tsv"); the sidecar log sits in its folder, not "inside" it.
+        d = os.path.dirname(d)
+    if not os.path.isdir(d):
         return None
     v = detect(engine, None, d)
     if v:
@@ -104,6 +146,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--engine", help="only backfill this search_engine (e.g. diann)")
     ap.add_argument("--emit-windows-plan", metavar="CSV",
                     help="write the list of searches still missing a version, for the Windows box to resolve")
     # The archive roots are POSIX (Hive) by default. A Windows node sees the SAME share as
@@ -127,7 +170,8 @@ def main():
                    FROM delimp_searches s
                    LEFT JOIN delimp_search_provenance p ON p.search_id = s.id
                    WHERE s.search_engine_version IS NULL
-                   ORDER BY s.search_name""" + (f" LIMIT {a.limit}" if a.limit else ""))
+                     AND (%s IS NULL OR s.search_engine = %s)
+                   ORDER BY s.search_name""" + (f" LIMIT {a.limit}" if a.limit else ""), (a.engine, a.engine))
     rows = cur.fetchall()
     print(f"{len(rows)} searches missing a version")
 
