@@ -2277,6 +2277,83 @@ const ECOL = {a:'#00B5E2', b:'#FFBF00', both:'#6CCA98'};
 const ENG_COLOR = {spectronaut:'#0E6F79', diann:'#A8681A', fragpipe:'#2E7346', radiant:'#7C3AED'};
 function eDot(e){ return `<span class="inline-block w-2 h-2 rounded-full align-middle mr-1" style="background:${ENG_COLOR[e]||'#64748b'}"></span>`; }
 
+// ---- chromatogram panel -----------------------------------------------------------------------
+// Mirror plot: MS1 above the axis, quantifying fragments mirrored below. What makes a peptide
+// believable is not that a peak exists but that the intact precursor and its fragments rise and
+// fall TOGETHER at the same retention time -- two independent measurements agreeing. Chance
+// matches do not do that, which is why both halves are drawn on one shared time axis.
+function xicSvg(x, w, h){
+  const ms1 = x.ms1 || [], frs = x.fragments || [];
+  const pts = ms1.concat(...frs.map(f=>f.trace||[]));
+  if(!pts.length) return '';
+  const rts = pts.map(p=>p.rt);
+  const t0 = Math.min(...rts), t1 = Math.max(...rts), span = (t1-t0)||1;
+  const mid = h/2;
+  const m1max = Math.max(...ms1.map(p=>p.i), 1);
+  const m2max = Math.max(1, ...frs.flatMap(f=>(f.trace||[]).map(p=>p.i)));
+  const X = t => ((t-t0)/span)*w;
+  const up = p => mid - (p.i/m1max)*(mid-2);
+  const dn = p => mid + (p.i/m2max)*(mid-2);
+  const line = (tr, fy) => tr.length<2 ? '' : `<polyline fill="none" stroke-width="1" points="${tr.map(p=>`${X(p.rt).toFixed(1)},${fy(p).toFixed(1)}`).join(' ')}"/>`;
+  // fragments strongest-first, so the base peak is the most opaque
+  const fragLines = frs.map((f,i)=>`<g stroke="var(--frg,#38bdf8)" opacity="${(1-i*0.13).toFixed(2)}">${line(f.trace||[], dn)}</g>`).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%;height:${h}px">
+    <line x1="0" y1="${mid}" x2="${w}" y2="${mid}" stroke="currentColor" opacity="0.18" stroke-width="0.5"/>
+    <g stroke="#34d399">${line(ms1, up)}</g>
+    ${fragLines}
+  </svg>`;
+}
+
+function xicCard(x, tone){
+  const seq = x.stripped_seq || '';
+  return `<div class="rounded-lg border ${tone} p-2 bg-white/[0.02]">
+    <div class="font-mono text-[10px] text-slate-300 break-all leading-tight mb-1">${esc(seq.length>30?seq.slice(0,30)+'…':seq)}<span class="text-slate-500"> +${x.charge}</span></div>
+    <div class="text-slate-400">${xicSvg(x, 170, 66)}</div>
+    <div class="flex justify-between text-[9px] text-slate-500 font-mono mt-1">
+      <span>${eDot(x.engine)}${esc(x.engine)}</span>
+      <span>${x.rt_apex==null?'':fmtF(x.rt_apex,1)+' min'} · ${x.n_fragments_total||0} frg</span>
+    </div></div>`;
+}
+
+async function loadXicPanel(rb){
+  const el = $('#xicPanel'); if(!el) return;
+  try{
+    const d = await api(`/api/engines/run/${encodeURIComponent(rb)}/xic?per_class=8`);
+    const sh = d.shared||[], un = d.unique||[];
+    if(!sh.length && !un.length){
+      el.innerHTML = `<div class="glass card p-5 mb-5"><h2 class="font-bold text-white mb-1">Chromatograms</h2>
+        ${empty('No extracted-ion chromatograms are loaded for this acquisition yet. They appear here once a search with chromatograms (a Spectronaut XIC export, or DIA-NN run with --xic) is ingested for these runs.')}</div>`;
+      return;
+    }
+    const withTraces = d.engines_with_traces||[];
+    const n = d.n_engines_on_run||0;
+    el.innerHTML = `<div class="glass card p-5 mb-5 fade-in">
+      <div class="flex justify-between items-baseline flex-wrap gap-2">
+        <h2 class="font-bold text-white">Chromatograms</h2>
+        <div class="text-xs text-slate-500">MS1 above the line · quantifying fragments mirrored below · shared time axis</div>
+      </div>
+      <p class="text-xs text-slate-500 mt-1 mb-4">A peak alone means little. What makes a peptide believable is the intact precursor and its
+      fragments rising and falling <em>together</em> at the same retention time — two independent measurements agreeing.</p>
+
+      ${sh.length?`<h3 class="text-sm font-semibold text-emerald-300 mb-2">Found by all ${n} engines <span class="text-slate-500 font-normal text-xs">— every engine reported these</span></h3>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2 mb-5">${sh.map(x=>xicCard(x,'border-emerald-400/25')).join('')}</div>`:''}
+
+      ${un.length?`<h3 class="text-sm font-semibold text-amber-300 mb-2">Claimed by one engine <span class="text-slate-500 font-normal text-xs">— only the finder wrote a trace</span></h3>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">${un.map(x=>xicCard(x,'border-amber-400/25')).join('')}</div>`:''}
+
+      <div class="mt-4 rounded-lg border border-white/10 bg-white/5 p-3 text-[11px] text-slate-400">
+        <b class="text-slate-300">What a missing trace does not mean.</b> Every engine's chromatogram export covers only the
+        precursors <em>that engine reported</em> — DIA-NN's <code>--xic</code> writes its identification list, and Spectronaut's
+        <code>.xic.db</code> does the same. So for a peptide only one engine found, no other engine has a trace to show, and that
+        absence means <b>“not reported here”</b>, never “there was no signal there”. None of these exports can show you what a
+        different engine should have found.
+        ${withTraces.length<n?`<div class="mt-2">Traces currently loaded for <b>${withTraces.map(esc).join(', ')}</b> only, so these are not
+        engine-vs-engine overlays — they are ${withTraces.length===1?esc(withTraces[0])+"'s":'each engine\u2019s'} own extraction.</div>`:''}
+      </div>
+    </div>`;
+  }catch(e){ el.innerHTML = ''; }
+}
+
 function eAllPanel(a){
   if(!a || a.error || !a.engines || a.n_engines<2) return '';
   const p=a.precursor, pe=a.peptide;
@@ -2542,6 +2619,8 @@ async function renderEngineRun(rb){
 
     ${eAllPanel(allEng)}
 
+    <div id="xicPanel"></div>
+
     <div class="glass card p-6 mb-5">
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div class="min-w-0">
@@ -2648,13 +2727,14 @@ async function renderEngineRun(rb){
         <h2 class="font-bold text-white">The peptides themselves</h2>
         <div class="flex gap-1 flex-wrap ml-auto text-xs">
           ${[['only_a','Only '+la],['only_b','Only '+lb],['shared','Shared'],['charge','Charge disagreement'],['il','I/L spelling']]
-            .map(([m,l])=>`<button id="eb_${m}" onclick="eLoadPeps('${esc(rb)}','${m}')"
+            .map(([m,l])=>`<button id="eb_${m}" onclick="eLoadPeps('${esc(rb)}','${m}',0)"
               class="px-2.5 py-1 rounded-lg border border-white/15 text-slate-300 hover:text-white">${esc(l)}</button>`).join('')}
         </div>
       </div>
       <div id="ePeps"><div class="skeleton h-40 rounded-xl"></div></div>
     </div>`;
-    eLoadPeps(rb,'only_a');
+    eLoadPeps(rb,'only_a',0);
+    loadXicPanel(rb);
   }catch(e){ view.innerHTML = crumb([['Dashboard','dashboard'],['Engine comparison','engines'],[rb,null]]) + empty('Could not load: '+e.message); }
 }
 
@@ -2667,15 +2747,21 @@ function ePick(rb, engine){
   else toast(`A = ${engine} — now pick the engine to compare against`);
 }
 
-async function eLoadPeps(rb, mode){
+// These lists run to thousands of rows -- 6,207 precursors are unique to one engine on the dog run
+// alone -- so they are paged. The server ranks the WHOLE population once and returns a window onto
+// that single ranking, which is what keeps "are the unique ones weaker?" answerable: re-ranking per
+// page would make each page an unrelated sample rather than a position in one ordering.
+const EPEP_PAGE = 50;
+async function eLoadPeps(rb, mode, offset){
   const box=$('#ePeps'); if(!box) return;
+  const off = Math.max(0, offset|0);
   document.querySelectorAll('[id^=eb_]').forEach(b=>b.classList.remove('tab-active'));
   const btn=$('#eb_'+mode); if(btn) btn.classList.add('tab-active');
   box.innerHTML=`<div class="skeleton h-40 rounded-xl"></div>`;
   try{
     const sel=window.__ePair||{};
     const qs=(sel.a&&sel.b)?`&a=${encodeURIComponent(sel.a)}&b=${encodeURIComponent(sel.b)}`:'';
-    const d=await api(`/api/engines/run/${encodeURIComponent(rb)}/peptides?mode=${mode}&limit=200${qs}`);
+    const d=await api(`/api/engines/run/${encodeURIComponent(rb)}/peptides?mode=${mode}&limit=${EPEP_PAGE}&offset=${off}${qs}`);
     const rows=d.rows||[];
     if(!rows.length){ box.innerHTML=empty('Nothing in this category — which is itself a result.'); return; }
     const pep = s => `<span onclick="event.stopPropagation();go('peptide','${encodeURIComponent(s)}')" class="font-mono text-xs cursor-pointer text-accent-400 hover:underline">${esc(s)}</span>`;
@@ -2695,6 +2781,19 @@ async function eLoadPeps(rb, mode){
           r.im!=null?fmtF(r.im,4):'—', r.q_value!=null?Number(r.q_value).toExponential(1):'—', sci(r.intensity)]
           .concat(shared?[sci(r.intensity_b)]:[]).concat([esc(r.protein_group||'—')])));
     }
-    box.innerHTML = `<div class="text-xs text-slate-500 mb-2">${fmt(d.total)} in this category${d.total>rows.length?` · showing the ${fmt(rows.length)} most intense`:''}. Click a peptide to open its corpus page.</div>` + html;
+    const total=d.total||rows.length, lim=d.limit||EPEP_PAGE, cur=d.offset||0;
+    const last=Math.max(0, Math.floor((total-1)/lim)*lim);
+    const btnC=(on)=>`px-2 py-1 rounded-md glass ${on?'hover:bg-white/10 text-slate-200':'opacity-30 pointer-events-none'}`;
+    const pager = total<=lim ? '' : `
+      <div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-white/5 text-xs flex-wrap">
+        <span class="text-slate-500">${fmt(cur+1)}–${fmt(Math.min(cur+lim,total))} of <b class="text-slate-300">${fmt(total)}</b>, ranked by intensity</span>
+        <div class="flex gap-1">
+          <button onclick="eLoadPeps('${esc(rb)}','${esc(mode)}',0)" class="${btnC(cur>0)}">« first</button>
+          <button onclick="eLoadPeps('${esc(rb)}','${esc(mode)}',${Math.max(0,cur-lim)})" class="${btnC(cur>0)}">‹ prev</button>
+          <button onclick="eLoadPeps('${esc(rb)}','${esc(mode)}',${cur+lim})" class="${btnC(cur+lim<total)}">next ›</button>
+          <button onclick="eLoadPeps('${esc(rb)}','${esc(mode)}',${last})" class="${btnC(cur+lim<total)}">last »</button>
+        </div>
+      </div>`;
+    box.innerHTML = `<div class="text-xs text-slate-500 mb-2">${fmt(total)} in this category. Click a peptide to open its corpus page.</div>` + html + pager;
   }catch(e){ box.innerHTML=empty('Could not load: '+e.message); }
 }

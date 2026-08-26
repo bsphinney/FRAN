@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.20.1"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
+APP_VERSION = "0.21.0"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
                         # quant r2 vs scale offset, accession-level protein matching, charge/IL
                         # miscounts, and the shared-vs-unique depth profile. Four engines now in
                         # the corpus (Spectronaut, DIA-NN, FragPipe, Radiant).
@@ -881,14 +881,23 @@ def api_engines_run_all(raw_basename: str):
     return ok(_safe(lambda: queries.engine_comparison_all(raw_basename), {}))
 
 
+@app.get("/api/engines/run/{raw_basename}/xic")
+def api_engines_run_xic(raw_basename: str, per_class: int = Query(8, ge=1, le=24)):
+    """Example chromatograms for this acquisition, split into peptides every engine found and
+    peptides only one engine found."""
+    return ok(_safe(lambda: queries.engine_run_xic(raw_basename, per_class), {}))
+
+
 @app.get("/api/engines/run/{raw_basename}/peptides")
 def api_engine_peptides(raw_basename: str, a: str = Query(""), b: str = Query(""),
-                        mode: str = Query("only_a"), limit: int = Query(200, ge=1, le=200)):
+                        mode: str = Query("only_a"), limit: int = Query(50, ge=1, le=200),
+                        offset: int = Query(0, ge=0)):
     """The peptides behind the counts: unique to either engine, charge-state disagreements, or
     I/L spelling differences."""
     if mode not in ("only_a", "only_b", "shared", "charge", "il"):
         raise HTTPException(400, "mode must be one of only_a, only_b, shared, charge, il")
-    return ok(_safe(lambda: queries.engine_disagreement_peptides(raw_basename, a, b, mode, limit),
+    return ok(_safe(lambda: queries.engine_disagreement_peptides(raw_basename, a, b, mode, limit,
+                                                                 offset),
                     {"rows": [], "total": 0}))
 
 

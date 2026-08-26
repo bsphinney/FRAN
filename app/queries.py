@@ -3887,8 +3887,77 @@ def engine_comparison(raw_basename: str, engine_a: str = "", engine_b: str = "")
     return SLOW_CACHE.get_or_set(f"engine_comparison:{raw_basename}:{engine_a}:{engine_b}", _p)
 
 
+def engine_run_xic(raw_basename: str, per_class: int = 8) -> dict[str, Any]:
+    """Example chromatograms for one acquisition, split by how many engines found the peptide.
+
+    WHAT THIS CAN AND CANNOT SHOW, because the distinction decides how the panel must be labelled:
+    every engine's XIC export covers only the precursors THAT ENGINE REPORTED. DIA-NN's --xic writes
+    its identification list; Spectronaut's .xic.db does the same. So for a peptide only one engine
+    found, only that engine has a trace -- and its absence elsewhere means "not reported here",
+    NEVER "no signal there". A shared peptide can be overlaid honestly; a unique one cannot, and the
+    UI must say so rather than let the layout imply an engine looked and saw nothing.
+    """
+    def _p() -> dict[str, Any]:
+        real_rb = resolve_run_key(raw_basename)
+        rows = query(
+            """
+            WITH found AS (
+              SELECT p.stripped_seq, p.charge, count(DISTINCT s.search_engine) AS n_eng,
+                     string_agg(DISTINCT s.search_engine, ',' ORDER BY s.search_engine) AS engines
+                FROM delimp_precursors p
+                JOIN delimp_searches s ON s.id = p.search_id
+                JOIN raw_files rf ON rf.raw_path = p.raw_path
+               WHERE rf.raw_basename = %s
+               GROUP BY 1, 2)
+            SELECT x.stripped_seq, x.modified_seq, x.charge, x.engine, x.precursor_mz,
+                   x.rt_apex, x.ms1_apex, x.n_fragments_total, x.ms1, x.fragments,
+                   COALESCE(f.n_eng, 0) AS n_eng, f.engines
+              FROM delimp_precursor_xic x
+              LEFT JOIN found f ON f.stripped_seq = x.stripped_seq AND f.charge = x.charge
+             WHERE x.run = %s AND x.ms1 IS NOT NULL
+             ORDER BY x.ms1_apex DESC NULLS LAST
+             LIMIT 400
+            """,
+            (real_rb, real_rb),
+            tables=["delimp_precursor_xic", "delimp_precursors", "delimp_searches", "raw_files"],
+            timeout_ms=20000) or []
+        if not rows:
+            return {"raw_basename": raw_basename, "shared": [], "unique": [], "n_available": 0}
+
+        n_eng_on_run = max((r["n_eng"] or 0) for r in rows)
+
+        def _trim(r):
+            """Downsample nothing, but keep only what a sparkline needs: a trace is ~50 points and
+            a precursor has ~6 fragments, so the payload is already small. Fragments are ordered
+            strongest-first so a panel showing three shows the three that matter."""
+            frs = r["fragments"] or []
+            if isinstance(frs, list):
+                frs = sorted(frs, key=lambda f: -(f.get("apex") or 0))[:6]
+            return {"stripped_seq": r["stripped_seq"], "modified_seq": r["modified_seq"],
+                    "charge": r["charge"], "engine": r["engine"], "precursor_mz": r["precursor_mz"],
+                    "rt_apex": r["rt_apex"], "ms1_apex": r["ms1_apex"],
+                    "n_fragments_total": r["n_fragments_total"],
+                    "n_engines": r["n_eng"], "engines": (r["engines"] or "").split(",") if r["engines"] else [],
+                    "ms1": r["ms1"] or [], "fragments": frs}
+
+        shared, uniq = [], []
+        for r in rows:
+            b = shared if (r["n_eng"] or 0) >= n_eng_on_run and n_eng_on_run > 1 else (
+                uniq if (r["n_eng"] or 0) == 1 else None)
+            if b is not None and len(b) < per_class:
+                b.append(_trim(r))
+            if len(shared) >= per_class and len(uniq) >= per_class:
+                break
+        return {"raw_basename": raw_basename, "n_engines_on_run": n_eng_on_run,
+                "n_available": len(rows), "shared": shared, "unique": uniq,
+                "engines_with_traces": sorted({r["engine"] for r in rows if r["engine"]})}
+
+    return SLOW_CACHE.get_or_set(f"engine_run_xic:{raw_basename}:{per_class}", _p)
+
+
 def engine_disagreement_peptides(raw_basename: str, engine_a: str = "", engine_b: str = "",
-                                 mode: str = "only_a", limit: int = 200) -> dict[str, Any]:
+                                 mode: str = "only_a", limit: int = 200,
+                                 offset: int = 0) -> dict[str, Any]:
     """The peptides themselves, not just the counts.
 
     mode:
@@ -3963,10 +4032,15 @@ def engine_disagreement_peptides(raw_basename: str, engine_a: str = "", engine_b
                     rows.append({"collapsed": coll, "spelling_a": ia[coll], "spelling_b": ib[coll]})
 
         total = len(rows)
-        return {"rows": rows[:min(int(limit), MAX_PAGE)], "total": total,
+        # Page in the ranked list rather than re-ranking per page: the ordering is computed over the
+        # whole population (that is what makes "are the unique ones weaker?" answerable), so a page
+        # is a window onto one stable ranking, not a fresh query.
+        off = max(0, int(offset))
+        return {"rows": rows[off:off + min(int(limit), MAX_PAGE)], "total": total,
+                "offset": off, "limit": min(int(limit), MAX_PAGE),
                 "engine_a": a_name, "engine_b": b_name, "mode": mode}
     return SLOW_CACHE.get_or_set(
-        f"engine_disagree:{raw_basename}:{engine_a}:{engine_b}:{mode}:{limit}", _p)
+        f"engine_disagree:{raw_basename}:{engine_a}:{engine_b}:{mode}:{limit}:{offset}", _p)
 
 
 def engine_species_summary(limit: int = 60) -> list[dict[str, Any]]:
