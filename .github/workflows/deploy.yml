@@ -65,9 +65,53 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Freshness gate. A push run deploys THE COMMIT THAT TRIGGERED IT, and GitHub does not
+  # guarantee it runs before a later one: on 2026-08-26 a delayed run for 3b65580 executed
+  # AFTER the run for 1fc4925 and redeployed the older code straight over it, taking the
+  # site from 0.23.0 back to 0.22.0. Every run reported success; the only visible symptom
+  # was the live version going backwards.
+  #
+  # concurrency + cancel-in-progress:false cannot prevent this -- that protects an in-flight
+  # publish, it does not order the queue -- so the run has to check for itself whether it is
+  # still current.
+  #
+  # workflow_dispatch is NEVER gated: it is a deliberate human action and is the documented
+  # rollback path, which by definition deploys something that is not main HEAD.
+  freshness:
+    name: Still the current main?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      fresh: ${{ steps.check.outputs.fresh }}
+    steps:
+      - name: Compare the triggering commit against origin/main
+        id: check
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "event=${{ github.event_name }}: not gated (manual runs include rollback)"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          tip=$(git ls-remote https://github.com/${{ github.repository }}.git refs/heads/main | cut -f1)
+          echo "triggering commit : ${{ github.sha }}"
+          echo "origin/main tip   : ${tip}"
+          if [ "${tip}" = "${{ github.sha }}" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+            echo "current -- proceeding"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            echo "SUPERSEDED: main has moved on. Skipping so this run cannot roll production back."
+            echo "### Deploy skipped: superseded" >> "$GITHUB_STEP_SUMMARY"
+            echo "This run was triggered by \`${{ github.sha }}\`, but \`origin/main\` is now \`${tip}\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "Deploying it would have replaced newer code with older." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # Gate. `needs: gate` on the deploy job is the only thing that makes this a PRE-deploy
   # gate rather than a parallel one.
   gate:
+    needs: freshness
+    if: needs.freshness.outputs.fresh == 'true'
     uses: ./.github/workflows/verify.yml
     permissions:
       contents: read
@@ -76,7 +120,8 @@ jobs:
 
   deploy:
     name: Package, OneDeploy, health gate
-    needs: gate
+    needs: [freshness, gate]
+    if: needs.freshness.outputs.fresh == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
