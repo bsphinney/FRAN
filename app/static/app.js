@@ -2449,10 +2449,18 @@ async function renderEngineRun(rb){
     view.innerHTML = `
     ${crumb([['Dashboard','dashboard'],['Engine comparison','engines'],[rb,null]])}
     <div class="glass card p-6 mb-5 fade-in">
+      <h1 class="text-xl font-extrabold text-white font-mono break-all">${esc(rb)}</h1>
+      <div class="text-slate-400 text-sm mt-1">One acquisition · sample, instrument and gradient identical · only the software differs</div>
+    </div>
+
+    ${eAllPanel(allEng)}
+
+    <div class="glass card p-6 mb-5">
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div class="min-w-0">
-          <h1 class="text-xl font-extrabold text-white font-mono break-all">${esc(rb)}</h1>
-          <div class="text-slate-400 text-sm mt-1">One acquisition · sample, instrument and gradient identical · only the software differs</div>
+          <h2 class="font-bold text-white">Compare two in detail</h2>
+          <div class="text-xs text-slate-500 mt-1">Everything below is a two-engine drill-down: quantitative correlation, RT and ion-mobility
+          agreement, and the peptides behind each count. Pick the pair.</div>
         </div>
         <div class="flex gap-2 flex-wrap">
           ${(mine.engines||[]).map(e=>`<button onclick="ePick('${esc(rb)}','${esc(e)}')"
@@ -2470,8 +2478,6 @@ async function renderEngineRun(rb){
       </div>
       ${scope}
     </div>
-
-    ${eAllPanel(allEng)}
 
     <div class="grid lg:grid-cols-2 gap-5 mb-5">
       <div class="glass card p-5">
