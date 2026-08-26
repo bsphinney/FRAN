@@ -811,6 +811,15 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                 f"INSERT INTO delimp_precursors ({prec_cols}) VALUES %s",
                 prec_rows, page_size=5000)
         conn.commit()
+        # Keep n_engines_confirming true for the acquisitions this ingest touched. A search from a
+        # NEW engine on an existing acquisition invalidates every row already there, not just the
+        # rows it adds, so this cannot be left to a periodic backfill. No-ops unless one of these
+        # acquisitions is actually covered by more than one engine.
+        try:
+            from backfill_engines_confirming import refresh_for
+            refresh_for(conn, sorted({str(r) for r in runs}))
+        except Exception as _e:  # noqa: BLE001 - never fail an ingest over a derived column
+            print(f"  [warn] cross-engine refresh skipped: {type(_e).__name__}: {_e}", flush=True)
         print(f"  COMMITTED search_id={search_id}: {len(recs):,} precursors, "
               f"{len({k[1] for k in prot}):,} distinct proteins ({len(prot):,} protein×run), {len(runs)} runs.")
         # PRIVATE provenance layer: full real names + every raw-file location + parsed

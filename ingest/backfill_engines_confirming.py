@@ -67,11 +67,57 @@ UPDATE delimp_precursors p
 """
 
 
+def refresh_for(conn, raw_basenames, verbose=True) -> int:
+    """Recompute n_engines_confirming for these acquisitions. Returns rows changed.
+
+    Called by corpus_ingest after every ingest, because a one-time backfill cannot stay correct:
+    when a search from a NEW engine lands on an acquisition already in the corpus, its own rows have
+    no value AND every existing row for that acquisition becomes wrong -- they say 1 while two
+    engines now confirm. The column decays on every ingest, which is how it came to be 1 on all
+    434M rows.
+
+    Cheap in the normal case, and that is the point. Most ingests add a search for runs only that
+    engine covers, so the first query returns nothing and no precursor row is touched at all. Work
+    happens only for acquisitions that ACTUALLY became multi-engine.
+    """
+    if not raw_basenames:
+        return 0
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT rf.raw_basename
+          FROM search_raw_files f
+          JOIN delimp_searches s ON s.id = f.search_id
+          JOIN raw_files rf ON rf.raw_path = f.raw_path
+         WHERE rf.raw_basename = ANY(%s)
+         GROUP BY 1 HAVING count(DISTINCT s.search_engine) > 1""", (list(raw_basenames),))
+    multi = [r[0] for r in cur.fetchall()]
+    if not multi:
+        if verbose:
+            print(f"  cross-engine: none of these {len(raw_basenames)} acquisition(s) are "
+                  f"multi-engine; nothing to recompute", flush=True)
+        return 0
+    changed = 0
+    for rb in multi:
+        cur.execute(UPDATE_ONE, (rb, rb))
+        changed += cur.rowcount
+        conn.commit()
+    if verbose:
+        print(f"  cross-engine: {len(multi)} acquisition(s) are multi-engine, "
+              f"{changed:,} precursor row(s) updated", flush=True)
+    return changed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="only this many acquisitions")
     ap.add_argument("--statement-timeout", default="600s")
+    # The 764 acquisitions are independent -- each touches only rows belonging to its own raw files
+    # -- so they parallelise cleanly across a SLURM array. STRIDED, not contiguous: acquisition cost
+    # varies with how many precursors it holds, and contiguous blocks would leave one task with all
+    # the large ones. ~29s each serially is ~6h; eight shards is well under an hour.
+    ap.add_argument("--shard", default="", metavar="I/N",
+                    help="process only acquisitions where index %% N == I (0-based)")
     a = ap.parse_args()
 
     import corpus_ingest as ci
@@ -88,12 +134,19 @@ def main():
           f"in {time.time()-t0:.0f}s", flush=True)
     if not runs:
         print("nothing to do"); conn.close(); return
+    if a.shard:
+        i, n = (int(x) for x in a.shard.split("/"))
+        runs = [r for k, r in enumerate(runs) if k % n == i]
+        print(f"  shard {i}/{n}: {len(runs)} acquisitions", flush=True)
     if a.limit:
         runs = runs[:a.limit]
         print(f"  --limit: processing {len(runs)}", flush=True)
 
     if not a.apply:
-        print("\nDRY RUN — re-run with --apply. Counting affected rows without writing:", flush=True)
+        # Measured per acquisition, not across all of them: the all-at-once form ran past a 600s
+        # statement timeout without producing a number.
+        runs = runs[:max(1, a.limit or 3)]
+        print(f"\nDRY RUN — sampling {len(runs)} acquisition(s); re-run with --apply:", flush=True)
         cur.execute("""
             WITH counts AS (
               SELECT rf.raw_basename, p.stripped_seq, p.charge,
@@ -107,8 +160,9 @@ def main():
               FROM counts""", (runs,))
         multi, total = cur.fetchone()
         conn.rollback()
-        print(f"  {total:,} distinct (run, peptide, charge) in these acquisitions")
-        print(f"  {multi:,} of them were reported by MORE THAN ONE engine")
+        print(f"  {total:,} distinct (run, peptide, charge) in the sample")
+        print(f"  {multi:,} of them were reported by MORE THAN ONE engine "
+              f"({100*multi/total:.0f}%)" if total else "  (nothing)")
         conn.close(); return
 
     changed = done = 0
