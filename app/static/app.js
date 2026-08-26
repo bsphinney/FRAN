@@ -2403,24 +2403,66 @@ async function loadCombo(rb, engines, offset){
   }catch(e){ box.innerHTML = `<div class="text-xs text-slate-500">Could not load: ${esc(e.message)}</div>`; }
 }
 
-function eAllPanel(a){
+// `rb` is passed in rather than read from a.raw_basename. The API RE-SANITISES that field on
+// the way out, so what it echoes is the anonymised form of an already-anonymised name --
+// asking for run-3c5f57 returns run-bda078, which resolves to nothing. Clicking a column
+// with it returned "those engines did not all search this run". The caller's key is the one
+// that actually resolves.
+function eAllPanel(a, rb){
   if(!a || a.error || !a.engines || a.n_engines<2) return '';
   const p=a.precursor, pe=a.peptide;
-  const maxN = Math.max(...p.upset.map(b=>b.n), 1);
-  const bars = p.upset.map(b=>{
-    const w = Math.max(1, Math.round(100*b.n/maxN));
-    const lbl = b.engines.map(e=>eDot(e)+esc(e)).join('<span class="text-slate-600 mx-1">+</span>');
-    const tone = b.n_engines===a.n_engines ? 'bg-emerald-400/70'
-               : b.n_engines===1 ? 'bg-amber-400/60' : 'bg-sky-400/60';
-    const tag = b.n_engines===a.n_engines ? 'all agree'
-              : b.n_engines===1 ? 'only this engine' : `${b.n_engines} of ${a.n_engines}`;
-    return `<div class="mb-2 cursor-pointer group" onclick="loadCombo('${esc(a.raw_basename)}','${b.engines.join(',')}')"
-                 title="Show the ${fmt(b.n)} precursors found by exactly ${b.engines.join(' + ')}">
-      <div class="flex justify-between items-baseline text-xs mb-1">
-        <span class="text-slate-300 group-hover:text-white">${lbl} <span class="text-slate-600">· ${tag}</span></span>
-        <span class="font-mono text-white">${fmt(b.n)} <span class="text-slate-600 group-hover:text-accent-400">›</span></span></div>
-      <div class="h-2 rounded bg-white/5 overflow-hidden"><div class="h-full ${tone} group-hover:brightness-125" style="width:${w}%"></div></div>
-    </div>`;}).join('');
+  // A REAL UpSet plot: intersection bars on top, a dot matrix beneath saying which engines each
+  // column means. The previous form was a labelled bar LIST, which reads fine for 3 engines and
+  // stops working past that -- the matrix is what keeps 4+ engines legible, and it makes the empty
+  // combinations visible too, which is itself a result.
+  const U = p.upset.slice().sort((x,y)=> y.n - x.n || y.n_engines - x.n_engines);
+  const maxN = Math.max(...U.map(b=>b.n), 1);
+  const BAR_H = 92, CELL = 34, ROW_H = 22, LBL_W = 116;
+  const maxSet = Math.max(...a.engines.map(e=>e.n_precursors||0), 1);
+  const gridW = Math.max(1, U.length) * CELL;
+  const toneOf = b => b.n_engines===a.n_engines ? '#34d399' : b.n_engines===1 ? '#fbbf24' : '#38bdf8';
+
+  const colBars = U.map((b,i)=>{
+    const h = Math.max(2, Math.round(BAR_H * b.n / maxN));
+    return `<g style="cursor:pointer" onclick="loadCombo('${esc(rb)}','${b.engines.join(',')}')">
+      <rect x="${i*CELL}" y="0" width="${CELL}" height="${BAR_H+10}" fill="transparent"/>
+      <rect x="${i*CELL+7}" y="${BAR_H-h}" width="${CELL-14}" height="${h}" fill="${toneOf(b)}" opacity="0.85" rx="1"/>
+      <text x="${i*CELL+CELL/2}" y="${Math.max(9, BAR_H-h-3)}" text-anchor="middle" font-size="8"
+            fill="currentColor" opacity="0.8">${b.n>=1000?(b.n/1000).toFixed(b.n>=10000?0:1)+'k':b.n}</text>
+      <title>${esc(b.engines.join(' + '))} — ${fmt(b.n)} precursors. Click to list them.</title>
+    </g>`;}).join('');
+
+  const links = U.map((b,i)=>{
+    const rows = a.engines.map((x,ix)=>b.engines.includes(x.engine)?ix:-1).filter(x=>x>=0);
+    if (rows.length < 2) return '';
+    return `<line x1="${i*CELL+CELL/2}" y1="${Math.min(...rows)*ROW_H+ROW_H/2}"
+                  x2="${i*CELL+CELL/2}" y2="${Math.max(...rows)*ROW_H+ROW_H/2}"
+                  stroke="${toneOf(b)}" stroke-width="1.5" opacity="0.5"/>`;}).join('');
+
+  const dots = a.engines.map((e,r)=> U.map((b,i)=>{
+    const on = b.engines.includes(e.engine);
+    return `<circle cx="${i*CELL+CELL/2}" cy="${r*ROW_H+ROW_H/2}" r="4.5"
+             fill="${on?(ENG_COLOR[e.engine]||'#94a3b8'):'currentColor'}" opacity="${on?1:0.13}"/>`;
+  }).join('')).join('');
+
+  const rowLabels = a.engines.map(e=>`
+    <div class="flex items-center justify-end gap-2" style="height:${ROW_H}px">
+      <span class="text-[10px] text-slate-400 truncate">${esc(e.engine)}</span>
+      <span class="inline-block rounded-sm" title="${fmt(e.n_precursors)} precursors in this run"
+            style="width:${Math.max(3,Math.round(44*(e.n_precursors||0)/maxSet))}px;height:7px;background:${ENG_COLOR[e.engine]||'#64748b'};opacity:.75"></span>
+    </div>`).join('');
+
+  const bars = `<div class="overflow-x-auto"><div style="min-width:${gridW+LBL_W}px">
+      <div class="flex"><div style="width:${LBL_W}px"></div>
+        <svg viewBox="0 0 ${gridW} ${BAR_H+10}" style="width:${gridW}px;height:${BAR_H+10}px" class="text-slate-400">${colBars}</svg></div>
+      <div class="flex"><div style="width:${LBL_W}px">${rowLabels}</div>
+        <svg viewBox="0 0 ${gridW} ${a.engines.length*ROW_H}" style="width:${gridW}px;height:${a.engines.length*ROW_H}px" class="text-slate-500">${links}${dots}</svg></div>
+    </div></div>
+    <div class="flex gap-4 mt-2 text-[10px] text-slate-500 flex-wrap">
+      <span><span class="inline-block w-2 h-2 rounded-sm align-middle mr-1" style="background:#34d399"></span>all ${a.n_engines} agree</span>
+      <span><span class="inline-block w-2 h-2 rounded-sm align-middle mr-1" style="background:#38bdf8"></span>some but not all</span>
+      <span><span class="inline-block w-2 h-2 rounded-sm align-middle mr-1" style="background:#fbbf24"></span>one engine only</span>
+    </div>`;
 
   const cards = a.engines.map(e=>`
     <div class="rounded-lg border border-white/5 p-3">
@@ -2494,8 +2536,9 @@ function eAllPanel(a){
     <div class="grid lg:grid-cols-2 gap-5">
       <div>
         <h3 class="text-sm font-semibold text-white mb-1">Who found what</h3>
-        <p class="text-[11px] text-slate-500 mb-3">One bar per exact combination — every precursor is counted once, so the bars sum to ${fmt(p.union)}.
-        <b class="text-slate-400">Click any bar</b> to list the precursors behind it.</p>
+        <p class="text-[11px] text-slate-500 mb-3">Each column is one exact combination: the bar is how many precursors, the dots below say which
+        engines. Every precursor is counted once, so the bars sum to ${fmt(p.union)}.
+        <b class="text-slate-400">Click a column</b> to list the precursors behind it.</p>
         ${bars}
         <div id="comboBox" class="mt-3"></div>
       </div>
@@ -2694,7 +2737,7 @@ async function renderEngineRun(rb){
       <div class="text-slate-400 text-sm mt-1">One acquisition · sample, instrument and gradient identical · only the software differs</div>
     </div>
 
-    ${eAllPanel(allEng)}
+    ${eAllPanel(allEng, rb)}
 
     <div id="xicPanel"></div>
 
