@@ -535,8 +535,21 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         write_pg = "protein_group" in have_cols
         # idempotent: remove any prior ingest of this output_dir (cascades to proteins/precursors/srf
         # + the PRIVATE provenance row — without this, re-ingests orphaned old provenance rows).
-        cur.execute("SELECT id FROM delimp_searches WHERE output_dir=%s", (output_dir,))
-        for (sid,) in cur.fetchall():
+        # Carry the FASTA provenance across the delete. This block is a DELETE-then-INSERT, so it
+        # is an upsert in every way that matters: anything the re-ingest fails to RE-DERIVE comes
+        # back NULL and overwrites a good value. That is how spectrum_lance.register() dropped the
+        # link rate 92.8% -> 55.1% and cost 577 datasets a restore. A re-derive here fails whenever
+        # output_dir is no longer mounted on the ingest host — the normal case for the 1,940
+        # Spectronaut rows, whose output_dir is a Windows path — so treat the stored row as the
+        # fallback and only let a fresh detection win.
+        prior_fa = {}
+        cur.execute("""SELECT id, fasta_path, fasta_md5, fasta_n_proteins, contaminant_lib
+                       FROM delimp_searches WHERE output_dir=%s""", (output_dir,))
+        for sid, _fp, _md5, _np, _cl in cur.fetchall():
+            for k, v in (("fasta_path", _fp), ("fasta_md5", _md5),
+                         ("fasta_n_proteins", _np), ("contaminant_lib", _cl)):
+                if v is not None and prior_fa.get(k) is None:
+                    prior_fa[k] = v
             cur.execute("DELETE FROM delimp_precursors WHERE search_id=%s", (sid,))
             cur.execute("DELETE FROM delimp_proteins   WHERE search_id=%s", (sid,))
             cur.execute("DELETE FROM search_raw_files  WHERE search_id=%s", (sid,))
@@ -588,8 +601,18 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             fa = _detect_fasta(engine, report, output_dir) or {}
         except Exception:  # noqa: BLE001 - never fail an ingest over provenance
             fa = {}
+        # Only carry the stored values forward when this run did not identify a DIFFERENT
+        # database. md5 and entry count describe one specific file; a freshly resolved path
+        # with the previous row's md5 beside it is worse than a NULL, because it reads as
+        # verified provenance.
+        kept: list[str] = []
+        if prior_fa and fa.get("fasta_path") in (None, prior_fa.get("fasta_path")):
+            kept = [k for k in prior_fa if fa.get(k) is None]
+            for k in kept:
+                fa[k] = prior_fa[k]
         print(f"  fasta: {fa.get('fasta_path') or 'not found (no setup/log beside the report)'}"
-              + (f"  n={fa['fasta_n_proteins']}" if fa.get("fasta_n_proteins") else ""))
+              + (f"  n={fa['fasta_n_proteins']}" if fa.get("fasta_n_proteins") else "")
+              + (f"  [kept from previous ingest: {','.join(kept)}]" if kept else ""))
         if has_npg:
             cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
                            search_engine_version,pipeline_id,pipeline_version,n_raw_files,n_precursors_total,

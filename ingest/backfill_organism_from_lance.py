@@ -18,11 +18,12 @@ n_peptides_scored, top3_json), which exists for exactly this and is currently po
 you get a corpus nobody can audit.
 
 WHY THIS SOURCE AT ALL. Every search ran against a proteome, so every run has an organism — FRAN just
-never recorded which. `delimp_searches.fasta_path` is filled for 157 of 1,963 searches, `fasta_md5`
-and `fasta_n_proteins` for none, and `corpus_ingest.py` never writes any of them. The archive does not
-carry it either: Spectronaut's AnalysisLog logs the operation ("Digesting Fasta...") but never the
-filename, and the `.params` files are 126-byte export summaries. The report's own organism annotation
-is what survived.
+never recorded which. `delimp_searches.fasta_path` was filled for 157 of 2,014 searches and
+`fasta_md5` / `fasta_n_proteins` for none; `corpus_ingest.py` writes all three as of 2026-08-25
+(engine_fasta.py), but only where the export kept an ExperimentSetupOverview/setup.txt or a DIA-NN
+log, so the archived rows this script exists for stay uncovered. Spectronaut's AnalysisLog logs the
+operation ("Digesting Fasta...") but never the filename, and the `.params` files are 126-byte export
+summaries. The report's own organism annotation is what survived.
 
 METHOD. Only organism-UNIQUE peptides vote. A ';'-joined value ('Cicer arietinum;Homo sapiens') means
 the peptide occurs in BOTH, which is uninformative about which one the sample is — counting it toward
