@@ -932,7 +932,9 @@ async function loadFunFacts(seq){
         ${stat('Charge states',chargeTxt)}
         ${stat('Ion mobility 1/K₀',imTxt)}
         ${stat(useIrt?'iRT median':'RT median',rtTxt)}
-        ${stat('Cross-engine',b.max_engines>1?`<span class="text-plum">${b.max_engines}× engines</span>`:'1 engine')}
+        ${stat('Cross-engine', (b.n_engines||0)>1
+          ? `<span class="text-plum">${b.n_engines}× engines</span><span class="block text-[10px] text-slate-500 font-normal">${(b.engine_names||[]).map(esc).join(', ')}</span>`
+          : ((b.engine_names||[])[0] ? `1 engine<span class="block text-[10px] text-slate-500 font-normal">${esc(b.engine_names[0])}</span>` : '—'))}
         ${stat('Peak abundance',intTxt)}</div>
       ${resBadges?`<div class="mb-3"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Interesting residues</div><div class="flex flex-wrap gap-1.5">${resBadges}</div></div>`:''}
       ${chips?`<div><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Seen in these species <span class="text-slate-600">(by run count)</span></div><div class="flex flex-wrap gap-1.5">${chips}</div></div>`:''}

@@ -623,6 +623,20 @@ def peptide_fun_facts(stripped_seq: str) -> dict[str, Any]:
         (seq,), tables=["delimp_precursors"], fetch="one")
     if not breadth or not breadth.get("n_obs"):
         return {"stripped_seq": seq, "found": False, "physchem": physchem}
+    # WHICH ENGINES actually reported this peptide. It has to be derived, not read: the breadth
+    # query above reports MAX(n_engines_confirming), and that column is a stub -- it is 1 on every
+    # row in the corpus, because nothing ever computed it. So the card said "1 engine" for
+    # IPSHAVVAR, which 213 Spectronaut searches, 17 DIA-NN searches and 1 Radiant search all
+    # report. delimp_precursors carries no engine at all; the engine is on delimp_searches, so the
+    # only honest answer needs the join.
+    engines = query(
+        """SELECT s.search_engine AS engine, COUNT(*) AS n,
+                  COUNT(DISTINCT p.search_id) AS n_searches
+             FROM delimp_precursors p
+             JOIN delimp_searches s ON s.id = p.search_id
+            WHERE p.stripped_seq = %s
+            GROUP BY 1 ORDER BY n DESC""",
+        (seq,), tables=["delimp_precursors", "delimp_searches"], timeout_ms=12000) or []
     organisms = query(
         """SELECT COALESCE(NULLIF(sm.organism_name, ''), 'Unknown') AS organism,
                   COUNT(DISTINCT pr.raw_path) AS n_runs
@@ -636,11 +650,16 @@ def peptide_fun_facts(stripped_seq: str) -> dict[str, Any]:
            FROM delimp_precursors pr LEFT JOIN delimp_sample_metadata sm ON sm.raw_path = pr.raw_path
            WHERE pr.stripped_seq = %s AND pr.intensity IS NOT NULL ORDER BY pr.intensity DESC LIMIT 1""",
         (seq,), tables=["delimp_precursors", "delimp_sample_metadata"], fetch="one")
+    bd = {k: breadth.get(k) for k in ("n_obs", "n_searches", "n_runs", "max_engines",
+                                     "n_im", "im_min", "im_max", "rt_min", "rt_max", "n_irt",
+                                     "irt_min", "irt_max", "irt_p25", "irt_p50", "irt_p75",
+                                     "rt_p25", "rt_p50", "rt_p75", "max_intensity")}
+    bd["charges"] = list(breadth.get("charges") or [])
+    bd["n_engines"] = len(engines)
+    bd["engine_names"] = [e["engine"] for e in engines]
     return {"stripped_seq": seq, "found": True, "physchem": physchem,
-            "breadth": {k: breadth.get(k) for k in ("n_obs", "n_searches", "n_runs", "max_engines",
-                        "n_im", "im_min", "im_max", "rt_min", "rt_max", "n_irt", "irt_min", "irt_max",
-                        "irt_p25", "irt_p50", "irt_p75", "rt_p25", "rt_p50", "rt_p75",
-                        "max_intensity")} | {"charges": list(breadth.get("charges") or [])},
+            "engines": engines,
+            "breadth": bd,
             "n_organisms": len(named), "organisms": named[:24],
             "n_unknown_runs": sum(o["n_runs"] for o in organisms if o["organism"] == "Unknown"),
             "most_intense": ({"organism": top["organism"], "raw_path": top["raw_path"],
