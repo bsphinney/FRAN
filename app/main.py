@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.25.0"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
+APP_VERSION = "0.25.1"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
                         # quant r2 vs scale offset, accession-level protein matching, charge/IL
                         # miscounts, and the shared-vs-unique depth profile. Four engines now in
                         # the corpus (Spectronaut, DIA-NN, FragPipe, Radiant).

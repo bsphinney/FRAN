@@ -845,6 +845,11 @@ _PEPTIDE_SEARCH_COLS = """
     COUNT(DISTINCT search_id)             AS n_searches,
     MIN(q_value)                          AS best_q_value,
     bool_or(im IS NOT NULL)               AS has_im,
+    -- Left as-is deliberately. This aggregate runs over a LIST of matched peptides, so joining
+    -- delimp_searches here would join once per peptide in a result page rather than once for one
+    -- peptide. The single-peptide paths (peptide_detail, peptide_fun_facts) derive it correctly and
+    -- are what the peptide page actually shows; this only feeds a header badge that stays hidden
+    -- while the column reads 1.
     MAX(n_engines_confirming)             AS max_engines
 """
 
@@ -2878,23 +2883,29 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
     seq = (stripped_seq or "").strip().upper()
     summary = query(
         """
-        SELECT stripped_seq,
+        SELECT p.stripped_seq,
                COUNT(*) AS n_precursors,
-               COUNT(DISTINCT modified_seq_proforma) AS n_modforms,
-               COUNT(DISTINCT charge) AS n_charges,
-               COUNT(DISTINCT raw_path) AS n_runs,
-               COUNT(DISTINCT search_id) AS n_searches,
-               MIN(q_value) AS best_q_value,
-               AVG(rt) AS avg_rt,
-               AVG(im) AS avg_im,
-               bool_or(im IS NOT NULL) AS has_im,
-               MAX(n_engines_confirming) AS max_engines
-        FROM delimp_precursors
-        WHERE stripped_seq = %s
-        GROUP BY stripped_seq
+               COUNT(DISTINCT p.modified_seq_proforma) AS n_modforms,
+               COUNT(DISTINCT p.charge) AS n_charges,
+               COUNT(DISTINCT p.raw_path) AS n_runs,
+               COUNT(DISTINCT p.search_id) AS n_searches,
+               MIN(p.q_value) AS best_q_value,
+               AVG(p.rt) AS avg_rt,
+               AVG(p.im) AS avg_im,
+               bool_or(p.im IS NOT NULL) AS has_im,
+               -- DERIVED rather than read from n_engines_confirming: a stored copy of a derived
+               -- value decays, because a later search from a new engine invalidates every row
+               -- already here. Joined into THIS scan, not fetched by a correlated subquery -- the
+               -- subquery form scanned the peptide's rows a second time and cost 9.2s against
+               -- 0.0s here. delimp_searches has 2,028 rows, so the join itself is free.
+               count(DISTINCT s.search_engine) AS max_engines
+        FROM delimp_precursors p
+        JOIN delimp_searches s ON s.id = p.search_id
+        WHERE p.stripped_seq = %s
+        GROUP BY p.stripped_seq
         """,
         (seq,),
-        tables=["delimp_precursors"],
+        tables=["delimp_precursors", "delimp_searches"],
         fetch="one",
     )
     # One row per (modified form, charge) with aggregate coordinates.
