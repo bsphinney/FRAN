@@ -55,6 +55,8 @@ SCHEMA = pa.schema([
     ("frg_chan_interference", pa.list_(pa.bool_())),
 ])
 
+_REG_TABLE = "delimp_spectrum_lane"
+
 REGISTRY_DDL = """
 CREATE TABLE IF NOT EXISTS delimp_spectrum_lane (
     id             BIGSERIAL PRIMARY KEY,
@@ -143,7 +145,27 @@ def register(conn, search_id, search_name, lance_path, n_prec, n_frag, md5, vers
 
 
 def ensure_registry(conn):
-    cur = conn.cursor(); cur.execute(REGISTRY_DDL); conn.commit()
+    """Create the registry only when it is actually missing.
+
+    This used to run REGISTRY_DDL on EVERY call. `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` still
+    takes an AccessExclusiveLock even when the column already exists, so under concurrent ingest it
+    queues behind whatever else is writing and dies on statement_timeout. That is not hypothetical:
+    8 of 13 searches in the 2026-08-25 DIA-NN XIC batch failed here, every one of them with
+    "canceling statement due to statement timeout" from this line, and not one for a data reason.
+    corpus_ingest documents the same hazard for its own ALTERs.
+
+    The catalog check is a cheap read, so the common path -- registry already correct -- now takes
+    no lock at all."""
+    cur = conn.cursor()
+    cur.execute("""SELECT to_regclass('public.%s') IS NOT NULL,
+                          EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='%s' AND column_name='writer_version')"""
+                % (_REG_TABLE, _REG_TABLE))
+    have_table, have_col = cur.fetchone()
+    if have_table and have_col:
+        return
+    cur.execute(REGISTRY_DDL)
+    conn.commit()
 
 
 def verify(lance_path, expected_md5) -> bool:
