@@ -2354,6 +2354,55 @@ async function loadXicPanel(rb){
   }catch(e){ el.innerHTML = ''; }
 }
 
+// An UpSet bar is only useful if you can ask "which ones?". The pairwise peptide lists cannot
+// express a three-engine bucket at all -- "only_a" is defined against a chosen partner -- so this
+// queries the exact membership set instead. Paged, because a bucket can hold thousands.
+async function loadCombo(rb, engines, offset){
+  const box = $('#comboBox'); if(!box) return;
+  const off = Math.max(0, offset|0);
+  box.innerHTML = `<div class="skeleton h-24 rounded-xl"></div>`;
+  try{
+    const d = await api(`/api/engines/run/${encodeURIComponent(rb)}/combo?engines=${encodeURIComponent(engines)}&limit=25&offset=${off}`);
+    const rows = d.rows||[], total = d.total||0, lim = d.limit||25, cur = d.offset||0;
+    const label = (d.engines||[]).map(e=>eDot(e)+esc(e)).join('<span class="text-slate-600 mx-1">+</span>');
+    if(!total){ box.innerHTML = `<div class="rounded-lg border border-white/10 bg-white/5 p-3 text-xs text-slate-400">Nothing in that bucket.</div>`; return; }
+    const last = Math.max(0, Math.floor((total-1)/lim)*lim);
+    const btn = on => `px-2 py-0.5 rounded glass text-[11px] ${on?'hover:bg-white/10 text-slate-200':'opacity-30 pointer-events-none'}`;
+    box.innerHTML = `
+      <div class="rounded-lg border border-white/10 bg-white/5 p-3">
+        <div class="flex justify-between items-baseline flex-wrap gap-2 mb-2">
+          <div class="text-xs text-slate-300">Found by exactly ${label}
+            <span class="text-slate-500">· ${fmt(total)} precursor${total===1?'':'s'}, strongest first</span></div>
+          <button onclick="document.getElementById('comboBox').innerHTML=''" class="text-[11px] text-slate-500 hover:text-slate-300">close ✕</button>
+        </div>
+        <div class="overflow-x-auto"><table class="w-full text-xs">
+          <thead><tr class="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+            <th class="text-left pb-1">peptide</th><th class="text-right pb-1 px-2">z</th>
+            <th class="text-right pb-1 px-2">m/z</th><th class="text-right pb-1 px-2">RT</th>
+            <th class="text-right pb-1 px-2">q</th><th class="text-right pb-1 px-2">intensity</th>
+            <th class="text-left pb-1 pl-2">protein</th></tr></thead>
+          <tbody>${rows.map(r=>`<tr class="border-b border-white/5">
+            <td class="py-1 pr-2"><span onclick="go('peptide','${encodeURIComponent(r.stripped_seq)}')"
+                class="font-mono cursor-pointer text-accent-400 hover:underline">${esc(r.stripped_seq)}</span></td>
+            <td class="py-1 px-2 text-right font-mono text-slate-300">${r.charge}</td>
+            <td class="py-1 px-2 text-right font-mono text-slate-300">${r.precursor_mz==null?'—':fmtF(r.precursor_mz,3)}</td>
+            <td class="py-1 px-2 text-right font-mono text-slate-300">${r.rt==null?'—':fmtF(r.rt,2)}</td>
+            <td class="py-1 px-2 text-right font-mono text-slate-400">${r.q_value==null?'—':Number(r.q_value).toExponential(1)}</td>
+            <td class="py-1 px-2 text-right font-mono text-white">${r.intensity==null?'—':Number(r.intensity).toExponential(2)}</td>
+            <td class="py-1 pl-2 font-mono text-slate-400 truncate max-w-[14rem]">${esc(r.protein_group||'')}</td>
+          </tr>`).join('')}</tbody></table></div>
+        ${total>lim?`<div class="flex items-center justify-between mt-2 text-[11px]">
+          <span class="text-slate-500">${fmt(cur+1)}–${fmt(Math.min(cur+lim,total))} of ${fmt(total)}</span>
+          <div class="flex gap-1">
+            <button onclick="loadCombo('${esc(rb)}','${esc(engines)}',${Math.max(0,cur-lim)})" class="${btn(cur>0)}">‹ prev</button>
+            <button onclick="loadCombo('${esc(rb)}','${esc(engines)}',${cur+lim})" class="${btn(cur+lim<total)}">next ›</button>
+            <button onclick="loadCombo('${esc(rb)}','${esc(engines)}',${last})" class="${btn(cur+lim<total)}">last »</button>
+          </div></div>`:''}
+      </div>`;
+    box.scrollIntoView({behavior:'smooth', block:'nearest'});
+  }catch(e){ box.innerHTML = `<div class="text-xs text-slate-500">Could not load: ${esc(e.message)}</div>`; }
+}
+
 function eAllPanel(a){
   if(!a || a.error || !a.engines || a.n_engines<2) return '';
   const p=a.precursor, pe=a.peptide;
@@ -2365,11 +2414,12 @@ function eAllPanel(a){
                : b.n_engines===1 ? 'bg-amber-400/60' : 'bg-sky-400/60';
     const tag = b.n_engines===a.n_engines ? 'all agree'
               : b.n_engines===1 ? 'only this engine' : `${b.n_engines} of ${a.n_engines}`;
-    return `<div class="mb-2">
+    return `<div class="mb-2 cursor-pointer group" onclick="loadCombo('${esc(a.raw_basename)}','${b.engines.join(',')}')"
+                 title="Show the ${fmt(b.n)} precursors found by exactly ${b.engines.join(' + ')}">
       <div class="flex justify-between items-baseline text-xs mb-1">
-        <span class="text-slate-300">${lbl} <span class="text-slate-600">· ${tag}</span></span>
-        <span class="font-mono text-white">${fmt(b.n)}</span></div>
-      <div class="h-2 rounded bg-white/5 overflow-hidden"><div class="h-full ${tone}" style="width:${w}%"></div></div>
+        <span class="text-slate-300 group-hover:text-white">${lbl} <span class="text-slate-600">· ${tag}</span></span>
+        <span class="font-mono text-white">${fmt(b.n)} <span class="text-slate-600 group-hover:text-accent-400">›</span></span></div>
+      <div class="h-2 rounded bg-white/5 overflow-hidden"><div class="h-full ${tone} group-hover:brightness-125" style="width:${w}%"></div></div>
     </div>`;}).join('');
 
   const cards = a.engines.map(e=>`
@@ -2444,8 +2494,10 @@ function eAllPanel(a){
     <div class="grid lg:grid-cols-2 gap-5">
       <div>
         <h3 class="text-sm font-semibold text-white mb-1">Who found what</h3>
-        <p class="text-[11px] text-slate-500 mb-3">One bar per exact combination — every precursor is counted once, so the bars sum to ${fmt(p.union)}.</p>
+        <p class="text-[11px] text-slate-500 mb-3">One bar per exact combination — every precursor is counted once, so the bars sum to ${fmt(p.union)}.
+        <b class="text-slate-400">Click any bar</b> to list the precursors behind it.</p>
         ${bars}
+        <div id="comboBox" class="mt-3"></div>
       </div>
       <div>
         <h3 class="text-sm font-semibold text-white mb-2">Headline</h3>

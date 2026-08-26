@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.22.0"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
+APP_VERSION = "0.23.0"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
                         # quant r2 vs scale offset, accession-level protein matching, charge/IL
                         # miscounts, and the shared-vs-unique depth profile. Four engines now in
                         # the corpus (Spectronaut, DIA-NN, FragPipe, Radiant).
@@ -886,6 +886,14 @@ def api_engines_run_xic(raw_basename: str, per_class: int = Query(8, ge=1, le=24
     """Example chromatograms for this acquisition, split into peptides every engine found and
     peptides only one engine found."""
     return ok(_safe(lambda: queries.engine_run_xic(raw_basename, per_class), {}))
+
+
+@app.get("/api/engines/run/{raw_basename}/combo")
+def api_engines_run_combo(raw_basename: str, engines: str = Query(""),
+                          limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    """The precursors found by EXACTLY this set of engines — what an UpSet bar represents."""
+    return ok(_safe(lambda: queries.engine_combo_peptides(raw_basename, engines, limit, offset),
+                    {"rows": [], "total": 0}))
 
 
 @app.get("/api/engines/run/{raw_basename}/peptides")

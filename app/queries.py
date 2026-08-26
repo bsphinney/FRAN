@@ -3987,6 +3987,55 @@ def engine_run_xic(raw_basename: str, per_class: int = 8) -> dict[str, Any]:
     return SLOW_CACHE.get_or_set(f"engine_run_xic:{raw_basename}:{per_class}", _p)
 
 
+def engine_combo_peptides(raw_basename: str, engines: str = "", limit: int = 50,
+                          offset: int = 0) -> dict[str, Any]:
+    """The precursors found by EXACTLY this set of engines and no others.
+
+    This is what makes the UpSet bars answerable rather than decorative: a bar says 4,265
+    precursors were found by diann+spectronaut but not fragpipe, and clicking it should show which
+    ones. The pairwise peptide lists cannot express that -- "only_a" is defined against a chosen
+    partner, so a three-engine bucket has no pairwise form at all.
+
+    EXACTLY is load-bearing. A precursor found by all three is NOT in the diann+spectronaut bucket,
+    which is what keeps the buckets summing to the union and the counts matching the bars.
+    """
+    def _p() -> dict[str, Any]:
+        want = {e.strip().lower() for e in engines.split(",") if e.strip()}
+        if not want:
+            return {"rows": [], "total": 0, "engines": []}
+        real_rb = resolve_run_key(raw_basename)
+        searches = engine_run_searches(real_rb)
+        by_engine: dict[str, dict] = {}
+        for s in searches:
+            by_engine[s["search_engine"]] = s
+        names = sorted(by_engine)
+        if not want.issubset(set(names)):
+            return {"rows": [], "total": 0, "engines": sorted(want),
+                    "error": "those engines did not all search this run"}
+
+        rows = {e: _engine_precursors(by_engine[e]["search_id"], real_rb) or [] for e in names}
+        keyed = {e: {(r["stripped_seq"], r["charge"]): r for r in rows[e]} for e in names}
+        hit = []
+        for k in set().union(*[set(keyed[e]) for e in names]):
+            who = {e for e in names if k in keyed[e]}
+            if who == want:
+                # report from the strongest engine that saw it, so intensity is not an arbitrary pick
+                best = max(who, key=lambda e: (keyed[e][k].get("intensity") or 0))
+                r = keyed[best][k]
+                hit.append({"stripped_seq": r["stripped_seq"], "charge": r["charge"],
+                            "precursor_mz": r.get("precursor_mz"), "rt": r.get("rt"),
+                            "im": r.get("im"), "q_value": r.get("q_value"),
+                            "intensity": r.get("intensity"),
+                            "protein_group": r.get("protein_group"), "from_engine": best})
+        hit.sort(key=lambda x: -(x["intensity"] or 0))
+        off = max(0, int(offset)); lim = min(int(limit), 200)
+        return {"rows": hit[off:off + lim], "total": len(hit), "offset": off, "limit": lim,
+                "engines": sorted(want), "n_engines_on_run": len(names)}
+
+    return SLOW_CACHE.get_or_set(
+        f"engine_combo:{raw_basename}:{engines}:{limit}:{offset}", _p)
+
+
 def engine_disagreement_peptides(raw_basename: str, engine_a: str = "", engine_b: str = "",
                                  mode: str = "only_a", limit: int = 200,
                                  offset: int = 0) -> dict[str, Any]:
