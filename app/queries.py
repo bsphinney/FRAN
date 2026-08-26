@@ -3555,6 +3555,20 @@ def _engine_precursors(search_id: str, raw_basename: str, limit: int = 400000):
         tables=["delimp_precursors", "raw_files"], timeout_ms=60000)
 
 
+def _engine_proteins(search_id: str, raw_basename: str, limit: int = 100000):
+    """One search's PROTEIN rows for one acquisition. delimp_proteins carries the gene, which
+    delimp_precursors does not, and gene is the only protein-level unit that survives the engines'
+    different grouping conventions."""
+    return query(
+        """SELECT pr.protein_group, pr.gene, pr.n_unique_peptides
+             FROM delimp_proteins pr
+             JOIN raw_files rf ON rf.raw_path = pr.raw_path
+            WHERE pr.search_id = %s::uuid AND rf.raw_basename = %s
+            LIMIT %s""",
+        (search_id, raw_basename, limit),
+        tables=["delimp_proteins", "raw_files"], timeout_ms=60000)
+
+
 def _il(seq: str) -> str:
     """I/L-collapsed sequence. Isoleucine and leucine are isobaric -- no mass spectrometer can tell
     them apart -- so two engines can legitimately spell the same molecule differently."""
@@ -3608,6 +3622,40 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
         pep_il = {e: {_il(x) for x in pep[e]} for e in names}
         prot = {e: set().union(*[_accessions(r["protein_group"]) for r in rows[e]]) if rows[e]
                 else set() for e in names}
+
+        # Protein-level comparison needs THREE units, because the engines do not report proteins the
+        # same way and an accession-set comparison silently punishes that difference rather than
+        # showing it. Measured on one dog run:
+        #
+        #   diann        1,012 groups, 293 multi-accession, 1,522 accessions,   931 genes
+        #   fragpipe       842 groups,   0 multi-accession,   842 accessions,   773 genes
+        #   spectronaut  1,365 groups, 475 multi-accession, 2,222 accessions, 1,255 genes
+        #
+        # FragPipe never emits a group with more than one accession -- its bundled DIA-NN runs with
+        # --no-prot-inf, so it performs no protein inference at that step. Comparing accession SETS
+        # therefore counts Spectronaut's extra group members as disagreement when they are a
+        # reporting convention: 19% agreement by accession against 38% by gene. Genes are the
+        # fairest cross-engine unit; the group SHAPE is reported alongside so the convention itself
+        # is visible instead of being mistaken for a result.
+        prot_rows = {e: (_engine_proteins(by_engine[e]["search_id"], real_rb) or []) for e in names}
+        genes, shape = {}, {}
+        for e in names:
+            g = set()
+            n_multi = n_acc = 0
+            for r in prot_rows[e]:
+                if r.get("gene"):
+                    g.update(x.strip() for x in str(r["gene"]).replace(",", ";").split(";") if x.strip())
+                accs = _accessions(r.get("protein_group"))
+                n_acc += len(accs)
+                if len(accs) > 1:
+                    n_multi += 1
+            genes[e] = g
+            ng = len(prot_rows[e])
+            shape[e] = {"engine": e, "n_groups": ng, "n_multi_accession": n_multi,
+                        "pct_multi": round(100.0 * n_multi / ng, 1) if ng else None,
+                        "n_accessions": n_acc,
+                        "accessions_per_group": round(n_acc / ng, 2) if ng else None,
+                        "n_genes": len(g)}
 
         def upset(sets: dict[str, set]) -> list[dict[str, Any]]:
             """One bucket per exact membership set. A key is counted in exactly one bucket, so the
@@ -3705,6 +3753,11 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
             "protein": {"union": len(set().union(*prot.values())),
                         "core": len(set.intersection(*prot.values())) if prot else 0,
                         "by_k": by_k(prot), "upset": upset(prot)},
+            "gene": ({"union": len(set().union(*genes.values())),
+                      "core": len(set.intersection(*genes.values())),
+                      "by_k": by_k(genes), "upset": upset(genes)}
+                     if all(genes.values()) else None),
+            "group_shape": [shape[e] for e in names],
             "pairwise": {"precursor": jac(prec), "peptide": jac(pep)},
             "quant_matrix": [_pair_quant(a, b) for a, b in combinations(names, 2)],
         }

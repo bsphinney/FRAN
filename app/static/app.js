@@ -2316,7 +2316,8 @@ function eAllPanel(a){
   // accessions are, because a protein count is a peptide count passed through an inference rule.
   const units = [['precursor', a.precursor, 'Precursors', 'sequence + charge'],
                  ['peptide', a.peptide, 'Peptides', 'sequence only'],
-                 ['protein', a.protein, 'Protein accessions', 'accession-matched']];
+                 ['gene', a.gene, 'Genes', 'the fair cross-engine unit'],
+                 ['protein', a.protein, 'Protein accessions', 'strictest — see grouping below']];
   const unitRows = units.filter(([, u]) => u && u.union).map(([, u, label, sub])=>{
     const all = u.core, one = (u.by_k && u.by_k['1']) || 0, mid = Math.max(0, u.union - all - one);
     const pct = n => u.union ? (100*n/u.union) : 0;
@@ -2393,6 +2394,27 @@ function eAllPanel(a){
         ${unitRows}
       </div>
       <div>
+        ${(a.group_shape||[]).length?`
+        <h3 class="text-sm font-semibold text-white mb-1">How each engine reports groups</h3>
+        <p class="text-[11px] text-slate-500 mb-2">Read this before the accession row above. The engines do not package proteins
+        the same way, so an accession comparison partly measures convention rather than findings.</p>
+        <div class="overflow-x-auto mb-5"><table class="w-full text-xs">
+          <thead><tr class="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+            <th class="text-left pb-1">engine</th><th class="text-right pb-1 px-2">groups</th>
+            <th class="text-right pb-1 px-2">multi-accession</th><th class="text-right pb-1 px-2">acc/group</th>
+            <th class="text-right pb-1 pl-2">genes</th></tr></thead>
+          <tbody>${a.group_shape.map(g=>`<tr class="border-b border-white/5">
+            <td class="py-1.5 pr-2 text-slate-300">${eDot(g.engine)}${esc(g.engine)}</td>
+            <td class="py-1.5 px-2 text-right font-mono text-white">${fmt(g.n_groups)}</td>
+            <td class="py-1.5 px-2 text-right font-mono ${g.n_multi_accession===0?'text-amber-300':'text-white'}">${fmt(g.n_multi_accession)}${g.pct_multi!=null?` <span class="text-slate-500">(${g.pct_multi}%)</span>`:''}</td>
+            <td class="py-1.5 px-2 text-right font-mono text-white">${g.accessions_per_group==null?'—':fmtF(g.accessions_per_group,2)}</td>
+            <td class="py-1.5 pl-2 text-right font-mono text-slate-300">${fmt(g.n_genes)}</td>
+          </tr>`).join('')}</tbody></table></div>
+        ${a.group_shape.some(g=>g.n_multi_accession===0)?`<div class="mb-5 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-[11px] text-amber-200">
+          <b>${a.group_shape.filter(g=>g.n_multi_accession===0).map(g=>esc(g.engine)).join(', ')}</b>
+          reports no group with more than one accession — it is not doing protein inference at this step.
+          Its accessions therefore cannot match another engine's expanded groups, which is why the accession row
+          above disagrees far more than the gene row. <b>Compare genes.</b></div>`:''}`:''}
         <h3 class="text-sm font-semibold text-white mb-1">Quantitation, every pair</h3>
         <p class="text-[11px] text-slate-500 mb-3">Correlation and scale are different questions. Engines can track each other
         almost perfectly while reporting numbers orders of magnitude apart.</p>
