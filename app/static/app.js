@@ -2310,6 +2310,48 @@ function eAllPanel(a){
       <span class="font-mono text-white">${fmt(j.shared)} <span class="text-slate-500">shared · J=${j.jaccard==null?'—':fmtF(j.jaccard,3)}</span></span>
     </div>`).join('');
 
+  // Agreement at every unit, N-way. The pairwise panel below shows the same three units for a
+  // chosen pair; this shows them for ALL engines at once, which is where the inference effect is
+  // visible: on the dog run 48% of peptides are found by all three but only 21% of protein
+  // accessions are, because a protein count is a peptide count passed through an inference rule.
+  const units = [['precursor', a.precursor, 'Precursors', 'sequence + charge'],
+                 ['peptide', a.peptide, 'Peptides', 'sequence only'],
+                 ['protein', a.protein, 'Protein accessions', 'accession-matched']];
+  const unitRows = units.filter(([, u]) => u && u.union).map(([, u, label, sub])=>{
+    const all = u.core, one = (u.by_k && u.by_k['1']) || 0, mid = Math.max(0, u.union - all - one);
+    const pct = n => u.union ? (100*n/u.union) : 0;
+    return `<div class="mb-3">
+      <div class="flex justify-between text-sm mb-1">
+        <span class="text-slate-300">${label} <span class="text-slate-500">(${sub})</span></span>
+        <span class="font-mono text-white">${fmt(u.union)} <span class="text-slate-500">total</span></span></div>
+      <div class="flex h-6 rounded-md overflow-hidden text-[10px] font-mono">
+        <div class="bg-emerald-400/70 flex items-center justify-center text-slate-900" style="width:${pct(all)}%" title="all ${a.n_engines}">${pct(all)>7?fmt(all):''}</div>
+        <div class="bg-sky-400/60 flex items-center justify-center text-slate-900" style="width:${pct(mid)}%" title="some but not all">${pct(mid)>7?fmt(mid):''}</div>
+        <div class="bg-amber-400/60 flex items-center justify-center text-slate-900" style="width:${pct(one)}%" title="exactly one engine">${pct(one)>7?fmt(one):''}</div>
+      </div>
+      <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
+        <span>all ${a.n_engines}: ${fmt(all)} (${Math.round(pct(all))}%)</span>
+        <span>partial: ${fmt(mid)}</span><span>one only: ${fmt(one)} (${Math.round(pct(one))}%)</span></div>
+    </div>`;}).join('');
+
+  // Quantitation across every pair. R2 and a scale offset each need two axes, so the N-way answer
+  // is the matrix, not a number -- and showing it whole is what removes the "pick two" step. The
+  // scale column is the one that matters: on the dog run Spectronaut reports ~438x DIA-NN for the
+  // same precursors, which is a unit difference and not biology.
+  const qm = (a.quant_matrix||[]).map(q=>{
+    const bad = q.fold_offset!=null && (q.fold_offset>2 || q.fold_offset<0.5);
+    const f = q.fold_offset==null ? '—' : (q.fold_offset>=1?`${fmtF(q.fold_offset,1)}×`:`${fmtF(1/q.fold_offset,1)}× (rev)`);
+    return `<tr class="border-b border-white/5">
+      <td class="py-1.5 pr-2 text-slate-300">${eDot(q.a)}${esc(q.a)} <span class="text-slate-600">vs</span> ${eDot(q.b)}${esc(q.b)}</td>
+      <td class="py-1.5 px-2 text-right font-mono text-white">${fmt(q.n_shared)}</td>
+      <td class="py-1.5 px-2 text-right font-mono ${q.r2!=null&&q.r2<0.8?'text-amber-300':'text-white'}">${q.r2==null?'—':fmtF(q.r2,3)}</td>
+      <td class="py-1.5 px-2 text-right font-mono ${bad?'text-amber-300 font-bold':'text-white'}">${f}</td>
+      <td class="py-1.5 px-2 text-right font-mono text-slate-300">${q.rt?fmtF(q.rt.median_delta,3):'—'}</td>
+      <td class="py-1.5 pl-2 text-right font-mono text-slate-300">${q.im?fmtF(q.im.median_delta,4):'—'}</td>
+    </tr>`;}).join('');
+  const worst = (a.quant_matrix||[]).reduce((m,q)=>{
+    const f=q.fold_offset==null?1:Math.max(q.fold_offset,1/q.fold_offset); return f>m?f:m;}, 1);
+
   const corePct = p.union? Math.round(100*p.core/p.union) : 0;
   const onePct  = p.union? Math.round(100*(p.by_k['1']||0)/p.union) : 0;
   return `
@@ -2340,6 +2382,29 @@ function eAllPanel(a){
         <h3 class="text-sm font-semibold text-white mt-4 mb-1">Pairwise overlap</h3>
         ${jac}
         <div class="text-[11px] text-slate-500 mt-2">Peptide level: ${fmt(pe.core)} found by all ${a.n_engines}${pe.rescued_by_il?`, +${pe.rescued_by_il} more once I/L is collapsed (isobaric — no instrument can tell them apart)`:''}.</div>
+      </div>
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-5 mt-6 pt-5 border-t border-white/5">
+      <div>
+        <h3 class="text-sm font-semibold text-white mb-1">Agreement at every unit</h3>
+        <p class="text-[11px] text-slate-500 mb-3">A protein count is a peptide count passed through an inference rule.
+        Watch the green shrink as the unit changes — that movement <em>is</em> the inference, not the data.</p>
+        ${unitRows}
+      </div>
+      <div>
+        <h3 class="text-sm font-semibold text-white mb-1">Quantitation, every pair</h3>
+        <p class="text-[11px] text-slate-500 mb-3">Correlation and scale are different questions. Engines can track each other
+        almost perfectly while reporting numbers orders of magnitude apart.</p>
+        <div class="overflow-x-auto"><table class="w-full text-xs">
+          <thead><tr class="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+            <th class="text-left pb-1">pair</th><th class="text-right pb-1 px-2">shared</th>
+            <th class="text-right pb-1 px-2">R²</th><th class="text-right pb-1 px-2">scale</th>
+            <th class="text-right pb-1 px-2">Δrt min</th><th class="text-right pb-1 pl-2">Δim</th>
+          </tr></thead><tbody>${qm}</tbody></table></div>
+        ${worst>2?`<div class="mt-3 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-[11px] text-amber-200">
+          <b>Do not compare these intensities across engines.</b> The largest scale gap here is ${fmtF(worst,0)}×.
+          That is a unit difference, not biology — compare ratios within an engine, never absolute values between them.</div>`:''}
       </div>
     </div>
   </div>`;

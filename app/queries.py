@@ -3584,6 +3584,7 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
     constant and software is the only variable.
     """
     def _p() -> dict[str, Any]:
+        import math
         from itertools import combinations
         real_rb = resolve_run_key(raw_basename)
         searches = engine_run_searches(real_rb)
@@ -3638,6 +3639,40 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
                             "jaccard": round(len(sets[a] & sets[b]) / u, 4) if u else None})
             return out
 
+        # Quantitation is intrinsically a PAIR question -- a correlation and a scale offset need two
+        # axes -- so the N-way answer is not one number but the full matrix. Computing every pair
+        # here is what removes the "pick two" step: the page can show all of them at once.
+        rowd = {e: {(r["stripped_seq"], r["charge"]): r for r in rows[e]} for e in names}
+
+        def _pair_quant(a: str, b: str) -> dict[str, Any]:
+            shared = set(rowd[a]) & set(rowd[b])
+            xs, ys = [], []
+            for k in shared:
+                ia, ib = rowd[a][k].get("intensity"), rowd[b][k].get("intensity")
+                if ia and ib and ia > 0 and ib > 0:
+                    xs.append(math.log10(ia)); ys.append(math.log10(ib))
+            r = None
+            if len(xs) > 10:
+                n = len(xs); mx = sum(xs)/n; my = sum(ys)/n
+                cov = sum((x-mx)*(y-my) for x, y in zip(xs, ys))
+                vx = math.sqrt(sum((x-mx)**2 for x in xs)); vy = math.sqrt(sum((y-my)**2 for y in ys))
+                r = cov/(vx*vy) if vx and vy else None
+            ratios = sorted(x - y for x, y in zip(xs, ys))
+            med = ratios[len(ratios)//2] if ratios else None
+
+            def phys(field, tol):
+                ds = sorted(rowd[a][k][field] - rowd[b][k][field] for k in shared
+                            if rowd[a][k].get(field) is not None and rowd[b][k].get(field) is not None)
+                if len(ds) < 10:
+                    return None
+                return {"n": len(ds), "median_delta": ds[len(ds)//2],
+                        "within_tol_pct": 100.0*sum(1 for x in ds if abs(x) < tol)/len(ds)}
+
+            return {"a": a, "b": b, "n_shared": len(shared), "n_quantified": len(xs),
+                    "r2": (r*r if r is not None else None),
+                    "fold_offset": (10**med if med is not None else None),
+                    "rt": phys("rt", 1.0), "im": phys("im", 0.05)}
+
         core_prec = set.intersection(*prec.values())
         core_pep = set.intersection(*pep.values())
         core_pep_il = set.intersection(*pep_il.values())
@@ -3668,8 +3703,10 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
                         "rescued_by_il": len(core_pep_il) - len(core_pep),
                         "by_k": by_k(pep), "upset": upset(pep)},
             "protein": {"union": len(set().union(*prot.values())),
-                        "core": len(set.intersection(*prot.values())) if prot else 0},
+                        "core": len(set.intersection(*prot.values())) if prot else 0,
+                        "by_k": by_k(prot), "upset": upset(prot)},
             "pairwise": {"precursor": jac(prec), "peptide": jac(pep)},
+            "quant_matrix": [_pair_quant(a, b) for a, b in combinations(names, 2)],
         }
 
     return SLOW_CACHE.get_or_set(f"engine_comparison_all:{raw_basename}", _p)
