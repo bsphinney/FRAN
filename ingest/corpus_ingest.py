@@ -543,9 +543,13 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # Spectronaut rows, whose output_dir is a Windows path — so treat the stored row as the
         # fallback and only let a fresh detection win.
         prior_fa = {}
-        cur.execute("""SELECT id, fasta_path, fasta_md5, fasta_n_proteins, contaminant_lib
+        prior_ver = None
+        cur.execute("""SELECT id, fasta_path, fasta_md5, fasta_n_proteins, contaminant_lib,
+                              search_engine_version
                        FROM delimp_searches WHERE output_dir=%s""", (output_dir,))
-        for sid, _fp, _md5, _np, _cl in cur.fetchall():
+        for sid, _fp, _md5, _np, _cl, _ev in cur.fetchall():
+            if _ev and prior_ver is None:
+                prior_ver = _ev
             for k, v in (("fasta_path", _fp), ("fasta_md5", _md5),
                          ("fasta_n_proteins", _np), ("contaminant_lib", _cl)):
                 if v is not None and prior_fa.get(k) is None:
@@ -591,7 +595,24 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             engine_ver = _detect_version(engine, report, output_dir)
         except Exception:  # noqa: BLE001 - never fail an ingest over a version string
             engine_ver = None
-        print(f"  engine version: {engine_ver or 'not found (no setup.txt/log beside the report)'}")
+        # Same clobber exposure as the FASTA fields, and it costs more here because the column has
+        # been BACKFILLED: search_engine_version went from 27/72 DIA-NN searches to 70/72 on
+        # 2026-08-25 by reading sidecars reachable from Hive but not from the ingesting host. Since
+        # this is a DELETE-then-INSERT, a re-ingest that cannot re-detect writes NULL straight over
+        # that recovered value. Detection needs a sidecar beside the report, which archived
+        # parquet-only exports do not have, so failing to re-detect is the NORMAL case, not an edge
+        # one -- 654 searches are unversioned for exactly that reason.
+        #
+        # A fresh detection always wins: re-exporting to the same output_dir with a newer
+        # Spectronaut is a real scenario, and that export carries its own sidecar, so detection
+        # succeeds and the new version is correct. The stored value is only a fallback for "could
+        # not tell", which is never a reason to forget what we already knew.
+        if not engine_ver and prior_ver:
+            engine_ver = prior_ver
+            print(f"  engine version: kept {prior_ver} from the previous ingest "
+                  f"(re-detect found no sidecar)", flush=True)
+        else:
+            print(f"  engine version: {engine_ver or 'not found (no setup.txt/log beside the report)'}")
         # Which DATABASE the search used. Same contract as engine_version above: best effort,
         # never fatal. Without it the corpus cannot tell a user whether two searches are even
         # comparable -- entries-per-gene is what decides whether a protein-count gap is a real
