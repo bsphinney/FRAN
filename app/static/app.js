@@ -2464,7 +2464,32 @@ function eAllPanel(a){
     </div>
 
     <div class="grid lg:grid-cols-2 gap-5 mt-6 pt-5 border-t border-white/5">
-      <div>
+      <div class="lg:col-span-2">
+        ${(a.consensus_quality||[]).length?`
+        <h3 class="text-sm font-semibold text-white mb-1">Does quality track agreement?</h3>
+        <p class="text-[11px] text-slate-500 mb-3">The pairwise question is "are engine A's unique IDs weaker than its shared ones?".
+        This is the version that needs no pair: group every precursor by how many engines agreed, and see what each group looks like.
+        If the one-engine population sits at the same intensity and confidence as the all-engine one, the extra depth is simply
+        <em>found</em>; if it clusters near the noise floor, an engine is reaching deeper — a legitimate choice, but not the same claim.</p>
+        <div class="overflow-x-auto mb-2"><table class="w-full text-xs">
+          <thead><tr class="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+            <th class="text-left pb-1">agreed by</th><th class="text-right pb-1 px-2">precursors</th>
+            <th class="text-right pb-1 px-2">median log₁₀ intensity</th><th class="text-right pb-1 pl-2">median q-value</th>
+          </tr></thead><tbody>${a.consensus_quality.map(c=>{
+            const top = c.n_engines===a.n_engines, one = c.n_engines===1;
+            return `<tr class="border-b border-white/5">
+              <td class="py-1.5 pr-2 ${top?'text-emerald-300':one?'text-amber-300':'text-slate-300'}">${c.n_engines} of ${a.n_engines}${top?' — all agree':one?' — one engine alone':''}</td>
+              <td class="py-1.5 px-2 text-right font-mono text-white">${fmt(c.n_precursors)}</td>
+              <td class="py-1.5 px-2 text-right font-mono ${one?'text-amber-300':'text-white'}">${c.median_log10_intensity==null?'—':fmtF(c.median_log10_intensity,2)}</td>
+              <td class="py-1.5 pl-2 text-right font-mono text-slate-300">${c.median_q==null?'—':Number(c.median_q).toExponential(1)}</td>
+            </tr>`;}).join('')}</tbody></table></div>
+        ${(()=>{const cs=a.consensus_quality, hi=cs.find(c=>c.n_engines===a.n_engines), lo=cs.find(c=>c.n_engines===1);
+          if(!hi||!lo||hi.median_log10_intensity==null||lo.median_log10_intensity==null) return '';
+          const fold=Math.pow(10, hi.median_log10_intensity-lo.median_log10_intensity);
+          return `<div class="rounded-lg border border-white/10 bg-white/5 p-3 text-[11px] text-slate-300 mb-5">
+            Precursors only <b>one</b> engine reported are <b class="text-amber-300">${fold>=10?fmtF(fold,0):fmtF(fold,1)}×</b> weaker
+            in median intensity than those <b>all ${a.n_engines}</b> agree on${hi.median_q!=null&&lo.median_q!=null?`, and ${fmtF(lo.median_q/hi.median_q,0)}× less confident by q-value`:''}.
+            ${fold>5?'That is the signature of engines reaching into the noise floor, not of one engine simply finding more.':'The unique identifications look comparable in strength to the shared ones.'}</div>`;})()}`:''}
         <h3 class="text-sm font-semibold text-white mb-1">Agreement at every unit</h3>
         <p class="text-[11px] text-slate-500 mb-3">A protein count is a peptide count passed through an inference rule.
         Watch the green shrink as the unit changes — that movement <em>is</em> the inference, not the data.</p>

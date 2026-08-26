@@ -3721,6 +3721,37 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
                     "fold_offset": (10**med if med is not None else None),
                     "rt": phys("rt", 1.0), "im": phys("im", 0.05)}
 
+        # THE N-WAY FORM OF "is the extra depth real?". The pairwise panel asks whether engine A's
+        # unique identifications are weaker than the ones it shares with B. The better question,
+        # and the one that needs no pair at all: does identification QUALITY track how many engines
+        # agree? Group every precursor by consensus level and report what each level looks like.
+        #
+        # If the k=1 population sits at the same intensity and q-value as k=N, the extra depth is
+        # simply found. If it clusters near the noise floor, engines are reaching deeper -- a
+        # legitimate choice, but not the same claim.
+        consensus = []
+        seen_keys: dict[tuple, int] = {}
+        for e in names:
+            for k in prec[e]:
+                seen_keys[k] = seen_keys.get(k, 0) + 1
+        for k_level in range(len(names), 0, -1):
+            ints, qs = [], []
+            for e in names:
+                for key, r in rowd[e].items():
+                    if seen_keys.get(key) != k_level:
+                        continue
+                    if r.get("intensity") and r["intensity"] > 0:
+                        ints.append(math.log10(r["intensity"]))
+                    if r.get("q_value") is not None:
+                        qs.append(r["q_value"])
+            n_keys = sum(1 for v in seen_keys.values() if v == k_level)
+            ints.sort(); qs.sort()
+            consensus.append({
+                "n_engines": k_level, "n_precursors": n_keys,
+                "median_log10_intensity": (ints[len(ints)//2] if ints else None),
+                "median_q": (qs[len(qs)//2] if qs else None),
+                "n_quantified": len(ints)})
+
         core_prec = set.intersection(*prec.values())
         core_pep = set.intersection(*pep.values())
         core_pep_il = set.intersection(*pep_il.values())
@@ -3760,6 +3791,7 @@ def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
             "group_shape": [shape[e] for e in names],
             "pairwise": {"precursor": jac(prec), "peptide": jac(pep)},
             "quant_matrix": [_pair_quant(a, b) for a, b in combinations(names, 2)],
+            "consensus_quality": consensus,
         }
 
     return SLOW_CACHE.get_or_set(f"engine_comparison_all:{raw_basename}", _p)
