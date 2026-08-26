@@ -35,7 +35,11 @@ SIF=/quobyte/proteomics-grp/apptainers/postgres16.sif
 PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
 CODE=/quobyte/proteomics-grp/brett/glendon/fran_ingest
 DEST=/nfs/lssc0/flinders/proteomics/Data/de-limp-db-backups
-KEEP="${FRAN_BACKUP_KEEP:-4}"
+# 12 weekly generations ~= 85 days. KEEP=4 gave 28 days, thin cover for what is believed to be
+# the ONLY copy of the corpus: corruption not noticed inside four weeks would have had no clean
+# dump behind it. At ~50 GB a dump that is ~600 GB against 94 TB free, so it is not
+# space-constrained, and the variable stays overridable.
+KEEP="${FRAN_BACKUP_KEEP:-12}"
 STAMP=$(date '+%Y%m%d_%H%M')
 OUT="$DEST/delimp_${STAMP}.dump"
 
@@ -101,6 +105,9 @@ echo "  wrote $OUT ($sz) in ${el}s; $(wc -l < "$OUT.toc") archive entries verifi
 
 # Retention. Never prunes below one surviving dump, and only ever removes files it can see are
 # complete (.part and .bad are excluded by the glob).
+# The glob deliberately does not reach into legacy_pg18/. Those dumps are archive format 1.16
+# (pg_dump 18.4) and CANNOT be read by the pg_restore 16.15 this job uses. They are the only
+# pre-August generations, so retention must not eat them.
 mapfile -t old < <(ls -1t "$DEST"/delimp_*.dump 2>/dev/null | tail -n +$((KEEP+1)))
 if [ ${#old[@]} -gt 0 ]; then
   for f in "${old[@]}"; do echo "  pruning $(basename "$f") ($(du -h "$f" | cut -f1))"; rm -f "$f" "$f.toc"; done
