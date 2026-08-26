@@ -63,18 +63,36 @@ def main() -> int:
         found += 1
         md5s += bool(got.get("fasta_md5"))
         counts += bool(got.get("fasta_n_proteins"))
-        print(f"  {engine:12s} {os.path.basename(str(got['fasta_path']))[:52]:52s} "
-              f"n={got.get('fasta_n_proteins') or '-'}")
+        # basename() alone leaves Windows paths whole on POSIX, and most output_dir values in
+        # this corpus are Windows paths -- normalise first or the dry run is unreadable.
+        shown = os.path.basename(str(got["fasta_path"]).replace("\\", "/"))
+        print(f"  {engine:12s} {shown[:52]:52s} n={got.get('fasta_n_proteins') or '-'}")
         if a.commit:
+            # COALESCE so a detection that resolved the path but not the md5 cannot blank an
+            # md5 already on the row (the spectrum_lance.register() lesson) -- but only while
+            # the row still names the SAME database. Once --redo resolves a DIFFERENT file the
+            # stored md5 and entry count describe the old one, and keeping them would pair a
+            # fresh path with a stale fingerprint, which reads as verified provenance and is
+            # worse than a NULL. Every SET expression sees the pre-UPDATE fasta_path, so the
+            # single CASE is evaluated against the stored value even though fasta_path is
+            # assigned in the same statement. Named placeholders: this file's INSERTs have
+            # twice been broken by positional drift.
             cur.execute(
                 """UPDATE delimp_searches
-                      SET fasta_path        = COALESCE(%s, fasta_path),
-                          fasta_md5         = COALESCE(%s, fasta_md5),
-                          fasta_n_proteins  = COALESCE(%s, fasta_n_proteins),
-                          contaminant_lib   = COALESCE(%s, contaminant_lib)
-                    WHERE id = %s""",
-                (got.get("fasta_path"), got.get("fasta_md5"),
-                 got.get("fasta_n_proteins"), got.get("contaminant_lib"), sid))
+                      SET fasta_md5        = CASE WHEN fasta_path IS DISTINCT FROM %(path)s
+                                                  THEN %(md5)s
+                                                  ELSE COALESCE(%(md5)s, fasta_md5) END,
+                          fasta_n_proteins = CASE WHEN fasta_path IS DISTINCT FROM %(path)s
+                                                  THEN %(n)s
+                                                  ELSE COALESCE(%(n)s, fasta_n_proteins) END,
+                          contaminant_lib  = CASE WHEN fasta_path IS DISTINCT FROM %(path)s
+                                                  THEN %(contam)s
+                                                  ELSE COALESCE(%(contam)s, contaminant_lib) END,
+                          fasta_path       = %(path)s
+                    WHERE id = %(id)s""",
+                {"path": got.get("fasta_path"), "md5": got.get("fasta_md5"),
+                 "n": got.get("fasta_n_proteins"), "contam": got.get("contaminant_lib"),
+                 "id": sid})
     if a.commit:
         cn.commit()
     print(f"\nresolved a database for {found}/{len(rows)} "

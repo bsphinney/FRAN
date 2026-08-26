@@ -71,10 +71,24 @@ def _first(patterns: list[str], root: str) -> list[str]:
     return hits
 
 
+_STAT_CACHE: dict[tuple, tuple[str | None, int | None]] = {}
+
+
 def _stat_fasta(path: str) -> tuple[str | None, int | None]:
     """(md5, n_proteins) for a reachable FASTA; (None, None) otherwise. Streams — these files
-    run to hundreds of MB and the ingest host should not hold one in memory."""
+    run to hundreds of MB and the ingest host should not hold one in memory.
+
+    Memoised on (realpath, size, mtime) because backfill_fasta.py replays this over ~2,000
+    searches and a whole lab shares a handful of proteomes: without the memo the same
+    UP000005640 is re-hashed once per search."""
     if not path or not os.path.isfile(path):
+        return None, None
+    try:
+        st = os.stat(path)
+        key = (os.path.realpath(path), st.st_size, st.st_mtime_ns)
+        if key in _STAT_CACHE:
+            return _STAT_CACHE[key]
+    except OSError:
         return None, None
     try:
         h = hashlib.md5()  # noqa: S324 - provenance fingerprint, not a security control
@@ -90,7 +104,8 @@ def _stat_fasta(path: str) -> tuple[str | None, int | None]:
                 first = False
                 n += (tail + chunk).count(b"\n>")
                 tail = chunk[-1:]
-        return h.hexdigest(), n or None
+        _STAT_CACHE[key] = (h.hexdigest(), n or None)
+        return _STAT_CACHE[key]
     except OSError:
         return None, None
 
@@ -103,8 +118,11 @@ def _resolve(name: str, search_roots: list[str]) -> str | None:
     for root in search_roots:
         if not root or not os.path.isdir(root):
             continue
-        for cand in (os.path.join(root, base), *glob.glob(os.path.join(root, "**", base),
-                                                          recursive=False)):
+        # One level down, deliberately: the FASTA roots handed in are shares like
+        # /quobyte/proteomics-grp/MRS and a recursive walk there is minutes of stat() per
+        # search. A database that is buried deeper stays unresolved (path only, no md5),
+        # which is the honest answer.
+        for cand in (os.path.join(root, base), *glob.glob(os.path.join(root, "*", base))):
             if os.path.isfile(cand):
                 return cand
     return None
@@ -140,15 +158,21 @@ def detect(engine: str, report_path: str | None, search_dir: str | None = None,
                     search_db = [n for n in names if not _CONTAM_HINT.search(n)]
                     contam = [n for n in names if _CONTAM_HINT.search(n)]
                     if not search_db:
-                        continue
+                        # Every entry looked like a contaminant list, so the name is doing the
+                        # lying, not the search: a proteome built with contaminants appended
+                        # ("..._plus_contaminants.fasta") is one file and it IS the database.
+                        search_db, contam = names, []
                     name = search_db[0].strip()
                     resolved = _resolve(name, extra)
                     md5, n_prot = _stat_fasta(resolved) if resolved else (None, None)
                     return {"fasta_path": resolved or name,
                             "fasta_md5": md5, "fasta_n_proteins": n_prot,
                             "contaminant_lib": contam[0].strip() if contam else None}
-        elif eng in ("diann", "dia-nn", "fragpipe"):
-            # FragPipe's bundled DIA-NN writes the same log, so the same parse serves both.
+        else:
+            # DIA-NN's log, and everything that embeds DIA-NN: FragPipe's bundled copy writes the
+            # same log, and Radiant/Fulcrum is a container around one. engine_version.py falls
+            # through to the DIA-NN parse for unknown engines for the same reason. The regex
+            # requires a literal `--fasta`, so a log from something else simply does not match.
             for root in roots:
                 for p in _first(["report.log.txt", "*.log.txt", "*.log",
                                  os.path.join("dia-quant-output", "report.log.txt")], root):
@@ -157,7 +181,9 @@ def detect(engine: str, report_path: str | None, search_dir: str | None = None,
                         continue
                     paths = [h.strip("\"'") for h in hits]
                     contam = [x for x in paths if _CONTAM_HINT.search(os.path.basename(x))]
-                    main = [x for x in paths if x not in contam] or paths
+                    main = [x for x in paths if x not in contam]
+                    if not main:  # as in the Spectronaut branch: a single "..._contaminants.fasta"
+                        main, contam = paths, []  # is the database, not the contaminant library
                     resolved = _resolve(main[0], extra) or (
                         main[0] if os.path.isabs(main[0]) else None)
                     md5, n_prot = _stat_fasta(resolved) if resolved else (None, None)
