@@ -738,8 +738,13 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             # gradient: EvoSep map if SPD known, else the observed RT span as a proxy
             grad = (_SPD_GRAD.get(int(spd)) if (spd and int(spd) in _SPD_GRAD)
                     else (round(float(run_max_rt[run]), 2) if run_max_rt.get(run) else None))
-            _im, _is = _norm_instrument(md.get("instrument_model"), md.get("instrument_serial"))
-            _plat = _resolve_platform(md.get("platform") or platform, _im, md.get("mobility_min"))
+            # NOT named _im/_is. `_im` is a MODULE-LEVEL function (ion mobility, used at line ~364
+            # and in both precursor COPY paths); binding that name anywhere inside ingest() makes it
+            # a local for the WHOLE function, so the earlier call raises UnboundLocalError and every
+            # Spectronaut ingest fails fast. Caught fleet-wide by win-2 on 2026-08-26.
+            _imodel, _iserial = _norm_instrument(md.get("instrument_model"),
+                                                 md.get("instrument_serial"))
+            _plat = _resolve_platform(md.get("platform") or platform, _imodel, md.get("mobility_min"))
             cur.execute("""INSERT INTO raw_files (raw_path,raw_basename,raw_name_anonymized,platform,
                            acquisition_method,samples_per_day,gradient_minutes,
                            instrument_model,instrument_serial,acquisition_date,
@@ -764,7 +769,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                            file_size_bytes=COALESCE(EXCLUDED.file_size_bytes, raw_files.file_size_bytes),
                            instrument_metadata_json=COALESCE(EXCLUDED.instrument_metadata_json, raw_files.instrument_metadata_json)""",
                         (rp, run, sanitize(run), _plat, acq, spd, grad,
-                         _im, _is, md.get("acquisition_date"),
+                         _imodel, _iserial, md.get("acquisition_date"),
                          md.get("mass_range_min"), md.get("mass_range_max"), md.get("mobility_min"), md.get("mobility_max"),
                          md.get("n_ms1_frames"), md.get("n_ms2_frames"), md.get("file_size_bytes"),
                          md.get("instrument_metadata_json"), SCHEMA_VERSION))
