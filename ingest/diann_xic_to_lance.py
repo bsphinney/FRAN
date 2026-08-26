@@ -185,28 +185,41 @@ def main():
     ap.add_argument("--apply", action="store_true", help="write Lance + register (else dry run)")
     a = ap.parse_args()
 
+    # DIA-NN's XIC layout is not one shape. A single --out run writes report_xic/<run>.xic.parquet,
+    # but a per-run driver writes ONE DIRECTORY PER RUN -- e.g. the NIST bat project has
+    # <species>/DIA_NN_TEMP/<run>.d_report_xic/<run>.xic.parquet, 638 of them. Collect both, and
+    # collect them ONLY from under the given root: an earlier survey globbed a sibling directory and
+    # paired 318 unrelated XIC files to a search, which would have attached another run's
+    # chromatograms to it.
     xd = a.xic_dir or os.path.join(a.dir, "report_xic")
     if not os.path.isdir(xd):
         xd = a.dir
-    xics = sorted(f for f in os.listdir(xd) if f.endswith(".xic.parquet"))
-    if not xics:
+    found: dict[str, str] = {}                    # run -> path, first hit wins
+    for dirpath, _dirnames, filenames in os.walk(xd):
+        for fn in filenames:
+            if fn.endswith(".xic.parquet"):
+                found.setdefault(fn[:-len(".xic.parquet")], os.path.join(dirpath, fn))
+    if not found:
         raise SystemExit(f"no *.xic.parquet under {xd}")
+    xics = sorted(found)
+    print(f"xic layout: {len(xics)} run(s) under {xd}"
+          f"{' (nested per-run directories)' if any(os.path.dirname(v) != xd for v in found.values()) else ''}",
+          flush=True)
     rep = a.report or next((os.path.join(a.dir, n) for n in ("report.parquet", "report.tsv")
                             if os.path.exists(os.path.join(a.dir, n))), None)
     if not rep:
         raise SystemExit(f"no report.parquet/report.tsv in {a.dir}")
     keep = {r for r in a.runs.split(",") if r} or None
 
-    print(f"xic files: {len(xics)}  report: {os.path.basename(rep)}", flush=True)
+    print(f"report: {os.path.basename(rep)}", flush=True)
     meta, by_pr = _report_meta(rep)
     print(f"report metadata rows: {len(meta):,}  distinct precursors: {len(by_pr):,}", flush=True)
 
     total, ntr, first = 0, 0, True
-    for fn in xics:
-        run = fn[:-len(".xic.parquet")]
+    for run in xics:
         if keep and run not in keep:
             continue
-        rows = build_rows(os.path.join(xd, fn), run, meta, by_pr, a.search_id, a.search_name)
+        rows = build_rows(found[run], run, meta, by_pr, a.search_id, a.search_name)
         rep_here = sum(1 for r in rows if r["q_value"] is not None)
         mbr = len(rows) - rep_here
         print(f"  {run}: {len(rows):,} precursors, {sum(r['n_traces'] for r in rows):,} traces, "
