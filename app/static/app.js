@@ -2270,6 +2270,81 @@ const ECOL = {a:'#00B5E2', b:'#FFBF00', both:'#6CCA98'};
 
 // A three-part bar: only-A | shared | only-B. Reads as one population split three ways, which is
 // what it is — far easier to judge than two separate totals.
+// All engines on one acquisition, no pair to pick. The pairwise view below answers "A vs B", which
+// cannot show the most useful thing when three engines ran the same file: how often TWO agree
+// against the THIRD. Two independent algorithms agreeing is far stronger evidence than one
+// engine's own confidence score, so those buckets get their own row.
+const ENG_COLOR = {spectronaut:'#0E6F79', diann:'#A8681A', fragpipe:'#2E7346', radiant:'#7C3AED'};
+function eDot(e){ return `<span class="inline-block w-2 h-2 rounded-full align-middle mr-1" style="background:${ENG_COLOR[e]||'#64748b'}"></span>`; }
+
+function eAllPanel(a){
+  if(!a || a.error || !a.engines || a.n_engines<2) return '';
+  const p=a.precursor, pe=a.peptide;
+  const maxN = Math.max(...p.upset.map(b=>b.n), 1);
+  const bars = p.upset.map(b=>{
+    const w = Math.max(1, Math.round(100*b.n/maxN));
+    const lbl = b.engines.map(e=>eDot(e)+esc(e)).join('<span class="text-slate-600 mx-1">+</span>');
+    const tone = b.n_engines===a.n_engines ? 'bg-emerald-400/70'
+               : b.n_engines===1 ? 'bg-amber-400/60' : 'bg-sky-400/60';
+    const tag = b.n_engines===a.n_engines ? 'all agree'
+              : b.n_engines===1 ? 'only this engine' : `${b.n_engines} of ${a.n_engines}`;
+    return `<div class="mb-2">
+      <div class="flex justify-between items-baseline text-xs mb-1">
+        <span class="text-slate-300">${lbl} <span class="text-slate-600">· ${tag}</span></span>
+        <span class="font-mono text-white">${fmt(b.n)}</span></div>
+      <div class="h-2 rounded bg-white/5 overflow-hidden"><div class="h-full ${tone}" style="width:${w}%"></div></div>
+    </div>`;}).join('');
+
+  const cards = a.engines.map(e=>`
+    <div class="rounded-lg border border-white/5 p-3">
+      <div class="text-sm font-semibold text-white">${eDot(e.engine)}${esc(e.engine)}</div>
+      <div class="text-[10px] text-slate-500 mb-2 truncate">${esc(e.search_engine_version||'version not recorded')}</div>
+      <div class="text-lg font-mono text-white">${fmt(e.n_precursors)}</div>
+      <div class="text-[10px] text-slate-500">precursors · ${fmt(e.n_peptides)} peptides</div>
+      <div class="text-[11px] mt-1 text-amber-300">${fmt(e.n_unique_precursors)} <span class="text-slate-500">found by this engine alone</span></div>
+    </div>`).join('');
+
+  const jac = a.pairwise.precursor.map(j=>`
+    <div class="flex justify-between text-xs py-1 border-b border-white/5">
+      <span class="text-slate-300">${eDot(j.a)}${esc(j.a)} <span class="text-slate-600">vs</span> ${eDot(j.b)}${esc(j.b)}</span>
+      <span class="font-mono text-white">${fmt(j.shared)} <span class="text-slate-500">shared · J=${j.jaccard==null?'—':fmtF(j.jaccard,3)}</span></span>
+    </div>`).join('');
+
+  const corePct = p.union? Math.round(100*p.core/p.union) : 0;
+  const onePct  = p.union? Math.round(100*(p.by_k['1']||0)/p.union) : 0;
+  return `
+  <div class="glass card p-5 mb-5 fade-in">
+    <div class="flex justify-between items-baseline flex-wrap gap-2">
+      <h2 class="font-bold text-white">All ${a.n_engines} engines on this run</h2>
+      <div class="text-xs text-slate-500">${fmt(p.union)} precursors found by at least one engine</div>
+    </div>
+    <p class="text-xs text-slate-500 mt-1 mb-4">Same raw file for every engine, so sample, instrument and gradient are held
+      constant and the software is the only variable.</p>
+    <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">${cards}</div>
+    <div class="grid lg:grid-cols-2 gap-5">
+      <div>
+        <h3 class="text-sm font-semibold text-white mb-1">Who found what</h3>
+        <p class="text-[11px] text-slate-500 mb-3">One bar per exact combination — every precursor is counted once, so the bars sum to ${fmt(p.union)}.</p>
+        ${bars}
+      </div>
+      <div>
+        <h3 class="text-sm font-semibold text-white mb-2">Headline</h3>
+        <div class="rounded-lg bg-white/5 p-3 mb-3">
+          <div class="text-2xl font-mono text-emerald-300">${fmt(p.core)} <span class="text-sm text-slate-400">(${corePct}%)</span></div>
+          <div class="text-xs text-slate-400">found by <b>all ${a.n_engines}</b> — the identifications no engine choice would change</div>
+        </div>
+        <div class="rounded-lg bg-white/5 p-3 mb-3">
+          <div class="text-2xl font-mono text-amber-300">${fmt(p.by_k['1']||0)} <span class="text-sm text-slate-400">(${onePct}%)</span></div>
+          <div class="text-xs text-slate-400">claimed by <b>exactly one</b> engine — where the choice of software decides your result</div>
+        </div>
+        <h3 class="text-sm font-semibold text-white mt-4 mb-1">Pairwise overlap</h3>
+        ${jac}
+        <div class="text-[11px] text-slate-500 mt-2">Peptide level: ${fmt(pe.core)} found by all ${a.n_engines}${pe.rescued_by_il?`, +${pe.rescued_by_il} more once I/L is collapsed (isobaric — no instrument can tell them apart)`:''}.</div>
+      </div>
+    </div>
+  </div>`;
+}
+
 function eSplit(onlyA, both, onlyB, la, lb){
   const t = (onlyA+both+onlyB)||1, pc = n => (100*n/t).toFixed(1);
   return `<div>
@@ -2350,6 +2425,7 @@ async function renderEngineRun(rb){
     const qs = (sel.a&&sel.b)?`?a=${encodeURIComponent(sel.a)}&b=${encodeURIComponent(sel.b)}`:'';
     const d = await api(`/api/engines/run/${encodeURIComponent(rb)}${qs}`);
     const A=d.engine_a, B=d.engine_b, la=A.engine, lb=B.engine;
+    const allEng = await api(`/api/engines/run/${encodeURIComponent(rb)}/all`).catch(()=>null);
     const all = await api(`/api/engines/runs?limit=300`).catch(()=>({rows:[]}));
     const mine = (all.rows||[]).find(r=>r.raw_basename===rb) || {engines:[la,lb]};
 
@@ -2394,6 +2470,8 @@ async function renderEngineRun(rb){
       </div>
       ${scope}
     </div>
+
+    ${eAllPanel(allEng)}
 
     <div class="grid lg:grid-cols-2 gap-5 mb-5">
       <div class="glass card p-5">

@@ -23,7 +23,7 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
-APP_VERSION = "0.18.1"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
+APP_VERSION = "0.19.0"  # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
                         # quant r2 vs scale offset, accession-level protein matching, charge/IL
                         # miscounts, and the shared-vs-unique depth profile. Four engines now in
                         # the corpus (Spectronaut, DIA-NN, FragPipe, Radiant).
@@ -873,6 +873,12 @@ def api_engine_run(raw_basename: str, a: str = Query(""), b: str = Query("")):
     if not res or res.get("error"):
         raise HTTPException(404, (res or {}).get("error") or "No multi-engine comparison for that run.")
     return ok(res)
+
+
+@app.get("/api/engines/run/{raw_basename}/all")
+def api_engines_run_all(raw_basename: str):
+    """Every engine that searched this acquisition, in one view (no pair to pick)."""
+    return ok(_safe(lambda: queries.engine_comparison_all(raw_basename), {}))
 
 
 @app.get("/api/engines/run/{raw_basename}/peptides")

@@ -3567,6 +3567,114 @@ def _accessions(pg: str) -> set[str]:
     return {a.strip() for a in str(pg or "").split(";") if a.strip()}
 
 
+def engine_comparison_all(raw_basename: str) -> dict[str, Any]:
+    """EVERY engine that searched one acquisition, in one view — not a pair.
+
+    The pairwise view answers "A vs B", which is the wrong question when three engines ran the same
+    file: the interesting quantities are how many identifications ALL of them agree on, how many
+    each one claims alone, and — the part a pair can never show — how often two engines agree
+    against the third. That last one is the useful signal, because two independent algorithms
+    agreeing is much stronger evidence than one engine's confidence score.
+
+    So the core output is an UpSet-style breakdown: a count for every non-empty COMBINATION of
+    engines, keyed on the exact set that found each precursor. With 3 engines that is 7 buckets,
+    which is the whole picture rather than three separate pairwise slices of it.
+
+    Everything is computed on the SAME raw file, so sample, instrument and gradient are held
+    constant and software is the only variable.
+    """
+    def _p() -> dict[str, Any]:
+        from itertools import combinations
+        real_rb = resolve_run_key(raw_basename)
+        searches = engine_run_searches(real_rb)
+        if len(searches) < 2:
+            return {"raw_basename": raw_basename, "error": "fewer than two searches cover this run"}
+        by_engine: dict[str, dict] = {}
+        for s in searches:                       # newest search wins per engine
+            by_engine[s["search_engine"]] = s
+        # 2**n combinations are enumerated below, so refuse a pathological n rather than melt.
+        names = sorted(by_engine)[:6]
+
+        rows: dict[str, list] = {}
+        for e in names:
+            rows[e] = _engine_precursors(by_engine[e]["search_id"], real_rb)
+        names = [e for e in names if rows.get(e)]
+        if len(names) < 2:
+            return {"raw_basename": raw_basename, "error": "no precursors for at least two engines"}
+
+        prec = {e: {(r["stripped_seq"], r["charge"]) for r in rows[e]} for e in names}
+        pep = {e: {r["stripped_seq"] for r in rows[e]} for e in names}
+        pep_il = {e: {_il(x) for x in pep[e]} for e in names}
+        prot = {e: set().union(*[_accessions(r["protein_group"]) for r in rows[e]]) if rows[e]
+                else set() for e in names}
+
+        def upset(sets: dict[str, set]) -> list[dict[str, Any]]:
+            """One bucket per exact membership set. A key is counted in exactly one bucket, so the
+            buckets sum to the union — which is what makes them readable as a breakdown."""
+            universe = set().union(*sets.values())
+            owner: dict[frozenset, int] = {}
+            for k in universe:
+                who = frozenset(e for e in sets if k in sets[e])
+                owner[who] = owner.get(who, 0) + 1
+            out = []
+            for who, n in owner.items():
+                out.append({"engines": sorted(who), "n_engines": len(who), "n": n})
+            out.sort(key=lambda x: (-x["n_engines"], -x["n"]))
+            return out
+
+        def by_k(sets: dict[str, set]) -> dict[str, int]:
+            universe = set().union(*sets.values())
+            h: dict[str, int] = {}
+            for k in universe:
+                c = str(sum(1 for e in sets if k in sets[e]))
+                h[c] = h.get(c, 0) + 1
+            return dict(sorted(h.items(), key=lambda x: -int(x[0])))
+
+        def jac(sets: dict[str, set]) -> list[dict[str, Any]]:
+            out = []
+            for a, b in combinations(names, 2):
+                u = len(sets[a] | sets[b])
+                out.append({"a": a, "b": b, "shared": len(sets[a] & sets[b]),
+                            "jaccard": round(len(sets[a] & sets[b]) / u, 4) if u else None})
+            return out
+
+        core_prec = set.intersection(*prec.values())
+        core_pep = set.intersection(*pep.values())
+        core_pep_il = set.intersection(*pep_il.values())
+
+        engines_out = []
+        for e in names:
+            others_p = set().union(*[prec[o] for o in names if o != e])
+            others_q = set().union(*[pep[o] for o in names if o != e])
+            s = by_engine[e]
+            engines_out.append({
+                "engine": e,
+                "search_name": s.get("search_name"),
+                "search_engine_version": s.get("search_engine_version"),
+                "n_precursors": len(prec[e]), "n_peptides": len(pep[e]),
+                "n_protein_accessions": len(prot[e]),
+                "n_unique_precursors": len(prec[e] - others_p),
+                "n_unique_peptides": len(pep[e] - others_q),
+            })
+
+        return {
+            "raw_basename": raw_basename,
+            "n_engines": len(names),
+            "engines": engines_out,
+            "precursor": {"union": len(set().union(*prec.values())), "core": len(core_prec),
+                          "by_k": by_k(prec), "upset": upset(prec)},
+            "peptide": {"union": len(set().union(*pep.values())), "core": len(core_pep),
+                        "core_il": len(core_pep_il),
+                        "rescued_by_il": len(core_pep_il) - len(core_pep),
+                        "by_k": by_k(pep), "upset": upset(pep)},
+            "protein": {"union": len(set().union(*prot.values())),
+                        "core": len(set.intersection(*prot.values())) if prot else 0},
+            "pairwise": {"precursor": jac(prec), "peptide": jac(pep)},
+        }
+
+    return SLOW_CACHE.get_or_set(f"engine_comparison_all:{raw_basename}", _p)
+
+
 def engine_comparison(raw_basename: str, engine_a: str = "", engine_b: str = "") -> dict[str, Any]:
     """Full two-engine comparison for ONE acquisition: agreement at every level, quantitative
     correlation, physical-measurement agreement, and a profile of what each engine uniquely claims.
