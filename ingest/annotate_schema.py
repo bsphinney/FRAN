@@ -107,10 +107,22 @@ COMMENTS = [
      "(4.75M groups -> 6.00M proteins). The old value moved to n_protein_groups_total. Any protein "
      "figure quoted from before that date is a group count."),
     ("delimp_searches", "fasta_path",
-     "Only ~157 of 1,963 populated, and fasta_md5 / fasta_n_proteins are never written -- "
-     "corpus_ingest.py records no FASTA at all. The searched proteome is therefore NOT recoverable "
-     "for historical searches (Spectronaut's AnalysisLog logs 'Digesting Fasta...' without the "
-     "filename; .params files are 126-byte export summaries)."),
+     "The search database. Written at ingest since 2026-08-25 (engine_fasta.py): DIA-NN from the "
+     "--fasta flag on line 1 of report.log.txt, Spectronaut from 'Protein Databases Used -> "
+     "Original File' in *ExperimentSetupOverview*.txt / setup.txt. Historical rows are being "
+     "backfilled by backfill_fasta.py. COVERAGE IS PARTIAL BY CONSTRUCTION: "
+     "RunSummaries/*_RunOverview.tsv does NOT carry the database (verified 2026-08-25), so "
+     "archived Spectronaut exports that kept only RunSummaries stay NULL. Before 2026-08-25 only "
+     "~157 of 2,014 rows were populated, all from a one-off load ingested 2026-06-13..06-30; "
+     "corpus_ingest.py recorded no FASTA at all."),
+    ("delimp_searches", "fasta_n_proteins",
+     "Entry count of the search database, from the same detector as fasta_path, and only when the "
+     "file is reachable from the ingest host -- Spectronaut records a bare filename, so it fills "
+     "only if that name resolves under a known FASTA root. READ THIS BEFORE COMPARING PROTEIN "
+     "COUNTS ACROSS SEARCHES: divided by the distinct gene count it gives entries-per-gene, which "
+     "is what decides whether a protein-count difference is real depth or database redundancy. "
+     "A one-protein-per-gene proteome sits at ~1.00; a full proteome with unreviewed isoforms can "
+     "exceed 2, and that alone can move a cross-engine protein-group gap from +5% to +42%."),
 
     # ---- sample metadata: the empty annotation block -------------------------------------------
     ("delimp_sample_metadata", None,

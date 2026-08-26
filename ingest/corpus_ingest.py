@@ -579,20 +579,37 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         except Exception:  # noqa: BLE001 - never fail an ingest over a version string
             engine_ver = None
         print(f"  engine version: {engine_ver or 'not found (no setup.txt/log beside the report)'}")
+        # Which DATABASE the search used. Same contract as engine_version above: best effort,
+        # never fatal. Without it the corpus cannot tell a user whether two searches are even
+        # comparable -- entries-per-gene is what decides whether a protein-count gap is a real
+        # depth difference or an artefact of database redundancy.
+        try:
+            from engine_fasta import detect as _detect_fasta
+            fa = _detect_fasta(engine, report, output_dir) or {}
+        except Exception:  # noqa: BLE001 - never fail an ingest over provenance
+            fa = {}
+        print(f"  fasta: {fa.get('fasta_path') or 'not found (no setup/log beside the report)'}"
+              + (f"  n={fa['fasta_n_proteins']}" if fa.get("fasta_n_proteins") else ""))
         if has_npg:
             cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
                            search_engine_version,pipeline_id,pipeline_version,n_raw_files,n_precursors_total,
-                           n_proteins_total,n_protein_groups_total,status,ingested_schema_version)
-                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,'completed',%s)""",
+                           n_proteins_total,n_protein_groups_total,status,ingested_schema_version,
+                           fasta_path,fasta_md5,fasta_n_proteins,contaminant_lib)
+                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,'completed',%s,%s,%s,%s,%s)""",
                         (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader", _versions().pipeline_stamp(),
-                         len(runs), len(recs), n_proteins, n_protein_groups, SCHEMA_VERSION))
+                         len(runs), len(recs), n_proteins, n_protein_groups, SCHEMA_VERSION,
+                         fa.get("fasta_path"), fa.get("fasta_md5"), fa.get("fasta_n_proteins"),
+                         fa.get("contaminant_lib")))
         else:  # column not there yet — keep the OLD semantics rather than silently mixing the two
             cur.execute("""INSERT INTO delimp_searches (id,search_name,output_dir,submitted_at,search_engine,
                            search_engine_version,pipeline_id,pipeline_version,n_raw_files,n_precursors_total,
-                           n_proteins_total,status,ingested_schema_version)
-                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,'completed',%s)""",
+                           n_proteins_total,status,ingested_schema_version,
+                           fasta_path,fasta_md5,fasta_n_proteins,contaminant_lib)
+                           VALUES (%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,'completed',%s,%s,%s,%s,%s)""",
                         (search_id, search_name, output_dir, engine, engine_ver, f"{engine}-uploader", _versions().pipeline_stamp(),
-                         len(runs), len(recs), n_protein_groups, SCHEMA_VERSION))
+                         len(runs), len(recs), n_protein_groups, SCHEMA_VERSION,
+                         fa.get("fasta_path"), fa.get("fasta_md5"), fa.get("fasta_n_proteins"),
+                         fa.get("contaminant_lib")))
         # per-run max RT (≈ gradient length) for gradient_minutes
         run_max_rt = {}
         for x in recs:
