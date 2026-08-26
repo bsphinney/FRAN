@@ -17,6 +17,16 @@
 #
 # pg_dump therefore comes from a container (postgres:16, giving 16.15 >= server 16.14). A client
 # OLDER than the server is refused by pg_dump, so the version floor is not optional.
+#
+# THE THREE LEGACY DUMPS NEED A DIFFERENT CLIENT. Being written by pg_dump 18.4 is not cosmetic:
+# they are custom-format archive version 1.16, and pg_restore 16.15 rejects the file outright --
+# "unsupported version (1.16) in file header" -- so it cannot even LIST them, let alone restore.
+# Checked all three (2026-06-19, 06-22, 07-16); all three fail identically. Read them with
+#   apptainer exec --bind /nfs/lssc0/flinders/proteomics \
+#     /quobyte/proteomics-grp/apptainers/postgres18.sif pg_restore --list <dump>
+# which was pulled for exactly this and does list their tables. Dumps written by THIS job are
+# archive 1.14 from the 16.15 client, so postgres16.sif verifies and restores them; the two
+# containers are not interchangeable and the older dumps are the ones that need the newer tool.
 set -uo pipefail
 source /etc/profile.d/modules.sh 2>/dev/null || true
 source /etc/profile.d/hpccf.sh   2>/dev/null || true
@@ -45,7 +55,19 @@ PGPASSWORD=$("$PY" -c "
 import sys; sys.path.insert(0,'$CODE')
 from refresh_leaderboards import _token; print(_token())" 2>/dev/null | tail -1)
 [ -z "${PGPASSWORD:-}" ] && { echo "ABORT: could not obtain a PG Farm token"; exit 1; }
-export PGPASSWORD
+# Hand the token to the container through the environment, NOT through `--env PGPASSWORD=...`.
+# An --env flag lands in apptainer's own argv, and argv is world-readable: /proc on the compute
+# nodes has no hidepid, and from inside a job on hive-as-11-3-52 all 1384 processes were listable
+# while only 8 were mine. The window is small, not hours -- apptainer execs into pg_dump, so once
+# the dump is running the only surviving process is pg_dump itself and its argv carries no token
+# (verified on the live job: pid 1726107, PGPASSWORD absent from cmdline). But "small" is still a
+# live PG Farm JWT with read access to the whole 228 GB corpus, briefly visible to every other
+# user on the node, once a week, forever. Apptainer forwards APPTAINERENV_<VAR> from the host in
+# as <VAR>, which keeps the secret in this job's environment where only its own uid can read it,
+# and costs nothing.
+export APPTAINERENV_PGPASSWORD="$PGPASSWORD"
+export APPTAINERENV_PGSSLMODE=require
+unset PGPASSWORD
 
 # Write to .part and rename only on success: a truncated dump that looks like a finished one is
 # worse than no dump, because the retention prune below would count it as a good generation.
@@ -54,8 +76,7 @@ t0=$(date +%s)
 # it the container cannot see the destination and pg_dump fails with "No such file or directory"
 # even though the job itself can stat the directory perfectly well (the free-space check above
 # passes). Bind the share root so the .part, the final file and the .toc all resolve.
-apptainer exec --bind /nfs/lssc0/flinders/proteomics \
-  --env PGPASSWORD="$PGPASSWORD" --env PGSSLMODE=require "$SIF" \
+apptainer exec --bind /nfs/lssc0/flinders/proteomics "$SIF" \
   pg_dump -h pgfarm.library.ucdavis.edu -p 5432 \
           -U genome-proteomics-service-account \
           -d "uc-davis-genome-center-proteomics-core/delimp" \
