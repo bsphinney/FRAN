@@ -213,7 +213,7 @@ async function renderDashboard(){
   <div class="grid lg:grid-cols-3 gap-4 mb-6">
     <div id="speciesCard" class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Species <span class="text-[10px] text-slate-500 font-normal">click any to open its page</span></h3><div class="h-44"><canvas id="c_species"></canvas></div><div id="speciesLegend" class="mt-3 space-y-1 max-h-36 overflow-auto pr-1"></div><div id="speciesPending" class="mt-2 text-[10px] text-slate-500"></div></div>
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Platform / acquisition</h3><div class="h-64"><canvas id="c_platform"></canvas></div></div>
-    <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Search engines</h3><div class="h-64"><canvas id="c_engine"></canvas></div></div>
+    <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Search engines</h3><div id="engineList" class="h-64 overflow-auto pr-1"></div></div>
   </div>
 
   <div class="glass card p-5 fade-in">
@@ -333,9 +333,43 @@ function drawPlatform(rows){ const cc=chartColors(); const ctx=$('#c_platform');
   const labels=Object.keys(agg);
   charts.platform=new Chart(ctx,{type:'bar',data:{labels,datasets:[{data:labels.map(k=>agg[k]),backgroundColor:labels.map((_,i)=>PALETTE[i%PALETTE.length]),borderRadius:8}]},
   options:{indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{grid:{color:cc.grid},ticks:{color:cc.tick}},y:{grid:{display:false},ticks:{color:cc.tick,font:{size:10}}}},maintainAspectRatio:false}}); }
-function drawEngine(rows){ const cc=chartColors(); const ctx=$('#c_engine'); if(!ctx)return;
-  charts.engine=new Chart(ctx,{type:'polarArea',data:{labels:rows.map(r=>r.search_engine),datasets:[{data:rows.map(r=>r.n_searches),backgroundColor:PALETTE.map(c=>c+'cc'),borderWidth:0}]},
-  options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:10,font:{size:10}}}},scales:{r:{grid:{color:cc.grid},ticks:{display:false}}},maintainAspectRatio:false}}); }
+// Engine counts span three orders of magnitude -- spectronaut 1,954 searches against radiant and
+// fragpipe at 1 each. On the polar area chart this rendered as one solid wedge with the other three
+// engines invisible: a chart that answers "is spectronaut bigger" (already obvious) and hides
+// "which other engines exist at all", which is the question worth asking of a cross-engine corpus.
+//
+// Bars are LOG-scaled so a count of 1 is still visible next to 1,954, and every bar carries its
+// real number so the scale can never be mistaken for the value. The scale is labelled, because an
+// unlabelled log axis is its own way of misleading.
+function drawEngine(rows){
+  const el=$('#engineList'); if(!el) return;
+  const rs=(rows||[]).slice().sort((a,b)=>Number(b.n_searches)-Number(a.n_searches));
+  if(!rs.length){ el.innerHTML=empty('No searches yet.'); return; }
+  const lg = n => Math.log10(Math.max(1, Number(n)||0) + 1);
+  const maxL = Math.max(...rs.map(r=>lg(r.n_searches)), 1);
+  const totS = rs.reduce((a,r)=>a+Number(r.n_searches||0),0);
+  const totP = rs.reduce((a,r)=>a+Number(r.n_precursors||0),0);
+  const big = n => { n=Number(n)||0;
+    return n>=1e9?(n/1e9).toFixed(1)+'B' : n>=1e6?(n/1e6).toFixed(1)+'M' : n>=1e3?(n/1e3).toFixed(0)+'k' : String(n); };
+  el.innerHTML = rs.map((r,i)=>{
+    const w=Math.max(4, Math.round(100*lg(r.n_searches)/maxL));
+    const c=PALETTE[i%PALETTE.length];
+    const pctP = totP? (100*Number(r.n_precursors||0)/totP) : 0;
+    return `<div class="mb-3">
+      <div class="flex justify-between items-baseline text-xs mb-1">
+        <span class="text-slate-200 font-semibold">${esc(r.search_engine)}</span>
+        <span class="font-mono text-white">${fmt(r.n_searches)}<span class="text-slate-500"> search${Number(r.n_searches)===1?'':'es'}</span></span>
+      </div>
+      <div class="h-2.5 rounded bg-white/5 overflow-hidden"><div class="h-full rounded" style="width:${w}%;background:${c}"></div></div>
+      <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
+        <span>${big(r.n_precursors)} precursors</span>
+        <span>${pctP<0.1&&pctP>0?'<0.1':fmtF(pctP,1)}% of the corpus</span>
+      </div>
+    </div>`;}).join('') +
+    `<div class="text-[10px] text-slate-500 pt-2 border-t border-white/5">Bar length is <b>log-scaled</b> —
+      counts span ${fmt(rs[0].n_searches)} to ${fmt(rs[rs.length-1].n_searches)}, so a linear bar would hide every engine but the largest.
+      ${fmt(totS)} searches in total.</div>`;
+}
 
 let imData={}, imMode={};   // per-canvas cache of the fetched sample + current view mode
 
