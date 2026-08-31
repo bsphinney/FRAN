@@ -38,7 +38,12 @@ COLMAP = {
     "stripped_seq": [r"^PEP\.StrippedSequence$", r"StrippedSequence$"],
     "modified_seq": [r"^EG\.ModifiedSequence$", r"^EG\.ModifiedPeptide$", r"ModifiedSequence$", r"^EG\.PrecursorId$"],
     "charge":       [r"^FG\.Charge$", r"Charge$"],
-    "q_value":      [r"^EG\.Qvalue$", r"EG.*Qvalue"],
+    "q_value":      [r"^EG\.Qvalue$", r"EG\.(?!Global)\w*Qvalue"],
+    # Experiment-wide (global) precursor q-value. Spectronaut DOES export one -- verified present
+    # and populated in every FRAN (Normal) report checked, and genuinely independent of EG.Qvalue
+    # (not a copy). The loose fallback above is anchored away from "Global" so that a report
+    # lacking EG.Qvalue cannot silently land the GLOBAL value in q_value.
+    "global_q_value":[r"^EG\.GlobalPrecursorQvalue$", r"GlobalPrecursorQvalue$"],
     # Decoys: absent from the target-only FRAN.rs schema, but present in the "everything + decoys"
     # ML export. They must never reach the public corpus — see the skip in iter_records().
     "is_decoy":     [r"^EG\.IsDecoy$", r"IsDecoy$"],
@@ -200,7 +205,7 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
                 "iim": None,                               # Spectronaut has no indexed IM column
                 "ccs": _f(r, cols, "ccs"),
                 "q_value": _f(r, cols, "q_value"),
-                "global_q_value": None,                    # Spectronaut: EG.Qvalue only (no separate global)
+                "global_q_value": _f(r, cols, "global_q_value"),
                 "pg_q_value": _f(r, cols, "pg_q_value"),
                 "pep": _f(r, cols, "pep"),
                 "intensity": _f(r, cols, "intensity"),
