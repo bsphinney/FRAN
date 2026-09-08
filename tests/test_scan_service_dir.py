@@ -99,13 +99,35 @@ with tempfile.TemporaryDirectory() as root:
         os.chmod(unreadable_proj_str, 0o755)
 
 # --- in_fran resolution -------------------------------------------------------
+# service_folder_from_path: extract campus/client/project from a full path
+check("service_folder_from_path R:\\ example",
+      sd.service_folder_from_path(r"R:\Data\lab\service\off_campus\University of TexAS-Southwestern\tu benjamin\AcobaMichelle-TuB-TXSW-YeastIP_ian")
+      == "off_campus/University of TexAS-Southwestern/tu benjamin")
+
+check("service_folder_from_path with deeper nesting takes exactly 3 components",
+      sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\gabri_labStufs\DdaDiaExToFLu\Dia_Ex\SpN_KfastDia301711m\SpNlib_k50ngEx_O_W15-34_")
+      == "on_campus/gabri_labStufs/DdaDiaExToFLu")
+
+check("service_folder_from_path POSIX example",
+      sd.service_folder_from_path("/nfs/lssc0/flinders/proteomics/Data/lab/service/on_campus/SomeLab/proj1/whatever.sne")
+      == "on_campus/SomeLab/proj1")
+
+check("service_folder_from_path no lab/service marker returns None",
+      sd.service_folder_from_path("/some/random/path") is None)
+
+check("service_folder_from_path fewer than 3 components returns None",
+      sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\SomeLab") is None)
+
+# mark_in_fran: matches exact project keys, not client prefixes
 rows = [
     {"service_folder": "on_campus/SomeLab/proj1", "campus": "on_campus"},
-    {"service_folder": "off_campus/OtherLab/proj2", "campus": "off_campus"},
+    {"service_folder": "on_campus/SomeLab/proj2", "campus": "on_campus"},
+    {"service_folder": "off_campus/OtherLab/proj3", "campus": "off_campus"},
 ]
 sd.mark_in_fran(rows, {"on_campus/SomeLab/proj1"})
-check("in_fran true when the folder has a search", rows[0]["in_fran"] is True)
-check("in_fran false otherwise", rows[1]["in_fran"] is False)
+check("in_fran true when project matches exactly", rows[0]["in_fran"] is True)
+check("in_fran false for sibling project (regression test)", rows[1]["in_fran"] is False)
+check("in_fran false for unrelated project", rows[2]["in_fran"] is False)
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)

@@ -143,24 +143,55 @@ def walk_projects(root: str = SERVICE_ROOT) -> list[dict]:
     return out
 
 
-def ingested_folders(con) -> set[str]:
-    """service_folder values that already have at least one FRAN search.
+def service_folder_from_path(path: str) -> str | None:
+    """'…/lab/service/<campus>/<client>/<project>/…' -> 'campus/client/project', else None.
 
-    Provenance stores the CLIENT folder (service_customer) and its campus, not the project folder,
-    so this matches at client level and marks every project under a client we have searches for.
-    That is deliberately generous: in_fran drives a "needs ingesting" prompt, and claiming work is
-    un-ingested when it is not wastes someone's afternoon, which is the worse error here.
+    Accepts both \\ and / separators and both R:\\Data\\lab\\service\\ and
+    /nfs/…/lab/service/ prefixes; matches the lab/service marker case-insensitively.
+    Takes EXACTLY the first three components after the marker.
+    Returns None when the path is not under lab/service, or has fewer than three components.
+    Does not strip or alter case in the returned components.
+    """
+    # Normalize separators to /
+    norm_path = path.replace("\\", "/").lower()
+    # Find the lab/service marker
+    marker = "lab/service/"
+    idx = norm_path.find(marker)
+    if idx < 0:
+        return None
+    # Start after the marker; get the original case from the input
+    idx_orig = path.replace("\\", "/").lower().find(marker)
+    remainder = path.replace("\\", "/")[idx_orig + len(marker):]
+    # Split on / and take first three components
+    parts = remainder.split("/")
+    if len(parts) < 3:
+        return None
+    return "/".join(parts[:3])
+
+
+def ingested_folders(con) -> set[str]:
+    """Project-level service_folder values that already have at least one FRAN search.
+
+    Queries delimp_search_provenance.output_dir (where not null), extracts the full
+    service_folder path (campus/client/project), and returns the set of unique project paths.
+
+    CONSEQUENCE: searches whose output_dir is not a service path (roughly 578 of 2,044)
+    do not contribute, so some folders will read "not ingested" when they actually are.
+    That is the safe direction — it costs someone an afternoon checking, whereas marking
+    at client level hides genuinely un-ingested work, the failure this table exists to prevent.
     """
     cur = con.cursor()
-    cur.execute("""SELECT DISTINCT service_campus, service_customer
-                     FROM delimp_search_provenance
-                    WHERE service_customer IS NOT NULL""")
-    return {f"{(c or '').strip()}/{(s or '').strip()}" for c, s in cur.fetchall()}
+    cur.execute("""SELECT output_dir FROM delimp_search_provenance
+                    WHERE output_dir IS NOT NULL""")
+    ingested = set()
+    for (output_dir,) in cur.fetchall():
+        folder = service_folder_from_path(output_dir)
+        if folder is not None:
+            ingested.add(folder)
+    return ingested
 
 
 def mark_in_fran(rows: list[dict], ingested: set[str]) -> None:
-    """Set row['in_fran'] from the client-level ingested set."""
+    """Set row['in_fran'] for exact service_folder matches in the ingested set."""
     for r in rows:
-        parts = r["service_folder"].split("/")
-        client_key = "/".join(parts[:2])
-        r["in_fran"] = client_key in ingested or r["service_folder"] in ingested
+        r["in_fran"] = r["service_folder"] in ingested
