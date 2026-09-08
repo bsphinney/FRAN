@@ -253,6 +253,15 @@ The top interior substitutions are textbook conservative SNP changes, which is t
 that the detector works: `Q→E` 98, `D→N` 63, `V→L` 52, `N→D` 52, `C→G` 50, `L→V` 35, `S→T` 24,
 `D→E` 23.
 
+**Determinism is a requirement, not a detail.** Two runs of the prototype returned 1,142 and
+1,139 credible candidates. The cause is that a de novo peptide may have several 1-substitution
+corpus neighbours (255 have two, 99 have three, 82 have four or more) and the prototype took
+whichever the set iterated first — which Python's per-run string hash seed changes. The ingestor
+must **sort candidate neighbours deterministically** (by corpus `n_obs` descending, then sequence)
+and either keep all of them with a `neighbour_rank`, or record the chosen one plus `n_neighbours`.
+Otherwise the same bundle ingests to different numbers on different days, and the regression tests
+in §10 cannot assert anything.
+
 `delimp_denovo_gvp` columns: `search_id`, `stripped_seq`, `corpus_stripped_seq`, `position`,
 `aa_from`, `aa_to`, `mass_delta`, `one_nt_reachable`, `is_isobaric`, `is_terminal`, `n_neighbours`.
 
