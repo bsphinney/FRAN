@@ -123,6 +123,48 @@ def select(candidates, skip_failed=True):
     return chosen, skipped
 
 
+def _claim_queue(a):
+    """Claim rows from delimp_ingest_queue and shape them like scan candidates.
+
+    Returns (candidates, conn). Rows are claimed ONLY under --apply: a dry run must not take a
+    lease it will never release.
+
+    These are prepended to the scan's candidate list, which is what makes the queue authoritative
+    for Hive-produced searches -- _run() takes chosen[:limit] off the front, so a registered search
+    can never be starved behind the alphabetically-sorted FRAN_reports backlog. That starvation is
+    why two DIA-NN searches dropped into incoming/ on 2026-08-26 were still uningested 13 days
+    later.
+
+    A queue that cannot be reached must not take the whole run down with it -- the scan half still
+    works -- so failures here are reported and skipped.
+    """
+    if not a.apply:
+        return [], None
+    try:
+        import fran_queue
+        con = fran_queue._conn()
+        rows = fran_queue.claim_batch(con, a.limit, os.uname().nodename)
+    except Exception as e:  # noqa: BLE001
+        print(f"  queue unavailable ({type(e).__name__}: {e}); continuing with scan only",
+              flush=True)
+        return [], None
+    cands = [{"search": r["search_name"] or os.path.basename(r["searchdir"].rstrip("/")),
+              "engine": r["engine"],
+              "dir": r["searchdir"],
+              "identity": r["output_dir"],
+              "identity_from": "queue",
+              "n_exports": 1, "n_usable": 1,
+              "queue_id": r["id"],
+              **({"organism": r["organism_name"]} if r.get("organism_name") else {}),
+              **({"taxon": r["taxon"]} if r.get("taxon") else {})}
+             for r in rows]
+    if cands:
+        print(f"\nqueue: claimed {len(cands)} registered search(es) — these run first", flush=True)
+        for c in cands:
+            print(f"  Q{c['queue_id']:<5} {c['engine']:<12} {c['dir']}", flush=True)
+    return cands, con
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="actually ingest (default: dry run)")
@@ -148,7 +190,7 @@ def main():
                   for j in jobs]
         print(f"direct mode: {len(chosen)} job(s) from {a.direct}", flush=True)
         skipped = []
-        return _run(a, chosen, skipped)
+        return _run(a, chosen, skipped)  # --direct never uses the queue
 
     if a.candidates and os.path.exists(a.candidates):
         candidates = json.load(open(a.candidates))
@@ -169,11 +211,31 @@ def main():
     for name, why in skipped:
         print(f"  SKIP {name[:60]}  ({why})", flush=True)
 
-    return _run(a, chosen, skipped)
+    queued, qcon = _claim_queue(a)
+    return _run(a, queued + chosen, skipped, qcon)
 
 
-def _run(a, chosen, skipped):
+def _run(a, chosen, skipped, qcon=None):
     ok = dup = fail = 0
+
+    def _mark(c, outcome, err=None):
+        """Write a queue row's terminal state back. No-op for scan candidates.
+
+        A duplicate counts as DONE, not as a failure: the guard refusing the write means the search
+        is already in the corpus, so the registration is satisfied and must not burn a retry.
+        """
+        if qcon is None or not c.get("queue_id"):
+            return
+        try:
+            import fran_queue
+            if outcome in ("ok", "duplicate"):
+                fran_queue.mark_done(qcon, c["queue_id"])
+            else:
+                st = fran_queue.mark_failed(qcon, c["queue_id"], err or outcome)
+                print(f"      queue Q{c['queue_id']} -> {st}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"      WARNING: could not update queue Q{c.get('queue_id')}: {e}", flush=True)
+
     todo = chosen[:a.limit]
     if len(chosen) > a.limit:
         print(f"\nlimit={a.limit}: ingesting {len(todo)} now, {len(chosen)-a.limit} left for the "
@@ -196,17 +258,27 @@ def _run(a, chosen, skipped):
         if not target:
             fail += 1
             print("      FAILED: no report file found in the directory", flush=True)
+            _mark(c, "fail", "no report file found in the directory")
             continue
         if target != c["dir"]:
             print(f"      report: {os.path.basename(target)}", flush=True)
         cmd = [a.python, os.path.join(HERE, "corpus_ingest.py"), target,
                "--engine", c["engine"], "--name", c["search"],
                "--output-dir", c.get("identity") or c["dir"], "--bulk-copy"]
+        # A producer that resolved the organism (the drop-box manifest records it, and the queue
+        # stores it) knows better than corpus_ingest's own inference. Both this and --direct set
+        # these keys; until 2026-09-08 the command never passed them and they were dead fields.
+        if c.get("organism"):
+            cmd += ["--organism-name", str(c["organism"])]
+        if c.get("taxon"):
+            cmd += ["--taxon", str(c["taxon"])]
         t0 = time.time()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
         except subprocess.TimeoutExpired:
-            print(f"      TIMEOUT after {a.timeout}s", flush=True); fail += 1; continue
+            print(f"      TIMEOUT after {a.timeout}s", flush=True); fail += 1
+            _mark(c, "fail", f"timeout after {a.timeout}s")
+            continue
         tail = ((r.stdout or "") + "\n--- stderr ---\n" + (r.stderr or ""))[-2500:]
         el = time.time() - t0
         # ORDER MATTERS. The duplicate guard `return`s rather than sys.exit(1), so a refused
@@ -221,15 +293,18 @@ def _run(a, chosen, skipped):
             for line in blob.splitlines():
                 if line.strip().startswith("exists:"):
                     print(f"      {line.strip()}", flush=True)
+            _mark(c, "duplicate")
         elif r.returncode == 0:
             ok += 1
             print(f"      OK in {el:.0f}s", flush=True)
+            _mark(c, "ok")
         else:
             fail += 1
             print(f"      FAILED rc={r.returncode} in {el:.0f}s", flush=True)
             print("      --- last output ---", flush=True)
             for line in [x for x in tail.splitlines() if x.strip()][-14:]:
                 print("      | " + line, flush=True)
+            _mark(c, "fail", f"rc={r.returncode}: " + tail[-800:])
     print(f"\n===== done: {ok} ingested, {dup} duplicate-skipped, {fail} failed, "
           f"{len(chosen)-len(todo)} still queued — {time.strftime('%F %T')} =====", flush=True)
     return 0
