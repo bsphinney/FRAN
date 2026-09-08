@@ -150,10 +150,17 @@ def export_one(sne: str, name: str, out_dir: str, schema: str, snexec: list[str]
         return None
     os.makedirs(out_dir, exist_ok=True)
     try:
-        subprocess.run(cmd, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  !! export failed: {e}")
+        r = subprocess.run(cmd)
+    except FileNotFoundError as e:
+        print(f"  !! export failed (spectronaut not found?): {e}")
         return None
+    if r.returncode != 0:
+        # Spectronaut often exits non-zero (e.g. 20 = "1 Errors") on a DOWNSTREAM report step
+        # (VolcanoPlot / Heatmap / RT-recalibration need >=2 conditions or enough points) AFTER it
+        # has already written the FRAN report. So DON'T discard on non-zero — look for the report
+        # below and ingest it if present; treat only "no report file" as a real failure. (win-2)
+        print(f"  !! manageSNE returned {r.returncode} (often a non-fatal downstream-report error; "
+              f"checking for the FRAN report anyway)")
     # locate the report Spectronaut wrote. Spectronaut nests it in a timestamped subfolder
     # of -o, so search RECURSIVELY; prefer the *Report* file over side reports (RunOverview,
     # iRTCalibration, ConditionSetup, ...).
@@ -202,6 +209,7 @@ def main():
     ap.add_argument("--ingest", action="store_true", help="after each export, ingest report (+XICs) into FRAN")
     ap.add_argument("--xics", action="store_true", help="also try to dump XIC dbs via --setXICExportDirectory. NOTE: manageSNE generally does NOT export XICs from a loaded SNE — use Spectronaut's GUI 'Export all XIC' for chromatograms. Off by default.")
     ap.add_argument("--keep-loose", action="store_true", help="keep the loose report folders too (default: keep only the per-experiment .zip)")
+    ap.add_argument("--bulk-copy", action="store_true", help="pass --bulk-copy to corpus_ingest (COPY FROM STDIN, not per-row INSERT) — much faster + far shorter open txn on huge files; better shared-cluster citizen (mac-1 2026-06-30)")
     ap.add_argument("--flinders", metavar="DIR", help="also copy each experiment .zip to this folder (e.g. the mounted Flinders archive)")
     ap.add_argument("--dry-run", action="store_true", help="list .sne files + the exact commands; run nothing")
     ap.add_argument("--columns", action="store_true", help="print the report-schema columns FRAN needs and exit")
@@ -235,9 +243,14 @@ def main():
         # then zip. (XIC ingest needs both the report — for fragment labels via F.Rank — and
         # the SQLite dbs.)
         if a.ingest:
-            print(f"  >> ingesting report as '{name}'")
-            subprocess.run([sys.executable, os.path.join(here, "corpus_ingest.py"),
-                            rep, "--engine", "spectronaut", "--name", name])
+            print(f"  >> ingesting report as '{name}'  (output-dir={sne})")
+            # idempotency key MUST be the stable .sne path, NOT the timestamped report dir
+            # (corpus_ingest defaults output_dir to the report's folder, which changes every
+            # export -> would duplicate). search_id = uuid5(output_dir) so this is stable. (win-2)
+            _ci = [sys.executable, os.path.join(here, "corpus_ingest.py"),
+                   rep, "--engine", "spectronaut", "--name", name, "--output-dir", sne]
+            if a.bulk_copy: _ci.append("--bulk-copy")
+            subprocess.run(_ci)
             if xic_dir and glob.glob(os.path.join(xic_dir, "*.sqlite")) + glob.glob(os.path.join(xic_dir, "*.db")):
                 print(f"  >> ingesting XICs from {xic_dir}")
                 subprocess.run([sys.executable, os.path.join(here, "sne_xic_ingest.py"),
