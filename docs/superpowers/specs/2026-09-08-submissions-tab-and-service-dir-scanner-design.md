@@ -178,6 +178,36 @@ a large share, so it is an sbatch job rather than login-node work. It writes `sc
 run, so staleness is visible in the data — the specific failure that made the June table rot
 unnoticed.
 
+## Functionality that MUST survive this change
+
+Three exports exist today and are load-bearing workflows, not decoration. Any new page that
+replaces or fronts an existing one carries them forward.
+
+| Endpoint | Builder | Produces | Feeds |
+|---|---|---|---|
+| `/api/export/diann_report/{search_id}` | `build_report_parquet` | DIA-NN-style `report.parquet` | `limpa::readDIANN()` / DE-LIMP (HF or local) |
+| `/api/export/research_brief/{search_id}` | `build_research_brief` | markdown brief | a HIVE Claude running the proteomics-pipeline skill |
+| `/api/export/resubmit_brief/{submission_id}` | `build_resubmit_brief` | markdown brief | a HIVE/Flinders Claude, to re-search UN-INGESTED data |
+
+Where they appear now, and must still appear:
+
+- Run/search page: `⬇ report.parquet → DE-LIMP`, with the footnote explaining parquet → DE-LIMP and
+  HIVE brief → markdown packet (`app.js:475`, `:478`).
+- Collaborator search rows: a per-search `⬇ Export` (`app.js:1887`).
+- Lab page, per un-ingested submission: `📦 on share · N runs`, the `service_folder` in mono, and
+  `🔄 Re-search this data` (`app.js:2012`, `:2057`). **The Submissions tab reproduces exactly this
+  trio** — it is the pattern being relocated, not replaced.
+
+### The resubmit brief depends on the stale table
+
+`build_resubmit_brief` reads `service_folder` and `service_folder_win` from
+`delimp_submission_service_dir` to tell the receiving Claude where the raw data is. When there is no
+row it still builds a brief, but with no paths — so for every submission after PROT_0724 the
+"re-search this data" workflow silently produces a packet that cannot locate the data.
+
+That makes Part 3's scanner a prerequisite for keeping an EXISTING feature working, not merely a
+nicety for a new status column. It is the reason the scanner is sequenced first in the rollout.
+
 ## Testing
 
 - `PROT_0793`, `0793` and `793` all resolve to the same submission; the hex id still resolves.
