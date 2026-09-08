@@ -261,6 +261,73 @@ the corpus stores it plain, a carbamidomethyl-handling mismatch could manufactur
 substitutions. The ingestor must strip modifications to a bare residue string before comparison,
 and the test suite should assert that a carbamidomethylated peptide matches its plain corpus form.
 
+## 7b. Mass shift → dbSNP → minor allele frequency (the GPMDB feature)
+
+Requested by Glendon: GPMDB let you go from a substitution to dbSNP and be two clicks from a
+minor allele frequency. Nothing replaced it. FRAN can do it, and render the MAF inline rather
+than two clicks away.
+
+**Every piece already exists.** §7 produces the substitution; `app/coverage.py` already maps a
+peptide onto a protein position by I/L-normalized substring match against a cached UniProt
+canonical sequence; the EBI Proteins API supplies the variant annotation. The chain is:
+
+```
+de novo peptide  --(§7 GVP)-->  aa_from→aa_to at peptide position i
+                 --(coverage.py)-->  protein accession + position p
+                 --(EBI Proteins API /variation/{acc})-->  rsID + gnomAD MAF + ClinVar significance
+```
+
+**Verified end to end on the crane bundle, 2026-09-08.** Six human skin/hair keratins fetched;
+1,142 credible GVP candidates mapped against them:
+
+| | |
+|---|---|
+| Candidates landing inside a tested keratin | 44 |
+| …matching a catalogued variant | 6 |
+| …with a dbSNP rsID **and** an allele frequency | 2 |
+
+```
+KRT2  p.S101G   rs2634041    MAF 0.3756      Benign   (ClinVar)
+KRT1  p.A454S   rs17678945   MAF 0.0222635   Benign   (gnomAD v4.1.0 Exomes)
+KRT10 p.N341D   -            -               UniProt VARIANT
+KRT1  p.N236D   -            -               UniProt VARIANT
+KRT1  p.R483K   -            -               UniProt VARIANT  (found by TWO overlapping peptides)
+```
+
+API coverage, measured on `P04264` (KRT1): 875 variant features, 848 single-residue
+substitutions, **757 carrying a dbSNP rsID**, **436 carrying a population frequency**. Frequency
+sources: gnomAD v4.1.0 Exomes (408), ClinVar (63), gnomAD (40), 1000Genomes (34).
+
+### Why this is the strongest GVP control
+
+§7's two controls — SNP-reachability and non-isobaric — are *necessary conditions*; they only rule
+candidates out. A match to a catalogued variant at the exact position with the exact residue pair
+is **positive evidence** that the substitution is real rather than a de novo sequencing error. It
+is the only control here that can confirm rather than merely fail to reject. `KRT1 p.R483K`
+arriving independently from two overlapping peptides is the same argument at the peptide level, and
+`n_supporting_peptides` is therefore stored.
+
+### Scope, stated honestly
+
+- **dbSNP is human-only.** For crane and ocelot there is no variant database; homology (§6) remains
+  the route there. The dbSNP link serves the human samples — which is where mainstream forensic GVP
+  work (hair-based human identification) actually lives.
+- The 44/1,142 mapping rate above reflects a six-accession test, not the design: production
+  resolves the protein from FRAN's own `delimp_proteins` rather than guessing accessions.
+- A catalogued match is evidence, not proof. A de novo error can coincide with a known variant.
+
+### `delimp_variant_annotation` — a cache, not a mirror
+
+The API returns ~1.2 MB per protein, so annotation is cached rather than re-fetched:
+`accession`, `position`, `aa_wt`, `aa_alt`, `rsid`, `maf`, `maf_source`, `clinical_significance`,
+`fetched_at`. Keyed on (accession, position, aa_wt, aa_alt). Written by the DE-LIMP ingestor like
+every other de novo table; FRAN only reads it. Refetched on a TTL, never assumed permanent — allele
+frequencies are revised as gnomAD releases.
+
+The GVP row then renders `Q→E @ p.Gln1234Glu · rs12345 · MAF 0.03 · Benign` with no click at all,
+and `find_gvp_candidates` (§8) gains `min_maf` / `max_maf` / `has_rsid` filters so the variant hunt
+can be run across every de novo run at once.
+
 ## 8. Cross-run querying and the Claude backend
 
 Queries run across **all** de novo runs, not within one. That means:
