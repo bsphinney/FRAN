@@ -72,6 +72,16 @@ def walk_projects(root: str = SERVICE_ROOT) -> list[dict]:
     Walks into symlinked directories but tracks visited real paths at campus/client levels
     to avoid infinite loops. At project level, includes all discovered projects even if
     symlinked, so each unique service_folder path appears in the output.
+
+    NOTE: visited_realpaths is global to the walk, so two distinct symlinked siblings pointing
+    at the same real target would silently drop the second — same shape as the loop case, no signal.
+
+    NOTE: OSError at the top-level os.scandir(root) does a bare return out, unlike campus/client
+    branches which append to _UNREADABLE_PATHS. Only matters if service root itself is unreadable.
+
+    NOTE: with follow_symlinks=True, a self-referential symlink (ELOOP) can make is_dir() raise
+    inside count_runs(), and the surrounding except OSError then marks the whole project as
+    unreadable rather than skipping just the one bad entry.
     """
     global _UNREADABLE_PATHS
     _UNREADABLE_PATHS = []

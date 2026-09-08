@@ -60,13 +60,14 @@ with tempfile.TemporaryDirectory() as root:
     check("symlinked project directory IS inventoried",
           "on_campus/SomeLab/proj_link" in folders, str(folders))
 
-    # Symlink loop: on_campus/loop -> root should not cause duplicate entries
+    # Symlink loop: on_campus/loop -> root should not cause junk entries
     loop = p / "on_campus" / "loop"
     loop.symlink_to(p)
     rows = sd.walk_projects(str(root))
-    all_folders = [r["service_folder"] for r in rows]
-    check("symlink pointing at ancestor doesn't produce duplicates",
-          len(all_folders) == len(set(all_folders)), f"got {len(all_folders)} rows, {len(set(all_folders))} unique")
+    all_folders = {r["service_folder"] for r in rows}
+    expected = {"on_campus/SomeLab/proj1", "on_campus/SomeLab/proj_link", "off_campus/OtherLab/proj2"}
+    check("ancestor symlink produces no junk rows", all_folders == expected,
+          f"unexpected {sorted(all_folders - expected)}, missing {sorted(expected - all_folders)}")
 
     # Uppercase extensions are counted
     (proj / "run5.D").mkdir()
