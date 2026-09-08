@@ -98,5 +98,14 @@ with tempfile.TemporaryDirectory() as root:
     finally:
         os.chmod(unreadable_proj_str, 0o755)
 
+# --- in_fran resolution -------------------------------------------------------
+rows = [
+    {"service_folder": "on_campus/SomeLab/proj1", "campus": "on_campus"},
+    {"service_folder": "off_campus/OtherLab/proj2", "campus": "off_campus"},
+]
+sd.mark_in_fran(rows, {"on_campus/SomeLab/proj1"})
+check("in_fran true when the folder has a search", rows[0]["in_fran"] is True)
+check("in_fran false otherwise", rows[1]["in_fran"] is False)
+
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)

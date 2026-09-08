@@ -141,3 +141,26 @@ def walk_projects(root: str = SERVICE_ROOT) -> list[dict]:
                             "run_count": run_count})
 
     return out
+
+
+def ingested_folders(con) -> set[str]:
+    """service_folder values that already have at least one FRAN search.
+
+    Provenance stores the CLIENT folder (service_customer) and its campus, not the project folder,
+    so this matches at client level and marks every project under a client we have searches for.
+    That is deliberately generous: in_fran drives a "needs ingesting" prompt, and claiming work is
+    un-ingested when it is not wastes someone's afternoon, which is the worse error here.
+    """
+    cur = con.cursor()
+    cur.execute("""SELECT DISTINCT service_campus, service_customer
+                     FROM delimp_search_provenance
+                    WHERE service_customer IS NOT NULL""")
+    return {f"{(c or '').strip()}/{(s or '').strip()}" for c, s in cur.fetchall()}
+
+
+def mark_in_fran(rows: list[dict], ingested: set[str]) -> None:
+    """Set row['in_fran'] from the client-level ingested set."""
+    for r in rows:
+        parts = r["service_folder"].split("/")
+        client_key = "/".join(parts[:2])
+        r["in_fran"] = client_key in ingested or r["service_folder"] in ingested
