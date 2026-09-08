@@ -213,7 +213,7 @@ async function renderDashboard(){
   <div class="grid lg:grid-cols-3 gap-4 mb-6">
     <div id="speciesCard" class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Species <span class="text-[10px] text-slate-500 font-normal">click any to open its page</span></h3><div class="h-44"><canvas id="c_species"></canvas></div><div id="speciesLegend" class="mt-3 space-y-1 max-h-36 overflow-auto pr-1"></div><div id="speciesPending" class="mt-2 text-[10px] text-slate-500"></div></div>
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Platform / acquisition</h3><div class="h-64"><canvas id="c_platform"></canvas></div></div>
-    <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Search engines</h3><div id="engineList" class="h-64 overflow-auto pr-1"></div></div>
+    <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Search engines</h3><div id="engineList" class="max-h-80 overflow-auto pr-1"></div><div id="engineNote" class="text-[10px] text-slate-500 pt-2 mt-1 border-t border-white/5"></div></div>
   </div>
 
   <div class="glass card p-5 fade-in">
@@ -344,7 +344,8 @@ function drawPlatform(rows){ const cc=chartColors(); const ctx=$('#c_platform');
 function drawEngine(rows){
   const el=$('#engineList'); if(!el) return;
   const rs=(rows||[]).slice().sort((a,b)=>Number(b.n_searches)-Number(a.n_searches));
-  if(!rs.length){ el.innerHTML=empty('No searches yet.'); return; }
+  const note0 = $('#engineNote');
+  if(!rs.length){ el.innerHTML=empty('No searches yet.'); if(note0) note0.innerHTML=''; return; }
   const lg = n => Math.log10(Math.max(1, Number(n)||0) + 1);
   const maxL = Math.max(...rs.map(r=>lg(r.n_searches)), 1);
   const totS = rs.reduce((a,r)=>a+Number(r.n_searches||0),0);
@@ -355,7 +356,7 @@ function drawEngine(rows){
     const w=Math.max(4, Math.round(100*lg(r.n_searches)/maxL));
     const c=PALETTE[i%PALETTE.length];
     const pctP = totP? (100*Number(r.n_precursors||0)/totP) : 0;
-    return `<div class="mb-3">
+    return `<div class="mb-2">
       <div class="flex justify-between items-baseline text-xs mb-1">
         <span class="text-slate-200 font-semibold">${esc(r.search_engine)}</span>
         <span class="font-mono text-white">${fmt(r.n_searches)}<span class="text-slate-500"> search${Number(r.n_searches)===1?'':'es'}</span></span>
@@ -365,10 +366,12 @@ function drawEngine(rows){
         <span>${big(r.n_precursors)} precursors</span>
         <span>${pctP<0.1&&pctP>0?'<0.1':fmtF(pctP,1)}% of the corpus</span>
       </div>
-    </div>`;}).join('') +
-    `<div class="text-[10px] text-slate-500 pt-2 border-t border-white/5">Bar length is <b>log-scaled</b> —
+    </div>`;}).join('');
+  el.scrollTop = 0;
+  const note = $('#engineNote');
+  if(note) note.innerHTML = `Bar length is <b>log-scaled</b> —
       counts span ${fmt(rs[0].n_searches)} to ${fmt(rs[rs.length-1].n_searches)}, so a linear bar would hide every engine but the largest.
-      ${fmt(totS)} searches in total.</div>`;
+      ${fmt(totS)} searches in total.`;
 }
 
 let imData={}, imMode={};   // per-canvas cache of the fetched sample + current view mode
