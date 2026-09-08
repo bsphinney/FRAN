@@ -57,8 +57,22 @@ DEFAULT_ROOTS = [
     # listed and never looked inside.
     "/quobyte/proteomics-grp/fran/incoming",
     "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports",
-    "/quobyte/proteomics-grp/brett",
 ]
+# /quobyte/proteomics-grp/brett WAS a root until 2026-09-08. It is a personal working directory,
+# and scanning it returns 72 candidates that are overwhelmingly experiments rather than customer
+# searches: 13 parameter-sweep variants of ONE dataset under siegel_glp1_2026-08-12/diag/
+# (ms2_40_ms1_7, ms2_50_ms1_10, ...), engine-tuning runs under radiant_orbitrap/, teaching data
+# under short_course_data/, plus engine_comparison/ and fran_species_proof/. Ingesting those as
+# distinct searches would corrupt every corpus count the same way STAN's QC runs would.
+#
+# Nothing there was ever actually ingested, because a single stray file --
+# brett/20250910_120054_KG-human-2_Report.tsv -- tripped detect_engine's loose _Report test and
+# made scan() classify the whole root as one search and prune the descent. That accident was the
+# only thing holding the line. Fixing the shadowing without removing this root would have started
+# ingesting the sweeps on the next cron tick.
+#
+# Work in that directory now reaches the corpus by EXPLICIT registration (fran_queue.py add),
+# which is one row per real search and cannot be tripped by a stray file.
 
 # Marker files that identify an engine's output directory. Ordered most- to least-specific:
 # FragPipe's tree also contains a DIA-NN report, so it must be tested first or every FragPipe dir
@@ -158,8 +172,18 @@ def prune(dirnames: list[str]) -> None:
                    if d not in _PRUNE_NAME and not d.lower().endswith(_PRUNE_SUFFIX)]
 
 
-def detect_engine(d: str, dirnames=None, filenames=None):
+def detect_engine(d: str, dirnames=None, filenames=None, loose: bool = True):
     """Which engine's output this directory is, or None.
+
+    `loose=False` disables ONLY the trailing _SN_REPORT filename heuristic, keeping the explicit
+    per-engine marker tests. scan() passes it for a configured ROOT, because a root that gets
+    classified is never descended into (`dirnames[:] = []`) and therefore hides its whole subtree.
+    A single stray file, /quobyte/proteomics-grp/brett/20250910_120054_KG-human-2_Report.tsv, was
+    enough to make that root report as one Spectronaut search and skip all 246 entries beneath it
+    -- among them PROT_0793, two finished DIA-NN searches that had never been ingested.
+
+    The explicit markers stay live at a root on purpose: pointing --roots straight at one search
+    directory is a normal way to use this tool, and that still resolves.
 
     Takes os.walk's own dirnames/filenames when available. That matters at full-tree scale: calling
     os.listdir() again per directory doubles the metadata traffic over a network filesystem holding
@@ -180,7 +204,7 @@ def detect_engine(d: str, dirnames=None, filenames=None):
                     return engine
             elif mk in files or mk in dirs:
                 return engine
-    if any(_SN_REPORT.search(e) for e in files):
+    if loose and any(_SN_REPORT.search(e) for e in files):
         return "spectronaut"
     return None
 
@@ -206,7 +230,9 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None, exclude
             if excluded(dirpath, excludes):
                 dirnames[:] = []
                 continue
-            engine = detect_engine(dirpath, dirnames, filenames)
+            # A root is only classifiable by an EXPLICIT marker. See detect_engine's `loose`.
+            at_root = os.path.normpath(dirpath) == os.path.normpath(root)
+            engine = detect_engine(dirpath, dirnames, filenames, loose=not at_root)
             if not engine or (engines and engine not in engines):
                 continue
             dirnames[:] = []                      # a search dir's children are its own outputs
