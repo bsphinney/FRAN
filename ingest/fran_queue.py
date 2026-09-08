@@ -72,7 +72,15 @@ CREATE TABLE IF NOT EXISTS delimp_ingest_queue (
   attempts      int  NOT NULL DEFAULT 0,
   last_error    text,
   last_attempt_at timestamptz,
-  search_id     uuid
+  search_id     uuid,
+  -- Observed-chromatogram lane, opt-in per row. NULL xic_dir means "precursors only", which is the
+  -- default and what the unattended cron has always done: lane writes are GB-scale (PROT_0793 alone
+  -- is 15 GB of *.xic.parquet) and that is a storage decision, not something a scanner should make.
+  -- A producer that just wrote the traces is the one who knows they exist, so it declares them here.
+  xic_dir       text,
+  lance_dir     text,
+  xic_status    text,
+  xic_error     text
 )"""
 INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS delimp_ingest_queue_ready_idx
@@ -179,12 +187,12 @@ def cmd_add(a) -> int:
         cur.execute("""
             INSERT INTO delimp_ingest_queue
               (output_dir, searchdir, engine, search_name, organism_name, taxon,
-               host, registered_by, priority)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               host, registered_by, priority, xic_dir, lance_dir)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (output_dir) DO NOTHING
             RETURNING id""",
             (output_dir, searchdir, a.engine, a.name, a.organism_name, a.taxon,
-             a.host, a.registered_by, a.priority))
+             a.host, a.registered_by, a.priority, a.xic_dir, a.lance_dir))
         row = cur.fetchone()
         con.commit()
     finally:
@@ -207,18 +215,19 @@ def cmd_list(a) -> int:
         where, params = "WHERE status = %s", [a.status]
     cur.execute(f"""
         SELECT id, status, engine, registered_by, registered_at, attempts,
-               COALESCE(search_name, searchdir), last_error
+               COALESCE(search_name, searchdir), last_error,
+               CASE WHEN xic_dir IS NULL THEN '' ELSE COALESCE(xic_status,'xic:pending') END
           FROM delimp_ingest_queue {where}
          ORDER BY status, priority DESC, registered_at
          LIMIT %s""", params + [a.limit])
     rows = cur.fetchall()
     if not rows:
         print("queue is empty" + (f" for status={a.status}" if a.status else ""))
-    for i, st, eng, by, at, att, what, err in rows:
+    for i, st, eng, by, at, att, what, err, xic in rows:
         line = f"{i:>5}  {st:<8}{eng:<12}{str(at)[:16]}  by={by:<16}"
         if att:
             line += f" attempts={att}"
-        print(line + f"  {str(what)[:70]}")
+        print(line + (f" [{xic}]" if xic else "") + f"  {str(what)[:70]}")
         if err:
             print(f"        last_error: {err[:150]}")
     con.close()
@@ -269,10 +278,11 @@ def claim_batch(con, limit: int, claimed_by: str) -> list[dict]:
                 ORDER BY priority DESC, registered_at
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED)
-     RETURNING id, output_dir, searchdir, engine, search_name, organism_name, taxon, attempts""",
+     RETURNING id, output_dir, searchdir, engine, search_name, organism_name, taxon, attempts,
+               xic_dir, lance_dir""",
         (claimed_by, STALE_CLAIM_H, limit))
     cols = ["id", "output_dir", "searchdir", "engine", "search_name",
-            "organism_name", "taxon", "attempts"]
+            "organism_name", "taxon", "attempts", "xic_dir", "lance_dir"]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     con.commit()
     return rows
@@ -303,6 +313,18 @@ def mark_failed(con, row_id: int, error: str) -> str:
     return status
 
 
+def mark_xic(con, row_id: int, status: str, error: str | None = None) -> None:
+    """Record the XIC lane's outcome SEPARATELY from the precursor ingest.
+
+    The lane is a bonus, not a precondition: precursors are already committed by the time it runs,
+    so a lane failure must never send the row back to 'queued' and re-ingest them.
+    """
+    cur = con.cursor()
+    cur.execute("""UPDATE delimp_ingest_queue SET xic_status=%s, xic_error=%s WHERE id=%s""",
+                (status, (str(error)[:4000] if error else None), row_id))
+    con.commit()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -320,6 +342,11 @@ def main(argv=None) -> int:
     p.add_argument("--taxon", type=int, default=None)
     p.add_argument("--host", default="hive", help="where searchdir is readable (default: hive)")
     p.add_argument("--priority", type=int, default=0, help="higher goes first")
+    p.add_argument("--xic-dir", default=None,
+                   help="observed-chromatogram source dir; setting it OPTS IN to the XIC lane "
+                        "(DIA-NN: walked recursively for *.xic.parquet, so per-run subdirs are fine)")
+    p.add_argument("--lance-dir", default=None,
+                   help="where the .xic.lance dataset is written (default: FRAN_XIC_LANCE_DIR)")
     p.add_argument("--force", action="store_true",
                    help="skip existence/engine/duplicate checks")
     p.set_defaults(fn=cmd_add)

@@ -215,6 +215,66 @@ def main():
     return _run(a, queued + chosen, skipped, qcon)
 
 
+DEFAULT_XIC_LANCE_DIR = os.environ.get(
+    "FRAN_XIC_LANCE_DIR", "/quobyte/proteomics-grp/brett/glendon/xic_lance")
+
+
+def _run_xic_lane(a, c, qcon):
+    """Run the observed-chromatogram lane for a queue row that asked for it.
+
+    Opt-in per row: only fires when the registration set xic_dir. The unattended cron has always
+    withheld the lanes because they are GB-scale (PROT_0793 alone is 15 GB of *.xic.parquet), and
+    that is a storage decision -- so the producer who wrote the traces declares them, rather than a
+    scanner guessing.
+
+    NEVER fails the queue row. Precursors are committed by the time this runs; sending the row back
+    to 'queued' over a lane error would re-ingest them. The outcome is recorded in xic_status /
+    xic_error instead, on its own axis.
+    """
+    xic_dir = c.get("xic_dir")
+    if not xic_dir or qcon is None or not c.get("queue_id"):
+        return
+    import fran_queue
+    out_dir = c.get("lance_dir") or DEFAULT_XIC_LANCE_DIR
+    try:
+        cur = qcon.cursor()
+        cur.execute("SELECT id FROM delimp_searches WHERE output_dir = %s",
+                    (c.get("identity") or c["dir"],))
+        row = cur.fetchone()
+        if not row:
+            fran_queue.mark_xic(qcon, c["queue_id"], "failed",
+                                "no delimp_searches row for this output_dir")
+            print("      xic lane: SKIPPED (no corpus row to attach traces to)", flush=True)
+            return
+        sid = str(row[0])
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(c["search"]))[:80]
+        out = os.path.join(out_dir, f"{safe}__{sid[:8]}.diann.xic.lance")
+        cmd = [a.python, os.path.join(HERE, "diann_xic_to_lance.py"),
+               "--dir", c["dir"], "--xic-dir", xic_dir, "--out", out,
+               "--search-id", sid, "--search-name", str(c["search"]), "--apply"]
+        print(f"      xic lane: {xic_dir} -> {out}", flush=True)
+        t0 = time.time()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
+        el = time.time() - t0
+        if r.returncode == 0:
+            fran_queue.mark_xic(qcon, c["queue_id"], "done")
+            print(f"      xic lane: OK in {el:.0f}s", flush=True)
+            for line in (r.stdout or "").splitlines():
+                if line.startswith("xic layout:") or line.startswith("wrote"):
+                    print(f"      {line}", flush=True)
+        else:
+            tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-800:]
+            fran_queue.mark_xic(qcon, c["queue_id"], "failed", tail)
+            print(f"      xic lane: FAILED rc={r.returncode} in {el:.0f}s "
+                  f"(precursors are already ingested; row stays done)", flush=True)
+    except Exception as e:  # noqa: BLE001
+        try:
+            fran_queue.mark_xic(qcon, c["queue_id"], "failed", str(e))
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"      xic lane: FAILED ({type(e).__name__}: {e})", flush=True)
+
+
 def _run(a, chosen, skipped, qcon=None):
     ok = dup = fail = 0
 
@@ -272,6 +332,11 @@ def _run(a, chosen, skipped, qcon=None):
             cmd += ["--organism-name", str(c["organism"])]
         if c.get("taxon"):
             cmd += ["--taxon", str(c["taxon"])]
+        # Spectronaut's chromatograms are .xic.db files corpus_ingest reads itself; DIA-NN's are
+        # *.xic.parquet and go through diann_xic_to_lance AFTER the ingest (see _run_xic_lane).
+        if c.get("xic_dir") and c["engine"] == "spectronaut":
+            cmd += ["--xic-dir", c["xic_dir"],
+                    "--lance-dir", c.get("lance_dir") or DEFAULT_XIC_LANCE_DIR]
         t0 = time.time()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
@@ -298,6 +363,8 @@ def _run(a, chosen, skipped, qcon=None):
             ok += 1
             print(f"      OK in {el:.0f}s", flush=True)
             _mark(c, "ok")
+            if c["engine"] == "diann":
+                _run_xic_lane(a, c, qcon)
         else:
             fail += 1
             print(f"      FAILED rc={r.returncode} in {el:.0f}s", flush=True)
