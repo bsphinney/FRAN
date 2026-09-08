@@ -46,5 +46,56 @@ with tempfile.TemporaryDirectory() as root:
     check("a project with no runs is still inventoried",
           next(r for r in rows if r["service_folder"].endswith("proj2"))["run_count"] == 0)
 
+    # Symlink handling
+    # Symlinked .d inside a project is counted
+    (proj / "run4.d").symlink_to(proj / "run1.d")
+    check("symlinked .d inside a project IS counted",
+          sd.count_runs(str(proj)) == 4, str(sd.count_runs(str(proj))))
+
+    # Symlinked project directory is inventoried
+    link_proj = p / "on_campus" / "SomeLab" / "proj_link"
+    link_proj.symlink_to(proj)
+    rows = sd.walk_projects(str(root))
+    folders = {r["service_folder"] for r in rows}
+    check("symlinked project directory IS inventoried",
+          "on_campus/SomeLab/proj_link" in folders, str(folders))
+
+    # Symlink loop: on_campus/loop -> root should not cause duplicate entries
+    loop = p / "on_campus" / "loop"
+    loop.symlink_to(p)
+    rows = sd.walk_projects(str(root))
+    all_folders = [r["service_folder"] for r in rows]
+    check("symlink pointing at ancestor doesn't produce duplicates",
+          len(all_folders) == len(set(all_folders)), f"got {len(all_folders)} rows, {len(set(all_folders))} unique")
+
+    # Uppercase extensions are counted
+    (proj / "run5.D").mkdir()
+    (proj / "run6.RAW").write_text("x")
+    check(".D and .RAW uppercase are counted",
+          sd.count_runs(str(proj)) == 6, str(sd.count_runs(str(proj))))
+
+    # Unreadable directory handling (only on platforms where chmod affects the current user)
+    unreadable_proj = p / "on_campus" / "RestrictedLab" / "restricted"
+    unreadable_proj.mkdir(parents=True)
+    (unreadable_proj / "run_hidden.d").mkdir()
+    unreadable_proj_str = str(unreadable_proj)
+    try:
+        os.chmod(unreadable_proj_str, 0o000)
+        rows = sd.walk_projects(str(root))
+        unreadable = sd.get_unreadable_paths()
+        # On some systems (e.g., running as root), chmod may not restrict access
+        if os.access(unreadable_proj_str, os.R_OK):
+            check("unreadable directory check skipped (running as root or similar)",
+                  True, "")
+        else:
+            check("unreadable directory is reported as unreadable",
+                  any("restricted" in u for u in unreadable), str(unreadable))
+            check("unreadable directory has None run_count, not 0",
+                  any(r["service_folder"] == "on_campus/RestrictedLab/restricted" and r["run_count"] is None
+                      for r in rows),
+                  str([r for r in rows if "restricted" in r["service_folder"]]))
+    finally:
+        os.chmod(unreadable_proj_str, 0o755)
+
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
