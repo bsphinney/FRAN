@@ -56,14 +56,74 @@ was itself flawed, producing a spurious **45%** before being corrected to ~0%. S
 design is the artefact to get reviewed, not merely a step to remember. Retrieve that corrected
 design before building a new one.
 
-- [ ] **Step 1: Retrieve the corrected 2026-07 entrapment design.** Ask its author or read the
-  session record. Do not reconstruct it from first principles — the first attempt failed in a way
-  that produced a plausible-looking wrong number.
-- [ ] **Step 2: Write the design down** in `docs/superpowers/specs/`, stating explicitly what the
-  null is, how entrapment sequences are constructed, and what would make the estimate spurious.
-- [ ] **Step 3: Have it reviewed** by someone other than its author before any candidates are
-  generated.
-- [ ] **Step 4: Implement it**, and report the variant-class FDR alongside every candidate list.
+### Why the first design failed, and in which direction
+
+The first entrapment set substituted an amino acid at **arbitrary sites** in real peptides. Many of
+those "fake" variants are *real human sequences* — alternative isoforms, or coincidental real SNPs.
+They were then identified for genuinely correct reasons, counted as false positives, and inflated
+the apparent FDR to ~45%. The entrapment was measuring its own contamination with real biology.
+
+Note the **direction**: it made the method look far worse than it was, so nobody sanity-checking for
+over-optimism would have caught it.
+
+### The corrected design — interior-reversed matched null
+
+1. Take each **real** variant peptide.
+2. **Reverse its interior, keeping both termini fixed.** This preserves trypticity, length and
+   amino-acid composition, so the null is matched to the real set on everything except being a real
+   sequence.
+3. **Verify each null is absent from ALL human isoforms** — not just the search FASTA. The 2026-07
+   session checked the UniProt search base *plus* the full Ensembl `pep.all`, 123,845 sequences.
+   **This verification is what the first design lacked.**
+4. Append equal numbers of real and entrapment peptides to the search DB.
+5. `variant-class FDR = entrapment IDs / real IDs`.
+
+Measured there: **0 entrapment hits vs 816 real variant PSMs**, so variant-class FDR ≈ 0%.
+Reference implementation: `sessions/2026-07-15_Parker_VM_Sperm/scripts/03_build_variant_fasta.py`
+(the block commented *"ENTRAPMENT: interior-reversed real variant peptides = guaranteed-non-biological
+matched null"*), result in `output/gvp_results/variant_class_fdr.txt`.
+
+- [ ] **Step 1: Port the interior-reversed generator** from that script rather than rewriting it.
+- [ ] **Step 2: Verify nulls against all human isoforms**, UniProt + Ensembl `pep.all`. A null that
+  is a real isoform is the exact bug that produced the spurious 45%.
+- [ ] **Step 3: Implement and report** the variant-class FDR alongside every candidate list.
+
+---
+
+### Task 0b (BLOCKING): the prevalence filter
+
+**This removes more candidates than the FDR does.** In the 2026-07 session the raw result was
+**67 known-rs GVPs** with clean identifications throughout, and it collapsed to **2 defensible core
+variants** under biological filters. The entrapment removed **none** of them; the prevalence check
+removed most. A 0% peptide-level FDR does not mean the genotypes are valid.
+
+**The decisive test: observed carrier prevalence vs allele frequency.** A rare-MAF variant
+"detected" in nearly every donor is genetically impossible however well it was identified — and that
+pattern is the signature of **reference-allele annotation error on an abundant protein**.
+
+- [ ] **Step 1: Compute alt-allele frequency** from the minor-allele field of
+  `delimp_variant_annotation` (Task 3 supplies it).
+- [ ] **Step 2: Compare observed carriers against Hardy–Weinberg expectation** across the donor set
+  — counting **per donor, not per run** (378 runs are 372 donors).
+- [ ] **Step 3: Downgrade the implausible**, with the reason recorded on the row.
+- [ ] **Step 4: Apply the other filters that did real work there:**
+  - variant peptide must be **unique** — absent from the reference proteome. This is what killed
+    semenogelin / cystatin / Ig-paralog cross-mapping.
+  - **isobaric collisions flagged**: deamidation +0.984 (`N→D`, `Q→E`) and methylation +14.016
+    (`D→E`, `S→T`, `G→A`, `V→I`). Note `V→I` is *also* I/L-invisible.
+  - contaminants and Ig allotypes segregated.
+  - **≥2 PSMs** required.
+
+**These two gates are orthogonal, and both are needed.** The entrapment bounds *what fraction of my
+variant identifications are wrong*; the prevalence filter bounds *what fraction of my correct
+identifications support a wrong genotype*.
+
+### De novo corroboration is supporting, not independent
+
+Casanovo corroborated 252 known-rs instances in that session — but it ran on **the same spectra**, so
+it cannot rescue a prevalence-inconsistent call. This lane is de novo-driven, so the temptation to
+present de novo agreement as a second independent line of evidence is structural. It is not
+independent. Say so wherever it is reported.
 
 Until this exists, a candidate list from Tasks 1–3 is a hypothesis generator, and any document
 reporting one must say so in those words.
