@@ -152,18 +152,16 @@ def service_folder_from_path(path: str) -> str | None:
     Returns None when the path is not under lab/service, or has fewer than three components.
     Does not strip or alter case in the returned components.
     """
-    # Normalize separators to /
+    # Normalize separators to / and find the marker position
     norm_path = path.replace("\\", "/").lower()
-    # Find the lab/service marker
     marker = "lab/service/"
     idx = norm_path.find(marker)
     if idx < 0:
         return None
     # Start after the marker; get the original case from the input
-    idx_orig = path.replace("\\", "/").lower().find(marker)
-    remainder = path.replace("\\", "/")[idx_orig + len(marker):]
-    # Split on / and take first three components
-    parts = remainder.split("/")
+    remainder = path.replace("\\", "/")[idx + len(marker):]
+    # Split on /, filter empty components, and take first three
+    parts = [p for p in remainder.split("/") if p]
     if len(parts) < 3:
         return None
     return "/".join(parts[:3])

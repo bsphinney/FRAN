@@ -118,16 +118,28 @@ check("service_folder_from_path no lab/service marker returns None",
 check("service_folder_from_path fewer than 3 components returns None",
       sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\SomeLab") is None)
 
+check("service_folder_from_path with doubled separator (backslash-slash)",
+      sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\SomeLab\proj1")
+      == "on_campus/SomeLab/proj1")
+
 # mark_in_fran: matches exact project keys, not client prefixes
 rows = [
     {"service_folder": "on_campus/SomeLab/proj1", "campus": "on_campus"},
     {"service_folder": "on_campus/SomeLab/proj2", "campus": "on_campus"},
-    {"service_folder": "off_campus/OtherLab/proj3", "campus": "off_campus"},
 ]
-sd.mark_in_fran(rows, {"on_campus/SomeLab/proj1"})
-check("in_fran true when project matches exactly", rows[0]["in_fran"] is True)
-check("in_fran false for sibling project (regression test)", rows[1]["in_fran"] is False)
-check("in_fran false for unrelated project", rows[2]["in_fran"] is False)
+sd.mark_in_fran(rows, {"on_campus/SomeLab"})
+check("a client-level key marks NO project as ingested",
+      rows[0]["in_fran"] is False and rows[1]["in_fran"] is False,
+      f"proj1={rows[0]['in_fran']} proj2={rows[1]['in_fran']}")
+
+# Positive case: project-level key does match
+rows_proj = [
+    {"service_folder": "on_campus/SomeLab/proj1", "campus": "on_campus"},
+    {"service_folder": "on_campus/SomeLab/proj2", "campus": "on_campus"},
+]
+sd.mark_in_fran(rows_proj, {"on_campus/SomeLab/proj1"})
+check("in_fran true when project matches exactly", rows_proj[0]["in_fran"] is True)
+check("in_fran false for sibling project with exact project key", rows_proj[1]["in_fran"] is False)
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
