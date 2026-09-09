@@ -40,6 +40,61 @@ Everything in Phase 1's Global Constraints, plus:
 
 ---
 
+> ## ⚠️ SUPERSEDED IN PART — read this first (2026-09-09)
+>
+> **A variant-database search of hair de novo data FAILED its own matched entrapment at FDR > 100%.**
+> Measured by `dataanalysis-16`: Sage variant-DB search, 20 hair runs, 28,104 variant peptides, both
+> entrapments in one controlled search.
+>
+> | | reversed null | **matched null** |
+> |---|---|---|
+> | single-pass, PSM-level | 4.07% | **156.98%** |
+> | single-pass, peptide-level | 40.00% | **139.59%** |
+> | two-pass gated, peptide-level | 181.82% | **157.92%** |
+>
+> FDR above 100% means **no target–decoy separation at all** — 1,863 matched-entrapment PSMs against
+> 2,945 variant PSMs, where every entrapment peptide is verified absent from UniProt *and* all
+> 123,845 Ensembl isoforms. They cannot be real, so whatever identifies them at that rate is not
+> identifying variants either.
+>
+> **Why the first number was 2.34% and the real one is 157%.** The interior-reversed entrapment is
+> 0.5% one-substitution-from-a-reference-peptide; the variant set is 40.3%. An **80× mismatch on the
+> property that defines the failure mode** — a reference peptide's spectrum being assigned to its own
+> single-substitution variant, sharing nearly every fragment ion. A null with no near-neighbour
+> competitor is an easier target and gives a **lower bound**, not the upper bound anyone wants
+> (Wen et al. 2024).
+>
+> **The two-pass result kills it independently.** Pass 1 (canonical only) confidently identified
+> 146,878 spectra. The variant search identified 146,797 at 1% FDR and **only 283 survived the
+> gate** — 30 variant PSMs against 74 reversed and 54 matched entrapment. Essentially every variant
+> identification sat on a spectrum the plain human reference already explained. The variant peptide
+> was never *needed*; it was an alternative explanation for spectra that already had one. That is
+> the database-inflation failure Aggarwal 2022 describes, observed directly.
+>
+> **Three changes to this plan, all mandatory:**
+> 1. A **matched entrapment is a GATE, not a diagnostic**, and must be validated against the variant
+>    class before its number is quoted. The unmatched version produced a clean, plausible, badly
+>    wrong 2.34%.
+> 2. **Two-pass gating is not optional.** A single combined search let 146,797 PSMs through; the gate
+>    left 283. A lane reporting variant hits without gating on canonical-explained spectra reports
+>    mostly non-results.
+> 3. **Report FDR at PEPTIDE level.** PSM level flattered the channel ~10× because a few variant
+>    peptides accumulate ~40 spectra each while entrapment peptides get ~4.
+>
+> **What survives unchanged.** The chance-match nulls below (Task 0) measure *string proximity*, not
+> search-engine identification, and are matched on their own defining property to within **1.75×**
+> (real peptides 10.71% one-substitution-from-corpus, decoys 6.11%) — not 80×. Tasks 1–3's per-
+> candidate controls, the paralog work and the amelogenin lane are unaffected. What is superseded is
+> any assumption that a **variant-database search** is a sound route on this data.
+>
+> Matched-entrapment builder (generic; needs a variant FASTA, a reference, and the Ensembl isoform
+> set): `/quobyte/proteomics-grp/brett/zach_hair_gvp/14_matched_entrapment.py`
+>
+> Caveats not to overstate past: 20 runs not 421; the matched null covers only the 40.3%
+> substitution-only variants, so the 59.7% cleavage-altering majority (a SNP creating or destroying a
+> K/R site leaves no wild-type tryptic competitor) is untested and needs its own treatment; and
+> 2017–2020 QE Plus hair is not a favourable substrate. None of that turns 157% into a usable number.
+
 ### Task 0 (BLOCKING): three nulls, because there are three error sources
 
 **Measured 2026-09-09, and it is the number that governs this whole plan: 39% of the "credible"
