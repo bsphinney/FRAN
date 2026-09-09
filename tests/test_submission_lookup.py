@@ -5,7 +5,7 @@ PROT_0793 is ProtiFi LLC. Before this change the only way to reach it was its he
 
 Run:  python tests/test_submission_lookup.py
 """
-import os, sys
+import os, re, sys
 from datetime import date
 os.environ["DELIMP_INTERNAL_MODE"] = "1"          # internal tables; see app/db.py
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -58,6 +58,17 @@ r3 = queries.internal_people_search("PROT_0804", 50)
 check("a submission with no linked search is still findable",
       (r3.get("total") or 0) > 0, str(r3.get("total")))
 
+# "PROT_0804" alone can't discriminate whether the SUBS query's `OR co.internal_id = %(ref)s` arm
+# does anything — it's already a substring ILIKE-matchable against itself. PROT_0804 has NO linked
+# search, so it can ONLY surface via that subs query (never via the rows query, which is rooted in
+# delimp_search_provenance). A separator variant like "prot-804" is NOT an ILIKE substring of
+# "PROT_0804" (hyphen vs underscore), so reaching it here isolates the ref-equality arm inside the
+# SUBS query specifically — see the I3 block below for the equivalent isolation of the ROWS query.
+r3b = queries.internal_people_search("prot-804", 50)
+check("a separator variant ('prot-804') still finds PROT_0804 through the subs-query ref arm",
+      any(x.get("kind") == "submission" and x.get("internal_id") == "PROT_0804" for x in r3b.get("rows") or []),
+      f'rows={[(x.get("kind"), x.get("internal_id")) for x in r3b.get("rows") or []]}')
+
 # PROT_0793 is a poor witness for the provenance-side co.internal_id match: its two "linked"
 # searches actually have p.coreomics_submission_id = NULL (linkage_status='unlinked') and only
 # surface because p.real_search_name literally contains the substring "PROT_0793" — a
@@ -66,7 +77,12 @@ check("a submission with no linked search is still findable",
 # FK-linked witness: 6 searches with p.coreomics_submission_id actually set to its hex id.
 # Reaching those 6 real search rows (not a bare submission stub) by number, through the
 # provenance branch, is exactly what the co.internal_id provenance clause is for.
-for term in ("PROT_0652", "0652"):
+# Neither "PROT_0652" nor "0652" isolates the ROWS query's `OR co.internal_id = %(ref)s` arm —
+# both are ILIKE-matchable substrings of "PROT_0652" on their own, so this loop alone would still
+# pass with that arm deleted. "prot-652" (hyphen, not the stored underscore) breaks the ILIKE
+# match and can only reach these rows through ref-equality — this is the I3 witness the ROWS query
+# was missing (the SUBS query's equivalent is proven by "prot-804" above).
+for term in ("PROT_0652", "0652", "prot-652"):
     r4 = queries.internal_people_search(term, 50)
     check(f"{term} reaches PROT_0652's real searches, not just a submission stub",
           any(x.get("kind") == "search" and x.get("search_engine") for x in r4.get("rows") or []),
@@ -76,7 +92,11 @@ for term in ("PROT_0652", "0652"):
 # --- the submissions list -------------------------------------------------------------------
 L = queries.internal_submissions(limit=25)
 check("list returns submissions", len(L.get("submissions") or []) > 0, str(len(L.get("submissions") or [])))
-check("list reports a total", (L.get("total") or 0) >= 790, str(L.get("total")))
+# A one-directional >= cannot catch inflation: dropping `co.internal_id IS NOT NULL` from the
+# total COUNT (app/queries.py) makes total 4,488 (every coreomics_submissions_cache row, numbered
+# or not) and >= 790 would still pass — the page header would read "4,488 numbered submissions".
+# 790 is measured against the live DB (2026-09-08); assert equality, not a floor.
+check("list reports a total of exactly 790 numbered submissions", (L.get("total") or 0) == 790, str(L.get("total")))
 first = (L.get("submissions") or [{}])[0]
 for k in ("internal_id", "institute", "n_searches", "num_samples", "submitted_at"):
     check(f"row carries {k}", k in first, sorted(first.keys())[:12])
@@ -92,6 +112,69 @@ keys = [(s.get("submitted_at") or date.min) for s in (L.get("submissions") or []
 check("newest first",
       all(keys[i] >= keys[i + 1] for i in range(len(keys) - 1)),
       [str(k) for k in keys[:6]])
+
+# Every returned row must carry a real, non-null PROT_#### internal_id — not a key-presence check.
+# Dropping `co.internal_id IS NOT NULL` from the ROWS query (app/queries.py) leaves the "row
+# carries internal_id" check above green (`internal_id: None` still satisfies key-presence), but
+# the page would render `null` in the Submission column with `go('submission','null')` click
+# targets for any coreomics_submissions_cache row that predates a number being assigned.
+_PROT_RE = re.compile(r"^PROT_\d{4}$")
+bad_ids = [s.get("internal_id") for s in (L.get("submissions") or []) if not (s.get("internal_id") and _PROT_RE.match(str(s["internal_id"])))]
+check("every row has a real PROT_#### internal_id (none null, none malformed)",
+      not bad_ids, bad_ids[:5])
+
+# --- synthetic witness for "NULLS LAST" ------------------------------------------------------
+# Live data has ZERO numbered submissions with a NULL submitted_at (measured against the live DB,
+# 2026-09-08: 0/790), so the "newest first" check above can't witness a NULLS-FIRST regression —
+# there's no undated row that could jump to the top. Unlike internal_collaborators() (which sorts
+# in Python), internal_submissions() sorts entirely inside the SQL text itself
+# (`ORDER BY co.submitted_at DESC NULLS LAST`), so there's no Python sort step to feed synthetic
+# input through the way the collaborator-recency synthetic block does. Instead: monkeypatch
+# queries.query (as that block does) to return canned rows in place of the `rows` SELECT, and call
+# the REAL internal_submissions() end to end — this still proves the function doesn't reorder or
+# otherwise interfere with what comes back (it doesn't; `submissions: rows` is a straight pass
+# -through), and lets the exact same "newest first" assertion used on live data above run against
+# both a NULLS-LAST-shaped and a NULLS-FIRST-shaped synthetic result.
+_SYN_SUBS = [   # what `ORDER BY submitted_at DESC NULLS LAST` actually produces
+    {"internal_id": "PROT_9001", "submission_id": "s1", "institute": "X", "pi": None, "submitter": None,
+     "num_samples": None, "submitted_at": date(2026, 8, 1), "n_searches": 0,
+     "in_fran": False, "run_count": None, "service_folder": None, "service_folder_win": None},
+    {"internal_id": "PROT_9002", "submission_id": "s2", "institute": "X", "pi": None, "submitter": None,
+     "num_samples": None, "submitted_at": date(2025, 1, 1), "n_searches": 0,
+     "in_fran": False, "run_count": None, "service_folder": None, "service_folder_win": None},
+    {"internal_id": "PROT_9003", "submission_id": "s3", "institute": "X", "pi": None, "submitter": None,
+     "num_samples": None, "submitted_at": None, "n_searches": 0,                       # undated, LAST
+     "in_fran": False, "run_count": None, "service_folder": None, "service_folder_win": None},
+]
+_real_query = queries.query
+def _fake_submissions_query(sql, *args, **kwargs):
+    if "ORDER BY co.submitted_at" in sql:
+        return list(_CURRENT_SYN)
+    if "EXISTS (SELECT 1 FROM delimp_search_provenance p" in sql:
+        return 0
+    if "MAX(matched_at)" in sql:
+        return [{"d": None}]
+    if "COUNT(*) FROM coreomics_submissions_cache co" in sql:
+        return len(_CURRENT_SYN)
+    return _real_query(sql, *args, **kwargs)
+
+queries.query = _fake_submissions_query
+try:
+    _CURRENT_SYN = _SYN_SUBS                                        # undated LAST — NULLS LAST shape
+    ok_result = queries.internal_submissions(limit=25)
+    ok_keys = [(s.get("submitted_at") or date.min) for s in ok_result.get("submissions") or []]
+    check("synthetic: NULLS-LAST-shaped data (undated submission last) passes 'newest first'",
+          all(ok_keys[i] >= ok_keys[i + 1] for i in range(len(ok_keys) - 1)),
+          [str(k) for k in ok_keys])
+
+    _CURRENT_SYN = [_SYN_SUBS[2], _SYN_SUBS[0], _SYN_SUBS[1]]        # undated FIRST — NULLS FIRST shape
+    broken_result = queries.internal_submissions(limit=25)
+    broken_keys = [(s.get("submitted_at") or date.min) for s in broken_result.get("submissions") or []]
+    check("synthetic: NULLS-FIRST-shaped data (undated submission first) FAILS 'newest first'",
+          not all(broken_keys[i] >= broken_keys[i + 1] for i in range(len(broken_keys) - 1)),
+          [str(k) for k in broken_keys])
+finally:
+    queries.query = _real_query      # restore before any other test module imports queries
 
 F = queries.internal_submissions(q="ProtiFi", limit=25)
 check("filtering by institute works",
@@ -125,8 +208,13 @@ S652 = queries.internal_submissions(q="0652", limit=25)
 sub652 = next((s for s in (S652.get("submissions") or []) if s.get("internal_id") == "PROT_0652"), {})
 check("PROT_0652 is present via q=0652",
       bool(sub652), [s.get("internal_id") for s in (S652.get("submissions") or [])][:5])
-check("PROT_0652 shows its genuinely FK-linked searches",
-      (sub652.get("n_searches") or 0) >= 1, sub652.get("n_searches"))
+# A one-directional >= 1 cannot catch de-correlation: if the n_searches subquery's WHERE clause
+# lost its `p.coreomics_submission_id = co.submission_id` correlation (app/queries.py), EVERY row
+# would count all 378 FK-linked searches in the corpus and >= 1 would still pass — the whole
+# tri-state page would collapse to "everything is in FRAN". PROT_0652 has exactly 6, measured
+# against the live DB (2026-09-08); assert equality.
+check("PROT_0652 shows exactly its 6 genuinely FK-linked searches",
+      sub652.get("n_searches") == 6, sub652.get("n_searches"))
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
