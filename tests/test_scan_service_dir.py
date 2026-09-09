@@ -118,9 +118,15 @@ check("service_folder_from_path no lab/service marker returns None",
 check("service_folder_from_path fewer than 3 components returns None",
       sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\SomeLab") is None)
 
-check("service_folder_from_path with doubled separator (backslash-slash)",
-      sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\SomeLab\proj1")
-      == "on_campus/SomeLab/proj1")
+check("service_folder_from_path with a doubled separator (backslash)",
+      sd.service_folder_from_path(r"R:\Data\lab\service\\on_campus\SomeLab\proj1")
+      == "on_campus/SomeLab/proj1",
+      repr(sd.service_folder_from_path(r"R:\Data\lab\service\\on_campus\SomeLab\proj1")))
+
+check("service_folder_from_path with a doubled separator (forward slash)",
+      sd.service_folder_from_path("/nfs/lssc0/flinders/proteomics/Data/lab/service//on_campus/SomeLab/proj1")
+      == "on_campus/SomeLab/proj1",
+      repr(sd.service_folder_from_path("/nfs/lssc0/flinders/proteomics/Data/lab/service//on_campus/SomeLab/proj1")))
 
 # mark_in_fran: matches exact project keys, not client prefixes
 rows = [
