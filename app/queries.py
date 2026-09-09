@@ -2416,7 +2416,7 @@ def internal_submissions(q: str | None = None, limit: int = 100, offset: int = 0
     like = f"%{(q or '').strip()}%"
     where, params = "", {"limit": int(limit), "offset": int(offset)}
     if q:
-        where = """AND (co.internal_id ILIKE %(like)s
+        where = """AND (co.internal_id ILIKE %(like)s OR co.internal_id = %(ref)s
                         OR co.institute ILIKE %(like)s OR co.pi_last_name ILIKE %(like)s
                         OR co.submitter_last_name ILIKE %(like)s
                         OR co.submitter_email ILIKE %(like)s)"""

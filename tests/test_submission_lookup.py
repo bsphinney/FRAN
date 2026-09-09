@@ -102,6 +102,19 @@ check("filtering by bare number works",
       any((s.get("internal_id") == "PROT_0793") for s in P.get("submissions") or []),
       [s.get("internal_id") for s in (P.get("submissions") or [])][:5])
 
+# A bare number cannot discriminate whether `OR co.internal_id = %(ref)s` does anything:
+# internal_id is literally "PROT_" + the zero-padded number, so "0793" is already a *substring*
+# of "PROT_0793" and `co.internal_id ILIKE %(like)s` matches it on its own — the check above
+# would pass even with the ref-equality arm deleted. A separator/case variant like "prot-793" is
+# NOT a substring of "PROT_0793" (the "-" vs "_" and the missing zero-pad break ILIKE), so it can
+# only be found through normalize_submission_ref -> co.internal_id = %(ref)s. This is the arm
+# that makes Task 1's normalize_submission_ref actually do something inside this query — do not
+# "simplify" this back to a bare-number check; that would silently delete the coverage.
+R = queries.internal_submissions(q="prot-793", limit=25)
+check("filtering by a normalized ref (separator variant) works",
+      any((s.get("internal_id") == "PROT_0793") for s in R.get("submissions") or []),
+      [s.get("internal_id") for s in (R.get("submissions") or [])][:5])
+
 # PROT_0793 is a poor witness for n_searches: its two "linked" searches actually carry
 # p.coreomics_submission_id = NULL (linkage_status='unlinked') and only appear under it via a
 # real_search_name substring match (see the block above) — so a correct FK-joined n_searches is
