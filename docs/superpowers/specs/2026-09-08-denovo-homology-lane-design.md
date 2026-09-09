@@ -337,6 +337,52 @@ The GVP row then renders `Q→E @ p.Gln1234Glu · rs12345 · MAF 0.03 · Benign`
 and `find_gvp_candidates` (§8) gains `min_maf` / `max_maf` / `has_rsid` filters so the variant hunt
 can be run across every de novo run at once.
 
+## 7c. Never threshold on the Casanovo peptide score
+
+**The peptide score is a length filter, not a quality filter.** From `casanovo/denovo/model.py`
+(`_peptide_score`): *"The peptide score is the product of the raw amino acid scores"* —
+`exp(sum(log(aa_scores)))`. So for length L at mean per-residue confidence p it is ≈ p^L, and it
+collapses with length whatever the quality. Clearing 0.95 at length 18 would need every one of 18
+residues above 99.7%.
+
+Measured independently on two teeth samples 2026-09-08:
+
+| peptide length | mean peptide score | per-residue geometric mean |
+|---|---|---|
+| 6 | 0.376 | 0.850 |
+| 18 | 0.059 | 0.855 |
+| 30 | **0.00224** | **0.816** |
+
+Per-residue confidence is flat — in the second sample it *rises* with length (0.703 → 0.798) — while
+the peptide score falls **168×**. Filtering at ≥ 0.9 moves the median peptide length from **21 to 8**,
+and the top-12 scoring peptides are all 6–9mers. A colleague measured the same effect on hair
+(median 18 → 9 at ≥ 0.5; zero PSMs ≥ 0.95 across 136,018 PSMs, which is arithmetic, not a defect).
+
+**Why this is severe for variant work specifically.** A score cutoff selects short peptides, and
+short peptides are the worst possible ones for GVP: a 7-mer maps ambiguously across the proteome and
+rarely spans a substitution with flanking context. The crane GVP candidates have a median length of
+10 (347 of 1,662 are 7-mers), so a ≥ 0.9 cutoff — median length 8 — would discard most of the set
+while *appearing* to raise confidence.
+
+**What the lane does instead:**
+
+1. **No confidence gate at ingest, ever.** Store the score; never filter on it at write time.
+   Filtering is a query-time decision made with the distribution visible.
+2. **Score at the site, from `opt_global_aa_scores`.** For a variant call the number that matters is
+   the per-residue confidence at the substituted position and its immediate neighbours — not a
+   whole-peptide product. `delimp_denovo_gvp` therefore stores `aa_score_at_site`,
+   `aa_score_flank_mean` (±2 residues) and `aa_score_min_flank`. This is also the quantitative
+   justification for site-level mapping over whole-peptide matching (§7, §7a).
+3. **Length-normalised geometric mean** `peptide_score^(1/L)` as the one comparable per-peptide
+   number, stored as `conf_geomean`. Roughly length-stable, so it compares across peptides where the
+   raw score cannot.
+4. **Always store `peptide_score` together with `length`.** Alone it is uninterpretable: a confident
+   long peptide and an unconfident short one are indistinguishable.
+
+**Consequence for the corpus-wide prior:** any cross-run or cross-cohort comparison of *mean peptide
+score* is confounded by that run's length distribution and would mostly encode how long the peptides
+were. `delimp_mv_denovo_peptide_index` aggregates `conf_geomean` and length, not raw score.
+
 ## 8. Cross-run querying and the Claude backend
 
 Queries run across **all** de novo runs, not within one. That means:
