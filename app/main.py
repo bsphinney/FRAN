@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db, queries
+from . import db, denovo, queries
 from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
@@ -993,6 +993,36 @@ def api_peptide_flyability(stripped_seq: str):
         return ok({"flyability": None})
     return ok({"flyability": live["score"], "classes": live["classes"],
                "model": koina._PFLY_MODEL, "source": "live"})
+
+
+@app.get("/api/denovo/runs")
+def api_denovo_runs(cohort: str | None = None,
+                    limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    """De novo sequencing runs — peptides read straight off spectra, with no database search."""
+    return ok(denovo.list_runs(cohort, limit, offset))
+
+
+@app.get("/api/denovo/run/{run_id}")
+def api_denovo_run(run_id: str):
+    """One run's provenance (engine, weights, GPU, donor, flags) and its class split."""
+    return ok(denovo.run_detail(run_id))
+
+
+@app.get("/api/denovo/run/{run_id}/peptides")
+def api_denovo_run_peptides(run_id: str, corpus_class: str | None = None,
+                            limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)):
+    """A run's peptides, each with the corpus spellings it links to.
+
+    corpus_hits is an ARRAY because the I/L match is one-to-many: de novo cannot tell isoleucine
+    from leucine, so one peptide can point at several real corpus peptides."""
+    return ok(denovo.run_peptides(run_id, corpus_class, limit, offset))
+
+
+@app.get("/api/peptide/{stripped_seq}/denovo")
+def api_peptide_denovo(stripped_seq: str):
+    """Which de novo runs called this peptide. Matched on the I/L-normalised key, so a peptide
+    spelled with I here finds the de novo peptide spelled with L."""
+    return ok(denovo.peptide_denovo(stripped_seq))
 
 
 @app.get("/api/peptide/{stripped_seq}/funfacts")

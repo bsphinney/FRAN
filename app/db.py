@@ -49,6 +49,13 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # No customer data (just paths/counts/md5); used to locate a peptide's measured spectrum in
         # the franfragments blob for the /api/peptide/{seq}/observed layer.
         "delimp_spectrum_lane",
+        # de novo lane (Casanovo). READ-ONLY here; written by the DE-LIMP ingestor.
+        # No customer identifiers: run names go through the public tier's existing masking, and
+        # donor_id is a lab-internal series label (ZG###), not a person's name.
+        "delimp_denovo_run",
+        "delimp_denovo_peptide",
+        "delimp_denovo_psm",
+        "delimp_denovo_corpus_match",
         # precomputed leaderboard snapshots (Highlights) — full GROUP BY over millions of
         # precursor rows times out live on PG Farm, so these are refreshed offline.
         "delimp_mv_top_peptides",
