@@ -24,7 +24,7 @@ also across the entire FRAN corpus"*.
 |---|---|
 | `search_id`, `raw_path` | the cell coordinates — sample is `raw_path` |
 | `protein_group`, `gene` | the row label |
-| `normalized_intensity`, `intensity` | the value |
+| `intensity` | the value — **use this one**, see (g); `normalized_intensity` exists for only 4% of searches |
 | `n_unique_peptides`, `n_precursors`, `pg_q_value`, `is_contaminant` | per-cell detail |
 
 For `PROT_0793_search_mouse` (`8221f5fc-492e-5c9d-a08d-542cfdb48791`): **480,123 rows, 6,388
@@ -55,6 +55,7 @@ Measured cost of each ranking rule on the mouse search:
 | mode | time | verdict |
 |---|---|---|
 | most abundant (mean intensity) | **0.52 s** | live |
+| corpus abundance (mean within-search percentile) | **97 s** | must be precomputed |
 | most variable (CV across samples) | **3.86 s** | live |
 | corpus rarity (searches per protein) | **53 s** | must be precomputed |
 
@@ -135,8 +136,9 @@ must never colour as "seen in 0 searches"** — absence and zero are different, 
 
 ### 1b. What the interactive mockup changed (2026-09-09, real data on screen)
 
-A mockup was built against the live `PROT_0793_search_mouse` data and iterated with Brett. Six
-things were wrong in the design above and are corrected here. Every one was invisible on paper.
+A mockup was built against the live `PROT_0793_search_mouse` data and iterated with Brett. EIGHT
+things were wrong in the design above and are corrected here. Every one was invisible on paper, and
+none was found by reasoning — each came from putting real data on screen and looking at it.
 
 **(a) Rarity must be matched CASE-INSENSITIVELY.** Gene symbols are capitalised per species — mouse
 `Aldoa`, human `ALDOA` — and the corpus is mostly human. Measured: `Aldoa` 278 searches vs `ALDOA`
