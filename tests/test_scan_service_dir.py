@@ -171,5 +171,109 @@ for col, expected_form in required_assignments.items():
           expected_form in do_update_normalized,
           f"missing or wrong: {expected_form}")
 
+# --- depth-adaptive walk: off-campus institutions nest one level deeper than on_campus --------
+# Real case this protects: off_campus/UC-Berkeley/ChangChris held 0 direct runs and 40-odd
+# project subfolders holding 239 acquisitions between them. A fixed depth-3 walk recorded
+# ChangChris itself as a zero-run project and never looked inside.
+
+with tempfile.TemporaryDirectory() as root:
+    p = pathlib.Path(root)
+
+    # Intermediate: zero direct runs, has subdirectories -> descend, record children, not itself.
+    inter = p / "off_campus" / "UC-Berkeley" / "ChangChris"
+    proj_a = inter / "proj_a"
+    proj_b = inter / "proj_b"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+    (proj_a / "run1.raw").write_text("x")
+    (proj_a / "run2.raw").write_text("x")
+    # proj_b left empty -- a genuine zero-run leaf at depth 4, still inventoried (Task 2's rule
+    # extends to whatever depth a leaf actually lands at).
+
+    # Real project WITH runs that also happens to have a subdirectory (e.g. a results/ folder).
+    # Must stay a single depth-3 row and must NOT be descended into.
+    proj_with_results = p / "on_campus" / "LabX" / "proj_with_results"
+    proj_with_results.mkdir(parents=True)
+    (proj_with_results / "run1.raw").write_text("x")
+    results_sub = proj_with_results / "results"
+    results_sub.mkdir()
+    (results_sub / "extra.raw").write_text("x")   # must NOT be counted or descended into
+
+    rows = sd.walk_projects(str(root))
+    folders = {r["service_folder"]: r for r in rows}
+
+    check("intermediate directory (0 runs, has subdirs) is NOT itself a row",
+          "off_campus/UC-Berkeley/ChangChris" not in folders, sorted(folders))
+    check("intermediate's children are recorded as depth-4 projects",
+          "off_campus/UC-Berkeley/ChangChris/proj_a" in folders
+          and "off_campus/UC-Berkeley/ChangChris/proj_b" in folders,
+          sorted(folders))
+    check("depth-4 child run_count is correct",
+          folders.get("off_campus/UC-Berkeley/ChangChris/proj_a", {}).get("run_count") == 2,
+          str(folders.get("off_campus/UC-Berkeley/ChangChris/proj_a")))
+    check("a genuinely empty depth-4 child is still inventoried, not dropped",
+          folders.get("off_campus/UC-Berkeley/ChangChris/proj_b", {}).get("run_count") == 0,
+          str(folders.get("off_campus/UC-Berkeley/ChangChris/proj_b")))
+
+    check("a project WITH runs stays itself even though it has a subdirectory",
+          "on_campus/LabX/proj_with_results" in folders, sorted(folders))
+    check("run_count for that project counts only its DIRECT runs, not the subdirectory's",
+          folders.get("on_campus/LabX/proj_with_results", {}).get("run_count") == 1,
+          str(folders.get("on_campus/LabX/proj_with_results")))
+    check("the subdirectory of a real project is NOT descended into as its own row",
+          "on_campus/LabX/proj_with_results/results" not in folders, sorted(folders))
+
+    # Unreadable directory with subdirectories must not be treated as an intermediate: no
+    # descent, no depth-4 rows, and it must still show up as unreadable (None, not 0).
+    unreadable_inter = p / "off_campus" / "RestrictedInst" / "RestrictedLab"
+    hidden_child = unreadable_inter / "hidden_proj"
+    hidden_child.mkdir(parents=True)
+    (hidden_child / "run.raw").write_text("x")
+    unreadable_inter_str = str(unreadable_inter)
+    try:
+        os.chmod(unreadable_inter_str, 0o000)
+        rows2 = sd.walk_projects(str(root))
+        folders2 = {r["service_folder"]: r for r in rows2}
+        if os.access(unreadable_inter_str, os.R_OK):
+            check("unreadable-intermediate check skipped (running as root or similar)", True, "")
+        else:
+            check("an unreadable directory is not descended into as an intermediate",
+                  "off_campus/RestrictedInst/RestrictedLab/hidden_proj" not in folders2,
+                  sorted(folders2))
+            check("the unreadable directory itself is still recorded, with run_count None",
+                  folders2.get("off_campus/RestrictedInst/RestrictedLab", {}).get("run_count")
+                  is None,
+                  str(folders2.get("off_campus/RestrictedInst/RestrictedLab")))
+    finally:
+        os.chmod(unreadable_inter_str, 0o755)
+
+# --- in_fran must match at whatever depth a row actually landed at ----------------------------
+rows_depth4 = [
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_a"},
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_b"},
+]
+sd.mark_in_fran(rows_depth4, {"off_campus/UC-Berkeley/ChangChris/proj_a"})
+check("in_fran matches an exact depth-4 row",
+      rows_depth4[0]["in_fran"] is True and rows_depth4[1]["in_fran"] is False,
+      f"proj_a={rows_depth4[0]['in_fran']} proj_b={rows_depth4[1]['in_fran']}")
+
+rows_depth4b = [{"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_a"}]
+sd.mark_in_fran(rows_depth4b, {"off_campus/UC-Berkeley/ChangChris/proj_a/output/report"})
+check("in_fran matches when the ingested path sits BELOW a depth-4 row",
+      rows_depth4b[0]["in_fran"] is True, rows_depth4b[0]["in_fran"])
+
+# Sibling safety: a deep ingested path under proj_a must never mark proj_b -- confirms the
+# depth-4 prefix rule cannot re-widen a match to the whole intermediate the way a client-level
+# key could (Task 3's ruling). This holds structurally because intermediates are never rows:
+# there is no depth-3 "ChangChris" row left for a shallow key to over-claim.
+rows_sibling = [
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_a"},
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_b"},
+]
+sd.mark_in_fran(rows_sibling, {"off_campus/UC-Berkeley/ChangChris/proj_a/output/report"})
+check("a depth-4 sibling is NOT marked in_fran by another sibling's ingested path",
+      rows_sibling[0]["in_fran"] is True and rows_sibling[1]["in_fran"] is False,
+      f"proj_a={rows_sibling[0]['in_fran']} proj_b={rows_sibling[1]['in_fran']}")
+
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
