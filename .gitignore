@@ -21,3 +21,10 @@ app/service_customer_aliases.json
 # put them in a private repo — do not un-ignore them here.
 FRAN_ANALYST_GUIDE.md
 FRAN_TISSUE_PLAN.md
+
+# CONFIDENTIAL — a collaborator's UNPUBLISHED method, kept here so the de novo lane's code has its
+# rationale to hand. There is a paper in progress; publishing this would scoop it.
+# The access tiers do NOT protect this: public/lab/full gate DATA IN THE DATABASE, not files in a
+# public git repo. Only this line does, and only by discipline — never `git add -f` it.
+# The shipped code stays generic (a peptidoform abundance ratio) and discloses no interpretation.
+DENOVO_RATIO_METHOD_CONFIDENTIAL.md
