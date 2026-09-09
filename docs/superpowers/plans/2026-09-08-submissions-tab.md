@@ -502,10 +502,16 @@ both joins, so no precomputation is needed:
 
 ```sql
         SELECT p.service_customer AS raw,
-               COUNT(*) AS n_searches,
+               -- DISTINCT is load-bearing, not decoration. The two LEFT JOINs below change the
+               -- grain to (search x raw_file), so a bare COUNT(*) here counts PAIRS, not searches.
+               -- Shipped once and caught by the final review: it read 7,476 corpus-wide against 949
+               -- real provenance rows, NIST 1,046 against 33, and the directory contradicted its own
+               -- drill-down one click apart. n_pis/n_projects survived only because they already had
+               -- DISTINCT; MAX() is fan-out safe. Audit EVERY aggregate here against the join grain.
+               COUNT(DISTINCT p.search_id) AS n_searches,
                COUNT(DISTINCT NULLIF(p.pi,'')) AS n_pis,
                COUNT(DISTINCT NULLIF(p.project,'')) AS n_projects,
-               COUNT(*) FILTER (WHERE p.coreomics_submission_id IS NOT NULL
+               COUNT(DISTINCT p.search_id) FILTER (WHERE p.coreomics_submission_id IS NOT NULL
                                    OR p.sample_submission_id IS NOT NULL) AS n_lims_linked,
                MAX(p.service_campus) AS campus, MAX(p.service_source) AS source,
                MAX(rf.acquisition_date)::date AS last_run
