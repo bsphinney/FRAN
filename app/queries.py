@@ -4351,10 +4351,17 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
         {"sid": search_id}, tables=["delimp_proteins", "raw_files"])
     # Acquisition order where known, name order otherwise: batch drift then reads as vertical bands.
     samples.sort(key=lambda s: (s["acquisition_date"] is None, s["acquisition_date"], s["raw_path"]))
-    # NOT raw_path: on the service share, the full path is a client/PI directory
-    # (delimp_submission_service_dir's own inventory, e.g. .../on_campus/<client>/...), which is
-    # confidential and this route is public-tier. basename is the only join key cells need.
-    sample_rows = [{"basename": _base(s["raw_path"]),
+    # Fix round 1 (3rd revision): every sample gets an opaque positional id ("s0", "s1", ...) in
+    # this sorted order. `cells` below is keyed by that id, NOT by filename — privacy.redact()
+    # only rewrites string VALUES under known keys (raw_path, raw_basename, ...), it never
+    # renames dict KEYS, so a filename-keyed cells dict ships real acquisition filenames to the
+    # public tier no matter what the samples[] field is called. raw_path is kept (it is already
+    # sanitized by redact() and is a key the redactor knows); "basename" is spelled
+    # "raw_basename" so the same sanitizer covers it too — "basename" is not in _FILE_KEYS and
+    # would pass through untouched.
+    sample_ids = {s["raw_path"]: f"s{i}" for i, s in enumerate(samples)}
+    sample_rows = [{"id": sample_ids[s["raw_path"]], "raw_path": s["raw_path"],
+                    "raw_basename": _base(s["raw_path"]),
                     "acquisition_date": s["acquisition_date"]} for s in samples]
     n_samples_total = len(sample_rows)
 
@@ -4414,7 +4421,9 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
 
     by_gene: dict[str, dict[str, float]] = {}
     for c in cells:
-        by_gene.setdefault(c["gene"], {})[_base(c["raw_path"])] = float(c["v"])
+        sid = sample_ids.get(c["raw_path"])
+        if sid is not None:      # cells is scoped to the same search_id as samples, so this
+            by_gene.setdefault(c["gene"], {})[sid] = float(c["v"])  # should always resolve
 
     reaches = sorted(r["reach"] for r in rows if r["reach"] is not None)
     def _pct(v):

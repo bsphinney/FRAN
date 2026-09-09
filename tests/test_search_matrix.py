@@ -109,26 +109,51 @@ check("the matrix is genuinely populated (>5000 cells across 50 proteins x 222 s
 zeros = sum(1 for p in prots for v in p["cells"].values() if v == 0)
 check("no cell is stored as a literal zero", zeros == 0, f"{zeros} zero cells")
 check("cells reference real sample keys",
-      all(k in {s["basename"] for s in samps} for p in prots for k in p["cells"]),
+      all(k in {s["id"] for s in samps} for p in prots for k in p["cells"]),
       "a cell key is not a returned sample")
 
 # CONTAMINANT + REACH annotations are present on every row.
 check("every row carries is_contaminant", all("is_contaminant" in p for p in prots))
 check("every row carries reach (may be None)", all("reach" in p for p in prots))
 
-# SAMPLES MUST NOT LEAK CLIENT/PI PATHS (Fix round 1). raw_path can point into
-# delimp_submission_service_dir's own territory — .../on_campus/<client>/... or
-# .../off_campus/<client>/... on the service share — which is confidential and this route is
-# public-tier with no is_full() gate. Only basename may appear in the samples list.
-check("no sample carries a raw_path key", all("raw_path" not in s for s in samps))
-# NOT A DISCRIMINATOR ON THIS FIXTURE: this search's raw files live under
-# /quobyte/proteomics-grp/brett/PROT_0793/..., so this check does NOT fail even with raw_path
-# restored — there is no on_campus/off_campus/lab-service marker to find on this search. It is a
-# guard for OTHER searches (the ones that actually sit on the service share), kept here so a
-# regression is caught the moment anyone tests against such a search, not proof against this one.
-check("no sample value contains a service-share client-directory marker",
-      not any(marker in str(v) for s in samps for v in s.values()
-              for marker in ("/lab/service/", "on_campus", "off_campus")))
+# REDACTION MUST COVER THE PUBLIC VIEW (Fix round 1, 3rd revision). Every check above ran with
+# DELIMP_INTERNAL_MODE=1, which sets reveal=True at import (app/main.py:221) — privacy.redact()
+# is a no-op under reveal=True. So "ALL PASS" up to this point proves nothing about what an
+# anonymous visitor sees. This block is the FIRST coverage in this file of the actual public
+# (reveal=False) path — it did not exist before this fix round, which is exactly how the original
+# leak got past every check here plus one review round.
+import re                                                     # noqa: E402
+from app import privacy                                       # noqa: E402
+from app.main import _json_safe                               # noqa: E402
+
+pub = privacy.redact(_json_safe(d), False)          # reveal=False: the anonymous view of `d`
+pub_samples, pub_proteins = pub.get("samples") or [], pub.get("proteins") or []
+
+check("public view: no sample carries a bare 'basename' key",
+      all("basename" not in s for s in pub_samples))
+
+RUN_RE = re.compile(r"^run-[0-9a-f]{6}(\.[A-Za-z0-9]+)?$")
+check("public view: raw_basename is sanitized to the run-xxxxxx shape",
+      all(RUN_RE.match(s.get("raw_basename") or "") for s in pub_samples),
+      str([s.get("raw_basename") for s in pub_samples[:4]]))
+check("public view: raw_path is sanitized to the run-xxxxxx shape",
+      all(RUN_RE.match(s.get("raw_path") or "") for s in pub_samples),
+      str([s.get("raw_path") for s in pub_samples[:4]]))
+
+# THE DISCRIMINATOR. Compare cell keys against the REAL (unredacted) basenames from `samps`, not
+# against pub_samples — real filenames obviously don't appear there if redaction worked. This is
+# the check that would have caught the actual bug: cells keyed by filename are invisible to
+# redact() because redact() rewrites string VALUES under known keys, never dict KEYS.
+real_basenames = {s["raw_basename"] for s in samps}
+cell_keys = {k for p in pub_proteins for k in p["cells"]}
+check("public view: no cells key is a real acquisition filename",
+      not (cell_keys & real_basenames), str(list(cell_keys & real_basenames)[:5]))
+
+# ...and the join must still work under redaction: every cells key is a returned public sample id.
+pub_ids = {s["id"] for s in pub_samples}
+check("public view: cells keys still match returned sample ids after redaction",
+      all(k in pub_ids for p in pub_proteins for k in p["cells"]),
+      "a cell key is not a public sample id")
 
 # --- the endpoint ----------------------------------------------------------------------------
 from fastapi.testclient import TestClient                    # noqa: E402
