@@ -73,10 +73,62 @@ Built by `SELECT protein_group, count(DISTINCT search_id), count(DISTINCT raw_pa
 delimp_proteins GROUP BY 1`, refreshed by the existing weekly Hive cron alongside the matviews —
 the same pattern `delimp_protein_peptide_count` already follows. Reads become a keyed lookup.
 
-**OPEN MEASUREMENT the plan must make before building:** how long the full rebuild takes across all
-~520k protein groups. The 53 s figure is for one search's 6,388 proteins; the full scan is larger.
-If it exceeds the cron's budget, the fallback is an incremental rebuild keyed on searches ingested
-since `computed_at`. Do not write the cron until this is measured.
+**MEASURED 2026-09-09: the full rebuild is 637 s (10.6 min) for 618,520 protein groups.** That fits
+a weekly cron comfortably; no incremental rebuild is needed, and the fallback design is dropped.
+
+**But the same measurement invalidated the rarity key, and this is the important part.** The
+distribution over `protein_group` is:
+
+    median searches per protein group:  2
+    maximum:                            1,176
+    seen in exactly ONE search:         290,944 of 618,520  (47%)
+
+Nearly half of all protein groups are seen exactly once, so "rare" is the *normal* state and a
+colour scale keyed on `protein_group` would push ~47% of rows to the extreme end and discriminate
+nothing. The cause is already documented in this codebase (`app/static/app.js:1556`): protein-*group*
+strings are raw DIA-NN group strings that vary between FASTAs, so one real protein becomes many group
+strings. Keyed this way, "corpus rarity" would largely be measuring **FASTA string variation and
+calling it biology** — a plausible-looking feature that is quietly wrong, which is the failure mode
+this spec exists to avoid.
+
+**Therefore rarity is keyed on `gene`, not `protein_group`**, since gene symbols are stable across
+FASTAs. `delimp_proteins.gene` is populated. The reach table becomes:
+
+    gene            TEXT PRIMARY KEY
+    n_searches      INTEGER
+    n_samples       INTEGER
+    computed_at     TIMESTAMPTZ
+
+**MEASURED, and the rarity colouring is VIABLE.** Gene-level rebuild is 121 s for 298,391 distinct
+genes (5× cheaper than the protein_group form), and only 4% of `delimp_proteins` rows carry no gene.
+
+The gene-level *global* distribution is still singleton-heavy — median 2, 40% seen once, deciles
+`[1,1,1,2,2,3,3,5,16]` — which by the criterion originally written here would have CUT the feature.
+That criterion was measuring the wrong denominator. The heatmap never colours the global corpus; it
+colours ~50 real proteins from one search. Measured on the rows that would actually be shown (top-50
+by CV, `PROT_0793_search_mouse`):
+
+    reach:      min 2   median 114.5   max 591
+    seen-in-1:  0 of 50
+    deciles:    [34, 63, 89, 99, 114, 152, 183, 221, 277]
+
+Zero singletons and a spread across two orders of magnitude — the scale discriminates. And it
+discriminates *biologically*: the common end is Aldoa (278), Ywhah (283), Hsp90ab1 (294), Jup (295),
+TPM2 (591) — housekeeping proteins this lab sees in everything. The rare end is Mup2 (33) and Mup21
+(21), major urinary proteins that are mouse-specific so only mouse work sees them, and Ighg3 (2) and
+Igkv1-110 (12), immunoglobulins that vary per animal. That is real signal, not FASTA noise.
+
+The global 40% is the corpus-wide long tail of one-off FASTA entries, which never reaches a top-CV
+row set.
+
+**Consequences for the build:**
+- Scale must be **log or percentile**, never linear — the within-view range is 2 to 591 and the
+  corpus range runs to 1,849.
+- Percentile the scale **against the displayed rows**, not the whole corpus, or the global singleton
+  mass flattens everything again. This is the finding above, encoded.
+- Rows with no gene (4%) render "not computed", never as rare. Absence is not zero.
+- Because reach is keyed on `gene`, a protein group with no gene symbol has no reach value; the
+  heatmap still shows it, uncoloured in rarity mode, labelled as such.
 
 **Staleness must be visible.** This table is exactly the shape of artefact this codebase has been
 bitten by repeatedly — a one-shot computation wearing an integration's clothes (the CoreOmics cache
@@ -173,7 +225,9 @@ GET /api/protein/{pg}/coverage?search_id=…      (search_id optional; omitted =
 
 | risk | mitigation |
 |---|---|
-| Full corpus-reach rebuild too slow for the cron | Measure before building; incremental fallback keyed on `computed_at` |
+| Full corpus-reach rebuild too slow for the cron | RESOLVED by measurement: 637 s for 618,520 groups, fits the weekly cron |
+| Rarity keyed on `protein_group` measures FASTA string variation, not biology | RESOLVED: 47% of groups seen once. Keyed on `gene` instead (121 s rebuild, 4% of rows have no gene) |
+| Gene-level rarity is globally singleton-heavy (40% seen once) | RESOLVED by measuring the right denominator: within the ~50 rows actually displayed, 0 singletons, reach spans 2-591. Scale percentiled against DISPLAYED rows, not the corpus |
 | Reach table silently goes stale | `computed_at` shown in the UI; absent row renders "not computed", never 0 |
 | Rarity mode surfaces TrEMBL junk | Measured and accepted; rarity is a colour, CV is the default sort |
 | 1.4M cells | Top-N with the rule exposed; N and mode both user-controlled |
