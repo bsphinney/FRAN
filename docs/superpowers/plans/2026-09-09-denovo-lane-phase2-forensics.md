@@ -40,6 +40,36 @@ Everything in Phase 1's Global Constraints, plus:
 
 ---
 
+### Task 0 (BLOCKING): the entrapment control
+
+**No candidate list ships without this.** Tasks 1–3 produce a ranked list of variant candidates;
+this task is what lets anyone state what fraction of it is wrong.
+
+**The gap it closes.** The three controls in Task 1 are per-candidate tests — each asks "could this
+substitution be real?" None of them is an error rate. A global FDR does not help either: it is
+computed over the whole identification set, and **the variant subclass has a different null**, so a
+global rate can look fine while the variant subset is mostly wrong.
+
+**The precedent, and why the design needs review before use.** The 2026-07 Parker VM sperm session
+established that a global FDR misses the variant subclass entirely — and its first entrapment design
+was itself flawed, producing a spurious **45%** before being corrected to ~0%. So the entrapment
+design is the artefact to get reviewed, not merely a step to remember. Retrieve that corrected
+design before building a new one.
+
+- [ ] **Step 1: Retrieve the corrected 2026-07 entrapment design.** Ask its author or read the
+  session record. Do not reconstruct it from first principles — the first attempt failed in a way
+  that produced a plausible-looking wrong number.
+- [ ] **Step 2: Write the design down** in `docs/superpowers/specs/`, stating explicitly what the
+  null is, how entrapment sequences are constructed, and what would make the estimate spurious.
+- [ ] **Step 3: Have it reviewed** by someone other than its author before any candidates are
+  generated.
+- [ ] **Step 4: Implement it**, and report the variant-class FDR alongside every candidate list.
+
+Until this exists, a candidate list from Tasks 1–3 is a hypothesis generator, and any document
+reporting one must say so in those words.
+
+---
+
 ### Task 1: GVP detection
 
 **Files:**
