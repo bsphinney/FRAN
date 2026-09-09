@@ -153,10 +153,22 @@ con.close()"
 The population step is Task 2; the test still fails on "table is populated" after this. That is
 expected — do not proceed past Task 2 with it failing.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the table to the governance allowlist**
+
+`app/db.py` gates `query()` on the table NAME before any SQL runs, so without this entry every
+query against the new table raises `GovernanceError` — Step 2's predicted "every check FAILS" does
+not happen; the test crashes uncaught instead. Add `"delimp_protein_corpus_reach"` to
+**`PUBLIC_TABLES`**, in the same style as the neighbouring `delimp_mv_*` entries.
+
+`PUBLIC_TABLES`, not `_INTERNAL_TABLES`, and the reason is not incidental: this table derives solely
+from `delimp_proteins`, which is already public, so it creates no confidentiality that does not
+already exist. Putting it in the internal list would break the read path for the public search page
+this feature lives on.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add ingest/migrations/2026-09-09_protein_corpus_reach.sql tests/test_corpus_reach.py
+git add ingest/migrations/2026-09-09_protein_corpus_reach.sql tests/test_corpus_reach.py app/db.py
 git commit -m "ingest: a corpus-reach table keyed on the uppercased gene"
 ```
 
