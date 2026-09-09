@@ -8,6 +8,9 @@ has no undated collaborator to witness a NULLs-first regression end to end. A se
 exercises the real sort key with a synthetic dataset that DOES include an undated collaborator,
 so the "sort last" behaviour is still proven even though production data can't show it today.
 
+Also asserts the raw_files join added for last_run does not fan out n_searches (a search with
+several raw files must not be counted once per raw file) — see the fan-out witness block below.
+
 Run:  python tests/test_collaborator_recency.py
 """
 import os, sys
@@ -26,6 +29,30 @@ rows = d.get("collaborators") or []
 check("collaborators returned", len(rows) > 100, str(len(rows)))
 check("every row carries last_run", all("last_run" in r for r in rows))
 check("searches count is still present", all("n_searches" in r for r in rows))
+
+# --- fan-out witness: the raw_files join must not inflate n_searches ----------------------
+# internal_collaborators() LEFT JOINs delimp_search_provenance to search_raw_files to raw_files
+# to compute last_run. That join changes the grain from one row per search to one row per
+# (search, raw_file) pair — a search with several raw files fans out into several rows. Any
+# aggregate over that joined query that isn't COUNT(DISTINCT ...) or MAX(...)/MIN(...) will count
+# PAIRS, not searches. The directory's own drill-down (internal_collaborator_searches) is
+# unaffected by this join, so a fan-out makes the list page and the drill-down disagree by
+# exactly the average raw-files-per-search ratio — the visible symptom is "NIST — 1,046 searches"
+# on the list page and a few dozen rows one click into it.
+# The strongest, cheapest witness: summed over EVERY merged group (keep + excluded — the fan-out
+# would inflate both), the directory's n_searches must equal the count of provenance rows that
+# have a service_customer at all, since internal_collaborators() partitions exactly those rows
+# into groups and n_searches is meant to be a count of them (each search_id appears in exactly
+# one provenance row, so COUNT(DISTINCT search_id) per group summed over all groups == that row
+# count). Derived from the live DB at test time, not hardcoded, so this doesn't rot as the corpus
+# grows but still fails hard the moment a join reintroduces fan-out.
+directory_total = sum(r["n_searches"] for r in rows) + sum(r["n_searches"] for r in (d.get("excluded") or []))
+prov_total = queries.query(
+    "SELECT COUNT(*) FROM delimp_search_provenance WHERE service_customer IS NOT NULL",
+    tables=["delimp_search_provenance"], fetch="val") or 0
+check("directory n_searches sums to the provenance row count (no raw-file fan-out)",
+      directory_total == prov_total, f"directory={directory_total} vs provenance={prov_total}")
+
 dates = [str(r["last_run"]) for r in rows if r.get("last_run")]
 # Measured against the live DB on 2026-09-08: 183 of 183 keep-flagged collaborator groups carry a
 # last_run — confirming the brief's docstring claim. Asserted exactly, so a join that silently

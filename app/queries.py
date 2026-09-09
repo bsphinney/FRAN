@@ -2124,10 +2124,10 @@ def internal_collaborators() -> dict[str, Any]:
     rows = query(
         """
         SELECT p.service_customer AS raw,
-               COUNT(*) AS n_searches,
+               COUNT(DISTINCT p.search_id) AS n_searches,
                COUNT(DISTINCT NULLIF(p.pi,'')) AS n_pis,
                COUNT(DISTINCT NULLIF(p.project,'')) AS n_projects,
-               COUNT(*) FILTER (WHERE p.coreomics_submission_id IS NOT NULL
+               COUNT(DISTINCT p.search_id) FILTER (WHERE p.coreomics_submission_id IS NOT NULL
                                    OR p.sample_submission_id IS NOT NULL) AS n_lims_linked,
                MAX(p.service_campus) AS campus, MAX(p.service_source) AS source,
                MAX(rf.acquisition_date)::date AS last_run

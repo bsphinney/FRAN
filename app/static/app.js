@@ -2139,8 +2139,13 @@ async function renderSubmissions(){
     if(!rows.length){ $('#subsBody').innerHTML=empty('No submissions match.'); return; }
     // Three states, never a blank cell. "not located" is the honest answer for anything the
     // 2026-06-24 disk-match never saw, which is everything after PROT_0724.
-    const state = s => (s.n_searches>0)
-      ? `<span class="text-emerald-300">✅ ${fmt(s.n_searches)} search${s.n_searches===1?'':'es'}</span>`
+    // SINGLE definition of "analyzed" (matches internal_lab() / the institution page, and the
+    // submission detail page's sd.in_fran read): n_searches>0 OR in_fran. A linked provenance
+    // search proves it regardless; in_fran alone also counts, since the disk-match sometimes
+    // knows a submission is in FRAN before/without a provenance-linked search_id (bug-logic #6 —
+    // the same submission can't read "analyzed" on one page and "on the share" on this one).
+    const state = s => (s.n_searches>0 || s.in_fran)
+      ? `<span class="text-emerald-300">✅ ${s.n_searches>0?`${fmt(s.n_searches)} search${s.n_searches===1?'':'es'}`:'analyzed in FRAN'}</span>`
       : (s.run_count!=null || s.service_folder)
         ? `<span class="text-accent-400">📦 ${s.run_count!=null?fmt(s.run_count)+' runs':''} on the share</span>
            ${s.service_folder?`<div class="text-[10px] text-slate-500 font-mono break-all mt-0.5" title="${esc(s.service_folder_win||'')}">${esc(s.service_folder)}</div>`:''}
