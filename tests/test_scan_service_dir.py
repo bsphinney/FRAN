@@ -150,12 +150,26 @@ check("in_fran false for sibling project with exact project key", rows_proj[1]["
 # --- the upsert must not clobber a human-reviewed match ----------------------
 check("upsert SQL keys on service_folder", "ON CONFLICT (service_folder)" in sd.UPSERT_SQL,
       sd.UPSERT_SQL[:160])
+# Absence checks: normalize ALL whitespace (newlines, tabs, spaces) and lowercase
+normalized_sql = " ".join(sd.UPSERT_SQL.split()).lower().replace(" ", "")
 for col in ("submission_id", "match_confidence", "clue", "matched_by", "matched_at"):
     check(f"upsert never overwrites {col}",
-          f"{col}=EXCLUDED" not in sd.UPSERT_SQL.replace(" ", ""),
+          f"{col}=excluded" not in normalized_sql,
           "found an EXCLUDED assignment")
-for col in ("run_count", "in_fran", "scanned_at"):
-    check(f"upsert refreshes {col}", col in sd.UPSERT_SQL.split("DO UPDATE SET")[1])
+# Refreshes checks: verify exact assignment forms after DO UPDATE SET
+do_update_part = sd.UPSERT_SQL.split("DO UPDATE SET")[1]
+do_update_normalized = " ".join(do_update_part.split()).lower()
+required_assignments = {
+    "run_count": "run_count = excluded.run_count",
+    "in_fran": "in_fran = excluded.in_fran",
+    "campus": "campus = excluded.campus",
+    "service_folder_win": "service_folder_win = excluded.service_folder_win",
+    "scanned_at": "scanned_at = now()",
+}
+for col, expected_form in required_assignments.items():
+    check(f"upsert refreshes {col} correctly",
+          expected_form in do_update_normalized,
+          f"missing or wrong: {expected_form}")
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)

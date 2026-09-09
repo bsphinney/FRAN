@@ -214,9 +214,14 @@ ON CONFLICT (service_folder) DO UPDATE SET
 
 
 def upsert(con, rows: list[dict]) -> int:
-    cur = con.cursor()
-    for r in rows:
-        cur.execute(UPSERT_SQL, (r["service_folder"], r["service_folder_win"], r["campus"],
-                                 r["run_count"], bool(r.get("in_fran"))))
+    with con.cursor() as cur:
+        for r in rows:
+            try:
+                # Bracket access (not .get()) ensures loud failure if mark_in_fran() was skipped,
+                # so a wiring bug surfaces as a KeyError rather than silent all-False data.
+                cur.execute(UPSERT_SQL, (r["service_folder"], r["service_folder_win"], r["campus"],
+                                         r["run_count"], bool(r["in_fran"])))
+            except Exception as e:
+                raise RuntimeError(f"upsert failed on {r['service_folder']!r}") from e
     con.commit()
     return len(rows)
