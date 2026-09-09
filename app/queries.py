@@ -2314,6 +2314,12 @@ def normalize_submission_ref(ref: str) -> str | None:
     (PROT_0793), in the CoreOmics UI and in conversation. The hex submission_id is the join key
     everywhere else and nobody quotes it. Note a hex id like '1ed8b74497e4' must NOT match: it can
     contain digits, and silently reading it as a number would resolve the wrong submission.
+
+    The {1,4} digit cap above is a safety constraint, not a convenience. Every CoreOmics
+    submission_id is exactly 12 lowercase hex characters (measured across all 4,488 rows on
+    2026-09-08), and 14 of those 4,488 happen to be entirely numeric. A looser digit bound would
+    silently accept one of those 12-digit hex ids as a submission number and resolve into the
+    wrong customer's submission. Widening this bound requires re-checking that invariant first.
     """
     m = _SUB_REF.match(ref or "")
     return f"PROT_{int(m.group(1)):04d}" if m else None

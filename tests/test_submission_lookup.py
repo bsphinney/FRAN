@@ -27,6 +27,9 @@ check("a name is not a number", n("ProtiFi") is None, repr(n("ProtiFi")))
 check("empty is None", n("") is None)
 # 5 digits is not this scheme; refusing beats silently truncating to 4
 check("five digits is refused", n("12345") is None, repr(n("12345")))
+# the collision this whole scheme is built to avoid: some real submission_ids are all-numeric
+# (14 of 4,488, measured 2026-09-08) — the {1,4} cap, not luck, is what keeps this None
+check("a 12-digit all-numeric hex id is refused", n("123456789012") is None, repr(n("123456789012")))
 
 d = queries.internal_submission("PROT_0793")
 sub = d.get("submission") or {}
