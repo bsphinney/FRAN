@@ -2276,6 +2276,7 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
     term = (q or "").strip()
     if len(term) < 2:
         return {"q": term, "total": 0, "rows": []}
+    ref = normalize_submission_ref(term)          # '0793' -> 'PROT_0793', else None
     like = f"%{term}%"
     rows = query(
         """
@@ -2291,6 +2292,7 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
         WHERE co.pi_last_name ILIKE %(like)s OR co.pi_first_name ILIKE %(like)s
            OR co.submitter_last_name ILIKE %(like)s OR co.submitter_first_name ILIKE %(like)s
            OR co.institute ILIKE %(like)s OR p.coreomics_submission_id::text ILIKE %(like)s
+           OR co.internal_id ILIKE %(like)s OR co.internal_id = %(ref)s
            OR p.customer_contact ILIKE %(like)s
            OR p.client ILIKE %(like)s OR p.pi ILIKE %(like)s OR p.project ILIKE %(like)s
            OR p.real_search_name ILIKE %(like)s
@@ -2298,9 +2300,33 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
                  p.real_search_name
         LIMIT %(limit)s
         """,
-        {"like": like, "limit": int(limit)},
+        {"like": like, "ref": ref, "limit": int(limit)},
         tables=["delimp_search_provenance", "coreomics_submissions_cache", "delimp_searches"],
     )
+    subs = query(
+        """
+        SELECT co.submission_id, co.internal_id, co.institute,
+               co.pi_first_name, co.pi_last_name,
+               co.submitter_first_name, co.submitter_last_name,
+               co.submitted_at::date AS co_submitted, co.num_samples AS co_num_samples
+        FROM coreomics_submissions_cache co
+        WHERE co.internal_id IS NOT NULL
+          AND (co.internal_id ILIKE %(like)s OR co.internal_id = %(ref)s
+               OR co.institute ILIKE %(like)s
+               OR co.pi_last_name ILIKE %(like)s OR co.submitter_last_name ILIKE %(like)s)
+        ORDER BY co.submitted_at DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        {"like": like, "ref": ref, "limit": int(limit)},
+        tables=["coreomics_submissions_cache"],
+    )
+    have = {r.get("coreomics_submission_id") for r in rows}
+    for s in subs:
+        if s["submission_id"] not in have:          # do not duplicate a submission already listed
+            s["kind"] = "submission"
+            rows.append(s)
+    for r in rows:
+        r.setdefault("kind", "search")
     return {"q": term, "total": len(rows), "rows": rows}
 
 

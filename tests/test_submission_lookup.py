@@ -41,5 +41,21 @@ check("resolving by number returns the same submission as the hex id",
 check("an unknown number returns no submission, without raising",
       (queries.internal_submission("PROT_9999") or {}).get("submission") is None)
 
+# --- search must find a submission by number, and submissions with no searches -------------
+r = queries.internal_people_search("PROT_0793", 50)
+check("searching PROT_0793 returns something", (r.get("total") or 0) > 0, str(r.get("total")))
+check("...and it names the right institute",
+      any("protifi" in str(x.get("institute") or x.get("co_institute") or "").lower()
+          for x in r.get("rows") or []), "no ProtiFi row")
+
+r2 = queries.internal_people_search("0793", 50)
+check("bare 0793 also finds it", (r2.get("total") or 0) > 0, str(r2.get("total")))
+
+# A submission with NO linked FRAN search must still be findable. PROT_0804 (UC Davis, 2026-09-08)
+# has none; the old query was rooted in delimp_search_provenance so it could not return one.
+r3 = queries.internal_people_search("PROT_0804", 50)
+check("a submission with no linked search is still findable",
+      (r3.get("total") or 0) > 0, str(r3.get("total")))
+
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
