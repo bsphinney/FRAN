@@ -61,6 +61,46 @@ The three per-candidate controls in Task 1 (single-nucleotide reachability, non-
 position) pass on a decoy just as happily as on a real variant. **They are plausibility tests, not
 an error rate**, and quoting a candidate count without this null overstates the result by ~2×.
 
+#### The 4-way cross validates it — and exposed a trap
+
+Following `denovo_decoy_method.html` §3, which validated its homology FDR by running two
+independent nulls and showing they agree. The same design here, with the axes renamed:
+
+| query \ corpus | real corpus | reversed corpus |
+|---|---|---|
+| **real de novo** | **7.30%** (target) | 2.78% (null B) |
+| **decoy de novo** | 2.83% (null A) | 2.24% (chance floor) |
+
+**The two nulls agree to within 2%** — 2.83% vs 2.78%, giving FDR 38.7% and 38.0%. They are built
+completely differently (one decoys the queries, the other the corpus), so agreement means the
+chance-match rate is a property of sequence space rather than of either construction. That is the
+same argument the crane document makes for its decoy-spectra vs decoy-database cross.
+
+**The trap, which produced a plausible wrong number.** Interior reversal is an **involution** —
+applying it twice returns the original. Reversing *both* the peptides and the corpus therefore
+cancels, and the fourth cell first reported **7.24%**: the target cell (7.30%) in disguise, with
+5,041 exact matches against the target's 5,082. A chance floor *higher than either null* is
+incoherent, but nothing in the pipeline would have flagged it.
+
+**So decoy the two axes with DIFFERENT operations.** Interior-*shuffling* the peptides against the
+interior-*reversed* corpus gives the genuine floor: **2.24%**. This cannot arise in the crane
+document, because decoy spectra and a reversed database are inherently independent operations. It
+bites only when both axes are sequence-space transforms — which is exactly this case.
+
+Reference implementations: `ingest/denovo_null.py` (single null),
+`ingest/denovo_null_cross.py` (the 4-way cross), `ingest/denovo_null_floor.py` (the corrected floor).
+
+#### What the candidate list actually is
+
+| | |
+|---|---|
+| raw 1-substitution candidates | 1,662 |
+| pass the three per-candidate controls | 1,133 |
+| expected chance matches | **~437** |
+| defensible signal | **~700** |
+
+And that is *before* the prevalence filter (Task 0b), which removed 65 of 67 in the 2026-07 session.
+
 #### Vocabulary, because it caused a real confusion here
 
 This is a **decoy**, not an entrapment. A decoy is a non-biological sequence used to estimate an
