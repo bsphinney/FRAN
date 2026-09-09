@@ -239,7 +239,7 @@ def index(request: Request):
     tier = db.access_tier()
     user = (auth.principal_name(request) or "") if tier != "public" else ""
     html = (BASE / "templates" / "index.html").read_text() \
-        .replace("%%APP_VERSION%%", APP_VERSION) \
+        .replace("__APPVER__", APP_VERSION) \
         .replace("__INTERNAL_MODE__", "true" if db.is_full() else "false") \
         .replace("__ACCESS_TIER__", tier) \
         .replace("__INTERNAL_USER__", user.replace('"', ""))
