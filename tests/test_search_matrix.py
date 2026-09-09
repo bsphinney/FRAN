@@ -116,5 +116,28 @@ check("cells reference real sample keys",
 check("every row carries is_contaminant", all("is_contaminant" in p for p in prots))
 check("every row carries reach (may be None)", all("reach" in p for p in prots))
 
+# --- the endpoint ----------------------------------------------------------------------------
+from fastapi.testclient import TestClient                    # noqa: E402
+from app.main import app                                     # noqa: E402
+
+client = TestClient(app)
+rr = client.get(f"/api/search/{SID}/matrix", params={"mode": "cv", "limit": 10})
+check("matrix endpoint returns 200", rr.status_code == 200, str(rr.status_code))
+body = rr.json()
+body = body.get("data", body)
+check("endpoint returns 10 proteins", len(body.get("proteins") or []) == 10,
+      str(len(body.get("proteins") or [])))
+check("endpoint echoes the mode", body.get("mode") == "cv", str(body.get("mode")))
+
+bad = client.get(f"/api/search/{SID}/matrix", params={"mode": "; DROP TABLE delimp_proteins --"})
+check("an unknown mode falls back rather than erroring", bad.status_code == 200, str(bad.status_code))
+check("...and falls back to cv", (bad.json().get("data") or bad.json()).get("mode") == "cv")
+
+missing = client.get("/api/search/00000000-0000-0000-0000-000000000000/matrix")
+check("an unknown search returns 200 with an empty matrix",
+      missing.status_code == 200
+      and not ((missing.json().get("data") or missing.json()).get("proteins")),
+      str(missing.status_code))
+
 print("\n" + ("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS)))
 sys.exit(1 if FAILS else 0)

@@ -1032,6 +1032,17 @@ def api_search_detail(search_id: str):
     return ok(res)
 
 
+@app.get("/api/search/{search_id}/matrix")
+def api_search_matrix(search_id: str, mode: str = "cv", limit: int = 50):
+    """The protein x sample matrix for a search page's heatmap.
+
+    Public-tier: every table it reads is in PUBLIC_TABLES. `mode` is validated inside
+    search_protein_matrix() against a fixed dict and falls back to "cv", so an unknown value can
+    never reach SQL.
+    """
+    return ok(queries.search_protein_matrix(search_id, mode=mode, limit=max(1, min(int(limit), 200))))
+
+
 if __name__ == "__main__":
     import uvicorn
 
