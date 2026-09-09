@@ -63,15 +63,16 @@ Measured cost of each ranking rule on the mouse search:
 ### 1. `delimp_protein_corpus_reach` — a precomputed table
 
 ```
-protein_group   TEXT PRIMARY KEY
-n_searches      INTEGER   -- how many FRAN searches have ever reported it
-n_samples       INTEGER   -- how many distinct raw files
+gene            TEXT PRIMARY KEY   -- keyed on gene, NOT protein_group; see the measurement below
+n_searches      INTEGER            -- how many FRAN searches have ever reported it
+n_samples       INTEGER            -- how many distinct raw files
 computed_at     TIMESTAMPTZ
 ```
 
-Built by `SELECT protein_group, count(DISTINCT search_id), count(DISTINCT raw_path) FROM
-delimp_proteins GROUP BY 1`, refreshed by the existing weekly Hive cron alongside the matviews —
-the same pattern `delimp_protein_peptide_count` already follows. Reads become a keyed lookup.
+Built by `SELECT gene, count(DISTINCT search_id), count(DISTINCT raw_path) FROM delimp_proteins
+WHERE NULLIF(gene,'') IS NOT NULL GROUP BY 1`, refreshed by the existing weekly Hive cron alongside
+the matviews — the same pattern `delimp_protein_peptide_count` already follows. Reads become a keyed
+lookup. Measured rebuild: **121 s for 298,391 genes**.
 
 **MEASURED 2026-09-09: the full rebuild is 637 s (10.6 min) for 618,520 protein groups.** That fits
 a weekly cron comfortably; no incremental rebuild is needed, and the fallback design is dropped.
@@ -92,12 +93,7 @@ calling it biology** — a plausible-looking feature that is quietly wrong, whic
 this spec exists to avoid.
 
 **Therefore rarity is keyed on `gene`, not `protein_group`**, since gene symbols are stable across
-FASTAs. `delimp_proteins.gene` is populated. The reach table becomes:
-
-    gene            TEXT PRIMARY KEY
-    n_searches      INTEGER
-    n_samples       INTEGER
-    computed_at     TIMESTAMPTZ
+FASTAs, and `delimp_proteins.gene` is populated on 96% of rows.
 
 **MEASURED, and the rarity colouring is VIABLE.** Gene-level rebuild is 121 s for 298,391 distinct
 genes (5× cheaper than the protein_group form), and only 4% of `delimp_proteins` rows carry no gene.
@@ -182,7 +178,7 @@ Extends the existing widget; does not replace it.
 ## Interfaces
 
 ```
-internal: delimp_protein_corpus_reach (protein_group PK, n_searches, n_samples, computed_at)
+delimp_protein_corpus_reach (gene PK, n_searches, n_samples, computed_at)
 
 queries.search_protein_matrix(search_id, mode='cv', limit=50) -> {
     proteins: [{protein_group, gene, n_searches, n_samples_corpus, cells:[…]}],
