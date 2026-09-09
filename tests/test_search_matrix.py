@@ -116,6 +116,20 @@ check("cells reference real sample keys",
 check("every row carries is_contaminant", all("is_contaminant" in p for p in prots))
 check("every row carries reach (may be None)", all("reach" in p for p in prots))
 
+# SAMPLES MUST NOT LEAK CLIENT/PI PATHS (Fix round 1). raw_path can point into
+# delimp_submission_service_dir's own territory — .../on_campus/<client>/... or
+# .../off_campus/<client>/... on the service share — which is confidential and this route is
+# public-tier with no is_full() gate. Only basename may appear in the samples list.
+check("no sample carries a raw_path key", all("raw_path" not in s for s in samps))
+# NOT A DISCRIMINATOR ON THIS FIXTURE: this search's raw files live under
+# /quobyte/proteomics-grp/brett/PROT_0793/..., so this check does NOT fail even with raw_path
+# restored — there is no on_campus/off_campus/lab-service marker to find on this search. It is a
+# guard for OTHER searches (the ones that actually sit on the service share), kept here so a
+# regression is caught the moment anyone tests against such a search, not proof against this one.
+check("no sample value contains a service-share client-directory marker",
+      not any(marker in str(v) for s in samps for v in s.values()
+              for marker in ("/lab/service/", "on_campus", "off_campus")))
+
 # --- the endpoint ----------------------------------------------------------------------------
 from fastapi.testclient import TestClient                    # noqa: E402
 from app.main import app                                     # noqa: E402

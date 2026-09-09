@@ -4351,7 +4351,10 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
         {"sid": search_id}, tables=["delimp_proteins", "raw_files"])
     # Acquisition order where known, name order otherwise: batch drift then reads as vertical bands.
     samples.sort(key=lambda s: (s["acquisition_date"] is None, s["acquisition_date"], s["raw_path"]))
-    sample_rows = [{"raw_path": s["raw_path"], "basename": _base(s["raw_path"]),
+    # NOT raw_path: on the service share, the full path is a client/PI directory
+    # (delimp_submission_service_dir's own inventory, e.g. .../on_campus/<client>/...), which is
+    # confidential and this route is public-tier. basename is the only join key cells need.
+    sample_rows = [{"basename": _base(s["raw_path"]),
                     "acquisition_date": s["acquisition_date"]} for s in samples]
     n_samples_total = len(sample_rows)
 
