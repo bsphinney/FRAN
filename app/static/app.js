@@ -58,6 +58,8 @@ function route(){
     case 'peptides': return renderPeptidesShowcase();
     case 'allspecies': return renderSpeciesShowcase();
     case 'engines': return renderEngines(param);
+    case 'denovo': return renderDenovo();
+    case 'denovorun': return renderDenovoRun(param);
     case 'enginerun': return renderEngineRun(param);
     case 'collaborators': return renderCollaborators();
     case 'mydata': return renderMyData();
@@ -604,6 +606,7 @@ async function renderPeptide(seq){
     <div id="xicbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-64 rounded-xl"></div></div>
     <div id="interfbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-32 rounded-xl"></div></div>
     <div id="lcabox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-20 rounded-xl"></div></div>
+    <div id="pep-denovo"></div>
     <div id="protbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-24 rounded-xl"></div></div>
     <div class="glass card p-5 fade-in mb-5"><h3 class="font-bold text-white mb-3">Modified forms × charge</h3>
     ${table(['ProForma','Charge','Obs','Avg m/z','Avg RT','Avg 1/K₀','Best q','Avg log₂ int','Engines'],
@@ -611,7 +614,7 @@ async function renderPeptide(seq){
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Observations across runs (${d.observations.length})</h3>
     ${table(['Search','Engine','Run','Charge','m/z','RT','1/K₀','q-value','Intensity'],
       d.observations.map(o=>[`<span class="text-accent-400 cursor-pointer" onclick="event.stopPropagation();go('run','${o.search_id}')">${esc(o.search_name||'—')}</span>`,esc(o.search_engine||'—'),`<span class="font-mono text-[11px]">${esc((o.raw_path||'').split('/').pop())}</span>`,o.charge+'+',fmtF(o.precursor_mz,4),fmtF(o.rt),fmtF(o.im,3),sci(o.q_value),sci(o.intensity)])) }</div>`;
-    loadFunFacts(seq); loadSummary(seq); loadFlyability(seq); loadCharges(seq); loadPredicted(seq, 2); loadObserved(seq); loadXIC(seq); loadInterference(seq); loadLCA(seq); loadProteins(seq);
+    loadFunFacts(seq); loadSummary(seq); loadFlyability(seq); loadCharges(seq); loadPredicted(seq, 2); loadObserved(seq); loadXIC(seq); loadInterference(seq); loadLCA(seq); loadProteins(seq); loadPeptideDenovo(seq);
   }catch(e){ dbError(e); }
 }
 
@@ -2955,4 +2958,182 @@ async function eLoadPeps(rb, mode, offset){
       </div>`;
     box.innerHTML = `<div class="text-xs text-slate-500 mb-2">${fmt(total)} in this category. Click a peptide to open its corpus page.</div>` + html + pager;
   }catch(e){ box.innerHTML=empty('Could not load: '+e.message); }
+}
+
+/* ── De novo lane ────────────────────────────────────────────────────────────────────────────
+   Peptides sequenced straight off spectra, with no database search. Two views: the run index,
+   and one run's peptide list where every peptide the corpus knows links into its FRAN page.
+
+   Three things here are deliberate and easy to "tidy" away:
+     * sample_role is shown on every row. Folder membership does not imply donor status — a bovine
+       BSA standard sits in the hair cohort with 7,844 PSMs and normal confidence, invisible to any
+       yield check, and every human variant callable from it is an artefact.
+     * corpus_hits is an ARRAY. De novo cannot tell isoleucine from leucine, so one peptide can
+       match several real corpus spellings (8.2% of crane matches did). Showing one and hiding the
+       rest would misrepresent what the method can distinguish.
+     * conf_geomean is displayed, never the raw peptide score. That score is the product of
+       per-residue scores, so it falls with length whatever the quality: filtering at 0.9 moves
+       median peptide length from 21 to 8.                                                     */
+
+function roleChip(role){
+  const c = {donor:'bg-emerald-500/15 text-emerald-300',
+             standard:'bg-amber-500/15 text-amber-300',
+             control:'bg-sky-500/15 text-sky-300',
+             unknown:'bg-slate-500/15 text-slate-400'}[role] || 'bg-slate-500/15 text-slate-400';
+  const t = role==='standard' ? 'A protein standard, not a donor sample — excluded from variant analysis'
+          : role==='unknown'  ? 'Not attributable to a known donor from the run name alone'
+          : '';
+  return `<span title="${esc(t)}" class="px-2 py-0.5 rounded text-[10px] font-mono ${c}">${esc(role)}</span>`;
+}
+
+function classChip(c){
+  const m = {conserved:['bg-teal/15 text-teal','Already in the FRAN corpus — contaminant or housekeeping, not evidence of this sample'],
+             gvp:['bg-plum/20 text-plum font-bold','One substitution from a corpus peptide — a variant candidate'],
+             novel:['bg-amber-500/15 text-amber-300','Never seen in the corpus']}[c]
+          || ['bg-slate-500/15 text-slate-300',''];
+  return `<span title="${esc(m[1])}" class="px-2 py-0.5 rounded text-[10px] font-mono ${m[0]}">${esc(c)}</span>`;
+}
+
+async function renderDenovo(){
+  view.innerHTML = `<div class="skeleton h-64 rounded-xl"></div>`;
+  try{
+    const d = await api('/api/denovo/runs?limit=300');
+    const R = d.rows || [];
+    if(!R.length){
+      view.innerHTML = crumb([['Dashboard','dashboard'],['De novo',null]]) +
+        empty('No de novo runs ingested yet.');
+      return;
+    }
+    const donors = new Set(R.map(r=>r.donor_id).filter(Boolean)).size;
+    const flagged = R.filter(r=>r.ingest_flag).length;
+    const rows = R.map(r=>`
+      <tr class="row-hover border-b border-white/5 cursor-pointer"
+          onclick="go('denovorun','${encodeURIComponent(r.run_id)}')">
+        <td class="py-2 pr-3 font-mono text-accent-400 break-all">${esc(r.run_name)}</td>
+        <td class="pr-3 text-slate-300">${esc(r.cohort||'—')}</td>
+        <td class="pr-3 font-mono text-slate-300">${esc(r.donor_id||'—')}</td>
+        <td class="pr-3">${roleChip(r.sample_role)}</td>
+        <td class="pr-3 text-right kpi-num">${fmt(r.n_peptides)}</td>
+        <td class="pr-3 text-right kpi-num text-slate-400">${r.len_median ?? '—'}</td>
+        <td class="pr-3 text-right kpi-num">${fmtF(r.conf_geomean_median,3)}</td>
+        <td class="pr-3 text-right kpi-num text-slate-400"
+            title="Chance-match rate from decoy peptides through the identical search. Blank when there are too few matches to divide by.">${
+          r.match_fdr==null ? '—' : (100*r.match_fdr).toFixed(1)+'%'}</td>
+        <td>${r.ingest_flag ? `<span class="px-2 py-0.5 rounded text-[10px] font-mono bg-rose-500/15 text-rose-300" title="flagged at ingest">${esc(r.ingest_flag)}</span>` : ''}</td>
+      </tr>`).join('');
+    view.innerHTML = `
+      ${crumb([['Dashboard','dashboard'],['De novo',null]])}
+      <div class="glass card p-6 mb-5 fade-in">
+        <h1 class="text-2xl font-extrabold text-white">De novo runs</h1>
+        <p class="text-slate-300 mt-2 max-w-3xl">Peptides read straight off the spectra by a de novo
+          engine, with no database search and no reference proteome. This is how a sample with no
+          sequenced genome — archaeological enamel, a feather from an unsequenced bird — still yields
+          peptides.</p>
+        <p class="text-slate-500 text-sm mt-2 max-w-3xl">Median confidence is the
+          <b>length-normalised</b> per-residue value. The raw peptide score is a product over
+          residues, so it collapses with length whatever the quality — thresholding on it selects
+          short peptides, not good ones.</p>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4">
+          ${stat('Runs', fmt(R.length))}
+          ${stat('Distinct donors', fmt(donors))}
+          ${stat('Peptides', fmt(R.reduce((a,r)=>a+(r.n_peptides||0),0)))}
+          ${stat('Flagged at ingest', fmt(flagged))}
+        </div>
+      </div>
+      <div class="glass card p-6 fade-in overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+            <th class="text-left pb-2 pr-3">Run</th><th class="text-left pb-2 pr-3">Cohort</th>
+            <th class="text-left pb-2 pr-3">Donor</th><th class="text-left pb-2 pr-3">Role</th>
+            <th class="text-right pb-2 pr-3">Peptides</th><th class="text-right pb-2 pr-3">Med len</th>
+            <th class="text-right pb-2 pr-3">Med conf</th><th class="text-right pb-2 pr-3">Match FDR</th>
+            <th></th></tr></thead>
+          <tbody>${rows}</tbody></table>
+      </div>`;
+  }catch(e){ view.innerHTML = empty('Could not load de novo runs: '+e.message); }
+}
+
+async function renderDenovoRun(runId){
+  view.innerHTML = `<div class="skeleton h-64 rounded-xl"></div>`;
+  try{
+    const [meta, peps] = await Promise.all([
+      api(`/api/denovo/run/${encodeURIComponent(runId)}`),
+      api(`/api/denovo/run/${encodeURIComponent(runId)}/peptides?limit=300`)]);
+    const r = meta.run;
+    if(!r){ view.innerHTML = crumb([['De novo','denovo'],['Run',null]]) + empty('No such run.'); return; }
+    const C = meta.classes || {};
+    const rows = (peps.rows||[]).map(p=>{
+      const hits = p.corpus_hits || [];
+      const linked = hits.length ? hits.map(h=>pepChip(h)).join(' ')
+                                 : '<span class="text-slate-600 text-xs">not seen</span>';
+      const amb = (p.n_candidates||0) > 1
+        ? `<span class="ml-1 text-[10px] font-mono text-amber-400" title="I and L are indistinguishable to de novo, so this matches ${p.n_candidates} corpus spellings">${p.n_candidates}×</span>`
+        : '';
+      return `<tr class="border-b border-white/5">
+        <td class="py-2 pr-3 font-mono break-all">${esc(p.stripped_seq)}</td>
+        <td class="pr-3 text-right kpi-num text-slate-400">${p.length}</td>
+        <td class="pr-3">${classChip(p.corpus_class)}</td>
+        <td class="pr-3">${linked}${amb}</td>
+        <td class="pr-3 text-right kpi-num">${fmt(p.n_psms)}</td>
+        <td class="pr-3 text-right kpi-num">${fmtF(p.conf_geomean,3)}</td>
+      </tr>`;}).join('');
+    view.innerHTML = `
+      ${crumb([['Dashboard','dashboard'],['De novo','denovo'],[r.run_name,null]])}
+      <div class="glass card p-6 mb-5 fade-in">
+        <h1 class="text-2xl font-extrabold text-white break-all">${esc(r.run_name)}</h1>
+        <p class="text-slate-400 text-sm mt-1">${esc(r.denovo_engine)} ${esc(r.engine_version||'')}
+          ${r.weights?' · '+esc(r.weights):''}${r.gpu_arch?' · '+esc(r.gpu_arch):''}
+          ${r.cohort?' · '+esc(r.cohort):''} · ${roleChip(r.sample_role)}
+          ${r.donor_id?' · donor '+esc(r.donor_id):''}</p>
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-4">
+          ${stat('Peptides', fmt(r.n_peptides))}
+          ${stat('Conserved', fmt(C.conserved||0))}
+          ${stat('Variant candidates', fmt(C.gvp||0))}
+          ${stat('Novel', fmt(C.novel||0))}
+          ${stat('Match FDR', r.match_fdr==null?'—':(100*r.match_fdr).toFixed(1)+'%')}
+        </div>
+        <p class="text-slate-500 text-sm mt-3 max-w-3xl"><b>Conserved</b> means already in the FRAN
+          corpus — contaminant or housekeeping, and not evidence of this sample. <b>Novel</b> means
+          never seen in the corpus, which is where a sample-specific signal would be.
+          ${r.match_fdr!=null?`<b>Match FDR ${(100*r.match_fdr).toFixed(1)}%</b> is how often a decoy
+          peptide lands the same match by chance, measured through the identical search.`:''}</p>
+      </div>
+      <div class="glass card p-6 fade-in overflow-x-auto">
+        <div class="text-xs text-slate-500 mb-2">${fmt(peps.total)} peptides. Click a corpus peptide
+          to open its FRAN page.</div>
+        <table class="w-full text-sm">
+          <thead><tr class="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+            <th class="text-left pb-2 pr-3">Peptide</th><th class="text-right pb-2 pr-3">Len</th>
+            <th class="text-left pb-2 pr-3">Class</th><th class="text-left pb-2 pr-3">In FRAN</th>
+            <th class="text-right pb-2 pr-3">PSMs</th><th class="text-right pb-2 pr-3">Conf</th>
+            </tr></thead>
+          <tbody>${rows}</tbody></table>
+      </div>`;
+  }catch(e){ view.innerHTML = empty('Could not load run: '+e.message); }
+}
+
+/* Layer added to the peptide page: which de novo runs called this peptide. Matched on the
+   I/L-normalised key, so a corpus peptide spelled with I finds the de novo peptide spelled with L. */
+async function loadPeptideDenovo(seq){
+  const box = document.getElementById('pep-denovo');
+  if(!box) return;
+  try{
+    const d = await api(`/api/peptide/${encodeURIComponent(seq)}/denovo`);
+    const R = d.rows || [];
+    if(!R.length){ box.innerHTML=''; return; }
+    box.innerHTML = `
+      <div class="glass card p-6 mb-5 fade-in">
+        <h3 class="font-bold text-white mb-1">Seen de novo
+          <span class="text-[10px] text-slate-500 font-normal">sequenced without a database search</span></h3>
+        <p class="text-[11px] text-slate-500 mb-3">Read straight off the spectra in ${R.length} run(s).
+          Independent of any search engine or reference proteome — but not of the spectra themselves.</p>
+        ${R.slice(0,12).map(r=>`
+          <div class="flex items-center justify-between text-xs py-1.5 border-b border-white/5">
+            <span class="cursor-pointer text-accent-400 font-mono break-all"
+                  onclick="go('denovorun','${encodeURIComponent(r.run_id)}')">${esc(r.run_name)}</span>
+            <span class="text-slate-500 whitespace-nowrap ml-3">${esc(r.cohort||'')}
+              ${r.donor_id?'· '+esc(r.donor_id):''} · ${fmt(r.n_psms)} PSMs · conf ${fmtF(r.conf_geomean,3)}</span>
+          </div>`).join('')}
+      </div>`;
+  }catch(e){ box.innerHTML=''; }
 }
