@@ -123,6 +123,22 @@ bad_ids = [s.get("internal_id") for s in (L.get("submissions") or []) if not (s.
 check("every row has a real PROT_#### internal_id (none null, none malformed)",
       not bad_ids, bad_ids[:5])
 
+# --- the shipped ORDER BY actually says NULLS LAST -------------------------------------------
+# The synthetic block below proves the ASSERTION would catch a NULLS-FIRST-shaped list. It does
+# NOT prove the QUERY produces a NULLS-LAST-shaped one: internal_submissions() returns
+# `query()`'s rows untouched, so monkeypatching query() bypasses the SQL entirely — the ORDER BY
+# never executes. Verified 2026-09-09 by a re-reviewer: flipping the REAL SQL to NULLS FIRST left
+# the whole suite ALL PASS. Live data cannot witness it either (0 of 790 numbered submissions have
+# a NULL submitted_at), so the only thing that binds a check to the clause is the clause itself.
+# This asserts on the shipped source, the same way test_submission_analyzed_definition.py asserts
+# on the condition shipped in app.js.
+_qsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "queries.py")).read()
+_orders = re.findall(r"ORDER BY\s+co\.submitted_at\s+DESC[^\n]*", _qsrc)
+check("every submitted_at ORDER BY is present", len(_orders) >= 2, f"found {len(_orders)}")
+check("every submitted_at ORDER BY sorts undated LAST",
+      all("NULLS LAST" in o for o in _orders),
+      f"offending: {[o for o in _orders if 'NULLS LAST' not in o]}")
+
 # --- synthetic witness for "NULLS LAST" ------------------------------------------------------
 # Live data has ZERO numbered submissions with a NULL submitted_at (measured against the live DB,
 # 2026-09-08: 0/790), so the "newest first" check above can't witness a NULLS-FIRST regression —
