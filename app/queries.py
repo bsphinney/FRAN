@@ -4302,3 +4302,122 @@ def engine_species_summary(limit: int = 60) -> list[dict[str, Any]]:
             tables=["search_raw_files", "raw_files", "delimp_searches", "delimp_sample_metadata"])
         return [dict(r) for r in rows]
     return SLOW_CACHE.get_or_set(f"engine_species_summary:{limit}", _p)
+
+
+_MATRIX_MODES = {
+    # ORDER BY fragment -> applied after the presence floor. Every one reads `intensity`, never
+    # `normalized_intensity`: the latter is populated for 75 of 2,086 searches (4%), so a matrix
+    # keyed on it renders for 4% of searches and is blank for the rest.
+    "cv":               "cv DESC NULLS LAST",
+    "abundance":        "mean_int DESC NULLS LAST",
+    "rarity":           "reach ASC NULLS LAST, n_samples DESC",
+    "corpus_abundance": "mean_pct_rank DESC NULLS LAST",
+}
+_MATRIX_FLOOR = 0.2          # of the search's sample count
+_MATRIX_MIN_PCT_SEARCHES = 20  # before mean_pct_rank is trusted
+
+
+def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict[str, Any]:
+    """PRIVATE-SAFE: the protein x sample matrix behind a search page's heatmap.
+
+    delimp_proteins is already one row per (search, sample, protein), so this is a read, not a
+    derivation. Four ranking modes: two scoped to this search (cv, abundance) and two corpus-wide
+    (rarity, corpus_abundance) served from delimp_protein_corpus_reach because they take 121 s and
+    97 s live.
+
+    PRESENCE FLOOR of 20% of samples applies to every mode. Without it mean intensity puts Or6c75 —
+    an olfactory receptor in 1 of 222 samples at 85.4e9 — above albumin in 219.
+
+    Reads `intensity`. NOT `normalized_intensity`, which exists for only 4% of searches.
+    """
+    if mode not in _MATRIX_MODES:
+        mode = "cv"
+    order = _MATRIX_MODES[mode]
+
+    n_samples_total = query(
+        "SELECT count(DISTINCT raw_path) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
+        {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
+    n_proteins_total = query(
+        "SELECT count(DISTINCT protein_group) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
+        {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
+    if not n_samples_total:
+        return {"proteins": [], "samples": [], "mode": mode, "limit": limit,
+                "n_proteins_total": 0, "n_samples_total": 0,
+                "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": None}
+
+    params = {"sid": search_id, "limit": int(limit),
+              "floor": _MATRIX_FLOOR * n_samples_total,
+              "minpct": _MATRIX_MIN_PCT_SEARCHES}
+    rows = query(
+        f"""
+        WITH agg AS (
+          SELECT p.gene,
+                 max(p.protein_group)                     AS protein_group,
+                 count(DISTINCT p.raw_path)               AS n_samples,
+                 avg(p.intensity)                         AS mean_int,
+                 stddev_pop(p.intensity)
+                   / NULLIF(avg(p.intensity), 0)          AS cv,
+                 bool_or(p.is_contaminant)                AS is_contaminant
+            FROM delimp_proteins p
+           WHERE p.search_id = %(sid)s AND p.intensity > 0
+             AND NULLIF(p.gene,'') IS NOT NULL
+           GROUP BY p.gene
+          HAVING count(DISTINCT p.raw_path) >= %(floor)s)
+        SELECT a.*, r.n_searches AS reach,
+               CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank
+          FROM agg a
+          LEFT JOIN delimp_protein_corpus_reach r ON r.gene = upper(a.gene)
+         ORDER BY {order}
+         LIMIT %(limit)s
+        """,
+        params, tables=["delimp_proteins", "delimp_protein_corpus_reach"])
+
+    genes = [r["gene"] for r in rows]
+    cells = query(
+        """SELECT gene, raw_path, avg(intensity) AS v
+             FROM delimp_proteins
+            WHERE search_id=%(sid)s AND gene = ANY(%(genes)s) AND intensity > 0
+            GROUP BY gene, raw_path""",
+        {"sid": search_id, "genes": genes}, tables=["delimp_proteins"]) if genes else []
+
+    samples = query(
+        """SELECT DISTINCT p.raw_path, rf.acquisition_date
+             FROM delimp_proteins p
+             LEFT JOIN raw_files rf ON rf.raw_path = p.raw_path
+            WHERE p.search_id=%(sid)s""",
+        {"sid": search_id}, tables=["delimp_proteins", "raw_files"])
+
+    def _base(rp: str) -> str:
+        return (rp or "").rstrip("/").split("/")[-1].removesuffix(".d").removesuffix(".raw")
+
+    # Acquisition order where known, name order otherwise: batch drift then reads as vertical bands.
+    samples.sort(key=lambda s: (s["acquisition_date"] is None, s["acquisition_date"], s["raw_path"]))
+    sample_rows = [{"raw_path": s["raw_path"], "basename": _base(s["raw_path"]),
+                    "acquisition_date": s["acquisition_date"]} for s in samples]
+
+    by_gene: dict[str, dict[str, float]] = {}
+    for c in cells:
+        by_gene.setdefault(c["gene"], {})[_base(c["raw_path"])] = float(c["v"])
+
+    reaches = sorted(r["reach"] for r in rows if r["reach"] is not None)
+    def _pct(v):
+        # Percentile against the DISPLAYED rows, not the corpus: globally 40% of genes are seen once,
+        # which would flatten the scale to a single bin.
+        if v is None or len(reaches) < 2:
+            return None
+        return reaches.index(v) / (len(reaches) - 1)
+
+    proteins = [{"gene": r["gene"], "protein_group": r["protein_group"],
+                 "n_samples": r["n_samples"], "is_contaminant": bool(r["is_contaminant"]),
+                 "cv": float(r["cv"]) if r["cv"] is not None else None,
+                 "mean_int": float(r["mean_int"]) if r["mean_int"] is not None else None,
+                 "reach": r["reach"],
+                 "mean_pct_rank": float(r["mean_pct_rank"]) if r["mean_pct_rank"] is not None else None,
+                 "reach_pct_rank": _pct(r["reach"]),
+                 "cells": by_gene.get(r["gene"], {})} for r in rows]
+
+    as_of = query("SELECT max(computed_at) AS d FROM delimp_protein_corpus_reach",
+                  tables=["delimp_protein_corpus_reach"], fetch="val")
+    return {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
+            "n_proteins_total": n_proteins_total, "n_samples_total": n_samples_total,
+            "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
