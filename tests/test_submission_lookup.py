@@ -57,5 +57,19 @@ r3 = queries.internal_people_search("PROT_0804", 50)
 check("a submission with no linked search is still findable",
       (r3.get("total") or 0) > 0, str(r3.get("total")))
 
+# PROT_0793 is a poor witness for the provenance-side co.internal_id match: its two "linked"
+# searches actually have p.coreomics_submission_id = NULL (linkage_status='unlinked') and only
+# surface because p.real_search_name literally contains the substring "PROT_0793" — a
+# pre-existing clause unrelated to this change. So PROT_0793 alone cannot prove the
+# `co.internal_id` provenance clause does anything. PROT_0652 (hex 652c08d115d8) is a genuine
+# FK-linked witness: 6 searches with p.coreomics_submission_id actually set to its hex id.
+# Reaching those 6 real search rows (not a bare submission stub) by number, through the
+# provenance branch, is exactly what the co.internal_id provenance clause is for.
+for term in ("PROT_0652", "0652"):
+    r4 = queries.internal_people_search(term, 50)
+    check(f"{term} reaches PROT_0652's real searches, not just a submission stub",
+          any(x.get("kind") == "search" and x.get("search_engine") for x in r4.get("rows") or []),
+          f'rows={[(x.get("kind"), x.get("search_engine")) for x in r4.get("rows") or []]}')
+
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
