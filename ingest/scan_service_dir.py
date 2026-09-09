@@ -195,13 +195,14 @@ def mark_in_fran(rows: list[dict], ingested: set[str]) -> None:
         r["in_fran"] = r["service_folder"] in ingested
 
 
-# The DO UPDATE list is deliberately short. submission_id / match_confidence / clue / matched_by /
-# matched_at are NOT refreshed: the 2026-06-24 ai-disk-match rows encode human-reviewed judgement
-# (clues like "submitter+date+organism") that this scanner cannot re-derive, and silently replacing
-# them with a weaker guess would be a regression nobody would notice. The scanner owns the
-# INVENTORY columns; matching owns the attribution columns, and only via match_submissions().
+# delimp_service_dir_inventory is one row per FOLDER, and the scanner owns every column in it —
+# there is no attribution column here to protect. Human-reviewed submission matching (the
+# 2026-06-24 ai-disk-match rows, and match_submissions() after it) lives in the separate
+# delimp_submission_service_dir, which this scanner never writes. Two tables, not one, because a
+# single folder can hold several submissions' worth of runs (see the migration's comment) and a
+# scan of the folder must never be able to clobber that judgement.
 UPSERT_SQL = """
-INSERT INTO delimp_submission_service_dir
+INSERT INTO delimp_service_dir_inventory
   (service_folder, service_folder_win, campus, run_count, in_fran, scanned_at)
 VALUES (%s, %s, %s, %s, %s, now())
 ON CONFLICT (service_folder) DO UPDATE SET
