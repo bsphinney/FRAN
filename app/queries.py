@@ -2119,21 +2119,25 @@ def internal_collaborators() -> dict[str, Any]:
 
     Returns {collaborators: [...keep...], excluded: [...internal/standard...], n_internal_standard,
     n_unattributed_searches}. CoreOmics PI/institute is ADVISORY (confidence confirmed|suggested) and
-    never overrides the folder name."""
+    never overrides the folder name. `keep` is sorted by `last_run` (raw_files.acquisition_date,
+    an ISO date or None — when work was ACQUIRED, not ingested) descending, undated last."""
     rows = query(
         """
-        SELECT service_customer AS raw,
+        SELECT p.service_customer AS raw,
                COUNT(*) AS n_searches,
-               COUNT(DISTINCT NULLIF(pi,'')) AS n_pis,
-               COUNT(DISTINCT NULLIF(project,'')) AS n_projects,
-               COUNT(*) FILTER (WHERE coreomics_submission_id IS NOT NULL
-                                   OR sample_submission_id IS NOT NULL) AS n_lims_linked,
-               MAX(service_campus) AS campus, MAX(service_source) AS source
-        FROM delimp_search_provenance
-        WHERE service_customer IS NOT NULL
-        GROUP BY service_customer
+               COUNT(DISTINCT NULLIF(p.pi,'')) AS n_pis,
+               COUNT(DISTINCT NULLIF(p.project,'')) AS n_projects,
+               COUNT(*) FILTER (WHERE p.coreomics_submission_id IS NOT NULL
+                                   OR p.sample_submission_id IS NOT NULL) AS n_lims_linked,
+               MAX(p.service_campus) AS campus, MAX(p.service_source) AS source,
+               MAX(rf.acquisition_date)::date AS last_run
+        FROM delimp_search_provenance p
+        LEFT JOIN search_raw_files srf ON srf.search_id = p.search_id
+        LEFT JOIN raw_files rf ON rf.raw_path = srf.raw_path
+        WHERE p.service_customer IS NOT NULL
+        GROUP BY p.service_customer
         """,
-        tables=["delimp_search_provenance"],
+        tables=["delimp_search_provenance", "search_raw_files", "raw_files"],
     )
     n_unattributed = query(
         "SELECT COUNT(*) FROM delimp_search_provenance WHERE service_customer IS NULL",
@@ -2149,11 +2153,14 @@ def internal_collaborators() -> dict[str, Any]:
                               "campus": info.get("campus") or r["campus"], "scope": "customer",
                               "n_searches": 0, "n_pis": 0, "n_projects": 0, "n_lims_linked": 0,
                               "co_pi": None, "co_institute": None, "co_confidence": None,
-                              "_sources": set()}
+                              "last_run": None, "_sources": set()}
         m["n_searches"] += r["n_searches"] or 0
         m["n_pis"] += r["n_pis"] or 0
         m["n_projects"] += r["n_projects"] or 0
         m["n_lims_linked"] += r["n_lims_linked"] or 0
+        # A canonical collaborator can span several raw service_customer folders — take the MAX
+        # acquisition date across all of them, not just the one from the last row merged in.
+        m["last_run"] = max([x for x in (m.get("last_run"), r["last_run"]) if x], default=None)
         if r["source"]:
             m["_sources"].add(r["source"])
         co = info.get("coreomics")
@@ -2163,8 +2170,11 @@ def internal_collaborators() -> dict[str, Any]:
 
     for m in merged.values():
         m["source"] = ",".join(sorted(m.pop("_sources")))
+    # Most recent acquisition first; collaborators with no dated raw file (no NULLIF-safe join hit)
+    # sort LAST, not first — an undated collaborator must never sit above one acquired last week.
     keep = sorted((m for m in merged.values() if m["flag"] == "keep"),
-                  key=lambda m: (-m["n_searches"], m["client"]))
+                  key=lambda m: (m["last_run"] is not None, m["last_run"] or "", m["n_searches"]),
+                  reverse=True)
     excluded = sorted((m for m in merged.values() if m["flag"] != "keep"),
                       key=lambda m: (-m["n_searches"], m["client"]))
     return {"collaborators": keep, "excluded": excluded,
