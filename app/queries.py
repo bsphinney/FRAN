@@ -2304,10 +2304,33 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
     return {"q": term, "total": len(rows), "rows": rows}
 
 
+_SUB_REF = re.compile(r"^\s*(?:prot[_-]?)?(\d{1,4})\s*$", re.I)
+
+
+def normalize_submission_ref(ref: str) -> str | None:
+    """'0793' / '793' / 'prot_0793' -> 'PROT_0793'. Anything else -> None.
+
+    Submission numbers are what people actually have in hand — they appear on the folder
+    (PROT_0793), in the CoreOmics UI and in conversation. The hex submission_id is the join key
+    everywhere else and nobody quotes it. Note a hex id like '1ed8b74497e4' must NOT match: it can
+    contain digits, and silently reading it as a number would resolve the wrong submission.
+    """
+    m = _SUB_REF.match(ref or "")
+    return f"PROT_{int(m.group(1)):04d}" if m else None
+
+
 def internal_submission(submission_id: str) -> dict[str, Any]:
     """PRIVATE: one CoreOmics submission (PI / submitter / institute / date / samples) plus EVERY
     FRAN search linked to it. Powers the submission-ID page. Returns {submission, searches:[...]}."""
     sid = (submission_id or "").strip()
+    ref = normalize_submission_ref(sid)
+    if ref:
+        # internal_id is the human number; every other table joins on the hex submission_id.
+        hit = query(
+            "SELECT submission_id FROM coreomics_submissions_cache WHERE internal_id = %s",
+            (ref,), tables=["coreomics_submissions_cache"])
+        if hit:
+            sid = hit[0]["submission_id"]
     sub_rows = query(
         """
         SELECT submission_id, pi_first_name, pi_last_name, submitter_first_name, submitter_last_name,
