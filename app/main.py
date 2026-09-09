@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -756,16 +757,29 @@ def api_protein_card(protein_group: str):
 def api_protein_coverage(protein_group: str, search_id: str | None = None):
     """Sequence coverage map: UniProt sequence + observed corpus peptides mapped
     onto it. Registered before the catch-all so the /coverage suffix isn't eaten.
-    With search_id, each peptide carries "here" — whether that search saw it."""
+    With search_id, each peptide carries "here" — whether that search saw it. A malformed search_id
+    is a client error (400) — it is NOT silently dropped to an unscoped response, which would hand
+    the caller a different shape than it asked for (the same class of bug the scoped cache key
+    exists to prevent)."""
     from . import coverage as cov
+    if search_id is not None:
+        try:
+            uuid.UUID(search_id)
+        except ValueError:
+            raise HTTPException(400, "search_id must be a valid UUID.")
     data = queries.protein_coverage_peptides(protein_group, search_id=search_id)
     acc = protein_group.split(";")[0].strip()
     custom = queries.is_custom_accession(protein_group, data.get("gene"))
     seq = "" if custom else cov.fetch_uniprot_sequence(acc)
     mapped = cov.map_coverage(seq, data.get("peptides") or [])
-    return ok({"accession": acc, "protein_group": protein_group, "gene": data.get("gene"),
-               "custom_construct": custom,
-               "sequence": seq, "sequence_available": bool(seq), **mapped})
+    resp = {"accession": acc, "protein_group": protein_group, "gene": data.get("gene"),
+            "custom_construct": custom,
+            "sequence": seq, "sequence_available": bool(seq), **mapped}
+    if data.get("scope_unavailable"):
+        # The "here" lookup itself failed (see protein_coverage_peptides): peptides carry no "here"
+        # key at all here, so the UI must say "comparison unavailable" rather than infer "not found".
+        resp["scope_unavailable"] = True
+    return ok(resp)
 
 
 @app.get("/api/protein/{protein_group:path}")

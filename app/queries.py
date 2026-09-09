@@ -2884,11 +2884,23 @@ def protein_coverage_peptides(protein_group: str, limit: int = 4000,
     With search_id, each peptide gains "here": whether THIS search saw it. Without it the return is
     unchanged, so every existing caller is untouched. The cache key includes the scope; sharing one
     key between scoped and unscoped calls would serve one shape to a caller expecting the other.
+
+    A degraded scoped result (the corpus scan succeeded but the "here" lookup itself failed) comes
+    back with peptides but no "here" keys, plus scope_unavailable=True, and is deliberately NOT
+    cached — same reasoning as the falsy-result case below: a transient failure on that one
+    statement shouldn't stick for the whole TTL when the very next request might just work. (Manual
+    cached()/put() rather than get_or_set because get_or_set can only decide "cache" vs "don't" from
+    truthiness, and this result must be truthy — it carries real peptides — while still not caching.)
     """
     pg = (protein_group or "").strip()
     key = f"covpep_{pg}" if not search_id else f"covpep_{pg}_{search_id}"
-    cached = CACHE.get_or_set(key, lambda: _protein_coverage_peptides(pg, limit, search_id))
-    return cached or {"gene": None, "peptides": []}
+    hit = CACHE.cached(key)
+    if hit is not None:
+        return hit
+    result = _protein_coverage_peptides(pg, limit, search_id)
+    if result and not result.get("scope_unavailable"):
+        CACHE.put(key, result)
+    return result or {"gene": None, "peptides": []}
 
 
 def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None) -> dict[str, Any] | None:
@@ -2947,16 +2959,25 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
     # page load forever. So gate on whether the query SUCCEEDED, not on whether it returned rows.
     if not ok:
         return None            # falsy -> not cached by get_or_set -> retried next request
+    result = {"gene": gene, "peptides": peps}
     if search_id and peps:
-        # One extra indexed lookup, not a re-derivation: idx_prec_protein_group already covers this.
-        seen = {r["stripped_seq"] for r in query(
-            """SELECT DISTINCT stripped_seq FROM delimp_precursors
-                WHERE protein_group=%s AND search_id=%s AND stripped_seq = ANY(%s)""",
-            (pg, search_id, [p["stripped_seq"] for p in peps]),
-            tables=["delimp_precursors"])}
-        for p in peps:
-            p["here"] = p["stripped_seq"] in seen
-    return {"gene": gene, "peptides": peps}
+        try:
+            # One extra indexed lookup, not a re-derivation: idx_prec_protein_group covers this too.
+            seen = {r["stripped_seq"] for r in query(
+                """SELECT DISTINCT stripped_seq FROM delimp_precursors
+                    WHERE protein_group=%s AND search_id=%s AND stripped_seq = ANY(%s)""",
+                (pg, search_id, [p["stripped_seq"] for p in peps]),
+                tables=["delimp_precursors"],
+                timeout_ms=10000,
+            )}
+            for p in peps:
+                p["here"] = p["stripped_seq"] in seen
+        except Exception:  # noqa: BLE001 - degrade: leave "here" ABSENT (never here=False — that
+            # would lie that this search found nothing), flag the scope as unavailable so the caller
+            # can say "comparison unavailable" instead of colouring every peptide corpus-only, and
+            # the caller's cache decision (see protein_coverage_peptides) skips caching this result.
+            result["scope_unavailable"] = True
+    return result
 
 
 def peptide_charge_distribution(stripped_seq: str) -> dict[str, Any]:

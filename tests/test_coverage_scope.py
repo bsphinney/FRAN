@@ -55,7 +55,7 @@ check("Fabp1: 'here' is a non-empty proper subset of the corpus peptides",
 # (c) Mup2's found-fraction exceeds Fabp1's — the substance of the feature.
 sc2 = queries.protein_coverage_peptides(MUP2, search_id=SID)
 here2 = sum(1 for p in sc2["peptides"] if p["here"])
-frac1 = here / len(sc["peptides"])
+frac1 = here / len(sc["peptides"]) if sc["peptides"] else 0
 frac2 = here2 / len(sc2["peptides"]) if sc2["peptides"] else 0
 check("Mup2 (rare, mouse-specific) has a higher found-fraction than Fabp1 (common)",
       len(sc2["peptides"]) > 0 and frac2 > frac1,
@@ -65,6 +65,45 @@ check("Mup2 (rare, mouse-specific) has a higher found-fraction than Fabp1 (commo
 none = queries.protein_coverage_peptides(FABP1, search_id="00000000-0000-0000-0000-000000000000")
 check("an unrelated search marks every peptide corpus-only",
       bool(none["peptides"]) and not any(p["here"] for p in none["peptides"]))
+
+# --- Fix round 1, IMPORTANT #1: a malformed search_id is a client error, not a fake outage -------
+# psycopg2 raises InvalidTextRepresentation for a non-UUID against the uuid column, which the
+# global handler turns into a 503 "Database unavailable" -- exactly the wrong message for a typo
+# in a URL. The endpoint must validate BEFORE it ever reaches the DB.
+from fastapi.testclient import TestClient                    # noqa: E402
+from app.main import app                                     # noqa: E402
+
+client = TestClient(app)
+bad = client.get(f"/api/protein/{FABP1}/coverage", params={"search_id": "not-a-uuid"})
+check("a malformed search_id returns 400, not a 503 'database unavailable'",
+      bad.status_code == 400, str(bad.status_code))
+
+# --- Fix round 1, IMPORTANT #2: the "here" lookup degrades like its two sibling queries ----------
+# Force ONLY the "here" lookup to fail (monkeypatch queries.query so the tell-tale "stripped_seq =
+# ANY" statement raises) while the corpus scan and gene lookup -- the siblings that already
+# degrade gracefully -- run for real. A fresh (protein, search_id) pair that nothing above has
+# touched, so this can't be served from an existing cache entry either way.
+FLAKY_SID = "11111111-1111-1111-1111-111111111111"
+_real_query = queries.query
+def _flaky_query(sql, *a, **kw):
+    if "stripped_seq = ANY" in sql:
+        raise RuntimeError("simulated transient failure in the here-lookup")
+    return _real_query(sql, *a, **kw)
+
+queries.query = _flaky_query
+try:
+    degraded = queries.protein_coverage_peptides(FABP1, search_id=FLAKY_SID)
+finally:
+    queries.query = _real_query
+
+check("a failed here-lookup still returns the corpus peptides",
+      len(degraded.get("peptides") or []) > 0, str(len(degraded.get("peptides") or [])))
+check("a failed here-lookup leaves 'here' ABSENT on every peptide (never a lying False)",
+      all("here" not in p for p in degraded["peptides"]))
+check("a failed here-lookup sets scope_unavailable=True",
+      degraded.get("scope_unavailable") is True)
+check("a failed here-lookup is NOT cached (so a retry can still succeed)",
+      queries.CACHE.cached(f"covpep_{FABP1}_{FLAKY_SID}") is None)
 
 print("\n" + ("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS)))
 sys.exit(1 if FAILS else 0)
