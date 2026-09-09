@@ -133,32 +133,134 @@ missing or stale row renders as "not computed" rather than as zero. **A protein 
 must never colour as "seen in 0 searches"** — absence and zero are different, the same distinction
 `count_runs() -> int | None` enforces in the scanner.
 
+### 1b. What the interactive mockup changed (2026-09-09, real data on screen)
+
+A mockup was built against the live `PROT_0793_search_mouse` data and iterated with Brett. Six
+things were wrong in the design above and are corrected here. Every one was invisible on paper.
+
+**(a) Rarity must be matched CASE-INSENSITIVELY.** Gene symbols are capitalised per species — mouse
+`Aldoa`, human `ALDOA` — and the corpus is mostly human. Measured: `Aldoa` 278 searches vs `ALDOA`
+1,278; `Actb` 93 vs `ACTB` 1,007; `Calm1` **1** vs `CALM1` 30. Calmodulin reading "seen in 1 search"
+was the tell. Keyed on the exact string, rarity in a mouse search would largely have encoded *"this
+is a mouse experiment"*. Reach is therefore computed on `upper(gene)`.
+The correction separates artefact from biology rather than flattening everything: Alb 273 -> 1,789,
+Aldoa 278 -> 1,529, Ighg3 2 -> 287, but **Mup2 stays at 33 and Try4 at 2** — those are genuinely
+mouse-specific with no human ortholog to merge with.
+
+**(b) Every ranking needs a PRESENCE FLOOR.** Without one, `avg(intensity)` puts a protein seen in
+one sample above albumin seen in 219. Measured, unfiltered: `Or6c75` (an olfactory receptor, 1/222
+samples, 85.4 **billion** mean) ranked first; albumin was 11th. With a floor of 20% of samples the
+list becomes Try4, Plbd1, Stom, Alb, Aldoa, Mup2, Cps1, Bhmt — a coherent mouse liver profile.
+4,005 of 6,388 genes clear the floor, so it is not over-aggressive. The plan's
+`HAVING count(*) >= 3` is far too weak; use `>= 0.2 * n_samples`.
+(The CV ranking was checked for the same defect and is clean on its own — its top 50 sit in a median
+147/222 samples — but it gets the floor too, for consistency.)
+
+**(c) RARITY IS A ROW ANNOTATION, NOT A CELL COLOUR.** Brett's catch, and it is decisive: rarity is a
+property of the protein, so colouring cells by it paints one number across all 222 columns and throws
+the x-axis away. Cells always show intensity, which genuinely varies per sample. Per-protein facts go
+in thin annotation strips beside the gene name — the standard heatmap idiom. This removes the
+colour-mode toggle entirely and shows both axes at once instead of making the user choose.
+
+**(d) A second strip: the contaminant flag.** `delimp_proteins.is_contaminant` already exists and
+flags 112 genes / 5,931 rows in this search. It explains an artefact visible in the mockup — `ACTB`,
+`KRT8`, `Krt18`, `HBA`, `CYCS`, `RGN`, `PRSS1` all appear alongside their mouse spellings and all
+resolve to `Cont_*` accessions. Human keratins and trypsin in a mouse sample are the classic
+contaminant panel, not a mixed FASTA. Worth surfacing, not hiding.
+
+**(e) Coverage is a THREE-STATE RESIDUE VIEW, matching the existing renderer.** Not two bars. Reuse
+the idiom already at `app/static/app.js:1696-1716`: a peptide-tile overview track plus the full
+monospace sequence — but colour each residue three ways: **found in this experiment**, **found by the
+corpus but not here**, **never observed**. Verified live: Fabp1 (P12710, 127 aa) is 96.1% here and
+98.4% including the corpus, with **18 corpus peptides this experiment did not find**; Mup2 (P11589,
+180 aa) is 82.2% with only 4 corpus-only peptides.
+That contrast is itself a result: **the rarity strip predicts how much the corpus can add.** Fabp1 is
+corpus-common so the corpus knows much more; Mup2 is mouse-specific and rare, so it barely knows more
+than you do.
+
+**(f) Show modified forms, split the same way.** `delimp_precursors` carries `modified_seq_diann`,
+`mods` and `n_mods`. Real examples pulled for Fabp1: `_YQLQSQENFEPFM[Oxidation (M)]K_`,
+`_[Acetyl (Protein N-term)]MNFSGKYQLQSQENFEPFMK_`,
+`_NEFTLGEEC[Carbamidomethyl (C)]ELETM[Oxidation (M)]TGEK_`. Colour each by whether this experiment saw
+that modified form or only the corpus did.
+
+**(g) USE `intensity`, NOT `normalized_intensity`. This one decides whether the feature works at
+all.** Everything above was prototyped on `normalized_intensity` because
+`PROT_0793_search_mouse` has it fully populated. Corpus-wide it is nearly absent:
+
+    searches with protein rows           2,086
+      with normalized_intensity             75   (4%)
+      with raw intensity                 2,084   (100%)
+    rows: normalized 3,887,530 / raw 45,815,369 / total 46,567,602
+
+A panel keyed on `normalized_intensity` would render for 4% of searches and be **blank for the other
+96%**, while looking perfect on the one search it was built against. Raw `intensity` is present for
+every search and 98% of rows.
+
+Nothing is lost by switching: the heatmap z-scores each row independently, and the corpus ranking is
+a percentile *within* each search — both normalise the scale away themselves, which is exactly why
+the raw column is sufficient. Any future ranking added here must state which column it reads and be
+checked against this table before it is believed.
+
+**(h) A fourth row mode: typical abundance across the corpus.** Brett asked to rank by corpus
+abundance. Raw mean intensity across searches is meaningless — measured, the same gene spans 906x
+(Alb), 3,646x (Aldoa) and 4,389x (Hsp90ab1) between searches, so it would rank instruments and
+loading. What IS comparable is each gene's `percent_rank()` **within** its own search, averaged
+across searches: "where does this protein typically sit in a run?" Genes need a minimum number of
+contributing searches or a single search yields a spurious 1.000 (measured: `OR6C75` scored 1.000
+from one search, `GM6133` 0.033 from one).
+
+Layout: **the legend goes ABOVE the grid, not below it.**
+
 ### 2. The heatmap panel
 
-Rendered **below the existing Runs table**, not replacing anything.
+Rendered **below the existing Runs table**, not replacing anything. Settled against real data in the
+mockup; the section above records what changed and why.
 
-- **Rows:** top N proteins (default 50, adjustable), with a **selector for all three rules**:
-  most variable (default), most abundant, rarest in corpus. Brett asked for all three switchable.
-  Default is CV because it shows what *differs* between samples — the biology — rather than what is
-  merely abundant, which for this search is Alb/Mup2/Fabp1 every time.
+- **Rows:** top N proteins (default 50, adjustable), with FOUR ranking modes. Each control states its
+  own scope, and there is no group-level scope label — two modes are within-search and two are
+  corpus-wide, so a shared "in this search" heading is false. Labels as shipped:
+
+  | control | ranks by | scope |
+  |---|---|---|
+  | Varies most — your samples *(default)* | CV of `intensity` across samples | this search |
+  | Most abundant — your samples | mean `intensity` | this search |
+  | Rarest — across the corpus | fewest corpus searches containing the gene | corpus |
+  | Most abundant — across the corpus | mean `percent_rank()` within a search | corpus |
+
+  Every mode applies the presence floor (>= 20% of samples). CV is the default because it shows what
+  *differs* between samples rather than what is merely abundant, which here is Alb/Mup2/Fabp1 every
+  time.
+
+  **The corpus-abundance mode needs a minimum contributing-search count** (20 used in the mockup) or a
+  gene seen once scores a spurious 1.000. Validated: with the floor, the top of that ranking is H4c1
+  (0.909, from 616 searches), Hsp90ab1 (0.906, 1,346), Gapdh (0.897, 1,317), Atp5f1a (0.885, 1,331),
+  EEF1A1 (0.880, 997), ACTB (0.878, 1,099), Hspa5 (0.874, 1,393), Alb (0.873, 1,786) — the textbook
+  list of the most abundant proteins in shotgun proteomics, which is the sanity check that says the
+  metric is sound.
+
 - **Columns:** samples (`raw_path`, basename shown), in acquisition order where
   `raw_files.acquisition_date` is available, else name order. Acquisition order makes batch drift and
-  column-wise QC problems visible as vertical bands.
-- **Cell colour, mode A — intensity:** log2 `normalized_intensity`, per-row z-scored so a row is
-  readable regardless of the protein's absolute abundance. A missing (protein, sample) pair is a
-  distinct "not identified" colour, never zero — a protein absent from a sample is information.
-- **Cell colour, mode B — corpus rarity:** each *row* tinted by `n_searches` from
-  `delimp_protein_corpus_reach`. Common housekeeping proteins sit cool; something the lab has seen
-  in three searches glows.
+  column-wise QC problems visible as vertical bands — the mockup showed exactly such a band on this
+  search, a block of samples where much of the panel drops out.
 
-  **Rarity is a colour, not the default sort.** Measured: the rarest proteins in this search are
-  `F6RH57`, `F6SH14`, `F6QI43` — unreviewed TrEMBL accessions with no gene symbol, each seen in
-  exactly one search. Sorting by rarity surfaces junk; colouring by it while sorting by CV is where
-  the value is, because a biologically interesting protein *glows* on its own.
+- **Cells always show amount:** log2 `intensity`, z-scored per row so a faint protein is as readable
+  as albumin. A missing (protein, sample) pair renders as a distinct "not identified" colour, never
+  as zero — a protein absent from a sample is information. Scale must be colour-blind safe
+  (viridis-like, not red/green).
 
-  This is the part no other tool can draw. Spectronaut and DE-LIMP see one experiment. FRAN sees
-  ~2,000 searches, so it can say *"this protein is unusual for this lab"* — that is the reason to
-  build this in FRAN rather than export to something else.
+- **Two row-annotation strips** beside the gene name, NOT cell colours:
+  1. **corpus rarity** — tint by `n_searches` from `delimp_protein_corpus_reach`, percentiled against
+     the DISPLAYED rows.
+  2. **contaminant flag** — `delimp_proteins.is_contaminant`.
+
+  Rarity cannot be a cell colour: it is a per-protein value, so it would paint one number across all
+  222 columns and waste the x-axis. This was Brett's finding and it removed the colour-mode toggle
+  entirely — both axes are now visible at once instead of the user choosing between them.
+
+  This is the part no other tool can draw. Spectronaut and DE-LIMP see one experiment; FRAN sees
+  ~2,000 searches, so it can say *"this protein is unusual for this lab"*. That is the reason to build
+  it here rather than export elsewhere.
 
 ### 3. Protein click → two-track coverage
 
