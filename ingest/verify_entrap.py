@@ -27,7 +27,13 @@ cur.execute("SELECT lance_path,n_precursors,n_traces,content_md5 FROM delimp_xic
 xp, xn_p, xn_t, xmd5 = cur.fetchone()
 print(f"  {xp}\n  {xn_p:,} prec / {xn_t:,} traces  md5={xmd5}")
 t = lance.dataset(xp).to_table()
-print("  checksum:", "MATCH" if xln.content_md5(t.cast(xln.SCHEMA)) == xmd5 else "MISMATCH")
+# verify(), not content_md5(): from xic writer 1.2.0 the registry stores a STREAMED digest, so a
+# hardcoded whole-table content_md5 reports MISMATCH on good data. verify() tries both.
+try:
+    _chk = "MATCH" if xln.verify(xp, xmd5) else "MISMATCH"
+except xln.LegacyDigestTooLarge as e:
+    _chk = f"UNVERIFIED (not a mismatch) — {e}"      # must not print as MISMATCH: see verify()
+print("  checksum:", _chk)
 print("  rows:", t.num_rows, "cols:", t.num_columns)
 nt = [x for x in t["n_traces"].to_pylist() if x is not None]
 print(f"  traces/precursor: min={min(nt)} max={max(nt)} mean={sum(nt)/len(nt):.1f}")

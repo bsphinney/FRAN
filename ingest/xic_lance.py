@@ -79,7 +79,11 @@ ALTER TABLE delimp_xic_lane ADD COLUMN IF NOT EXISTS writer_version TEXT;
 
 def content_md5(table: pa.Table) -> str:
     """See spectrum_lance.content_md5 — combine_chunks() is required so the checksum doesn't
-    depend on how Lance happens to chunk the data on read."""
+    depend on how Lance happens to chunk the data on read.
+
+    Only for tables that are ALREADY in memory. To checksum a Lance dataset use dataset_md5():
+    this function needs the whole table resident and then copies it three more times, which is
+    what OOM-killed the 224-run PROT_0793 mouse lane."""
     table = table.combine_chunks()
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as w:
@@ -87,12 +91,105 @@ def content_md5(table: pa.Table) -> str:
     return hashlib.md5(sink.getvalue().to_pybytes()).hexdigest()
 
 
-def write_lance(table: pa.Table, path: str, mode: str = "overwrite"):
+# In ROWS, and a row here is a whole precursor's chromatograms, so rows are fat and vary wildly:
+# 2.2 KB/row on the 967,427-row 1020_S6-H2 lane, 37 KB/row on the 198,522-row diann251_fragexport16
+# lane. 65,536 rows is a 2.4 GB batch on the latter, which defeats the point; 8,192 keeps the batch
+# at ~300 MB even there. Changing this constant changes the digest, so it is pinned, not tuned.
+MD5_BATCH_ROWS = 8_192
+
+
+class LegacyDigestTooLarge(RuntimeError):
+    """verify()'s pre-1.2.0 whole-table fallback would not fit in memory.
+
+    NOT a checksum mismatch. A caller that renders this as MISMATCH is reporting corruption where
+    there is none, which is why verify() raises instead of returning False."""
+
+
+# Peak RSS of the whole-table content_md5 over the dataset's on-disk Lance bytes. Measured on three
+# lanes spanning 2-10 GB and 0.2-4.9M rows, from a ~160 MB baseline:
+#     2.02 GB /   967,427 rows ->  8,370 MB   4.14x
+#     7.42 GB /   198,522 rows -> 18,074 MB   2.44x
+#     9.71 GB / 4,924,411 rows -> 48,435 MB   4.99x
+# 5.0x is the worst of those rounded up. It over-estimates a densely packed lane (the 7.42 GB one
+# would be refused at an estimated 37 GB when it really needs 18), and that is the direction to err:
+# the cost of over-estimating is a message telling you to raise max_bytes, the cost of
+# under-estimating is a SIGKILL with no diagnostic.
+_LEGACY_MD5_RSS_PER_DISK_BYTE = 5.0
+
+# The smallest allocation OBSERVED to lose to this: verifying the 7.42 GB diann251_fragexport16 row
+# was OOM-killed at 16 GB. A caller with a bigger allocation passes max_bytes.
+LEGACY_VERIFY_MAX_BYTES = 16 * 1024 ** 3
+
+
+def _fixed_tables(batches, n: int):
+    """Re-cut an arbitrary stream of record batches into single-chunk tables of exactly n rows
+    (the last one short).
+
+    The cut has to be imposed HERE rather than asked of Lance. Measured on a 967,427-row dataset
+    built by 319 appends: `ds.to_batches(batch_size=65536)` returned 319 batches of 35, 129, 201,
+    222 … rows — one per fragment, ignoring the requested size. A digest over Lance's own batches
+    would therefore change with the number of runs appended. Cutting to a fixed n restores the
+    layout-independence that content_md5 bought by holding the whole table at once (verified: the
+    same digest for source batch sizes 1,024 / 8,192 / 65,536)."""
+    buf, have = [], 0
+    for b in batches:
+        buf.append(b)
+        have += b.num_rows
+        while have >= n:
+            t = pa.Table.from_batches(buf).combine_chunks()
+            yield t.slice(0, n)
+            t = t.slice(n)
+            buf, have = t.to_batches(), t.num_rows
+    if have:
+        yield pa.Table.from_batches(buf).combine_chunks()
+
+
+def dataset_md5(ds, batch_rows: int = MD5_BATCH_ROWS) -> str:
+    """content_md5 of a whole Lance dataset, without ever holding the whole dataset.
+
+    content_md5(ds.to_table()) was the only place the finished lane was materialised, and it built
+    four full-size buffers to do it — to_table(), combine_chunks(), the IPC stream, then
+    to_pybytes() — three of them alive at once. Measured from a ~150 MB baseline:
+
+        2.02 GB / 967,427 rows   whole-table  8,370 MB, 32s     streamed  2,498 MB,  9s
+        7.42 GB / 198,522 rows   whole-table 18,074 MB, 53s     streamed  2,233 MB, 21s
+
+    i.e. the old cost tracked the dataset and the streamed one does not. That call, not the
+    per-run loop, is what OOM-killed the 224-run PROT_0793 mouse lane at 48 GB — it was reached
+    AFTER every run had been written, which is why the failure left a complete orphan directory.
+    Re-run at 160 GB the same code finished with MaxRSS 64.9 GB; on the 9.71 GB lane it produced,
+    this function is 61s and 1,582 MB peak, and the whole build now fits in 16 GB (MaxRSS
+    13.9 GB, byte-identical output).
+
+    DIFFERENT DIGEST, ON PURPOSE. The IPC stream frames each record batch separately, so hashing
+    n-row batches cannot produce the byte stream a single whole-table batch produces. md5s
+    recorded by writer <= 1.1.0 do not verify against this function — verify() falls back to the
+    old definition for them, and writer_version says which one a registry row carries."""
+    h = hashlib.md5()
+    for t in _fixed_tables(ds.to_batches(batch_size=batch_rows), batch_rows):
+        # Lance can hand back a schema carrying its own metadata; the digest must not depend on it.
+        if t.schema != SCHEMA:
+            t = t.cast(SCHEMA)
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, t.schema) as w:
+            w.write_table(t)
+        # memoryview, not to_pybytes(): hashing must not copy the buffer it is hashing.
+        h.update(memoryview(sink.getvalue()))
+    return h.hexdigest()
+
+
+def write_lance(table: pa.Table, path: str, mode: str = "overwrite", checksum: bool = True):
+    """Write/append one table. Returns (n_rows, content_md5 or None, version).
+
+    checksum=False is for callers appending one run of many: the per-run digest costs three full
+    copies of the table (combine_chunks + IPC buffer + to_pybytes) and answers nothing, because
+    the registry stores a digest of the WHOLE dataset. diann_xic_to_lance paid it 224 times for
+    one search and discarded the result every time."""
     import lance
     table = table.cast(SCHEMA) if table.schema != SCHEMA else table
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     ds = lance.write_dataset(table, path, mode=mode)
-    return table.num_rows, content_md5(table), ds.version
+    return table.num_rows, (content_md5(table) if checksum else None), ds.version
 
 
 def ensure_registry(conn):
@@ -137,9 +234,43 @@ def register(conn, search_id, search_name, lance_path, n_prec, n_traces, md5, ve
     conn.commit()
 
 
-def verify(lance_path, expected_md5) -> bool:
+def verify(lance_path, expected_md5, max_bytes: int = LEGACY_VERIFY_MAX_BYTES) -> bool:
+    """Streaming first, whole-table only if that misses.
+
+    Rows registered by writer <= 1.1.0 carry the whole-table content_md5, so the fallback is what
+    keeps them verifiable, and trying it AFTER the cheap check rather than dispatching on
+    writer_version is deliberate: a NULL or pilot writer_version cannot then produce a false OK.
+    Verified against live registry rows — Dog_yeast_entrapment_SN21 (writer NULL) and the
+    202106022_TIMS03 lane (1.1.0) both MATCH here and MISMATCH on the streamed digest alone.
+
+    BUDGET FOR THE FALLBACK. It is the 4x-RSS path dataset_md5 exists to avoid, and on a wide lane
+    it is not survivable in a small allocation: verifying the 7.42 GB / 198,522-row
+    diann251_fragexport16 row was OOM-killed at 16 GB (it needs ~18 GB, measured). That is inherent
+    to the old digest — you cannot check a whole-table checksum without the whole table — and it is
+    unchanged from before 1.2.0, when this was the ONLY path. Rows written at 1.2.0 never reach it.
+    Rather than be SIGKILLed there, which leaves the caller a vanished process and no diagnostic,
+    the fallback is estimated first and refused with LegacyDigestTooLarge if it will not fit."""
     import lance
-    return content_md5(lance.dataset(lance_path).to_table().cast(SCHEMA)) == expected_md5
+    ds = lance.dataset(lance_path)
+    if dataset_md5(ds) == expected_md5:
+        return True
+    # Only pre-1.2.0 rows get this far. Size the whole-table read before attempting it. On-disk
+    # bytes are the cheap proxy; they over-count a dataset that still holds superseded versions,
+    # which again errs toward refusing rather than dying.
+    on_disk = sum(os.path.getsize(os.path.join(dp, f))
+                  for dp, _dn, fns in os.walk(lance_path) for f in fns)
+    need = int(on_disk * _LEGACY_MD5_RSS_PER_DISK_BYTE)
+    if need > max_bytes:
+        raise LegacyDigestTooLarge(
+            f"{lance_path}: the streamed digest does not match the stored one. That means EITHER "
+            f"the row predates xic writer 1.2.0 (so it needs the whole-table checksum) OR the data "
+            f"has changed — and telling those apart requires the whole-table read, which is an "
+            f"estimated {need / 1024 ** 3:.0f} GB of RSS for {on_disk / 1024 ** 3:.1f} GB on disk "
+            f"({ds.count_rows():,} rows), above the {max_bytes / 1024 ** 3:.0f} GB this check will "
+            f"attempt. Re-run with a larger allocation and a raised max_bytes to settle it, or "
+            f"rebuild the lane at writer 1.2.0, which verifies in ~1.5 GB. This is a memory limit, "
+            f"NOT a verdict on the data.")
+    return content_md5(ds.to_table().cast(SCHEMA)) == expected_md5
 
 
 # ── decoding ────────────────────────────────────────────────────────────────────────────────
@@ -418,5 +549,24 @@ def process_one(report_path, xic_dir, out_dir, search_id=None, search_name=None,
     base = _re.sub(r"^\d{8}_\d{6}_", "", base)
     safe = _re.sub(r"[^A-Za-z0-9._-]+", "_", search_name or base).strip("_")
     lance_path = os.path.join(out_dir, f"{safe}.xic.lance")
-    _, md5, version = write_lance(tbl, lance_path, mode="overwrite")
-    return (lance_path, tbl.num_rows, n_traces, md5, version)
+    n_rows, _, version = write_lance(tbl, lance_path, mode="overwrite", checksum=False)
+    # Read the digest back off the DATASET rather than off the table in hand, so a Spectronaut lane
+    # and a DIA-NN lane registered by the same writer_version carry the same KIND of digest. The
+    # extra pass is a streaming read; holding tbl through it is not, hence the del.
+    del tbl, rows
+    # THE DATASET IS ON DISK BY NOW, and the caller registers it from what this returns. Reading it
+    # back re-opens a Quobyte path, so a transient I/O failure here would propagate into
+    # corpus_ingest's blanket "XIC lane best-effort, never fail the ingest" except and skip
+    # register() -- leaving a complete, correct, UNREGISTERED lane that nothing in the database can
+    # see. That is the same shape as the OOM this writer was just fixed for: a failure AFTER the
+    # write, invisible from the registry. The registry row is the thing that must survive; the
+    # digest is not, so a checksum failure downgrades to content_md5 NULL and says so.
+    md5 = None
+    try:
+        import lance
+        md5 = dataset_md5(lance.dataset(lance_path))
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] XIC lane WRITTEN BUT NOT CHECKSUMMED: {lance_path} — registering with "
+              f"content_md5 NULL; this lane cannot be verified until it is rebuilt "
+              f"({type(e).__name__}: {str(e)[:120]})", flush=True)
+    return (lance_path, n_rows, n_traces, md5, version)

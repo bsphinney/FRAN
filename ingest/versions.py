@@ -55,7 +55,12 @@ CORPUS_INGEST_VERSION = "1.3.0"          # 1.3.0: duplicate guard moved BEFORE t
 SPECTRUM_LANE_WRITER_VERSION = "1.2.1"   # 1.2.1: register() SQL carried a literal "%" in a comment;
                                          # psycopg2 read it as a conversion specifier and EVERY
                                          # registration raised IndexError from 2026-08-11 to 08-21.   # 1.2.0: frg_excluded + frg_chan_interference appended   # 1.1.0: content_md5 combine_chunks fix (2026-07-27)
-XIC_LANE_WRITER_VERSION = "1.1.0"        # 1.1.0: index keyed by (run, fgid). FG.XICDBID is GLOBAL
+XIC_LANE_WRITER_VERSION = "1.2.0"        # 1.2.0: content_md5 is now streamed in fixed 8,192-row
+                                         # batches (dataset_md5), so the digest DIFFERS from
+                                         # <=1.1.0's whole-table one. The old call materialised the
+                                         # finished lane four times over (4.1 GB RSS per GB of
+                                         # Lance, measured) and OOM-killed the 224-run PROT_0793
+                                         # mouse lane at 48 GB after every run had been written.        # 1.1.0: index keyed by (run, fgid). FG.XICDBID is GLOBAL
                                          # and every run's db holds every precursor, so the old flat
                                          # index gave 219/220 dbs another run's identity and lost the
                                          # per-run FDR filter (9.67M rows vs 3.49M real pairs).        # 1.0.3: normalise pandas NaN -> None on the TSV path
