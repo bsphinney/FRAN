@@ -60,6 +60,7 @@ function route(){
     case 'engines': return renderEngines(param);
     case 'enginerun': return renderEngineRun(param);
     case 'collaborators': return renderCollaborators();
+    case 'submissions': return renderSubmissions();
     case 'mydata': return renderMyData();
     case 'collab': return renderCollaborator(param);
     case 'submission': return renderSubmission(param);
@@ -2086,6 +2087,45 @@ async function renderLab(pi){
   }catch(e){ dbError(e,'#labBody'); }
 }
 
+/* ---------- INTERNAL: submission directory (private deployment only) ---------- */
+async function renderSubmissions(){
+  view.innerHTML=`<section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">📋 Submissions <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
+    <p class="text-slate-400 text-sm mt-1">Every CoreOmics submission, newest first — whether its data is in FRAN, still on the share, or not located yet.</p></section>
+    <div class="relative mb-4 max-w-xl">
+      <input id="subQ" placeholder="Submission number, institute, PI, submitter or email…" onkeydown="if(event.key==='Enter')renderSubmissions()"
+        class="w-full bg-ink-800/70 border border-white/10 rounded-xl px-4 py-2.5 pl-10 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50" />
+      <svg class="absolute left-3 top-3 text-slate-500" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+    </div>
+    <div class="glass card p-4 fade-in" id="subsBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
+  const q = (window.__SUBS_Q__||'');
+  const el = $('#subQ'); if(el){ el.value=q; el.oninput=e=>{ window.__SUBS_Q__=e.target.value; }; }
+  try{
+    const d = await api(`/api/internal/submissions?limit=100&q=${encodeURIComponent(q)}`);
+    const rows = d.submissions||[];
+    if(!rows.length){ $('#subsBody').innerHTML=empty('No submissions match.'); return; }
+    // Three states, never a blank cell. "not located" is the honest answer for anything the
+    // 2026-06-24 disk-match never saw, which is everything after PROT_0724.
+    const state = s => (s.n_searches>0)
+      ? `<span class="text-emerald-300">✅ ${fmt(s.n_searches)} search${s.n_searches===1?'':'es'}</span>`
+      : (s.run_count!=null || s.service_folder)
+        ? `<span class="text-accent-400">📦 ${s.run_count!=null?fmt(s.run_count)+' runs':''} on the share</span>
+           ${s.service_folder?`<div class="text-[10px] text-slate-500 font-mono break-all mt-0.5" title="${esc(s.service_folder_win||'')}">${esc(s.service_folder)}</div>`:''}
+           <button onclick="event.stopPropagation();exportReport('${esc(s.submission_id)}',this,'resubmit')" class="mt-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a HIVE/Flinders re-search brief for this un-ingested data">🔄 Re-search this data</button>`
+        : `<span class="text-slate-600">— not located</span>`;
+    $('#subsBody').innerHTML =
+      `<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} numbered submission${d.total===1?'':'s'}${d.locations_as_of?` · share locations as of ${esc(String(d.locations_as_of))}`:''}</div>`
+      + table(['Submission','Institute','PI · submitter','Samples','Submitted','In FRAN?'],
+          rows.map(s=>[
+            `<span class="font-mono font-semibold text-accent-400">${esc(s.internal_id)}</span>`,
+            esc(s.institute||'—'),
+            `<span class="text-xs text-slate-400">${esc([s.pi,s.submitter].filter(Boolean).join(' · ')||'—')}</span>`,
+            s.num_samples!=null?fmt(s.num_samples):'—',
+            `<span class="font-mono text-xs">${esc(String(s.submitted_at||'—'))}</span>`,
+            state(s)]),
+          rows.map(s=>`go('submission','${esc(s.internal_id)}')`));
+  }catch(e){ dbError(e,'#subsBody'); }
+}
+
 /* ---------- shared UI bits ---------- */
 function stat(label,val){ return `<div><div class="text-[11px] uppercase tracking-wider text-slate-500">${label}</div><div class="text-xl font-bold text-white kpi-num mt-0.5">${val}</div></div>`; }
 function table(cols, rows, onclicks){
@@ -2128,6 +2168,7 @@ function applyAuth(st){
   window.__FRAN_TIER__ = tier;
   const tog=(id,hide)=>{const e=document.getElementById(id); if(e) e.classList.toggle('hidden', hide);};
   tog('nav_collab', !isFull); tog('nav_collab_m', !isFull);     // Collaborators dir = full only
+  tog('nav_subs', !isFull);                                     // Submissions dir = full only
   tog('nav_mydata', tier!=='lab'); tog('nav_mydata_m', tier!=='lab'); // My Submissions = lab users
   // tier badge in the navbar
   let badge=document.getElementById('tierBadge');
