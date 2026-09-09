@@ -2454,10 +2454,20 @@ def internal_submissions(q: str | None = None, limit: int = 100, offset: int = 0
         f"""SELECT COUNT(*) FROM coreomics_submissions_cache co
              WHERE co.internal_id IS NOT NULL {where}""",
         params, tables=["coreomics_submissions_cache"], fetch="val") or 0
+    with_searches = query(
+        f"""SELECT COUNT(*) FROM coreomics_submissions_cache co
+             WHERE co.internal_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM delimp_search_provenance p
+                            WHERE p.coreomics_submission_id = co.submission_id) {where}""",
+        params, tables=["coreomics_submissions_cache", "delimp_search_provenance"],
+        fetch="val") or 0
     as_of = query("SELECT MAX(matched_at)::date AS d FROM delimp_submission_service_dir",
                   tables=["delimp_submission_service_dir"])
     return {"submissions": rows, "total": int(total),
-            "n_with_searches": sum(1 for r in rows if (r.get("n_searches") or 0) > 0),
+            # Corpus-wide under the SAME filter, not a count of the returned page. `total` beside it
+            # is corpus-wide, so a page-scoped sibling in the same dict reads as "0 of 790 have
+            # searches" at the default limit of 100 when the real answer is 160.
+            "n_with_searches": with_searches,
             "locations_as_of": (as_of[0]["d"] if as_of else None)}
 
 
