@@ -264,20 +264,47 @@ mockup; the section above records what changed and why.
   ~2,000 searches, so it can say *"this protein is unusual for this lab"*. That is the reason to build
   it here rather than export elsewhere.
 
-### 3. Protein click → two-track coverage
+### 3. Protein click → the peptide map
 
-Extends the existing widget; does not replace it.
+Extends the existing widget; does not replace it. Settled in the mockup against real data.
 
 - `protein_coverage_peptides(pg, search_id=None)` gains an optional scope. When set, the
-  `delimp_precursors` query adds `AND search_id = %s` — the index already covers `protein_group`,
-  so this narrows an already-fast lookup.
-- `GET /api/protein/{pg}/coverage?search_id=…` returns **both** peptide sets and both mapped tracks.
-  Without `search_id`, behaviour is byte-identical to today — existing callers are untouched.
-- The UI draws two tracks on one sequence: **this experiment** above, **the whole corpus** below,
-  with both percentages. The gap is the payload: *"you covered 34% here; the corpus has covered 71%
-  across 74 searches — here are the regions you missed."* That is a re-search recommendation
-  nothing else in the lab's stack can produce.
+  `delimp_precursors` query adds `AND search_id = %s` — `idx_prec_protein_group` already covers the
+  lookup, so this narrows an already-fast query.
+- `GET /api/protein/{pg}/coverage?search_id=…` returns **both** peptide sets. Without `search_id`,
+  behaviour is byte-identical to today, so existing callers are untouched.
+- **The display is an HDX-style peptide map**, not two summary bars: the sequence in wrapped rows
+  with residue numbering, and every peptide drawn as its own bar, lane-packed beneath the residues it
+  covers. Gold = found in this experiment; teal = the corpus found it and this experiment did not;
+  grey residues = never observed by anyone. Reuse the tile/monospace idiom already at
+  `app/static/app.js:1696-1716`.
+  Verified live: Fabp1 (P12710, 127 aa) 96.1% here / 98.4% including corpus, **18 corpus peptides
+  this experiment missed**; Mup2 (P11589, 180 aa) 82.2% with only 4. Mup2's uncovered N-terminus is
+  its signal peptide — correctly never observed, and a good smoke test that the mapping is right.
+- **Clicking a peptide opens an inline detail card**, not a navigation: residue range, and a
+  side-by-side of *this experiment* vs *the corpus* — precursor rows, runs, searches, charge states,
+  best q-value — plus that peptide's modified forms, each marked gold or teal by whether this
+  experiment saw that form. Real examples: `_YQLQSQENFEPFM[Oxidation (M)]K_`,
+  `_[Acetyl (Protein N-term)]MNFSGKYQLQSQENFEPFMK_`.
 - The existing custom-construct and missing-sequence paths keep working unchanged.
+
+**Navigation — where each link lives, and why.** Settled by trying it the wrong way round first.
+
+| element | action |
+|---|---|
+| gene name on the y-axis | opens the coverage panel — **in-page, not a link** |
+| gene name in the coverage header | `go('gene', <symbol>)` — the corpus view of that protein |
+| peptide bar in the map | opens the inline detail card |
+| peptide sequence in that card | `go('peptide', <stripped_seq>)` |
+
+The y-axis is for *scanning* 50 proteins, so its single click must be the cheap in-page action;
+making it navigate meant every attempt to see coverage left the page and lost the sort. Navigation
+belongs one level deeper, once the user has committed to a protein. Both destinations already exist
+(`case 'gene'` and `case 'peptide'` in the router) and both were verified against live data —
+`/api/gene/Aldoa` returns 7 groups / 278 searches / 3,191 runs, `/api/gene/Mup2` 1 / 33 / 563.
+
+This completes a drill path entirely out of pages that already exist: **search → heatmap → gene →
+coverage → peptide → the whole corpus.** The heatmap is only the entry point that was missing.
 
 ## Interfaces
 
