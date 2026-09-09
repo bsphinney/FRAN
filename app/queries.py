@@ -4334,18 +4334,27 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
         mode = "cv"
     order = _MATRIX_MODES[mode]
 
-    # work_mem="256MB": on the largest search (480k rows) the planner underestimates this table's
-    # row count by ~30x and sizes the COUNT(DISTINCT ...) sort for the small estimate, so the
-    # 4MB server default spills to an external merge on disk (same failure shape as the ALB
-    # witness above, line ~3284). MEASURED here, unlike ALB: 256MB does convert the sort to an
-    # in-memory quicksort (confirmed via EXPLAIN), but wall-clock barely moves — ~2.7s either
-    # way. The cost on THIS query is CPU-bound (sorting/deduping 480k rows), not disk I/O, so
-    # the ALB-style 10x speedup does not transfer. Kept anyway: it removes real disk contention
-    # under this shared cluster's I/O even though it doesn't fix this endpoint's latency.
-    # Bounded by maxconn (6) x 256MB = 1.5GB worst case for this one statement.
-    n_samples_total = query(
-        "SELECT count(DISTINCT raw_path) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
-        {"sid": search_id}, tables=["delimp_proteins"], fetch="val", work_mem="256MB") or 0
+    def _base(rp: str) -> str:
+        return (rp or "").rstrip("/").split("/")[-1].removesuffix(".d").removesuffix(".raw")
+
+    # n_samples_total used to come from its own `count(DISTINCT raw_path)` (2.69s on the
+    # largest search). Fix round 2: this SELECT DISTINCT below yields the identical number
+    # (222) for the identical predicate at 0.23s — a twelve-fold difference for the same
+    # information — and it runs anyway to build the samples list, so derive the count from it
+    # instead of paying for a second full scan+sort. Moved above the floor/params build
+    # because the presence floor's arithmetic depends on n_samples_total.
+    samples = query(
+        """SELECT DISTINCT p.raw_path, rf.acquisition_date
+             FROM delimp_proteins p
+             LEFT JOIN raw_files rf ON rf.raw_path = p.raw_path
+            WHERE p.search_id=%(sid)s""",
+        {"sid": search_id}, tables=["delimp_proteins", "raw_files"])
+    # Acquisition order where known, name order otherwise: batch drift then reads as vertical bands.
+    samples.sort(key=lambda s: (s["acquisition_date"] is None, s["acquisition_date"], s["raw_path"]))
+    sample_rows = [{"raw_path": s["raw_path"], "basename": _base(s["raw_path"]),
+                    "acquisition_date": s["acquisition_date"]} for s in samples]
+    n_samples_total = len(sample_rows)
+
     n_proteins_total = query(
         "SELECT count(DISTINCT protein_group) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
         {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
@@ -4357,11 +4366,17 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     params = {"sid": search_id, "limit": int(limit),
               "floor": _MATRIX_FLOOR * n_samples_total,
               "minpct": _MATRIX_MIN_PCT_SEARCHES}
-    # Same work_mem reasoning and same measured result as n_samples_total above: this is the
-    # same COUNT(DISTINCT raw_path) ... GROUP BY p.gene shape, now inside a GroupAggregate
-    # feeding a Hash Left Join. 256MB converts the sort to in-memory quicksort and the hash
-    # join to a single batch (confirmed via EXPLAIN), but wall-clock is still ~4s — CPU-bound
-    # on 478k rows, not disk-bound, so this does not bring the endpoint under ~3s.
+    # MEASURED cost of this aggregate on the largest search (480k rows): ~4s, CPU-bound on the
+    # GroupAggregate's own COUNT(DISTINCT raw_path) sorting/deduping ~478k rows per gene — not
+    # disk I/O (work_mem="256MB" below converts the sort to in-memory quicksort and the hash
+    # join to a single batch, confirmed via EXPLAIN, but wall-clock barely moves). Kept
+    # work_mem anyway: it removes real disk-contention risk on this shared cluster even though
+    # it isn't the fix for this endpoint's latency. Two remedies considered and rejected:
+    # count(*) instead of count(DISTINCT raw_path) is cheap but wrong — it over-counts samples
+    # wherever one gene maps to multiple protein groups, silently corrupting the presence floor
+    # that is the only thing keeping Or6c75-class 1-sample outliers out of the ranking. A
+    # precomputed per-search table (a second Tasks 1+2) is out of scope for a panel that
+    # already loads lazily, after the Runs table, so a slow matrix never blocks the page.
     rows = query(
         f"""
         WITH agg AS (
@@ -4393,21 +4408,6 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
             WHERE search_id=%(sid)s AND gene = ANY(%(genes)s) AND intensity > 0
             GROUP BY gene, raw_path""",
         {"sid": search_id, "genes": genes}, tables=["delimp_proteins"]) if genes else []
-
-    samples = query(
-        """SELECT DISTINCT p.raw_path, rf.acquisition_date
-             FROM delimp_proteins p
-             LEFT JOIN raw_files rf ON rf.raw_path = p.raw_path
-            WHERE p.search_id=%(sid)s""",
-        {"sid": search_id}, tables=["delimp_proteins", "raw_files"])
-
-    def _base(rp: str) -> str:
-        return (rp or "").rstrip("/").split("/")[-1].removesuffix(".d").removesuffix(".raw")
-
-    # Acquisition order where known, name order otherwise: batch drift then reads as vertical bands.
-    samples.sort(key=lambda s: (s["acquisition_date"] is None, s["acquisition_date"], s["raw_path"]))
-    sample_rows = [{"raw_path": s["raw_path"], "basename": _base(s["raw_path"]),
-                    "acquisition_date": s["acquisition_date"]} for s in samples]
 
     by_gene: dict[str, dict[str, float]] = {}
     for c in cells:
