@@ -2404,6 +2404,53 @@ def internal_submission(submission_id: str) -> dict[str, Any]:
             "service_dir": (loc[0] if loc else None)}
 
 
+def internal_submissions(q: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """PRIVATE: every numbered CoreOmics submission, newest first, with what FRAN knows about it.
+
+    Three states per row, and none of them is a blank cell: it has searches in FRAN; or its data is
+    located on the share and not ingested; or we have no location for it at all. The third is
+    common and honest — delimp_submission_service_dir was written once on 2026-06-24 and knows
+    nothing after PROT_0724 — so the caller is also told when locations were last determined.
+    """
+    ref = normalize_submission_ref(q or "") if q else None
+    like = f"%{(q or '').strip()}%"
+    where, params = "", {"limit": int(limit), "offset": int(offset)}
+    if q:
+        where = """AND (co.internal_id ILIKE %(like)s
+                        OR co.institute ILIKE %(like)s OR co.pi_last_name ILIKE %(like)s
+                        OR co.submitter_last_name ILIKE %(like)s
+                        OR co.submitter_email ILIKE %(like)s)"""
+        params.update({"like": like, "ref": ref})
+    rows = query(
+        f"""
+        SELECT co.internal_id, co.submission_id, co.institute,
+               NULLIF(TRIM(CONCAT_WS(' ', co.pi_first_name, co.pi_last_name)), '')        AS pi,
+               NULLIF(TRIM(CONCAT_WS(' ', co.submitter_first_name, co.submitter_last_name)), '') AS submitter,
+               co.num_samples, co.submitted_at::date AS submitted_at,
+               (SELECT COUNT(*) FROM delimp_search_provenance p
+                 WHERE p.coreomics_submission_id = co.submission_id)                       AS n_searches,
+               sd.in_fran, sd.run_count, sd.service_folder, sd.service_folder_win
+          FROM coreomics_submissions_cache co
+          LEFT JOIN delimp_submission_service_dir sd ON sd.submission_id = co.submission_id
+         WHERE co.internal_id IS NOT NULL {where}
+         ORDER BY co.submitted_at DESC NULLS LAST, co.internal_id DESC
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        params,
+        tables=["coreomics_submissions_cache", "delimp_search_provenance",
+                "delimp_submission_service_dir"],
+    )
+    total = query(
+        f"""SELECT COUNT(*) FROM coreomics_submissions_cache co
+             WHERE co.internal_id IS NOT NULL {where}""",
+        params, tables=["coreomics_submissions_cache"], fetch="val") or 0
+    as_of = query("SELECT MAX(matched_at)::date AS d FROM delimp_submission_service_dir",
+                  tables=["delimp_submission_service_dir"])
+    return {"submissions": rows, "total": int(total),
+            "n_with_searches": sum(1 for r in rows if (r.get("n_searches") or 0) > 0),
+            "locations_as_of": (as_of[0]["d"] if as_of else None)}
+
+
 _LAB_STOP = {"lab", "laboratory", "the", "dr", "prof", "mr", "ms", "mrs", "group", "core",
              "university", "california", "department", "institute", "center", "centre"}
 

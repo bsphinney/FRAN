@@ -6,6 +6,7 @@ PROT_0793 is ProtiFi LLC. Before this change the only way to reach it was its he
 Run:  python tests/test_submission_lookup.py
 """
 import os, sys
+from datetime import date
 os.environ["DELIMP_INTERNAL_MODE"] = "1"          # internal tables; see app/db.py
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app import queries                            # noqa: E402
@@ -70,6 +71,49 @@ for term in ("PROT_0652", "0652"):
     check(f"{term} reaches PROT_0652's real searches, not just a submission stub",
           any(x.get("kind") == "search" and x.get("search_engine") for x in r4.get("rows") or []),
           f'rows={[(x.get("kind"), x.get("search_engine")) for x in r4.get("rows") or []]}')
+
+
+# --- the submissions list -------------------------------------------------------------------
+L = queries.internal_submissions(limit=25)
+check("list returns submissions", len(L.get("submissions") or []) > 0, str(len(L.get("submissions") or [])))
+check("list reports a total", (L.get("total") or 0) >= 790, str(L.get("total")))
+first = (L.get("submissions") or [{}])[0]
+for k in ("internal_id", "institute", "n_searches", "num_samples", "submitted_at"):
+    check(f"row carries {k}", k in first, sorted(first.keys())[:12])
+check("locations_as_of is reported", L.get("locations_as_of") is not None)
+
+# "newest first" must hold over the WHOLE page, on the key the query actually sorts by
+# (submitted_at), not just the first row (a first-row-only check can't tell "sorted" from
+# "unsorted but starts high"). NULLs are sorted LAST by the query (NULLS LAST) — an unknown
+# submission date must not jump to the top and falsify "newest first" — so NULL is mapped to
+# date.min here, the smallest possible key, to keep the non-increasing assertion and the SQL's
+# NULLS LAST in agreement.
+keys = [(s.get("submitted_at") or date.min) for s in (L.get("submissions") or [])]
+check("newest first",
+      all(keys[i] >= keys[i + 1] for i in range(len(keys) - 1)),
+      [str(k) for k in keys[:6]])
+
+F = queries.internal_submissions(q="ProtiFi", limit=25)
+check("filtering by institute works",
+      any((s.get("internal_id") == "PROT_0793") for s in F.get("submissions") or []),
+      [s.get("internal_id") for s in (F.get("submissions") or [])][:5])
+P = queries.internal_submissions(q="0793", limit=25)
+check("filtering by bare number works",
+      any((s.get("internal_id") == "PROT_0793") for s in P.get("submissions") or []),
+      [s.get("internal_id") for s in (P.get("submissions") or [])][:5])
+
+# PROT_0793 is a poor witness for n_searches: its two "linked" searches actually carry
+# p.coreomics_submission_id = NULL (linkage_status='unlinked') and only appear under it via a
+# real_search_name substring match (see the block above) — so a correct FK-joined n_searches is
+# 0 for PROT_0793. PROT_0652 (hex 652c08d115d8) is the proven FK-linked witness: 6 searches with
+# p.coreomics_submission_id actually set to its hex id. Use PROT_0652 here so a future reader
+# does not "simplify" this back to PROT_0793.
+S652 = queries.internal_submissions(q="0652", limit=25)
+sub652 = next((s for s in (S652.get("submissions") or []) if s.get("internal_id") == "PROT_0652"), {})
+check("PROT_0652 is present via q=0652",
+      bool(sub652), [s.get("internal_id") for s in (S652.get("submissions") or [])][:5])
+check("PROT_0652 shows its genuinely FK-linked searches",
+      (sub652.get("n_searches") or 0) >= 1, sub652.get("n_searches"))
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)

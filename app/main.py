@@ -595,6 +595,15 @@ def api_internal_submission(submission_id: str):
                     {"submission_id": submission_id, "submission": None, "searches": []}))
 
 
+@app.get("/api/internal/submissions")
+def api_internal_submissions(q: str = "", limit: int = 100, offset: int = 0):
+    """FULL only: the submission directory — every numbered CoreOmics submission, newest first."""
+    if not db.is_full():
+        raise HTTPException(404, "Not found.")
+    return ok(_safe(lambda: queries.internal_submissions(q or None, limit, offset),
+                    {"submissions": [], "total": 0}))
+
+
 @app.get("/api/internal/lab/{pi:path}")
 def api_internal_lab(pi: str):
     """FULL only: a lab/PI page — all submissions + searches for a PI."""
