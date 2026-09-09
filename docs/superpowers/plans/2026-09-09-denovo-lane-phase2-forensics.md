@@ -40,7 +40,70 @@ Everything in Phase 1's Global Constraints, plus:
 
 ---
 
-### Task 0 (BLOCKING): the entrapment control
+### Task 0 (BLOCKING): three nulls, because there are three error sources
+
+**Measured 2026-09-09, and it is the number that governs this whole plan: 39% of the "credible"
+GVP candidates are chance matches.**
+
+| | real de novo | decoy (interior-reversed) |
+|---|---|---|
+| n | 15,512 | 15,459 |
+| exact corpus match | 5,082 | **0** |
+| 1 substitution | 1,662 | **945** |
+| credible (passes all three per-candidate controls) | 1,133 | **437** |
+
+**1-substitution FDR 57%; credible-candidate FDR 39%.** Interior-*shuffled* decoys agree (54% / 35%),
+so this is not an artefact of the reversal. Zero exact matches against 945 one-substitution hits is
+the mechanism: the corpus is dense enough in sequence space that a random peptide of realistic
+composition often sits one substitution from *something*.
+
+The three per-candidate controls in Task 1 (single-nucleotide reachability, non-isobaric, terminal
+position) pass on a decoy just as happily as on a real variant. **They are plausibility tests, not
+an error rate**, and quoting a candidate count without this null overstates the result by ~2×.
+
+#### Vocabulary, because it caused a real confusion here
+
+This is a **decoy**, not an entrapment. A decoy is a non-biological sequence used to estimate an
+error rate. An entrapment is a *real* sequence known to be absent from the sample (typically another
+organism's) used to test whether an error-rate estimate is honest. The 2026-07 session's
+"interior-reversed null, verified absent from all isoforms" is a matched-composition **decoy**, and
+calling it entrapment hid that fact.
+
+Note also that classic target–decoy does **not** transfer here unchanged: this lane runs **no
+database search**, so there is no search space to add decoys to. The null has to be built for the
+step that actually generates candidates — string distance against the corpus.
+
+#### The three nulls
+
+| Error source | Null | Status |
+|---|---|---|
+| **De novo sequencing error** | Decoy **spectra** — NovoBoard (Tran NH et al., *Mol Cell Proteomics* 2024, doi:10.1016/j.mcpro.2024.100849): keep ~20% of a real spectrum's peaks, replace the rest, sequence both, compete | **Already implemented** — `scripts/denovo_decoy_gen.py` at FRAC-0.8, used by `denovo_homology_fdr.py`. FRAC 0.5 leaks; 0.8 is the measured floor. |
+| **Chance corpus match** | Decoy **peptides** — interior-reversed and interior-shuffled, matched on length, composition and both termini, verified absent from the corpus | **Measured**: 39% credible-candidate FDR. Implement as a standard output. |
+| **Wrong genotype from a correct ID** | Carrier prevalence vs allele frequency (Task 0b) | Removed 65 of 67 candidates in the 2026-07 session. |
+
+They are orthogonal and all three are required. The first bounds *did the engine read the sequence
+right*; the second *is this match better than chance*; the third *does the genotype make sense*.
+
+- [ ] **Step 1: Generate decoy peptides** per run — interior-reversed AND interior-shuffled, both
+  filtered to remove any that are real corpus peptides (a decoy that is real is not a decoy).
+- [ ] **Step 2: Run the identical pigeonhole search** on them. Reusing the same code path is the
+  point; a separately-written decoy path would not measure the real one.
+- [ ] **Step 3: Report `match_fdr` on every candidate list**, computed as
+  `(decoy hits / n_decoy) / (real hits / n_real)`, and store it on `delimp_denovo_run`.
+- [ ] **Step 4: Wire in the existing NovoBoard decoy spectra** for the de novo error null, at
+  FRAC-0.8 — FRAC-0.5 leaks, which is a measured result, not a guess.
+- [ ] **Step 5: Never report a candidate count without its match_fdr.** The UI shows both or neither.
+
+#### Reference implementation for the decoy peptides
+
+`sessions/2026-07-15_Parker_VM_Sperm/scripts/03_build_variant_fasta.py` (block commented
+*"ENTRAPMENT: interior-reversed real variant peptides = guaranteed-non-biological matched null"*).
+Port the generator and the isoform-verification step; a null that is secretly a real isoform is the
+bug that produced a spurious 45% there.
+
+---
+
+### Task 0a: the historical entrapment note
 
 **No candidate list ships without this.** Tasks 1–3 produce a ranked list of variant candidates;
 this task is what lets anyone state what fraction of it is wrong.
