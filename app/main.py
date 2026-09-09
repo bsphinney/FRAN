@@ -753,11 +753,12 @@ def api_protein_card(protein_group: str):
 
 
 @app.get("/api/protein/{protein_group:path}/coverage")
-def api_protein_coverage(protein_group: str):
+def api_protein_coverage(protein_group: str, search_id: str | None = None):
     """Sequence coverage map: UniProt sequence + observed corpus peptides mapped
-    onto it. Registered before the catch-all so the /coverage suffix isn't eaten."""
+    onto it. Registered before the catch-all so the /coverage suffix isn't eaten.
+    With search_id, each peptide carries "here" — whether that search saw it."""
     from . import coverage as cov
-    data = queries.protein_coverage_peptides(protein_group)
+    data = queries.protein_coverage_peptides(protein_group, search_id=search_id)
     acc = protein_group.split(";")[0].strip()
     custom = queries.is_custom_accession(protein_group, data.get("gene"))
     seq = "" if custom else cov.fetch_uniprot_sequence(acc)

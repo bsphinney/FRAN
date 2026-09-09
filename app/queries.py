@@ -2873,18 +2873,25 @@ def peptides_showcase() -> dict[str, Any]:
     return SLOW_CACHE.get_or_set("peptides_showcase", _p)
 
 
-def protein_coverage_peptides(protein_group: str, limit: int = 4000) -> dict[str, Any]:
+def protein_coverage_peptides(protein_group: str, limit: int = 4000,
+                              search_id: str | None = None) -> dict[str, Any]:
     """Candidate observed peptides for a protein group (coverage map). CACHED: api_protein and
     api_protein_coverage BOTH call this for the same page, and a re-load re-calls it — caching means
     one successful scan serves all of them (consistent: no more 'map shows 83 but table shows 0' when
     one of the parallel calls times out). A failed/empty scan returns falsy -> NOT cached (get_or_set
-    skips falsy) -> retried next time, so a transient timeout doesn't stick."""
+    skips falsy) -> retried next time, so a transient timeout doesn't stick.
+
+    With search_id, each peptide gains "here": whether THIS search saw it. Without it the return is
+    unchanged, so every existing caller is untouched. The cache key includes the scope; sharing one
+    key between scoped and unscoped calls would serve one shape to a caller expecting the other.
+    """
     pg = (protein_group or "").strip()
-    cached = CACHE.get_or_set(f"covpep_{pg}", lambda: _protein_coverage_peptides(pg, limit))
+    key = f"covpep_{pg}" if not search_id else f"covpep_{pg}_{search_id}"
+    cached = CACHE.get_or_set(key, lambda: _protein_coverage_peptides(pg, limit, search_id))
     return cached or {"gene": None, "peptides": []}
 
 
-def _protein_coverage_peptides(pg: str, limit: int) -> dict[str, Any] | None:
+def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None) -> dict[str, Any] | None:
     try:  # live table under ingestion load -> tight timeout, degrade to no gene rather than 503
         gene = query(
             "SELECT MAX(gene) AS gene FROM delimp_proteins WHERE protein_group = %s",
@@ -2940,6 +2947,15 @@ def _protein_coverage_peptides(pg: str, limit: int) -> dict[str, Any] | None:
     # page load forever. So gate on whether the query SUCCEEDED, not on whether it returned rows.
     if not ok:
         return None            # falsy -> not cached by get_or_set -> retried next request
+    if search_id and peps:
+        # One extra indexed lookup, not a re-derivation: idx_prec_protein_group already covers this.
+        seen = {r["stripped_seq"] for r in query(
+            """SELECT DISTINCT stripped_seq FROM delimp_precursors
+                WHERE protein_group=%s AND search_id=%s AND stripped_seq = ANY(%s)""",
+            (pg, search_id, [p["stripped_seq"] for p in peps]),
+            tables=["delimp_precursors"])}
+        for p in peps:
+            p["here"] = p["stripped_seq"] in seen
     return {"gene": gene, "peptides": peps}
 
 
