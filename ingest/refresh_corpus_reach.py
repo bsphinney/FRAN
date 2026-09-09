@@ -36,6 +36,12 @@ rk AS (
   SELECT search_id, g, ns,
          percent_rank() OVER (PARTITION BY search_id ORDER BY ai) AS pr
     FROM per)
+-- n_searches and n_pct_searches are both count(*) over the same rk rows grouped by g, so
+-- today they cannot diverge (confirmed: 0 differing rows across all 278,194 genes). Kept as
+-- two columns anyway because they record two different facts — total reach vs. searches
+-- contributing to the percentile — that WOULD diverge if rk ever excluded some searches from
+-- the percentile but not from the reach count (e.g. a future per-search floor on rk). Don't
+-- collapse them on the assumption they're redundant; the redundancy is incidental, not structural.
 INSERT INTO delimp_protein_corpus_reach
       (gene, n_searches, n_samples, mean_pct_rank, n_pct_searches, computed_at)
 SELECT g, count(*), sum(ns), avg(pr)::real, count(*), now()

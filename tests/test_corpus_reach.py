@@ -37,9 +37,15 @@ check("table is populated", n > 100_000, str(n))
 lower = query(f"SELECT count(*) AS n FROM {T} WHERE gene <> upper(gene)", tables=[T], fetch="val") or 0
 check("every key is uppercased", lower == 0, f"{lower} non-uppercase keys")
 
-# Case-merging actually happened: ALB must exceed either spelling alone (273 / 1789 measured).
+# NOTE: this does NOT guard the case-merge bug. Human gene symbols are conventionally
+# all-caps, so exact-case 'ALB' alone is already 1736 searches — over this threshold with
+# no upper() at all. A build that forgot upper() would still land here and still pass. This
+# check only guards that the table is populated with a plausible corpus-scale count for a
+# common gene. The case-merge bug is guarded by the MUP2 check and the uppercase-key check
+# below (measured 2026-09-09: MUP2's only corpus spelling is 'Mup2', 33 searches — a
+# case-sensitive build puts 0 at key 'MUP2', failing the 0 < n < 200 assertion there).
 alb = query(f"SELECT n_searches FROM {T} WHERE gene='ALB'", tables=[T], fetch="val")
-check("ALB reach is case-merged (>1000, not ~273)", (alb or 0) > 1000, str(alb))
+check("ALB is populated with a plausible corpus-scale count (>1000)", (alb or 0) > 1000, str(alb))
 
 # ...and genuinely mouse-specific genes stay rare — the merge must not flatten everything.
 mup2 = query(f"SELECT n_searches FROM {T} WHERE gene='MUP2'", tables=[T], fetch="val")
