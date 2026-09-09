@@ -65,8 +65,25 @@ non_null_reach = [v for v in reach if v is not None]
 check("rarity mode is sorted ascending by corpus reach (non-null values)",
       all(non_null_reach[i] <= non_null_reach[i + 1] for i in range(len(non_null_reach) - 1)),
       str(reach[:6]))
+# NOT SUFFICIENT ALONE (measured, Fix round 1): this fixture's gene column already carries
+# plenty of all-uppercase symbols (MHC genes, contaminant keratins, ACTB, ALB) that case-match
+# under EITHER `r.gene = upper(a.gene)` or a broken `r.gene = a.gene`, so a case-sensitive join
+# still clears 40/50 here. It still catches a totally dead/unjoinable reach table — keep it —
+# but the Title-case check below is the one that actually discriminates the two joins.
 check("rarity mode: at least 40 of 50 rows carry a non-null reach (join is not dead)",
       len(non_null_reach) >= 40, f"{len(non_null_reach)} of {len(reach)} rows have a reach")
+# THE DISCRIMINATOR (Fix round 1). Measured under the correct join, rarity mode's top-10 is
+# 10/10 Title-case genes (Rps18-ps6, Mims1, H2bc9, Nat8f3, Gm3404, Fmo13, Ighg, Gbp8, Zfp68,
+# Try4) — real rare mouse-specific genes, which are written Title-case. An all-caps symbol
+# case-matches under EITHER join (see above), so it can never witness case-sensitivity; only a
+# Title-case gene surfacing with a real (non-null) reach proves the join is doing the upper()
+# normalization. Under `r.gene = a.gene` every Title-case gene gets reach=None and sorts last
+# via NULLS LAST, so this goes to 0/10. Threshold >= 6 of 10 has headroom against the measured
+# 10/10.
+top10_titlecase = sum(1 for p in r["proteins"][:10] if p["gene"] and p["gene"] != p["gene"].upper())
+check("rarity mode top-10 is majority Title-case genes (case-sensitive join witness)",
+      top10_titlecase >= 6, f"{top10_titlecase} of 10 top rows are Title-case: "
+      f"{[p['gene'] for p in r['proteins'][:10]]}")
 
 # CORPUS-ABUNDANCE mode is the mean within-search percentile, descending, and must be led by
 # genuinely abundant proteins. Measured corpus-wide: H4c1 .909, Hsp90ab1 .906, Gapdh .897, Alb .873.

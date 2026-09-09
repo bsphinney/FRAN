@@ -4334,9 +4334,18 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
         mode = "cv"
     order = _MATRIX_MODES[mode]
 
+    # work_mem="256MB": on the largest search (480k rows) the planner underestimates this table's
+    # row count by ~30x and sizes the COUNT(DISTINCT ...) sort for the small estimate, so the
+    # 4MB server default spills to an external merge on disk (same failure shape as the ALB
+    # witness above, line ~3284). MEASURED here, unlike ALB: 256MB does convert the sort to an
+    # in-memory quicksort (confirmed via EXPLAIN), but wall-clock barely moves — ~2.7s either
+    # way. The cost on THIS query is CPU-bound (sorting/deduping 480k rows), not disk I/O, so
+    # the ALB-style 10x speedup does not transfer. Kept anyway: it removes real disk contention
+    # under this shared cluster's I/O even though it doesn't fix this endpoint's latency.
+    # Bounded by maxconn (6) x 256MB = 1.5GB worst case for this one statement.
     n_samples_total = query(
         "SELECT count(DISTINCT raw_path) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
-        {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
+        {"sid": search_id}, tables=["delimp_proteins"], fetch="val", work_mem="256MB") or 0
     n_proteins_total = query(
         "SELECT count(DISTINCT protein_group) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
         {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
@@ -4348,6 +4357,11 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     params = {"sid": search_id, "limit": int(limit),
               "floor": _MATRIX_FLOOR * n_samples_total,
               "minpct": _MATRIX_MIN_PCT_SEARCHES}
+    # Same work_mem reasoning and same measured result as n_samples_total above: this is the
+    # same COUNT(DISTINCT raw_path) ... GROUP BY p.gene shape, now inside a GroupAggregate
+    # feeding a Hash Left Join. 256MB converts the sort to in-memory quicksort and the hash
+    # join to a single batch (confirmed via EXPLAIN), but wall-clock is still ~4s — CPU-bound
+    # on 478k rows, not disk-bound, so this does not bring the endpoint under ~3s.
     rows = query(
         f"""
         WITH agg AS (
@@ -4370,7 +4384,7 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
          ORDER BY {order}
          LIMIT %(limit)s
         """,
-        params, tables=["delimp_proteins", "delimp_protein_corpus_reach"])
+        params, tables=["delimp_proteins", "delimp_protein_corpus_reach"], work_mem="256MB")
 
     genes = [r["gene"] for r in rows]
     cells = query(
