@@ -307,8 +307,13 @@ git commit -m "ingest: build the corpus-reach table, case-merged and intensity-b
 ```python
 search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict
 # {"proteins": [{"gene", "protein_group", "n_samples", "is_contaminant",
-#                "reach", "reach_pct_rank", "cells": {sample_basename: float}}],
-#  "samples": [{"raw_path", "basename", "acquisition_date"}],
+#                "reach", "reach_pct_rank", "cells": {sample_id: float}}],
+#  "samples": [{"id", "raw_path", "raw_basename", "acquisition_date"}],
+# NOTE: cells are keyed by the OPAQUE sample id ("s0", "s1", ...), never by a filename.
+# privacy.redact() sanitises string VALUES under privacy._FILE_KEYS; it never renames KEYS, so a
+# filename used as a dict key reaches the public tier untouched. The sample field is likewise
+# `raw_basename`, not `basename` — the sanitiser matches on key name and `basename` is not in the
+# set. Both were found leaking real acquisition filenames to anonymous users during Task 4.
 #  "mode", "limit", "n_proteins_total", "n_samples_total",
 #  "floor_pct", "reach_computed_at"}
 # mode ∈ {"cv", "abundance", "rarity", "corpus_abundance"}
