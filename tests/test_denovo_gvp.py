@@ -69,6 +69,38 @@ idx4 = build_index(corpus4)
 h = find_gvp("PEPTETLK", idx4, corpus4)
 check("D->E flagged methylation-shaped", bool(h) and h[0]["is_methylation_shaped"] is True)
 
+# CONTROL 4 -- PTM-isobaric. Casanovo's residue vocabulary is fixed, so an unmodelled PTM has to be
+# absorbed as a residue call. A->S and F->Y are +15.995, exactly oxidation -- and hair is
+# chronically oxidised (sun, bleach, age), which is where this bites hardest.
+corpus_ox = {"PEPTAELK": ["PEPTAELK"], "PEPTFELK": ["PEPTFELK"]}
+idx_ox = build_index(corpus_ox)
+h = find_gvp("PEPTSELK", idx_ox, corpus_ox)
+check("A->S flagged PTM-isobaric", bool(h) and h[0]["is_ptm_isobaric"] is True)
+check("A->S names oxidation", bool(h) and h[0]["ptm_name"] == "oxidation",
+      h[0]["ptm_name"] if h else "no hit")
+# NB: PEPTYELK is 1 substitution from BOTH corpus peptides (A->Y and F->Y), and hits come back
+# sorted by corpus sequence, so h[0] is the A->Y hit. Select the substitution under test rather
+# than assuming it is first -- the same mistake as the S->E case above.
+h = find_gvp("PEPTYELK", idx_ox, corpus_ox)
+fy = [x for x in h if (x["aa_from"], x["aa_to"]) == ("F", "Y")]
+check("F->Y found among the hits", len(fy) == 1, f"got {len(fy)} of {len(h)}")
+check("F->Y flagged PTM-isobaric", bool(fy) and fy[0]["is_ptm_isobaric"] is True)
+check("F->Y names oxidation", bool(fy) and fy[0]["ptm_name"] == "oxidation")
+
+# N->Q is +14.016 like the pairs already listed; it was missing from the first exclusion table.
+corpus_nq = {"PEPTNELK": ["PEPTNELK"]}
+h = find_gvp("PEPTQELK", build_index(corpus_nq), corpus_nq)
+check("N->Q flagged methylation-shaped", bool(h) and h[0]["is_methylation_shaped"] is True)
+
+# A substitution with no PTM at that mass must NOT be flagged.
+corpus_w = {"PEPTAELK": ["PEPTAELK"]}
+h = find_gvp("PEPTWELK", build_index(corpus_w), corpus_w)
+check("A->W is not PTM-isobaric", bool(h) and h[0]["is_ptm_isobaric"] is False)
+
+# is_IL is returned so an uncallable site is visibly uncallable, never silently absent.
+h = find_gvp("LNDLEDALQQSK", idx, corpus)
+check("is_IL field returned", bool(h) and "is_IL" in h[0])
+
 # Determinism: neighbours sorted, or counts drift with the hash seed.
 c5 = {"AAAAAAAA": ["AAAAAAAA"], "AAAAAAAB": ["AAAAAAAB"]}
 r1 = [h["corpus_stripped_seq"] for h in find_gvp("AAAAAAAC", build_index(c5), c5)]

@@ -55,14 +55,38 @@ MASS = {"G": 57.02146, "A": 71.03711, "S": 87.03203, "P": 97.05276, "V": 99.0684
         "D": 115.02694, "Q": 128.05858, "K": 128.09496, "E": 129.04259, "M": 131.04049,
         "H": 137.05891, "F": 147.06841, "R": 156.10111, "Y": 163.06333, "W": 186.07931}
 
-# corpus residue -> what de novo reads, when the chemistry can produce it
-DEAMIDATION = {("N", "D"), ("Q", "E")}                       # +0.98402
-METHYLATION = {("D", "E"), ("S", "T"), ("G", "A"), ("V", "I")}   # +14.016
+# corpus residue -> what de novo reads, when the chemistry can produce the same mass shift.
+#
+# THE GENERAL PROBLEM. Casanovo's residue vocabulary is FIXED: Carbamidomethyl C, Oxidation M,
+# Deamidated N/Q, and four N-terminal mods. Any other modification cannot be represented, so the
+# model must absorb the mass some other way -- and one way is to call a different RESIDUE. A
+# substitution isobaric with an unmodelled PTM is therefore ambiguous on mass alone, and that
+# ambiguity is NOT covered by the other controls: it is not chance (the mass shift is real), not
+# generic model error (it is systematic and site-specific), and not a genotype problem. Worse, PTM
+# occupancy varies between samples -- age, storage, sun, bleach -- so a PTM-driven "variant" can
+# show carrier structure that MIMICS genetics and survives a prevalence filter.
+#
+# Enumerated by matching every substitution's mass delta against common PTM masses within 5 mDa.
+# Measured on the crane cohort: 336 of 1,133 credible candidates (30%) are PTM-isobaric.
+DEAMIDATION = {("N", "D"), ("Q", "E")}                                       # +0.98402
+METHYLATION = {("D", "E"), ("S", "T"), ("G", "A"), ("V", "I"), ("N", "Q")}   # +14.016
+
+# The rest, by PTM. Oxidation matters most for hair: chronically oxidised by sun, bleach and age,
+# and cysteine is ~17% of keratin-associated proteins.
+PTM_ISOBARIC = {
+    ("A", "S"): "oxidation",       ("F", "Y"): "oxidation",            # +15.995
+    ("P", "E"): "dioxidation",                                          # +31.990
+    ("S", "E"): "acetylation",                                          # +42.011
+    ("A", "I"): "trimethylation",  ("A", "L"): "trimethylation",
+    ("G", "V"): "trimethylation",                                       # +42.047
+    ("A", "N"): "carbamylation",                                        # +43.006
+    ("A", "Q"): "carbamidomethyl", ("G", "N"): "carbamidomethyl",       # +57.021
+}
 ISOBARIC_TOL = 0.06
 
 FIELDS = ["stripped_seq", "corpus_stripped_seq", "position", "aa_from", "aa_to", "mass_delta",
           "one_nt_reachable", "is_isobaric", "is_deamidation_shaped", "is_methylation_shaped",
-          "is_terminal", "n_neighbours"]
+          "is_ptm_isobaric", "ptm_name", "is_IL", "is_terminal", "n_neighbours"]
 
 
 def one_nt_apart(x: str, y: str) -> bool:
@@ -112,6 +136,13 @@ def find_gvp(peptide: str, index: dict, corpus: dict[str, list[str]]) -> list[di
                 "is_isobaric": dm < ISOBARIC_TOL,
                 "is_deamidation_shaped": (frm, to) in DEAMIDATION,
                 "is_methylation_shaped": (frm, to) in METHYLATION,
+                # NAMED, not merely flagged, so an oxidation-shaped candidate is visibly
+                # oxidation-shaped in the output rather than silently absent from it.
+                "is_ptm_isobaric": (frm, to) in PTM_ISOBARIC,
+                "ptm_name": PTM_ISOBARIC.get((frm, to), ""),
+                # I/L is collapsed upstream, so this should never fire. Returned anyway, so an
+                # uncallable site is visibly uncallable rather than missing from the output.
+                "is_IL": {frm, to} == {"I", "L"},
                 "is_terminal": i == 0 or i == len(q) - 1,
                 "n_neighbours": len(cands),
             })
