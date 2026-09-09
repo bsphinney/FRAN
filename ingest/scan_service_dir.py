@@ -193,3 +193,30 @@ def mark_in_fran(rows: list[dict], ingested: set[str]) -> None:
     """Set row['in_fran'] for exact service_folder matches in the ingested set."""
     for r in rows:
         r["in_fran"] = r["service_folder"] in ingested
+
+
+# The DO UPDATE list is deliberately short. submission_id / match_confidence / clue / matched_by /
+# matched_at are NOT refreshed: the 2026-06-24 ai-disk-match rows encode human-reviewed judgement
+# (clues like "submitter+date+organism") that this scanner cannot re-derive, and silently replacing
+# them with a weaker guess would be a regression nobody would notice. The scanner owns the
+# INVENTORY columns; matching owns the attribution columns, and only via match_submissions().
+UPSERT_SQL = """
+INSERT INTO delimp_submission_service_dir
+  (service_folder, service_folder_win, campus, run_count, in_fran, scanned_at)
+VALUES (%s, %s, %s, %s, %s, now())
+ON CONFLICT (service_folder) DO UPDATE SET
+  service_folder_win = EXCLUDED.service_folder_win,
+  campus             = EXCLUDED.campus,
+  run_count          = EXCLUDED.run_count,
+  in_fran            = EXCLUDED.in_fran,
+  scanned_at         = now()
+"""
+
+
+def upsert(con, rows: list[dict]) -> int:
+    cur = con.cursor()
+    for r in rows:
+        cur.execute(UPSERT_SQL, (r["service_folder"], r["service_folder_win"], r["campus"],
+                                 r["run_count"], bool(r.get("in_fran"))))
+    con.commit()
+    return len(rows)

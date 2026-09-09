@@ -147,5 +147,15 @@ sd.mark_in_fran(rows_proj, {"on_campus/SomeLab/proj1"})
 check("in_fran true when project matches exactly", rows_proj[0]["in_fran"] is True)
 check("in_fran false for sibling project with exact project key", rows_proj[1]["in_fran"] is False)
 
+# --- the upsert must not clobber a human-reviewed match ----------------------
+check("upsert SQL keys on service_folder", "ON CONFLICT (service_folder)" in sd.UPSERT_SQL,
+      sd.UPSERT_SQL[:160])
+for col in ("submission_id", "match_confidence", "clue", "matched_by", "matched_at"):
+    check(f"upsert never overwrites {col}",
+          f"{col}=EXCLUDED" not in sd.UPSERT_SQL.replace(" ", ""),
+          "found an EXCLUDED assignment")
+for col in ("run_count", "in_fran", "scanned_at"):
+    check(f"upsert refreshes {col}", col in sd.UPSERT_SQL.split("DO UPDATE SET")[1])
+
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
