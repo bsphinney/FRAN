@@ -105,5 +105,47 @@ check("a failed here-lookup sets scope_unavailable=True",
 check("a failed here-lookup is NOT cached (so a retry can still succeed)",
       queries.CACHE.cached(f"covpep_{FABP1}_{FLAKY_SID}") is None)
 
+# --- Fix round 1, MAJOR #7: the endpoint must deliver `sites`, not just the queries layer --------
+# All five original PTM tests sat at the queries() layer and passed the entire time the UI was
+# showing nothing -- Task 3's real discovery was that api_protein_coverage() built its response as
+# {..., **map_coverage(...)}, and map_coverage() never carried "sites", so it was silently dropped
+# before reaching the client. Proven able to fail by construction: comment out the
+# `"sites": data.get("sites") or []` line added to app/main.py and this goes red.
+RS41 = "P92966"
+PHOSPHO_SEARCH = "2c4911a3-79fd-5367-bdd0-ee85a16cd25b"
+cov = client.get(f"/api/protein/{RS41}/coverage", params={"search_id": PHOSPHO_SEARCH}).json()
+check("the /coverage endpoint delivers a non-empty sites list, not just the queries layer",
+      len(cov.get("sites") or []) > 0, str(cov.get("sites")))
+
+# --- Fix round 1, MAJOR #5: a failed sites lookup must degrade like its "here" sibling ------------
+# Same technique as the here-lookup test above: force ONLY the sites aggregate to fail (monkeypatch
+# on "n_mods > 0", the sites query's tell-tale substring) while the corpus scan and here-lookup --
+# siblings that already degrade gracefully -- run for real. Before the fix, this returned sites=[]
+# indistinguishable from "no modifications" AND cached that lie for the TTL.
+FLAKY_SITES_SID = "22222222-2222-2222-2222-222222222222"
+def _flaky_sites_query(sql, *a, **kw):
+    if "n_mods > 0" in sql:
+        raise RuntimeError("simulated transient failure in the sites aggregate")
+    return _real_query(sql, *a, **kw)
+
+queries.query = _flaky_sites_query
+try:
+    sites_degraded = queries.protein_coverage_peptides(RS41, search_id=FLAKY_SITES_SID)
+finally:
+    queries.query = _real_query
+
+check("a failed sites aggregate still returns the corpus peptides",
+      len(sites_degraded.get("peptides") or []) > 0, str(len(sites_degraded.get("peptides") or [])))
+check("a failed sites aggregate leaves the 'here' lookup intact (only the sites sibling failed)",
+      all("here" in p for p in sites_degraded["peptides"]),
+      "a random search_id legitimately finds nothing 'here' -- what matters is that the lookup "
+      "itself ran to completion (every peptide keyed) rather than being knocked out too")
+check("a failed sites aggregate sets sites_unavailable=True, not a lying empty list",
+      sites_degraded.get("sites_unavailable") is True)
+check("a failed sites aggregate still reports sites=[] (never guessed content)",
+      sites_degraded.get("sites") == [])
+check("a failed sites aggregate is NOT cached (so a retry can still succeed)",
+      queries.CACHE.cached(f"covpep_{RS41}_{FLAKY_SITES_SID}") is None)
+
 print("\n" + ("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS)))
 sys.exit(1 if FAILS else 0)

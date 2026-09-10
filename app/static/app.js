@@ -654,6 +654,26 @@ function _drawPeptideMap(card, gene){
   const hereRes=new Array(L).fill(false), corpRes=new Array(L).fill(false), anyRes=new Array(L).fill(false);
   peps.forEach(p=>{ for(let i=p.start-1;i<p.end&&i<L;i++){ anyRes[i]=true;
     if(!scopeOff){ if(p.here) hereRes[i]=true; else corpRes[i]=true; } } });
+  // Variable-modification sites, keyed by 1-based protein position. Colour by modification;
+  // phospho is the one people are looking for, so it gets the strongest colour. Deamidated was
+  // #fbbf24 (amber) -- too close to #FFCF40, the "found in this experiment" swatch on the same
+  // legend row (fix round 1, MAJOR #3) -- moved to a blue that can't be confused with it.
+  // Object.create(null): these are indexed by server-controlled JSON (unimod_id / pos). Neither
+  // is reachable as "__proto__"/"toString" today (unimod_id is a Python int filtered through
+  // VARIABLE_MODS, pos is integer arithmetic), but a plain-object map makes that a property of
+  // the code, not just of today's data (fix round 1, MINOR #12).
+  const MOD_NAMES=Object.assign(Object.create(null),{21:'Phospho',121:'GlyGly (ubiquitin)',1:'Acetyl',35:'Oxidation',7:'Deamidated',27:'Glu→pyro-Glu',28:'Gln→pyro-Glu'});
+  const MODCOL=Object.assign(Object.create(null),{21:'#f472b6',121:'#a3e635',1:'#c084fc',35:'#94a3b8',7:'#38bdf8',27:'#fb923c',28:'#f59e0b'});
+  // Mirrors proforma.py's BIOLOGICAL_MODS: phospho, GlyGly (the ubiquitin remnant) and acetyl are
+  // biology; oxidation, deamidation and Glu->pyro-Glu are largely sample-handling artifacts.
+  // Kept in sync BY HAND with proforma.py, and that sync has already failed once: GlyGly was added
+  // to the ingest's _MOD_UNIMOD without being added to VARIABLE_MODS, so ~750,000 ubiquitin
+  // remnants would have parsed cleanly and then been dropped a layer up -- absent data looking
+  // exactly like clean data. If you add a modification in proforma.py, add it to MODCOL, MOD_NAMES
+  // and BIO_MODS here in the same change.
+  const BIO_MODS=new Set([21,121,1]);
+  const siteAt=Object.create(null);
+  (d.sites||[]).forEach(s=>{ (siteAt[s.pos]=siteAt[s.pos]||[]).push(s); });
   const pctAll=Math.round(1000*anyRes.filter(Boolean).length/L)/10;
   const pctHere=scopeOff?null:Math.round(1000*hereRes.filter(Boolean).length/L)/10;
   const pcts=scopeOff
@@ -667,6 +687,21 @@ function _drawPeptideMap(card, gene){
     : `<span><span style="display:inline-block;width:22px;height:9px;background:#FFCF40;border-radius:2px;vertical-align:middle"></span> peptide found in this experiment</span>
        <span><span style="display:inline-block;width:22px;height:9px;background:#5eead4;border-radius:2px;vertical-align:middle"></span> found by the corpus, not here</span>
        <span class="text-slate-500">click a peptide for its corpus detail · click its sequence to open the FRAN peptide page</span>`;
+  // Built from the modifications actually PRESENT in d.sites, not a hardcoded three (fix round 1,
+  // MAJOR #3) -- the old fixed phospho/acetyl/oxidation list left 2 of the 5 possible modforms
+  // unlabelled (BSA: 3 of 7 markers had no legend entry) while also advertising phospho/acetyl on
+  // proteins that had neither. Grouped biological (phospho, acetyl) vs handling-artifact
+  // (oxidation, deamidation, Glu->pyro-Glu) so the UI doesn't present oxidation -- 34% of all
+  // corpus modifications and mostly sample handling, per proforma.py:29-32 -- as a peer of phospho.
+  const swatch=uid=>`<span><span style="display:inline-block;width:10px;height:0;border-bottom:2px solid ${MODCOL[uid]||'#e2e8f0'};vertical-align:middle"></span> ${esc(MOD_NAMES[uid]||('UNIMOD:'+uid))}</span>`;
+  const presentIds=[...new Set((d.sites||[]).map(s=>s.unimod_id))].sort((a,b)=>a-b);
+  const bioIds=presentIds.filter(u=>BIO_MODS.has(u)), artIds=presentIds.filter(u=>!BIO_MODS.has(u));
+  const modLegend=(d.sites_unavailable)
+    ? `<span class="text-slate-500">⚠ modification data unavailable for this view — sites may exist but could not be loaded</span>`
+    : (presentIds.length
+      ? `<span class="ml-1">${bioIds.map(swatch).join('')}</span>${artIds.length?`<span class="text-slate-600 mx-1">|</span><span title="Oxidation, deamidation and Glu→pyro-Glu are largely sample-handling artifacts, not necessarily biological">${artIds.map(swatch).join('')} <span class="text-slate-500">(handling artifacts)</span></span>`:''}
+         <span class="text-slate-400">sites are <b>as reported by the search engine</b> and not independently localized</span>`
+      : '');
   let seqHtml='';
   for(let off=0; off<L; off+=_PEPMAP_PERLINE){
     const end=Math.min(off+_PEPMAP_PERLINE,L);
@@ -682,7 +717,38 @@ function _drawPeptideMap(card, gene){
     const resChars=d.sequence.slice(off,end).split('').map((ch,i)=>{
       const gi=off+i;
       const col = scopeOff ? (anyRes[gi]?'#94a3b8':'#475569') : (hereRes[gi]?'#FFE9A8':(corpRes[gi]?'#a7f3e0':'#475569'));
-      return `<span style="display:inline-block;width:${W}%;text-align:center;color:${col}">${esc(ch)}</span>`;
+      const ss=siteAt[gi+1];
+      if(!ss) return `<span style="display:inline-block;width:${W}%;text-align:center;color:${col}">${esc(ch)}</span>`;
+      // Multiple modifications CAN land on one protein position (an N-terminal acetyl and a
+      // residue-1 phospho both map to peptide_start -- reachable by construction, not theoretical)
+      // -- every one of them is listed in the tooltip below; none is silently dropped (fix round 1,
+      // MAJOR #2, which found the old `ss[0]` losing a 9-precursor/95%-occupied phospho to a
+      // 1-precursor/5% acetyl purely because Acetyl's UNIMOD id sorts lower). The marker's colour
+      // follows the top of that list: biological (phospho/acetyl) over a handling artifact when
+      // both are present, tied off by precursor support -- phospho is what people are looking for.
+      const sorted=ss.slice().sort((a,b)=>(BIO_MODS.has(b.unimod_id)-BIO_MODS.has(a.unimod_id))||(b.n_precursors-a.n_precursors));
+      const s=sorted[0], mc=MODCOL[s.unimod_id]||'#e2e8f0';
+      const plural=(n,w)=>`${fmt(n)} ${w}${n===1?'':'s'}`;
+      // One line per modification at this position. Names the residue the ENGINE reported
+      // (x.residue), not the sequence letter drawn on the card (ch) -- the two are usually the
+      // same, but when they disagree that is a real discrepancy worth surfacing, not something to
+      // paper over by quietly picking the prettier answer (fix round 1, MAJOR #4).
+      const line=x=>{
+        const occPct=x.occupancy==null?null:Math.round(x.occupancy*100);
+        // "of precursors here" collided with "here" already meaning "this experiment" on this same
+        // card (fix round 1, MINOR #9); "0%" on a real 1-precursor site is also misleading (MINOR
+        // #8) -- both fixed together.
+        const occ=occPct==null?'':` · ~${occPct<1&&x.occupancy>0?'<1':occPct}% of precursors covering this residue (approximate)`;
+        const mism=(x.residue&&x.residue!==ch)?` ⚠ sequence has ${ch} here, engine reported ${x.residue}`:'';
+        return `${x.name} on ${x.residue||ch}${gi+1}${occ} · ${plural(x.n_precursors,'precursor')} in ${plural(x.n_runs,'run')}${mism}`;
+      };
+      const tip=(sorted.length>1
+        ? sorted.map(line).join('  |  ')+'  ·  multiple modifications reported at this position'
+        : line(s)) + ' · engine-reported, not independently localized';
+      // esc() once, on the assembled tip, not once per interpolated piece and again here (fix
+      // round 1, MINOR #13) -- the old double-escape turned any non-letter into "&amp;lt;".
+      return `<span title="${esc(tip)}" style="display:inline-block;width:${W}%;text-align:center;color:${col};`
+           + `border-bottom:2px solid ${mc};font-weight:700;cursor:help">${esc(ch)}</span>`;
     }).join('');
     const laneHtml=lanes.map(lane=>`<div style="position:relative;height:11px;margin-top:2px">${
       lane.map(p=>{
@@ -701,7 +767,7 @@ function _drawPeptideMap(card, gene){
         <span class="text-slate-500 text-xs font-mono font-normal">${esc(d.accession)} · ${fmt(L)} aa · ${fmt(peps.length)} peptides</span>
         <a onclick="go('gene','${encodeURIComponent(gene)}')" class="cursor-pointer text-xs font-semibold px-2 py-0.5 rounded-lg bg-accent/15 text-accent-400 hover:bg-accent/25 ml-1" title="everything the corpus knows about ${esc(gene)}">${esc(gene)} across the corpus ↗</a></h3>
       ${pcts}</div>
-    <div class="flex flex-wrap gap-4 text-[11px] text-slate-500 my-3">${legend}</div>
+    <div class="flex flex-wrap gap-4 text-[11px] text-slate-500 my-3">${legend}${modLegend}</div>
     <div>${seqHtml}</div>
     <div id="pepmapDetail" class="mt-2"></div>`;
 }
