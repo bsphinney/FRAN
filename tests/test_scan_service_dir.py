@@ -1,0 +1,279 @@
+"""The service-share walk: what counts as a run, and what is skipped.
+
+Run:  python tests/test_scan_service_dir.py
+"""
+import os, sys, tempfile, pathlib
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ingest"))
+import scan_service_dir as sd                              # noqa: E402
+
+FAILS = []
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  — {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILS.append(name)
+
+check("win_path spells the R: drive",
+      sd.win_path("on_campus/A/B") == r"R:\Data\lab\service\on_campus\A\B",
+      sd.win_path("on_campus/A/B"))
+
+with tempfile.TemporaryDirectory() as root:
+    p = pathlib.Path(root)
+    proj = p / "on_campus" / "SomeLab" / "proj1"
+    proj.mkdir(parents=True)
+    (proj / "run1.d").mkdir()
+    (proj / "run1.d" / "analysis.tdf").write_text("x")     # must NOT be counted
+    (proj / "run2.d").mkdir()
+    (proj / "run3.raw").write_text("x")
+    (proj / "notes.txt").write_text("x")                   # must NOT be counted
+    check("count_runs counts .d dirs and .raw files only", sd.count_runs(str(proj)) == 3,
+          str(sd.count_runs(str(proj))))
+
+    # campus-level junk is skipped
+    (p / "Thumbs.db").write_text("x")
+    (p / "htrms_quarantine_20250916_134754").mkdir()
+    empty = p / "off_campus" / "OtherLab" / "proj2"
+    empty.mkdir(parents=True)
+
+    rows = sd.walk_projects(str(root))
+    folders = {r["service_folder"] for r in rows}
+    check("finds the on_campus project", "on_campus/SomeLab/proj1" in folders, str(folders))
+    check("finds the off_campus project", "off_campus/OtherLab/proj2" in folders, str(folders))
+    check("skips Thumbs.db and quarantine dirs",
+          not any("htrms_quarantine" in f or "Thumbs" in f for f in folders), str(folders))
+    r1 = next(r for r in rows if r["service_folder"] == "on_campus/SomeLab/proj1")
+    check("row carries campus", r1["campus"] == "on_campus", r1["campus"])
+    check("row carries run_count", r1["run_count"] == 3, str(r1["run_count"]))
+    check("a project with no runs is still inventoried",
+          next(r for r in rows if r["service_folder"].endswith("proj2"))["run_count"] == 0)
+
+    # Symlink handling
+    # Symlinked .d inside a project is counted
+    (proj / "run4.d").symlink_to(proj / "run1.d")
+    check("symlinked .d inside a project IS counted",
+          sd.count_runs(str(proj)) == 4, str(sd.count_runs(str(proj))))
+
+    # Symlinked project directory is inventoried
+    link_proj = p / "on_campus" / "SomeLab" / "proj_link"
+    link_proj.symlink_to(proj)
+    rows = sd.walk_projects(str(root))
+    folders = {r["service_folder"] for r in rows}
+    check("symlinked project directory IS inventoried",
+          "on_campus/SomeLab/proj_link" in folders, str(folders))
+
+    # Symlink loop: on_campus/loop -> root should not cause junk entries
+    loop = p / "on_campus" / "loop"
+    loop.symlink_to(p)
+    rows = sd.walk_projects(str(root))
+    all_folders = {r["service_folder"] for r in rows}
+    expected = {"on_campus/SomeLab/proj1", "on_campus/SomeLab/proj_link", "off_campus/OtherLab/proj2"}
+    check("ancestor symlink produces no junk rows", all_folders == expected,
+          f"unexpected {sorted(all_folders - expected)}, missing {sorted(expected - all_folders)}")
+
+    # Uppercase extensions are counted
+    (proj / "run5.D").mkdir()
+    (proj / "run6.RAW").write_text("x")
+    check(".D and .RAW uppercase are counted",
+          sd.count_runs(str(proj)) == 6, str(sd.count_runs(str(proj))))
+
+    # Unreadable directory handling (only on platforms where chmod affects the current user)
+    unreadable_proj = p / "on_campus" / "RestrictedLab" / "restricted"
+    unreadable_proj.mkdir(parents=True)
+    (unreadable_proj / "run_hidden.d").mkdir()
+    unreadable_proj_str = str(unreadable_proj)
+    try:
+        os.chmod(unreadable_proj_str, 0o000)
+        rows = sd.walk_projects(str(root))
+        unreadable = sd.get_unreadable_paths()
+        # On some systems (e.g., running as root), chmod may not restrict access
+        if os.access(unreadable_proj_str, os.R_OK):
+            check("unreadable directory check skipped (running as root or similar)",
+                  True, "")
+        else:
+            check("unreadable directory is reported as unreadable",
+                  any("restricted" in u for u in unreadable), str(unreadable))
+            check("unreadable directory has None run_count, not 0",
+                  any(r["service_folder"] == "on_campus/RestrictedLab/restricted" and r["run_count"] is None
+                      for r in rows),
+                  str([r for r in rows if "restricted" in r["service_folder"]]))
+    finally:
+        os.chmod(unreadable_proj_str, 0o755)
+
+# --- in_fran resolution -------------------------------------------------------
+# service_folder_from_path: extract campus/client/project from a full path
+check("service_folder_from_path R:\\ example",
+      sd.service_folder_from_path(r"R:\Data\lab\service\off_campus\University of TexAS-Southwestern\tu benjamin\AcobaMichelle-TuB-TXSW-YeastIP_ian")
+      == "off_campus/University of TexAS-Southwestern/tu benjamin")
+
+check("service_folder_from_path with deeper nesting takes exactly 3 components",
+      sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\gabri_labStufs\DdaDiaExToFLu\Dia_Ex\SpN_KfastDia301711m\SpNlib_k50ngEx_O_W15-34_")
+      == "on_campus/gabri_labStufs/DdaDiaExToFLu")
+
+check("service_folder_from_path POSIX example",
+      sd.service_folder_from_path("/nfs/lssc0/flinders/proteomics/Data/lab/service/on_campus/SomeLab/proj1/whatever.sne")
+      == "on_campus/SomeLab/proj1")
+
+check("service_folder_from_path no lab/service marker returns None",
+      sd.service_folder_from_path("/some/random/path") is None)
+
+check("service_folder_from_path fewer than 3 components returns None",
+      sd.service_folder_from_path(r"R:\Data\lab\service\on_campus\SomeLab") is None)
+
+check("service_folder_from_path with a doubled separator (backslash)",
+      sd.service_folder_from_path(r"R:\Data\lab\service\\on_campus\SomeLab\proj1")
+      == "on_campus/SomeLab/proj1",
+      repr(sd.service_folder_from_path(r"R:\Data\lab\service\\on_campus\SomeLab\proj1")))
+
+check("service_folder_from_path with a doubled separator (forward slash)",
+      sd.service_folder_from_path("/nfs/lssc0/flinders/proteomics/Data/lab/service//on_campus/SomeLab/proj1")
+      == "on_campus/SomeLab/proj1",
+      repr(sd.service_folder_from_path("/nfs/lssc0/flinders/proteomics/Data/lab/service//on_campus/SomeLab/proj1")))
+
+# mark_in_fran: matches exact project keys, not client prefixes
+rows = [
+    {"service_folder": "on_campus/SomeLab/proj1", "campus": "on_campus"},
+    {"service_folder": "on_campus/SomeLab/proj2", "campus": "on_campus"},
+]
+sd.mark_in_fran(rows, {"on_campus/SomeLab"})
+check("a client-level key marks NO project as ingested",
+      rows[0]["in_fran"] is False and rows[1]["in_fran"] is False,
+      f"proj1={rows[0]['in_fran']} proj2={rows[1]['in_fran']}")
+
+# Positive case: project-level key does match
+rows_proj = [
+    {"service_folder": "on_campus/SomeLab/proj1", "campus": "on_campus"},
+    {"service_folder": "on_campus/SomeLab/proj2", "campus": "on_campus"},
+]
+sd.mark_in_fran(rows_proj, {"on_campus/SomeLab/proj1"})
+check("in_fran true when project matches exactly", rows_proj[0]["in_fran"] is True)
+check("in_fran false for sibling project with exact project key", rows_proj[1]["in_fran"] is False)
+
+# --- the upsert must not clobber a human-reviewed match ----------------------
+check("upsert SQL keys on service_folder", "ON CONFLICT (service_folder)" in sd.UPSERT_SQL,
+      sd.UPSERT_SQL[:160])
+# Absence checks: normalize ALL whitespace (newlines, tabs, spaces) and lowercase
+normalized_sql = " ".join(sd.UPSERT_SQL.split()).lower().replace(" ", "")
+for col in ("submission_id", "match_confidence", "clue", "matched_by", "matched_at"):
+    check(f"upsert never overwrites {col}",
+          f"{col}=excluded" not in normalized_sql,
+          "found an EXCLUDED assignment")
+# Refreshes checks: verify exact assignment forms after DO UPDATE SET
+do_update_part = sd.UPSERT_SQL.split("DO UPDATE SET")[1]
+do_update_normalized = " ".join(do_update_part.split()).lower()
+required_assignments = {
+    "run_count": "run_count = excluded.run_count",
+    "in_fran": "in_fran = excluded.in_fran",
+    "campus": "campus = excluded.campus",
+    "service_folder_win": "service_folder_win = excluded.service_folder_win",
+    "scanned_at": "scanned_at = now()",
+}
+for col, expected_form in required_assignments.items():
+    check(f"upsert refreshes {col} correctly",
+          expected_form in do_update_normalized,
+          f"missing or wrong: {expected_form}")
+
+# --- depth-adaptive walk: off-campus institutions nest one level deeper than on_campus --------
+# Real case this protects: off_campus/UC-Berkeley/ChangChris held 0 direct runs and 40-odd
+# project subfolders holding 239 acquisitions between them. A fixed depth-3 walk recorded
+# ChangChris itself as a zero-run project and never looked inside.
+
+with tempfile.TemporaryDirectory() as root:
+    p = pathlib.Path(root)
+
+    # Intermediate: zero direct runs, has subdirectories -> descend, record children, not itself.
+    inter = p / "off_campus" / "UC-Berkeley" / "ChangChris"
+    proj_a = inter / "proj_a"
+    proj_b = inter / "proj_b"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+    (proj_a / "run1.raw").write_text("x")
+    (proj_a / "run2.raw").write_text("x")
+    # proj_b left empty -- a genuine zero-run leaf at depth 4, still inventoried (Task 2's rule
+    # extends to whatever depth a leaf actually lands at).
+
+    # Real project WITH runs that also happens to have a subdirectory (e.g. a results/ folder).
+    # Must stay a single depth-3 row and must NOT be descended into.
+    proj_with_results = p / "on_campus" / "LabX" / "proj_with_results"
+    proj_with_results.mkdir(parents=True)
+    (proj_with_results / "run1.raw").write_text("x")
+    results_sub = proj_with_results / "results"
+    results_sub.mkdir()
+    (results_sub / "extra.raw").write_text("x")   # must NOT be counted or descended into
+
+    rows = sd.walk_projects(str(root))
+    folders = {r["service_folder"]: r for r in rows}
+
+    check("intermediate directory (0 runs, has subdirs) is NOT itself a row",
+          "off_campus/UC-Berkeley/ChangChris" not in folders, sorted(folders))
+    check("intermediate's children are recorded as depth-4 projects",
+          "off_campus/UC-Berkeley/ChangChris/proj_a" in folders
+          and "off_campus/UC-Berkeley/ChangChris/proj_b" in folders,
+          sorted(folders))
+    check("depth-4 child run_count is correct",
+          folders.get("off_campus/UC-Berkeley/ChangChris/proj_a", {}).get("run_count") == 2,
+          str(folders.get("off_campus/UC-Berkeley/ChangChris/proj_a")))
+    check("a genuinely empty depth-4 child is still inventoried, not dropped",
+          folders.get("off_campus/UC-Berkeley/ChangChris/proj_b", {}).get("run_count") == 0,
+          str(folders.get("off_campus/UC-Berkeley/ChangChris/proj_b")))
+
+    check("a project WITH runs stays itself even though it has a subdirectory",
+          "on_campus/LabX/proj_with_results" in folders, sorted(folders))
+    check("run_count for that project counts only its DIRECT runs, not the subdirectory's",
+          folders.get("on_campus/LabX/proj_with_results", {}).get("run_count") == 1,
+          str(folders.get("on_campus/LabX/proj_with_results")))
+    check("the subdirectory of a real project is NOT descended into as its own row",
+          "on_campus/LabX/proj_with_results/results" not in folders, sorted(folders))
+
+    # Unreadable directory with subdirectories must not be treated as an intermediate: no
+    # descent, no depth-4 rows, and it must still show up as unreadable (None, not 0).
+    unreadable_inter = p / "off_campus" / "RestrictedInst" / "RestrictedLab"
+    hidden_child = unreadable_inter / "hidden_proj"
+    hidden_child.mkdir(parents=True)
+    (hidden_child / "run.raw").write_text("x")
+    unreadable_inter_str = str(unreadable_inter)
+    try:
+        os.chmod(unreadable_inter_str, 0o000)
+        rows2 = sd.walk_projects(str(root))
+        folders2 = {r["service_folder"]: r for r in rows2}
+        if os.access(unreadable_inter_str, os.R_OK):
+            check("unreadable-intermediate check skipped (running as root or similar)", True, "")
+        else:
+            check("an unreadable directory is not descended into as an intermediate",
+                  "off_campus/RestrictedInst/RestrictedLab/hidden_proj" not in folders2,
+                  sorted(folders2))
+            check("the unreadable directory itself is still recorded, with run_count None",
+                  folders2.get("off_campus/RestrictedInst/RestrictedLab", {}).get("run_count")
+                  is None,
+                  str(folders2.get("off_campus/RestrictedInst/RestrictedLab")))
+    finally:
+        os.chmod(unreadable_inter_str, 0o755)
+
+# --- in_fran must match at whatever depth a row actually landed at ----------------------------
+rows_depth4 = [
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_a"},
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_b"},
+]
+sd.mark_in_fran(rows_depth4, {"off_campus/UC-Berkeley/ChangChris/proj_a"})
+check("in_fran matches an exact depth-4 row",
+      rows_depth4[0]["in_fran"] is True and rows_depth4[1]["in_fran"] is False,
+      f"proj_a={rows_depth4[0]['in_fran']} proj_b={rows_depth4[1]['in_fran']}")
+
+rows_depth4b = [{"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_a"}]
+sd.mark_in_fran(rows_depth4b, {"off_campus/UC-Berkeley/ChangChris/proj_a/output/report"})
+check("in_fran matches when the ingested path sits BELOW a depth-4 row",
+      rows_depth4b[0]["in_fran"] is True, rows_depth4b[0]["in_fran"])
+
+# Sibling safety: a deep ingested path under proj_a must never mark proj_b -- confirms the
+# depth-4 prefix rule cannot re-widen a match to the whole intermediate the way a client-level
+# key could (Task 3's ruling). This holds structurally because intermediates are never rows:
+# there is no depth-3 "ChangChris" row left for a shallow key to over-claim.
+rows_sibling = [
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_a"},
+    {"service_folder": "off_campus/UC-Berkeley/ChangChris/proj_b"},
+]
+sd.mark_in_fran(rows_sibling, {"off_campus/UC-Berkeley/ChangChris/proj_a/output/report"})
+check("a depth-4 sibling is NOT marked in_fran by another sibling's ingested path",
+      rows_sibling[0]["in_fran"] is True and rows_sibling[1]["in_fran"] is False,
+      f"proj_a={rows_sibling[0]['in_fran']} proj_b={rows_sibling[1]['in_fran']}")
+
+print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
+sys.exit(1 if FAILS else 0)

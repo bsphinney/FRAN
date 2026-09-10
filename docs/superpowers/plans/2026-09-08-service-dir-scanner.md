@@ -20,7 +20,7 @@
 - **Raw counting:** `.d` directories and `.raw` files. Never descend into a `.d` (it is a directory of instrument files, not a folder of runs).
 - **Credentials from files, never argv.** `DELIMP_PG_TOKEN_FILE` as every other ingest script does; argv is world-readable on the compute nodes.
 - **Heavy work is not login-node work.** The full walk runs under sbatch.
-- **`delimp_submission_service_dir` is an INTERNAL table** (`app/db.py:_INTERNAL_TABLES`). The
+- **The service-dir tables are INTERNAL tables** (`delimp_submission_service_dir` and the new `delimp_service_dir_inventory`) (`app/db.py:_INTERNAL_TABLES`). The
   governed `app.db.query` refuses it unless the request is internal, so any test or snippet using
   that layer must set `DELIMP_INTERNAL_MODE=1` BEFORE importing `app.db`. The scanner itself talks
   to psycopg2 directly and is unaffected.
@@ -30,30 +30,47 @@
 
 ---
 
-### Task 1: Schema — allow folders with no matched submission
+### Task 1: A folder-inventory table
 
 **Files:**
-- Create: `ingest/migrations/2026-09-08_service_dir_scannable.sql`
+- Create: `ingest/migrations/2026-09-08_service_dir_inventory.sql`
 - Test: `tests/test_service_dir_schema.py`
 
+**WHY THIS IS A NEW TABLE, NOT AN ALTER.** The first version of this task tried to add
+`UNIQUE (service_folder)` to `delimp_submission_service_dir`. Applying it failed:
+`UniqueViolation: could not create unique index`. Measured on the live data, **285 service_folder
+values appear more than once**, the worst mapping to ELEVEN submissions
+(`off_campus/UCSF/Jain-Isha/JainUCSF-Desousa-brandon`). That is correct data — a lab sends several
+submissions whose work lands in one project folder — so that table is genuinely
+one-row-per-submission and can never carry a unique folder.
+
+Folder facts therefore get their own table. Storing them in the existing one would repeat a
+folder's `run_count` once per mapped submission (eleven times for that UCSF folder), so a single
+scan would update eleven rows that could then disagree.
+
+`delimp_submission_service_dir` is left ENTIRELY UNTOUCHED. `build_resubmit_brief`,
+`internal_submission`, `internal_lab` and `internal_labs_by_institution` all read it and keep
+working unchanged.
+
 **Interfaces:**
-- Produces: `delimp_submission_service_dir` gains `id BIGSERIAL PRIMARY KEY`, `scanned_at TIMESTAMPTZ`, a `UNIQUE (service_folder)` constraint, and a nullable `submission_id`. Later tasks upsert on `ON CONFLICT (service_folder)`.
+- Produces: `delimp_service_dir_inventory` — `service_folder TEXT PRIMARY KEY`,
+  `service_folder_win TEXT`, `campus TEXT`, `run_count INTEGER` (NULL = could not be read),
+  `in_fran BOOLEAN`, `scanned_at TIMESTAMPTZ`. Task 4 upserts on `ON CONFLICT (service_folder)`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-"""delimp_submission_service_dir must be able to hold a folder with no submission.
+"""The folder inventory needs its own table, keyed on the folder.
 
-The scanner inventories every project folder on the share, including ones it cannot attribute to a
-CoreOmics submission. The table was keyed on submission_id alone (one row per submission), which
-cannot express that.
+delimp_submission_service_dir is one row per SUBMISSION and cannot be keyed on service_folder:
+285 folders there map to more than one submission (one maps to eleven). This table is one row per
+FOLDER, including folders no submission can be matched to.
 
 Run:  python tests/test_service_dir_schema.py
 """
 import os, sys
-# delimp_submission_service_dir is in app/db.py's _INTERNAL_TABLES, so the governed query layer
-# REFUSES it unless the request is internal. Set this before importing app.db, as
-# tests/test_federation_boundary.py does with its own env.
+# The service-dir tables are in app/db.py's _INTERNAL_TABLES; the governed query layer refuses
+# them unless the request is internal. Set this BEFORE importing app.db.
 os.environ.setdefault("DELIMP_INTERNAL_MODE", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app.db import query                                  # noqa: E402
@@ -65,81 +82,96 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 cols = {r["column_name"]: r for r in query(
-    """SELECT column_name, is_nullable FROM information_schema.columns
-       WHERE table_name='delimp_submission_service_dir'""",
-    tables=["delimp_submission_service_dir"])}
+    "SELECT column_name, is_nullable, data_type FROM information_schema.columns "
+    "WHERE table_name='delimp_service_dir_inventory'",
+    tables=["delimp_service_dir_inventory"])}
+for c in ("service_folder", "service_folder_win", "campus", "run_count", "in_fran", "scanned_at"):
+    check(f"{c} column exists", c in cols, sorted(cols))
+check("run_count is nullable (NULL = could not be read)",
+      cols.get("run_count", {}).get("is_nullable") == "YES",
+      str(cols.get("run_count", {}).get("is_nullable")))
 
-check("id column exists", "id" in cols)
-check("scanned_at column exists", "scanned_at" in cols)
-check("submission_id is nullable", cols.get("submission_id", {}).get("is_nullable") == "YES",
-      f"got {cols.get('submission_id', {}).get('is_nullable')}")
-
-idx = query("""SELECT indexdef FROM pg_indexes
-               WHERE tablename='delimp_submission_service_dir'""",
-            tables=["delimp_submission_service_dir"])
+idx = query("SELECT indexdef FROM pg_indexes WHERE tablename='delimp_service_dir_inventory'",
+            tables=["delimp_service_dir_inventory"])
 defs = " ".join(r["indexdef"] for r in idx)
-check("service_folder is UNIQUE", "UNIQUE" in defs and "service_folder" in defs, defs[:200])
+check("service_folder is the primary key", "UNIQUE" in defs and "service_folder" in defs, defs[:200])
 
-print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
+# The existing table must be untouched — its consumers depend on it.
+old = query("SELECT count(*) AS n FROM delimp_submission_service_dir",
+            tables=["delimp_submission_service_dir"])
+check("delimp_submission_service_dir still has its 1862 rows", old[0]["n"] == 1862, str(old[0]["n"]))
+oldcols = {r["column_name"] for r in query(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_name='delimp_submission_service_dir'",
+    tables=["delimp_submission_service_dir"])}
+check("delimp_submission_service_dir gained no columns",
+      oldcols == {"submission_id", "service_folder", "service_folder_win", "campus", "in_fran",
+                  "run_count", "match_confidence", "clue", "matched_by", "matched_at"},
+      str(sorted(oldcols)))
+
+print("\n" + ("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS)))
 sys.exit(1 if FAILS else 0)
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `python tests/test_service_dir_schema.py`
-Expected: FAIL on `id column exists`, `scanned_at column exists`, `service_folder is UNIQUE` (the table today is keyed on `submission_id` alone).
+Expected: the six column checks and the primary-key check FAIL (the table does not exist). The two
+"untouched" checks should PASS already — if either fails, STOP: something has altered the existing
+table, and that must be understood before going further.
 
-- [ ] **Step 3: Write the migration**
+- [ ] **Step 3: Write the migration file**
 
 ```sql
--- The scanner inventories every project folder on the service share, including folders it cannot
--- attribute to a CoreOmics submission. The table was PRIMARY KEY (submission_id), which cannot
--- hold an unattributed folder at all, and cannot hold two folders for one submission.
+-- One row per project FOLDER on the service share.
 --
--- Existing ai-disk-match rows are preserved untouched: they keep their submission_id, matched_by
--- and matched_at, and are simply given a surrogate id.
-ALTER TABLE delimp_submission_service_dir DROP CONSTRAINT IF EXISTS delimp_submission_service_dir_pkey;
-ALTER TABLE delimp_submission_service_dir ADD COLUMN IF NOT EXISTS id BIGSERIAL PRIMARY KEY;
-ALTER TABLE delimp_submission_service_dir ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMPTZ;
-ALTER TABLE delimp_submission_service_dir ALTER COLUMN submission_id DROP NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS delimp_submission_service_dir_folder_uq
-  ON delimp_submission_service_dir (service_folder);
-CREATE INDEX IF NOT EXISTS idx_service_dir_submission
-  ON delimp_submission_service_dir (submission_id);
+-- Deliberately NOT part of delimp_submission_service_dir, which is one row per SUBMISSION: 285 of
+-- its service_folder values repeat, one across eleven submissions, because a lab sends several
+-- submissions whose work lands in one folder. Keying that table on the folder is impossible, and
+-- storing folder facts in it would repeat run_count once per mapped submission.
+--
+-- run_count NULL means "could not be read", which must stay distinguishable from 0 = genuinely
+-- empty. That is why count_runs() returns int | None.
+CREATE TABLE IF NOT EXISTS delimp_service_dir_inventory (
+    service_folder     TEXT PRIMARY KEY,
+    service_folder_win TEXT,
+    campus             TEXT,
+    run_count          INTEGER,
+    in_fran            BOOLEAN,
+    scanned_at         TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_service_dir_inv_in_fran
+  ON delimp_service_dir_inventory (in_fran);
 ```
 
 - [ ] **Step 4: Apply it and re-run the test**
 
-```bash
-DELIMP_PG_TOKEN_FILE=~/.pgfarm_token python - <<'PY'
-import sys
-# ingest/ is NOT a package (no __init__.py) -- every script there does this, so do the same.
-sys.path.insert(0, "ingest")
-from coreomics_import import _conn                # the same file-based credential helper
-con = _conn(); cur = con.cursor()
-cur.execute(open("ingest/migrations/2026-09-08_service_dir_scannable.sql").read())
-con.commit(); con.close(); print("applied")
-PY
-python tests/test_service_dir_schema.py
-```
-Expected: `ALL PASS`. Then confirm no rows were lost:
+Write the statements INLINE in the apply command rather than reading the .sql file. Executing file
+contents is refused by this environment's safety gate, while inline statements are visible to
+whoever approves them. Save the .sql file anyway as the migration record.
 
 ```bash
-python - <<'PY'
-import os, sys
-os.environ.setdefault("DELIMP_INTERNAL_MODE", "1")        # internal table; see app/db.py
-sys.path.insert(0, ".")
-from app.db import query
-print(query("SELECT count(*) c FROM delimp_submission_service_dir",
-            tables=["delimp_submission_service_dir"]))   # expect 1862
-PY
+cd /Users/brettphinney/Documents/FRAN-scanner
+DELIMP_PG_TOKEN_FILE=~/.pgfarm_token python3 -c "
+import sys; sys.path.insert(0, 'ingest')
+from coreomics_import import _conn
+con = _conn(); cur = con.cursor()
+cur.execute('CREATE TABLE IF NOT EXISTS delimp_service_dir_inventory (service_folder TEXT PRIMARY KEY, service_folder_win TEXT, campus TEXT, run_count INTEGER, in_fran BOOLEAN, scanned_at TIMESTAMPTZ)')
+cur.execute('CREATE INDEX IF NOT EXISTS idx_service_dir_inv_in_fran ON delimp_service_dir_inventory (in_fran)')
+con.commit()
+cur.execute('SELECT count(*) FROM delimp_submission_service_dir')
+print('existing table still has', cur.fetchone()[0], 'rows')
+con.close()"
+python tests/test_service_dir_schema.py
 ```
+
+Expected: `existing table still has 1862 rows`, then `ALL PASS`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ingest/migrations/2026-09-08_service_dir_scannable.sql tests/test_service_dir_schema.py
-git commit -m "ingest: let the service-dir table hold folders with no matched submission"
+git add ingest/migrations/2026-09-08_service_dir_inventory.sql tests/test_service_dir_schema.py
+git commit -m "ingest: a folder-inventory table, because one folder can serve many submissions"
 ```
 
 ---
@@ -430,7 +462,7 @@ Expected: FAIL with `AttributeError: module 'scan_service_dir' has no attribute 
 # them with a weaker guess would be a regression nobody would notice. The scanner owns the
 # INVENTORY columns; matching owns the attribution columns, and only via match_submissions().
 UPSERT_SQL = """
-INSERT INTO delimp_submission_service_dir
+INSERT INTO delimp_service_dir_inventory
   (service_folder, service_folder_win, campus, run_count, in_fran, scanned_at)
 VALUES (%s, %s, %s, %s, %s, now())
 ON CONFLICT (service_folder) DO UPDATE SET
@@ -527,7 +559,7 @@ def main(argv=None) -> int:
     n = upsert(con, rows)
     cur = con.cursor()
     cur.execute("SELECT count(*), count(*) FILTER (WHERE scanned_at IS NOT NULL) "
-                "FROM delimp_submission_service_dir")
+                "FROM delimp_service_dir_inventory")
     tot, scanned = cur.fetchone()
     print(f"upserted {n}; table now {tot} rows, {scanned} carrying a scanned_at", flush=True)
     con.close()
