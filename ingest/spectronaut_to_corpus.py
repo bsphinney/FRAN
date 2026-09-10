@@ -58,6 +58,15 @@ COLMAP = {
     # never a score (EG.NormalizedCscore). Null if the schema has no precursor-level one.
     "norm_intensity":[r"^FG\.Normalized.*(MS2|PeakArea|Quantity)", r"^EG\.Normalized.*(Quantity|Intensity)"],
     "pep":          [r"^EG\.PEP$", r"PosteriorErrorProbability"],
+    # PTM site localization. UNPARAMETERIZED columns only -- the [Mod-Name]-suffixed columns
+    # (EG.PTMPositions [GlyGly (K)], EG.PTMProbabilities [GlyGly (K)], etc.) vary per search
+    # (one column per modification actually searched for), so a fixed regex can't match them
+    # reliably across reports. The unparameterized localization string below (e.g.
+    # "_...K[GlyGly (K): 100%]..._") carries the same per-site probabilities inline and is
+    # present in every report regardless of which mods were searched.
+    "ptm_localization":      [r"^EG\.PTMLocalizationProbabilities$", r"PTMLocalizationProbabilities$"],
+    "ptm_assay_probability": [r"^EG\.PTMAssayProbability$", r"PTMAssayProbability$"],
+    "has_localization":      [r"^EG\.HasLocalizationInformation$", r"HasLocalizationInformation$"],
     # acquisition metadata (for CE/instrument-conditioned training; often absent in the report)
     "instrument":   [r"^R\.Instrument", r"Instrument"],
     "ce":           [r"CollisionEnergy", r"\bNCE\b", r"^FG\.CollisionEnergy"],
@@ -75,8 +84,16 @@ COLMAP = {
 FRAG_FIELDS = ("frg_mz", "frg_type", "frg_num", "frg_charge", "frg_loss", "frg_intensity")
 
 # Common Spectronaut mod names -> UniMod (best-effort ProForma; extend as needed).
+# GlyGly (ubiquitin/NEDD8/ISG15 remnant, UniMod 121) was missing here -- with no mapping,
+# _to_proforma's repl() below silently returned the ORIGINAL "[GlyGly (K)]" text instead of
+# "[UNIMOD:121]" for every GG precursor ever ingested (~750,000 rows). Fixed 2026-09-10.
 _MOD_UNIMOD = {"Carbamidomethyl": 4, "Oxidation": 35, "Acetyl": 1,
-               "Phospho": 21, "Deamidation": 7, "Gln->pyro-Glu": 28, "Glu->pyro-Glu": 27}
+               "Phospho": 21, "Deamidation": 7, "Gln->pyro-Glu": 28, "Glu->pyro-Glu": 27,
+               "GlyGly": 121}
+
+# Per-site localization probability, e.g. "[GlyGly (K): 100%]" or, for an ambiguous site,
+# two brackets like "[GlyGly (K): 95.4%]" and "[GlyGly (K): 4.6%]" on the SAME precursor.
+_LOC_PROB_RE = re.compile(r":\s*([\d.]+)\s*%\]")
 
 
 def _norm(col: str) -> str:
@@ -112,15 +129,53 @@ def _strip_seq(modseq: str, stripped: str | None) -> str:
     return s.upper()
 
 
-def _to_proforma(modseq: str) -> str | None:
+def _to_proforma(modseq: str, unmapped: dict | None = None) -> str | None:
+    """Spectronaut EG.ModifiedSequence (e.g. "_...K[GlyGly (K)]..._") -> ProForma.
+
+    `unmapped`, if given, is a dict this function increments (name -> count) whenever a
+    bracketed mod name has no entry in _MOD_UNIMOD. Without that counter the old behavior --
+    silently returning the original bracketed text for any unmapped name -- is exactly how
+    ~750,000 GlyGly (ubiquitin remnant) precursors went unrecognized for years: the ProForma
+    string looked plausible (it still had brackets) so nothing downstream ever complained.
+    """
     if not isinstance(modseq, str) or not modseq:
         return None
     def repl(m):
         name = m.group(1).split(" ")[0].split("(")[0].strip()
         uid = _MOD_UNIMOD.get(name)
+        if uid is None and unmapped is not None:
+            unmapped[name] = unmapped.get(name, 0) + 1
         return f"[UNIMOD:{uid}]" if uid else m.group(0)
     s = re.sub(r"\[([^\]]*)\]", repl, modseq.strip("_"))
     return s
+
+
+def _parse_localization_min(loc_str) -> float | None:
+    """EG.PTMLocalizationProbabilities -> the MINIMUM per-site probability on the precursor
+    (as a 0-1 fraction), or None if the string carries no probability annotation.
+
+    Minimum, not mean or max: delimp_precursors.site_localization_probability gates a
+    downstream training-set filter (fran_schema.sql: `n_mods = 0 OR
+    site_localization_probability > 0.75`) that reads the column as "how confident are we in
+    EVERY modification position reported on this precursor" -- if even one site is
+    ambiguously placed, the precursor's reported mod positions are only as trustworthy as the
+    worst-localized site.
+
+    Deliberately NOT scoped to one modification name (e.g. only GlyGly sites): verified on
+    Hive that the SAME string can carry an ambiguous, unrelated site for a different
+    modification -- e.g. "_AAM[Oxidation (M): 100%]...QVSK[GlyGly (K): 100%]...M[Oxidation
+    (M): 0%]..._", a confidently localized GlyGly alongside an oxidation the search could not
+    place between two candidate methionines. A GlyGly-only minimum would report 100% for that
+    precursor even though its mod positions overall are not fully resolved; the whole-precursor
+    gate above is exactly the consumer that needs the wider view. Also verified the
+    single-modification ambiguous case this format supports: "_K[GlyGly (K): 95.4%]...K[GlyGly
+    (K): 4.6%]K_" -- one GG mark, uncertain which of two K's carries it -- where the minimum
+    (4.6%) is the only value that reflects how unresolved the placement really is.
+    """
+    if not isinstance(loc_str, str) or not loc_str:
+        return None
+    probs = [float(p) / 100.0 for p in _LOC_PROB_RE.findall(loc_str)]
+    return min(probs) if probs else None
 
 
 def report_columns(path: str) -> list[str]:
@@ -147,8 +202,11 @@ def iter_chunks(path: str, usecols: list, chunksize: int = 200_000):
 def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000):
     """Yield normalized per-precursor records (dict) from a Spectronaut report (TSV/Parquet).
 
-    Prints a summary of rows dropped for a non-numeric q-value; silence there means none."""
+    Prints a summary of rows dropped for a non-numeric q-value, and a summary of any
+    modification name seen in EG.ModifiedSequence with no UniMod mapping; silence in either
+    means none."""
     _skipped = {"non_numeric_q": 0, "values": set()}
+    _unmapped_mods: dict[str, int] = {}
     cols = resolve_columns(report_columns(report_path))
     need = ["run", "stripped_seq", "charge"]
     missing = [n for n in need if n not in cols]
@@ -191,12 +249,29 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
             # vendor extension so corpus_ingest can build a clean raw_path.
             run = re.sub(r"\.(d|raw|mzml|wiff|htrms)$", "", str(r.get(cols["run"])), flags=re.I)
             nmods = len(re.findall(r"\[[^\]]*\]|\([^)]*\)", str(modseq))) if isinstance(modseq, str) else 0
+            loc_str = r.get(cols["ptm_localization"]) if "ptm_localization" in cols else None
+            site_loc_prob = _parse_localization_min(loc_str)
+            # Defensive: if Spectronaut itself flags this precursor as having no localization
+            # information, don't report a probability parsed off of it either.
+            has_loc = r.get(cols["has_localization"]) if "has_localization" in cols else None
+            if has_loc is not None and pd.notna(has_loc) and str(has_loc).strip().lower() in ("false", "0", "0.0"):
+                site_loc_prob = None
             rec = {
                 "run": run,                                # corpus_ingest keys on "run"
                 "stripped_seq": _strip_seq(modseq, r.get(cols.get("stripped_seq", ""))),
                 "modified_seq_diann": str(modseq) if modseq is not None else None,
-                "modified_seq_proforma": _to_proforma(modseq),
+                "modified_seq_proforma": _to_proforma(modseq, _unmapped_mods),
                 "mods": None, "n_mods": nmods,             # full mod JSON TODO; proforma carries detail
+                # Precursor-wide minimum per-site localization probability -- see
+                # _parse_localization_min() for why minimum and why not GlyGly-only. No
+                # delimp_precursors column exists yet for the raw annotation string itself
+                # (see spectronaut_to_corpus.py's module docstring / the ingest report), so only
+                # the derived numeric value is threaded through to a real column;
+                # ptm_assay_probability/has_localization_info are carried on the record for a
+                # future column or other consumers but are NOT written to SQL today.
+                "site_localization_probability": site_loc_prob,
+                "ptm_assay_probability": _f(r, cols, "ptm_assay_probability"),
+                "has_localization_info": (bool(has_loc) if (has_loc is not None and pd.notna(has_loc)) else None),
                 "charge": int(r[cols["charge"]]) if pd.notna(r.get(cols["charge"])) else None,
                 "precursor_mz": _f(r, cols, "precursor_mz"),
                 "rt": _f(r, cols, "rt"),
@@ -240,6 +315,15 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
         print(f"  [spectronaut] dropped {_skipped['non_numeric_q']:,} row(s) with a "
               f"non-numeric q-value {sorted(_skipped['values'])} "
               f"(kept {yielded:,}) -- see iter_records()", flush=True)
+    if _unmapped_mods:
+        # NOT a hard failure -- an ingest run must never crash mid-stream over one unrecognized
+        # mod name -- but this must be LOUD: an unmapped name means _to_proforma passed the raw
+        # bracketed text through untouched, exactly how GlyGly went unrecognized for years (see
+        # _MOD_UNIMOD's comment). Extend _MOD_UNIMOD when this prints.
+        detail = ", ".join(f"{name!r}x{n:,}" for name, n in sorted(_unmapped_mods.items(), key=lambda kv: -kv[1]))
+        print(f"  [spectronaut] {sum(_unmapped_mods.values()):,} modification occurrence(s) had "
+              f"no UniMod mapping and were left as literal text in modified_seq_proforma: "
+              f"{detail} -- add to _MOD_UNIMOD in spectronaut_to_corpus.py", flush=True)
 
 def _f(row, cols, field):
     if field not in cols:

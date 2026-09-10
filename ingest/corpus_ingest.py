@@ -795,12 +795,14 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
                   x["mods"], x["n_mods"], int(x["charge"]) if x["charge"] else None, _flt(x["precursor_mz"]), _flt(x["rt"]),
                   _irt(x.get("irt")), _im(x["im"]), _im(x.get("iim")), _flt(x["q_value"]), _flt(x["global_q_value"]), _flt(x["pg_q_value"]),
-                  _flt(x["intensity"]), _flt(x["normalized_intensity"]), _pg(x), SCHEMA_VERSION) for x in recs]
+                  _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
+                  _pg(x), SCHEMA_VERSION) for x in recs]
         else:
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
                   x["mods"], x["n_mods"], int(x["charge"]) if x["charge"] else None, _flt(x["precursor_mz"]), _flt(x["rt"]),
                   _irt(x.get("irt")), _im(x["im"]), _im(x.get("iim")), _flt(x["q_value"]), _flt(x["global_q_value"]), _flt(x["pg_q_value"]),
-                  _flt(x["intensity"]), _flt(x["normalized_intensity"]), SCHEMA_VERSION) for x in recs]
+                  _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
+                  SCHEMA_VERSION) for x in recs]
         prec_cols = _PREC_COLS if write_pg else _PREC_COLS.replace("protein_group,", "")
         if BULK_COPY:
             # COPY is the fastest bulk path (esp. on HIVE, campus-LAN to PG Farm). Safe here because
@@ -912,7 +914,7 @@ XIC_LANCE_DIR = None      # where the .xic.lance datasets go (set by --xic-lance
 
 _PREC_COLS = ("search_id,raw_path,stripped_seq,modified_seq_diann,modified_seq_proforma,mods,n_mods,"
               "charge,precursor_mz,rt,irt,im,iim,q_value,global_q_value,pg_q_value,intensity,"
-              "normalized_intensity,protein_group,ingested_schema_version")
+              "normalized_intensity,site_localization_probability,protein_group,ingested_schema_version")
 
 
 def _copy_cell(v):
