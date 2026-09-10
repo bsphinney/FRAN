@@ -534,6 +534,27 @@ async function renderSearchMatrix(searchId, mode){
         ${empty('No protein passes the presence floor for this search.')}`;
       return;
     }
+    // Cell width adapts to the card's actual width instead of a size tuned only for the corpus's
+    // largest search (222 samples => 5px cells, ~full width). A 21-sample search at a fixed 5px
+    // rendered as a ~105px sliver in a ~1200px card. Fill the available width when there's room;
+    // once samples.length would need less than 5px each, floor at 5px and let the wrapper's
+    // overflow-x-auto scroll, exactly as the 222-sample case already does. LABEL_W/ANN_W/ANN2_W
+    // must match the sticky column widths/offsets used below (96 / 9 / 7) -- they are the same
+    // three numbers in both places on purpose, not independently chosen.
+    //
+    // The <table> itself must carry an explicit pixel width (not just each <td>'s width style)
+    // plus table-layout:fixed. Measured: without it, a <table> with empty cells and no width of
+    // its own uses the browser's auto table-layout, which happily shrinks every column BELOW its
+    // specified width to fit the wrapper when the columns' declared total would overflow -- i.e.
+    // the exact squash this fix exists to stop, just moved from "always 5px, too narrow to fill"
+    // to "silently shrinks under 5px, never scrolls" for any search wide enough to need scrolling.
+    // An explicit table width forces the wrapper to actually overflow (and scroll) instead.
+    const LABEL_W=96, ANN_W=9, ANN2_W=7, WRAP_BORDER=2;
+    const cardStyle=getComputedStyle(el);
+    const padX=parseFloat(cardStyle.paddingLeft||0)+parseFloat(cardStyle.paddingRight||0);
+    const available=Math.max(0, el.clientWidth - padX - LABEL_W - ANN_W - ANN2_W - WRAP_BORDER);
+    const cellW = samples.length ? Math.max(5, Math.floor(available/samples.length)) : 5;
+    const tableW = LABEL_W + ANN_W + ANN2_W + cellW*samples.length;
     // z-score per row over log2(intensity), computed across ALL of this search's samples (cells
     // missing a value are excluded from mu/sd, then rendered as the distinct "not identified" tile).
     let rows='';
@@ -557,7 +578,7 @@ async function renderSearchMatrix(searchId, mode){
         const v=p.cells[s.id]; let bg;
         if(v==null||v<=0){ bg='#111a2b'; }
         else{ const z=(Math.log2(v)-mu)/sd; bg=_hmViridis((z+2.2)/4.4); }
-        rows+=`<td style="width:5px;height:15px;padding:0;background:${bg}"></td>`;
+        rows+=`<td style="width:${cellW}px;height:15px;padding:0;background:${bg}"></td>`;
       }
       rows+='</tr>';
     }
@@ -574,7 +595,7 @@ async function renderSearchMatrix(searchId, mode){
     el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
       <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
       ${legend}
-      <div class="overflow-x-auto rounded-xl border border-white/10" style="background:rgba(0,0,0,.22)"><table style="border-collapse:collapse"><tbody>${rows}</tbody></table></div>
+      <div class="overflow-x-auto rounded-xl border border-white/10" style="background:rgba(0,0,0,.22)"><table style="border-collapse:collapse;table-layout:fixed;width:${tableW}px"><tbody>${rows}</tbody></table></div>
       ${note}`;
   }catch(e){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Protein × sample</h3>${empty('Matrix unavailable: '+esc(e.message))}`; }
 }
