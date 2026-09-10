@@ -25,6 +25,7 @@ from .db import (
     query,
 )
 from . import collab
+from .proforma import mod_name, sites_in_protein
 
 
 def _exact_or_none(sql: str, table: str):
@@ -2900,7 +2901,7 @@ def protein_coverage_peptides(protein_group: str, limit: int = 4000,
     result = _protein_coverage_peptides(pg, limit, search_id)
     if result and not result.get("scope_unavailable"):
         CACHE.put(key, result)
-    return result or {"gene": None, "peptides": []}
+    return result or {"gene": None, "peptides": [], "sites": []}
 
 
 def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None) -> dict[str, Any] | None:
@@ -3002,6 +3003,88 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
             # peptide corpus-only, and the caller's cache decision (see protein_coverage_peptides)
             # skips caching this result.
             result["scope_unavailable"] = True
+
+    # --- variable-modification sites -------------------------------------------------------
+    # A SECOND aggregate at the same protein scope, not a change of the existing grain. The
+    # stripped_seq aggregation above feeds the coverage bars, the here/corpus comparison and the
+    # peptide table, all of which work today; changing its grain would move all three at once.
+    #
+    # MEASURED 0.13s for this shape on P92966 (7 modforms), served by idx_prec_protein_group --
+    # the same index the peptide query above uses. The corpus-wide version of this query (no
+    # protein_group predicate) is an unindexed scan of 238 GB that ran over 15 minutes without
+    # finishing, which is why site search corpus-wide is a rollup table (Phase 2) and not this.
+    #
+    # n_mods > 0 was measured (2026-09-10) against `modified_seq_proforma LIKE '%UNIMOD:%'` across
+    # 10 protein groups spanning several searches/engines (P92966: 136/136; nine more: all exact
+    # matches, including one at 3,884/3,884) before trusting it as a filter -- `mods` and
+    # `normalized_intensity` are both columns that looked authoritative and were nearly empty, so
+    # this one was checked rather than assumed. They agreed everywhere sampled; kept as-is.
+    sites: list[dict] = []
+    if peps:
+        try:
+            params = [pg]
+            scope = ""
+            if search_id:
+                scope = " AND search_id = %s"
+                params.append(search_id)
+            modrows = query(
+                f"""SELECT modified_seq_proforma, stripped_seq,
+                           COUNT(*)                 AS n_precursors,
+                           COUNT(DISTINCT raw_path) AS n_runs
+                      FROM delimp_precursors
+                     WHERE protein_group = %s AND n_mods > 0{scope}
+                     GROUP BY modified_seq_proforma, stripped_seq""",
+                tuple(params), tables=["delimp_precursors"], timeout_ms=15000,
+            )
+        except Exception:  # noqa: BLE001 - a missing sites list degrades the panel, never 503s it
+            modrows = []
+
+        if modrows:
+            # `peps` is the raw stripped_seq aggregate above -- it carries no protein coordinates.
+            # Those only exist once a peptide has been mapped onto the CANONICAL sequence, which
+            # today happens later, in the /coverage route, after this function returns (it fetches
+            # the sequence and calls coverage.map_coverage()). Sites need that same mapping, so it
+            # is done here too rather than assumed to already be on `peps`. fetch_uniprot_sequence()
+            # is cached by accession, so the route's own fetch moments later is a cache hit, not a
+            # second network round-trip. Skipped for custom-FASTA constructs (no public entry to
+            # fetch) and left silently empty on any fetch failure -- same "degrade, don't 503" rule
+            # as the query above. A modform whose stripped_seq doesn't map has no protein coordinate
+            # and is skipped rather than guessed at.
+            from . import coverage as cov
+
+            seq = "" if is_custom_accession(pg, gene) else cov.fetch_uniprot_sequence(pg.split(";")[0].strip())
+            if seq:
+                mapped_peps = cov.map_coverage(seq, peps)["peptides"]  # new dicts; `peps` untouched
+                starts = {p["stripped_seq"]: p["start"] for p in mapped_peps}
+                agg: dict[tuple[int, int], dict] = {}
+                for r in modrows:
+                    start = starts.get(r["stripped_seq"])
+                    if not start:
+                        continue
+                    for uid, pos, residue in sites_in_protein(r["modified_seq_proforma"], start):
+                        k = (uid, pos)
+                        s = agg.setdefault(k, {"pos": pos, "residue": residue, "unimod_id": uid,
+                                               "name": mod_name(uid), "n_precursors": 0, "n_runs": 0})
+                        s["n_precursors"] += int(r["n_precursors"] or 0)
+                        s["n_runs"] = max(s["n_runs"], int(r["n_runs"] or 0))
+                # Occupancy: modified precursors at this position over ALL precursors covering it. A
+                # site shown without this reads as "this residue is phosphorylated", which is not
+                # what partial occupancy means -- and partial is the normal case.
+                cover: dict[int, int] = {}
+                for p in mapped_peps:
+                    st, en = p.get("start"), p.get("end")
+                    if not st:
+                        continue
+                    for i in range(st, en + 1):
+                        cover[i] = cover.get(i, 0) + int(p.get("n_precursors") or 0)
+                for s in agg.values():
+                    tot = cover.get(s["pos"]) or 0
+                    s["occupancy"] = round(s["n_precursors"] / tot, 4) if tot else None
+                sites = sorted(agg.values(), key=lambda s: (s["pos"], s["unimod_id"]))
+                result["sequence"] = seq  # incidental: lets a caller verify a site against the
+                # sequence it was computed from, without a second fetch. Not depended on elsewhere.
+
+    result["sites"] = sites
     return result
 
 
