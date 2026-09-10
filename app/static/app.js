@@ -487,8 +487,202 @@ async function renderSearchDetail(id){
     </div>
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Runs (${d.runs.length})</h3>
     ${d.runs.length?table(['Run','Platform','Acquisition','Instrument','Organism','Precursors','Proteins'],
-      d.runs.map(r=>[`<span class="font-mono text-xs text-white">${esc(r.raw_basename||r.raw_path)}</span>`,esc(r.platform||'—'),esc(r.acquisition_method||'—'),esc(r.instrument_model||'—'),esc(r.organism_name||'—'),fmt(r.n_precursors),fmt(r.n_proteins)])):empty('No run rows.')}</div>`;
+      d.runs.map(r=>[`<span class="font-mono text-xs text-white">${esc(r.raw_basename||r.raw_path)}</span>`,esc(r.platform||'—'),esc(r.acquisition_method||'—'),esc(r.instrument_model||'—'),esc(r.organism_name||'—'),fmt(r.n_precursors),fmt(r.n_proteins)])):empty('No run rows.')}</div>
+    <div class="glass card p-5 fade-in mt-4" id="matrixCard">
+      <div class="skeleton h-64 rounded-xl"></div></div>
+    <div class="glass card p-5 fade-in mt-4" id="pepmapCard" style="display:none"></div>`;
+  renderSearchMatrix(id);
   }catch(e){ dbError(e); }
+}
+
+/* ---------- SEARCH DETAIL: protein x sample heatmap + peptide coverage map ---------- */
+// viridis-ish, colour-blind safe. Used for cell intensity (z-scored per row) — never red/green.
+function _hmViridis(t){
+  t=Math.max(0,Math.min(1,t));
+  const stops=[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
+  const x=t*(stops.length-1), i=Math.floor(x), f=x-i;
+  const a=stops[i], b=stops[Math.min(i+1,stops.length-1)];
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},${Math.round(a[2]+(b[2]-a[2])*f)})`;
+}
+// rare = warm/bright, common = cool/dim. t=0 rare, t=1 common. Never used on the cells themselves.
+function _hmRarityColour(t){
+  t=Math.max(0,Math.min(1,t));
+  const stops=[[255,207,64],[244,114,60],[120,80,120],[40,52,80]];
+  const x=t*(stops.length-1), i=Math.floor(x), f=x-i;
+  const a=stops[i], b=stops[Math.min(i+1,stops.length-1)];
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},${Math.round(a[2]+(b[2]-a[2])*f)})`;
+}
+const _HM_MODES=[['cv','Varies most — your samples'],['abundance','Most abundant — your samples'],
+                  ['rarity','Rarest — across the corpus'],['corpus_abundance','Most abundant — across the corpus']];
+const _HM_MODE_DESC={cv:'how much each protein varies between your samples',
+  abundance:'its mean amount across your samples',
+  rarity:'how few corpus searches have ever seen it',
+  corpus_abundance:'where it typically ranks within a run, averaged over every corpus search that saw it'};
+let _hmSearchId=null, _hmMode='cv';
+async function renderSearchMatrix(searchId, mode){
+  _hmSearchId=searchId; _hmMode=mode||'cv';
+  const el=$('#matrixCard'); if(!el)return;
+  el.innerHTML=`<div class="skeleton h-64 rounded-xl"></div>`;
+  try{
+    const d=await api(`/api/search/${encodeURIComponent(searchId)}/matrix?mode=${encodeURIComponent(_hmMode)}&limit=50`);
+    const proteins=d.proteins||[], samples=d.samples||[];
+    const modeBtns=_HM_MODES.map(([m,label])=>
+      `<button onclick="renderSearchMatrix('${esc(searchId)}','${m}')" class="px-2.5 py-1 rounded-lg text-xs ${m===_hmMode?'tab-active':'glass text-slate-300'}">${label}</button>`).join('');
+    if(!proteins.length){
+      el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
+        <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
+        ${empty('No protein passes the presence floor for this search.')}`;
+      return;
+    }
+    // z-score per row over log2(intensity), computed across ALL of this search's samples (cells
+    // missing a value are excluded from mu/sd, then rendered as the distinct "not identified" tile).
+    let rows='';
+    for(const p of proteins){
+      const vals=samples.map(s=>p.cells[s.id]).filter(v=>v!=null&&v>0).map(Math.log2);
+      const mu=vals.reduce((a,b)=>a+b,0)/(vals.length||1);
+      const sd=Math.sqrt(vals.reduce((a,b)=>a+(b-mu)*(b-mu),0)/(vals.length||1))||1;
+      // reach_pct_rank is null both when reach itself is unknown and when too few displayed rows
+      // have a known reach to rank against — either way, render the neutral "not computed" tile,
+      // never the rare extreme (a null must never look like the rarest protein in the panel).
+      const rp=p.reach_pct_rank;
+      const rpColour = rp==null ? '#243049' : _hmRarityColour(rp);
+      const rpTitle = p.reach==null ? 'corpus reach: not computed' : `corpus reach: ${fmt(p.reach)} searches`;
+      const gname=esc(p.gene||p.protein_group);
+      rows+=`<tr class="row-hover">
+        <td style="position:sticky;left:0;z-index:2;width:96px;max-width:96px;overflow:hidden;background:#0e1626;color:#FFCF40;font-size:11px;font-weight:600;padding:0 9px;white-space:nowrap;border-right:1px solid rgba(255,255,255,.09);font-family:ui-monospace,monospace">
+          <span onclick="renderPeptideMap('${encodeURIComponent(p.protein_group)}','${encodeURIComponent(p.gene||'')}','${encodeURIComponent(searchId)}')" class="cursor-pointer hover:text-white hover:underline" title="${gname} — in ${fmt(p.n_samples)}/${fmt(samples.length)} samples · corpus: ${p.reach!=null?fmt(p.reach)+' searches':'unknown'}${p.is_contaminant?' · CONTAMINANT':''}">${gname}</span></td>
+        <td style="position:sticky;left:96px;z-index:2;width:9px;padding:0;border-left:1px solid #0b1220;background:${rpColour}" title="${esc(rpTitle)}"></td>
+        <td style="position:sticky;left:105px;z-index:2;width:7px;padding:0;border-right:1px solid rgba(255,255,255,.09);background:${p.is_contaminant?'#f43f5e':'transparent'}" title="${p.is_contaminant?'flagged contaminant':'not a contaminant'}"></td>`;
+      for(const s of samples){
+        const v=p.cells[s.id]; let bg;
+        if(v==null||v<=0){ bg='#111a2b'; }
+        else{ const z=(Math.log2(v)-mu)/sd; bg=_hmViridis((z+2.2)/4.4); }
+        rows+=`<td style="width:5px;height:15px;padding:0;background:${bg}"></td>`;
+      }
+      rows+='</tr>';
+    }
+    const reaches=proteins.map(p=>p.reach).filter(v=>v!=null).sort((a,b)=>a-b);
+    const lo=reaches[0], hi=reaches[reaches.length-1];
+    const legend=`<div class="flex flex-wrap items-center gap-5 text-[11px] text-slate-500 mb-3">
+      <span><b class="text-slate-300">cells</b>&nbsp;low<span style="display:inline-block;width:132px;height:9px;border-radius:5px;vertical-align:middle;margin:0 7px;background:linear-gradient(90deg,${_hmViridis(0)},${_hmViridis(.25)},${_hmViridis(.5)},${_hmViridis(.75)},${_hmViridis(1)})"></span>high&nbsp;<span class="text-slate-500">log2 amount, z-scored per protein</span></span>
+      <span><span style="display:inline-block;width:11px;height:11px;background:#111a2b;border:1px solid rgba(255,255,255,.09);border-radius:2px;vertical-align:middle"></span> not identified</span>
+      <span><b class="text-slate-300">strip 1</b>&nbsp;rare<span style="display:inline-block;width:132px;height:9px;border-radius:5px;vertical-align:middle;margin:0 7px;background:linear-gradient(90deg,${_hmRarityColour(0)},${_hmRarityColour(.33)},${_hmRarityColour(.66)},${_hmRarityColour(1)})"></span>common&nbsp;<span class="text-slate-500">corpus searches with this gene${reaches.length?` (${fmt(lo)}–${fmt(hi)} here)`:''}</span></span>
+      <span><span style="display:inline-block;width:11px;height:11px;background:#243049;border-radius:2px;vertical-align:middle"></span> rarity not computed</span>
+      <span><b class="text-slate-300">strip 2</b> <span style="display:inline-block;width:11px;height:11px;background:#f43f5e;border-radius:2px;vertical-align:middle"></span> flagged contaminant</span></div>`;
+    const scoped=(_hmMode==='rarity'||_hmMode==='corpus_abundance')?'':' — <b>this search only</b>';
+    const note=`<div class="text-[11px] text-slate-500 mt-2">Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_proteins_total)} proteins × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among proteins in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples. Click a gene name for its sequence coverage.</div>`;
+    el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
+      <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
+      ${legend}
+      <div class="overflow-x-auto rounded-xl border border-white/10" style="background:rgba(0,0,0,.22)"><table style="border-collapse:collapse"><tbody>${rows}</tbody></table></div>
+      ${note}`;
+  }catch(e){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Protein × sample</h3>${empty('Matrix unavailable: '+esc(e.message))}`; }
+}
+
+const _PEPMAP_PERLINE=60;
+let _pepMap=null;
+async function renderPeptideMap(pg, gene, searchId){
+  pg=decodeURIComponent(pg); gene=decodeURIComponent(gene); searchId=decodeURIComponent(searchId);
+  const card=$('#pepmapCard'); if(!card)return;
+  card.style.display='block';
+  card.innerHTML=`<div class="skeleton h-48 rounded-xl"></div>`;
+  card.scrollIntoView({behavior:'smooth',block:'nearest'});
+  try{
+    const d=await api(`/api/protein/${encodeURIComponent(pg)}/coverage?search_id=${encodeURIComponent(searchId)}`);
+    _pepMap=d; const g=gene||d.gene||pg;
+    if(d.custom_construct){
+      card.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage — ${esc(g)}</h3><div class="py-8 text-center"><div class="text-3xl mb-2">🧪</div><div class="text-slate-300 font-medium">Custom / recombinant construct</div><div class="text-sm text-slate-500 mt-1 max-w-lg mx-auto">This accession (<span class="font-mono">${esc(d.accession)}</span>) is a placeholder from a custom FASTA — an engineered or recombinant protein with no public UniProt/NCBI entry, so there's no canonical sequence to map coverage against.</div></div>`;
+      return;
+    }
+    if(!d.sequence_available){
+      card.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage — ${esc(g)}</h3>${empty('Canonical sequence not available from UniProt for '+esc(d.accession)+'.')}`;
+      return;
+    }
+    _drawPeptideMap(card, g);
+  }catch(e){ card.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage</h3>${empty('Coverage unavailable: '+esc(e.message))}`; }
+}
+
+function _drawPeptideMap(card, gene){
+  const d=_pepMap, L=d.length, peps=d.peptides||[];
+  // scope_unavailable: the "here" lookup itself failed. Peptides carry NO `here` key at all, so a
+  // missing key must render as "unknown", never as `here===false` — that would tell the user the
+  // corpus found something they didn't, which is not something anyone actually checked.
+  const scopeOff=!!d.scope_unavailable;
+  const nHere=scopeOff?null:peps.filter(p=>p.here).length;
+  const hereRes=new Array(L).fill(false), corpRes=new Array(L).fill(false), anyRes=new Array(L).fill(false);
+  peps.forEach(p=>{ for(let i=p.start-1;i<p.end&&i<L;i++){ anyRes[i]=true;
+    if(!scopeOff){ if(p.here) hereRes[i]=true; else corpRes[i]=true; } } });
+  const pctAll=Math.round(1000*anyRes.filter(Boolean).length/L)/10;
+  const pctHere=scopeOff?null:Math.round(1000*hereRes.filter(Boolean).length/L)/10;
+  const pcts=scopeOff
+    ? `<div class="text-right"><span class="text-base font-semibold text-slate-500">comparison unavailable</span><div class="text-[11px] text-slate-500">this experiment</div>
+       <div class="mt-1"><span class="text-2xl font-extrabold text-teal">${pctAll}%</span><span class="text-[11px] text-slate-500 ml-1">incl. corpus · ${fmt(peps.length)} peptides</span></div></div>`
+    : `<div class="text-right"><span class="text-2xl font-extrabold text-accent-400">${pctHere}%</span><span class="text-[11px] text-slate-500 ml-1">this experiment · ${fmt(nHere)} peptides</span>
+       <div class="mt-0.5"><span class="text-base font-extrabold text-teal">${pctAll}%</span><span class="text-[11px] text-slate-500 ml-1">incl. corpus · +${fmt(peps.length-nHere)} you didn't find</span></div></div>`;
+  const legend=scopeOff
+    ? `<span><span style="display:inline-block;width:22px;height:9px;background:#94a3b8;border-radius:2px;vertical-align:middle"></span> peptide seen by the corpus — comparison with this experiment unavailable</span>
+       <span class="text-slate-500">click a peptide for corpus detail · click its sequence to open the FRAN peptide page</span>`
+    : `<span><span style="display:inline-block;width:22px;height:9px;background:#FFCF40;border-radius:2px;vertical-align:middle"></span> peptide found in this experiment</span>
+       <span><span style="display:inline-block;width:22px;height:9px;background:#5eead4;border-radius:2px;vertical-align:middle"></span> found by the corpus, not here</span>
+       <span class="text-slate-500">click a peptide for its corpus detail · click its sequence to open the FRAN peptide page</span>`;
+  let seqHtml='';
+  for(let off=0; off<L; off+=_PEPMAP_PERLINE){
+    const end=Math.min(off+_PEPMAP_PERLINE,L);
+    const inLine=peps.filter(p=>p.end>off && p.start<=end);
+    const lanes=[];
+    inLine.slice().sort((a,b)=>a.start-b.start||b.end-a.end).forEach(p=>{
+      const li=lanes.findIndex(l=>l[l.length-1].end < p.start);
+      if(li<0) lanes.push([p]); else lanes[li].push(p);
+    });
+    const W=100/(end-off);
+    let ticks='';
+    for(let i=off; i<end; i+=10) ticks+=`<span style="position:absolute;left:${(i-off)*W}%;font-size:9px;color:#475569">${i+1}</span>`;
+    const resChars=d.sequence.slice(off,end).split('').map((ch,i)=>{
+      const gi=off+i;
+      const col = scopeOff ? (anyRes[gi]?'#94a3b8':'#475569') : (hereRes[gi]?'#FFE9A8':(corpRes[gi]?'#a7f3e0':'#475569'));
+      return `<span style="display:inline-block;width:${W}%;text-align:center;color:${col}">${esc(ch)}</span>`;
+    }).join('');
+    const laneHtml=lanes.map(lane=>`<div style="position:relative;height:11px;margin-top:2px">${
+      lane.map(p=>{
+        const a=Math.max(p.start-1,off), b=Math.min(p.end,end);
+        const bar = scopeOff ? '#94a3b8' : (p.here?'#FFCF40':'#5eead4');
+        return `<div onclick="pepMapDetail('${encodeURIComponent(p.stripped_seq)}')" title="${esc(p.stripped_seq)} · ${p.start}-${p.end}"
+          style="position:absolute;left:${(a-off)*W}%;width:${(b-a)*W}%;top:0;height:9px;border-radius:2px;cursor:pointer;background:${bar};opacity:.8"></div>`;
+      }).join('')}</div>`).join('');
+    seqHtml+=`<div class="mb-4">
+      <div style="position:relative;height:12px">${ticks}</div>
+      <div style="font-family:ui-monospace,monospace;font-size:12px;white-space:pre;color:#cbd5e1">${resChars}</div>
+      ${laneHtml}</div>`;
+  }
+  card.innerHTML=`<div class="flex justify-between items-start flex-wrap gap-3">
+      <h3 class="font-bold text-white m-0">Sequence coverage — <span class="text-accent-400">${esc(gene)}</span>
+        <span class="text-slate-500 text-xs font-mono font-normal">${esc(d.accession)} · ${fmt(L)} aa · ${fmt(peps.length)} peptides</span>
+        <a onclick="go('gene','${encodeURIComponent(gene)}')" class="cursor-pointer text-xs font-semibold px-2 py-0.5 rounded-lg bg-accent/15 text-accent-400 hover:bg-accent/25 ml-1" title="everything the corpus knows about ${esc(gene)}">${esc(gene)} across the corpus ↗</a></h3>
+      ${pcts}</div>
+    <div class="flex flex-wrap gap-4 text-[11px] text-slate-500 my-3">${legend}</div>
+    <div>${seqHtml}</div>
+    <div id="pepmapDetail" class="mt-2"></div>`;
+}
+
+function pepMapDetail(ss){
+  ss=decodeURIComponent(ss);
+  const d=_pepMap; if(!d)return;
+  const p=(d.peptides||[]).find(x=>x.stripped_seq===ss); if(!p)return;
+  const scopeOff=!!d.scope_unavailable;
+  const row=(k,v)=>`<div class="flex justify-between gap-4 text-[11.5px]"><span class="text-slate-500">${k}</span><span class="text-slate-200 kpi-num">${v}</span></div>`;
+  const hereBlock = scopeOff ? `<span class="text-slate-500">comparison with this experiment unavailable</span>`
+    : (p.here ? row('found','in this experiment') : `<span class="text-slate-500">not found in this experiment</span>`);
+  const corpusBlock = row('precursor rows',fmt(p.n_precursors))+(p.n_charges!=null?row('charge states',fmt(p.n_charges)):'')+
+    (p.n_runs!=null?row('runs',fmt(p.n_runs)):'')+row('best q-value',sci(p.best_q_value));
+  const seqCol = scopeOff?'text-slate-300':(p.here?'text-accent-400':'text-teal');
+  const el=$('#pepmapDetail'); if(!el)return;
+  el.innerHTML=`<div class="glass card p-4">
+    <span onclick="go('peptide','${encodeURIComponent(ss)}')" class="cursor-pointer font-mono text-xs ${seqCol} hover:underline break-all">${esc(ss)} ↗</span>
+    <div class="text-[11px] text-slate-500 mt-1 mb-3">residues ${p.start}–${p.end} · ${p.end-p.start+1} aa${scopeOff?'':(p.here?' · <b class="text-accent-400">found in this experiment</b>':' · <b class="text-teal">corpus only — not found here</b>')}</div>
+    <div class="grid grid-cols-2 gap-5">
+      <div><div class="text-[10px] uppercase tracking-wider text-accent-400 mb-1">this experiment</div>${hereBlock}</div>
+      <div><div class="text-[10px] uppercase tracking-wider text-teal mb-1">across the corpus</div>${corpusBlock}</div>
+    </div></div>`;
 }
 
 /* ---------- SEARCH RESULTS (peptide + protein) ---------- */
