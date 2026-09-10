@@ -393,6 +393,63 @@ rather than becoming a second, parallel search UI.
 - Modification-aware XIC or fragment views.
 - Open/unrestricted modification search. The vocabulary is six known types.
 
+## The PTM site report changes the design — ingest it, do not derive it
+
+Brett: *"when we look for PTMs in Spectronaut we always run the PTM workflow, and I want to capture
+this information if possible."*
+
+That is decisive, because Spectronaut's **PTM site report** exists only for experiments analysed
+with the PTM workflow — and if it always is, then FRAN can ingest real site-level data instead of
+reconstructing it from ProForma strings.
+
+Column names below are **verified from the Spectronaut 21 User Manual, Appendix 7.8** (a copy is on
+Hive at `/quobyte/proteomics-grp/brett/User Manual spectronaut 21.pdf`), not from memory.
+
+### Two report types, two grains — do not mix them
+
+| grain | columns | where they go |
+|---|---|---|
+| **precursor** (`EG.*`) | `EG.PTMLocalizationProbabilities`, `EG.PTMAssayProbability`, `EG.PTMProbabilities [Mod-Name]`, `EG.PTMPositions [Mod-Name]`, `EG.PTMSites [Mod-Name]` | add to `FRAN.rs`; ingest to `delimp_precursors` |
+| **site** (`PTM.*`) | the site report, below | a SEPARATE export; ingest to `delimp_ptm_site` |
+
+The manual describes the site report's levels as Experiment → Run → Protein Group → **PTM site**.
+It is a different report, not extra columns on the existing one, which is why mixing `PTM.*` into
+the precursor schema is the grain hazard flagged earlier.
+
+### The site report columns, and what each replaces
+
+| column | manual definition | what it does for FRAN |
+|---|---|---|
+| `PTM.SiteLocation` | "amino acid sequence position of this PTM site in the parent protein sequence" | **Replaces the entire parse-and-map path.** No ProForma parsing, no `peptide.start` arithmetic, no N-terminal off-by-one risk. |
+| `PTM.SiteAA` | "the amino acid that PTM site is modifying" | The residue, from the engine rather than inferred |
+| `PTM.SiteProbability` | "highest observed site probability corresponding to this PTM site in this run/sample" | **The localization confidence Brett asked for**, which `site_localization_probability` was created to hold and never received |
+| `PTM.Stoichiometry` | "the stoichiometry of the PTM site" | **Replaces the approximate occupancy** this spec accepted as a known-flawed Phase 1 limitation (overlapping peptides double-count the denominator). Spectronaut's own figure supersedes it. |
+| `PTM.FlankingRegion` | "flanking region of amino acids around the site location" | Sequence context — makes motif analysis possible, which nothing in FRAN can do today |
+| `PTM.ModificationTitle` | "the title of the modification presented by this PTM site object" | Which modification. **Note: a title string, not a UNIMOD id** — it still needs mapping, and that mapping is the same one that silently dropped GlyGly |
+| `PTM.ProteinId` | "the parent protein ID for this PTM site" | Joins to `delimp_proteins.protein_group` |
+| `PTM.Quantity`, `PTM.QuantityPerProtein`, `PTM.InputNormalizationFactor` | site-level quantitation | Per-site abundance |
+| `PTM.Multiplicity`, `PTM.NrOfCollapsedPeptides`, `PTM.CollapseKey`, `PTM.Group` | how parent peptides were collapsed into the site object | Provenance — how many peptides support this site |
+
+### What this changes
+
+- **`delimp_ptm_site` becomes an INGESTED table, not a derived rollup.** The Phase 2 design had it
+  computed from parsed ProForma strings. Ingesting it instead yields probability, stoichiometry and
+  flanking region, none of which are recoverable by parsing.
+- **Phase 1 stays exactly as built.** The ProForma parser and the coverage-map sites are not wasted:
+  they are the only path that works for the ~2,000 historical searches that will not be re-exported,
+  and for any search not run through the PTM workflow. The two sources coexist, with the site report
+  preferred where present — and the parser remains the fallback that makes the feature work on
+  today's data rather than only after a re-export.
+- **`PTM.ModificationTitle` is a name, not an id.** Mapping it is the same operation that dropped
+  GlyGly, so the ingest must **fail loudly on an unrecognised title** rather than pass it through as
+  prose. That is the actual lesson of the 750,000 invisible ubiquitin remnants.
+
+### Open question this raises
+
+`PTM.SiteProbability` is described as "in this run/sample", i.e. per run. Whether the export is per
+run or collapsed across the experiment determines the table's key. Settle it from the header dump
+and a row count, not from the manual's prose.
+
 ## Phase 0 — backfill `search_params_json`
 
 Brett: *"we should backfill the search_params_json."* Agreed, and today demonstrated exactly why.
