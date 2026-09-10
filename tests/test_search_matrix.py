@@ -51,16 +51,22 @@ cvs = [p.get("cv") for p in c["proteins"]]
 check("cv mode is sorted descending across the whole page",
       all(cvs[i] >= cvs[i + 1] for i in range(len(cvs) - 1)), str(cvs[:4]))
 
-# THE OPPOSITE REGRESSION (Fix round 3, Major 2). The "sorted descending" check above passes
-# vacuously if every cv is 0 -- 0 >= 0 -- so a future edit that collapsed cv to zero everywhere
-# (e.g. grouping per_sample by gene alone, dropping raw_path) would leave this entire file green.
-# This is a genuinely multi-sample search (222 samples), where cv MUST be a live, non-degenerate
-# signal if the aggregate is doing its job. Proven to actually catch the regression it targets,
-# not just assumed to: see the git-stash proof in Fix round 3 of task-6-report.md, where stubbing
-# the aggregate to return cv=0 for every row turned this check red while every other check in this
-# file (including the one above) stayed green.
-check("cv is a live signal on a multi-sample search, not collapsed to zero",
-      cvs[0] is not None and cvs[0] > 0.5, str(cvs[:4]))
+# THE OPPOSITE REGRESSION (Fix round 3, Major 2; threshold raised in Fix round 4). The "sorted
+# descending" check above passes vacuously if every cv is 0 -- 0 >= 0 -- so a future edit that
+# collapsed cv to zero everywhere (e.g. grouping per_sample by gene alone, dropping raw_path)
+# would leave this entire file green. This is a genuinely multi-sample search (222 samples),
+# where cv MUST be a live, non-degenerate signal if the aggregate is doing its job. Proven to
+# actually catch the regression it targets, not just assumed to: see the git-stash proof in Fix
+# round 3 of task-6-report.md, where stubbing the aggregate to return cv=0 for every row turned
+# this check red while every other check in this file (including the one above) stayed green.
+#
+# Threshold is a measured value witness, not an arbitrary liveness floor: on this fixture
+# cvs[0]=7.8122 (Ighg2b) and the whole top-50 page sits above cvs[49]=3.6590, so 5 sits 36% below
+# the top row and is still comfortably above the page floor -- enough headroom to never flake, low
+# enough to also catch a log-space mistake (CV over log2 intensities lands near 0.1), while an
+# 0.5 floor would have missed a uniform 8x-or-smaller shrink entirely.
+check("cv is a live signal on a multi-sample search (top row clears 5, not just non-zero)",
+      cvs[0] is not None and cvs[0] > 5, str(cvs[:4]))
 
 # THE CV GRAIN BUG (Fix round 2, CRITICAL). delimp_proteins is one row per (search, sample,
 # protein_group) -- a gene with more than one protein_group contributes multiple rows per

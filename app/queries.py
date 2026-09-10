@@ -4439,11 +4439,11 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
               "floor": _MATRIX_FLOOR * n_samples_total,
               "minpct": _MATRIX_MIN_PCT_SEARCHES}
     # MEASURED cost of this two-level aggregate on the largest search (480k rows, 6,340 genes):
-    # 3.1-4.5s across the four ranking modes -- unchanged or slightly better than the ~4s the old
-    # single-level aggregate took, because the per_sample CTE's GROUP BY (gene, raw_path) does the
-    # one real sort over ~478k rows, and the outer `agg` GROUP BY gene runs for free against that
-    # already-sorted stream (confirmed via EXPLAIN; work_mem="256MB" below converts both levels'
-    # sorts to in-memory quicksort rather than disk, though wall-clock barely moves on that alone).
+    # 3.1-5.7s across the four ranking modes (range across repeated runs on a shared cluster, not
+    # a single sample), in line with the ~4s the old single-level aggregate took. EXPLAIN shows
+    # HashAggregate over HashAggregate with no sort at either level (the old COUNT(DISTINCT
+    # raw_path) was what forced sorting; there is no DISTINCT here). work_mem="256MB" bounds the
+    # two hash tables so neither level spills.
     # Two remedies considered and rejected for counting samples AT THE ROW GRAIN, i.e. directly
     # over delimp_proteins rows, skipping per_sample: count(*) there is cheap but wrong -- it
     # over-counts samples wherever one gene maps to multiple protein groups, silently corrupting
