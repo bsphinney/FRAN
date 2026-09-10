@@ -2963,19 +2963,44 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
     if search_id and peps:
         try:
             # One extra indexed lookup, not a re-derivation: idx_prec_protein_group covers this too.
-            seen = {r["stripped_seq"] for r in query(
-                """SELECT DISTINCT stripped_seq FROM delimp_precursors
-                    WHERE protein_group=%s AND search_id=%s AND stripped_seq = ANY(%s)""",
+            # GROUP BY (not SELECT DISTINCT) so the UI can show a real this-experiment vs corpus
+            # comparison ("found in 187 of your runs; the corpus has seen it in 900") instead of a
+            # bare found/not-found flag next to corpus-only numbers — a boolean next to four corpus
+            # aggregates isn't a comparison. Same WHERE clause as before, so the membership test
+            # ("stripped_seq = ANY") that decides "here" is unchanged; this only widens what's
+            # SELECTed for the matched rows. The substring "stripped_seq = ANY" must stay in this
+            # SQL text verbatim -- tests/test_coverage_scope.py's degrade test keys off it to
+            # simulate a failure of only this lookup, not its siblings.
+            here_rows = query(
+                """SELECT stripped_seq,
+                          COUNT(*)                 AS n_precursors,
+                          COUNT(DISTINCT raw_path) AS n_runs,
+                          COUNT(DISTINCT charge)   AS n_charges,
+                          MIN(q_value)             AS best_q_value
+                     FROM delimp_precursors
+                    WHERE protein_group=%s AND search_id=%s AND stripped_seq = ANY(%s)
+                    GROUP BY stripped_seq""",
                 (pg, search_id, [p["stripped_seq"] for p in peps]),
                 tables=["delimp_precursors"],
                 timeout_ms=10000,
-            )}
+            )
+            here_map = {r["stripped_seq"]: r for r in here_rows}
             for p in peps:
-                p["here"] = p["stripped_seq"] in seen
-        except Exception:  # noqa: BLE001 - degrade: leave "here" ABSENT (never here=False — that
-            # would lie that this search found nothing), flag the scope as unavailable so the caller
-            # can say "comparison unavailable" instead of colouring every peptide corpus-only, and
-            # the caller's cache decision (see protein_coverage_peptides) skips caching this result.
+                hr = here_map.get(p["stripped_seq"])
+                p["here"] = hr is not None
+                if hr is not None:
+                    # Only set on a hit -- a peptide NOT found here gets no here_* keys at all,
+                    # same absence-not-zero discipline as "here" itself. "0 precursors" here would
+                    # read as "checked, found nothing", which is not what an unmatched row means.
+                    p["here_n_precursors"] = hr["n_precursors"]
+                    p["here_n_runs"] = hr["n_runs"]
+                    p["here_n_charges"] = hr["n_charges"]
+                    p["here_best_q_value"] = hr["best_q_value"]
+        except Exception:  # noqa: BLE001 - degrade: leave "here" (and here_*) ABSENT (never
+            # here=False — that would lie that this search found nothing), flag the scope as
+            # unavailable so the caller can say "comparison unavailable" instead of colouring every
+            # peptide corpus-only, and the caller's cache decision (see protein_coverage_peptides)
+            # skips caching this result.
             result["scope_unavailable"] = True
     return result
 

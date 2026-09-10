@@ -670,8 +670,13 @@ function pepMapDetail(ss){
   const p=(d.peptides||[]).find(x=>x.stripped_seq===ss); if(!p)return;
   const scopeOff=!!d.scope_unavailable;
   const row=(k,v)=>`<div class="flex justify-between gap-4 text-[11.5px]"><span class="text-slate-500">${k}</span><span class="text-slate-200 kpi-num">${v}</span></div>`;
+  // here_n_* are set only on a hit (see queries._protein_coverage_peptides) — absent, never zero,
+  // for a peptide this search didn't find, so the "this experiment" column is a real parallel
+  // comparison against the corpus column, not a found/not-found flag next to four corpus numbers.
   const hereBlock = scopeOff ? `<span class="text-slate-500">comparison with this experiment unavailable</span>`
-    : (p.here ? row('found','in this experiment') : `<span class="text-slate-500">not found in this experiment</span>`);
+    : (p.here ? row('precursor rows',fmt(p.here_n_precursors))+row('charge states',fmt(p.here_n_charges))+
+        row('runs',fmt(p.here_n_runs))+row('best q-value',sci(p.here_best_q_value))
+      : `<span class="text-slate-500">not found in this experiment</span>`);
   const corpusBlock = row('precursor rows',fmt(p.n_precursors))+(p.n_charges!=null?row('charge states',fmt(p.n_charges)):'')+
     (p.n_runs!=null?row('runs',fmt(p.n_runs)):'')+row('best q-value',sci(p.best_q_value));
   const seqCol = scopeOff?'text-slate-300':(p.here?'text-accent-400':'text-teal');
