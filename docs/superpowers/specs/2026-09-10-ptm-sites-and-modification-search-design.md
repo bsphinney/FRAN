@@ -53,9 +53,74 @@ Modification vocabulary — the entire corpus, as a share of *modified* precurso
 Phospho is 0.13% of *all* precursors, which extrapolates to roughly 570,000 phospho precursors
 corpus-wide.
 
-**The vocabulary being six items is the single most design-relevant fact here.** A general PTM
-search over an open modification space is a hard problem. A search over six known types, five of
-which are artifacts of sample handling and one of which is real biology, is a small one.
+> **CORRECTION, 2026-09-10 — the table above is WRONG and the "six types" claim was a measurement
+> artifact.** See "The unmapped-modification gap" immediately below. The scan that produced it
+> matched `UNIMOD:(\d+)`, so any modification the ingest failed to normalize was invisible to the
+> instrument by construction. Brett asked "what about ubiq gg" and the answer is that GlyGly — the
+> ubiquitin remnant — is present in enormous quantity and absent from that table entirely. The
+> percentages are also sample-unstable (see the Acetyl note under Task 1 in the plan's ledger:
+> 5.9% in one TABLESAMPLE, 0.05% in another, because TABLESAMPLE reads whole blocks and the table
+> is clustered by search). Treat nothing in that table as a corpus fact.
+
+### The unmapped-modification gap — the real finding
+
+`ingest/spectronaut_to_corpus.py:78-79` maps modification names to UNIMOD ids:
+
+```python
+_MOD_UNIMOD = {"Carbamidomethyl": 4, "Oxidation": 35, "Acetyl": 1,
+               "Phospho": 21, "Deamidation": 7, "Gln->pyro-Glu": 28, "Glu->pyro-Glu": 27}
+```
+
+Seven names. `_to_proforma()`'s `repl()` returns `m.group(0)` — the ORIGINAL text — for any name not
+in that dict. So an unmapped modification is stored verbatim, e.g. `K[GlyGly (K)]`, and is
+invisible to every query that looks for `UNIMOD:`.
+
+**GlyGly is not in the dict.** Measured consequence, in the three searches Brett named:
+
+| search | precursors | GG precursors | GG peptides | GG proteins |
+|---|---|---|---|---|
+| 20230803_160004_Bennett_Penn_Ubiq_July_2023 | 579,048 | **356,557 (61.6%)** | 37,866 | 5,393 |
+| 20230810_161326_Bennett_Penn_Ubiq_July_2023 | 60,802 | **40,208 (66.1%)** | 28,117 | 4,707 |
+| 20230810_163055_Bennett_Penn_Ubiq_July_2023 | 572,034 | **352,727 (61.7%)** | 35,302 | 5,312 |
+
+Roughly 750,000 GG precursors in three searches — more than all the phospho found anywhere. Twelve
+ubiquitin-named searches exist (`ubiq|digly|glygly` on `search_name`), and spot checks confirm
+`[GlyGly (K)]` stored as literal text in several.
+
+Two consequences that change this design:
+
+1. **The parser must resolve literal modification names, not only UNIMOD tags.** Fixing
+   `_MOD_UNIMOD` helps future ingests only; ~750,000 existing rows are already stored in literal
+   form, and re-ingesting them to correct a naming issue would be absurd. So `parse_proforma()`
+   needs a name→UNIMOD fallback: `[GlyGly (K)]` → UNIMOD 121, applying the same
+   `.split(" ")[0].split("(")[0]` reduction the ingest uses. The current parser's behaviour on
+   these is *safe but incomplete* — it skips unknown bracket tokens without counting them as
+   residues, so positions stay correct and nothing is corrupted; the sites simply never appear.
+2. **`_MOD_UNIMOD` gains `"GlyGly": 121`** so new ingests normalize properly, and the real fix is
+   to stop silently passing unmapped names through at all — an ingest that cannot name a
+   modification should say so, not store it as prose.
+
+**GG belongs in the variable, biological set.** It is the ubiquitin remnant: the direct readout of
+protein ubiquitination, and more biologically load-bearing than oxidation, which dominates the
+counts above and is mostly sample handling.
+
+### What the enrichment rates tell us about the phospho anomaly
+
+These ubiquitin searches run **61-66% modified**. That is what a real PTM enrichment looks like,
+and it is the comparison the phospho anomaly was missing. Against it, the `STY phospho` search's
+**0.11%** is not merely low — it is three orders of magnitude away from what an enriched experiment
+produces in this same corpus, through the same pipeline, from the same instrument platform. That
+strongly favours "something is wrong with that search or its ingest" over "the enrichment
+underperformed", and it raises the priority of the re-export diagnostic accordingly.
+
+**The methodological lesson, recorded because it is the same one this project keeps paying for.**
+The "six modification types" claim was produced by an instrument that could not have detected a
+seventh: a regex for `UNIMOD:\d+` over data where unnormalized modifications are stored as prose.
+It is the identical defect shape as the thirteen-plus assertion failures in the sibling heatmap
+plan — an observation incapable of discriminating the thing it was trusted to decide. It was caught
+by a domain expert asking an obvious question, not by the measurement. Any future claim about
+"which modifications exist in the corpus" must scan for **bracket tokens generally**, then classify,
+never for the normalized form alone.
 
 ### Position is recoverable; confidence is not
 
@@ -327,6 +392,157 @@ rather than becoming a second, parallel search UI.
   change with its own risk; this spec only stops depending on it.
 - Modification-aware XIC or fragment views.
 - Open/unrestricted modification search. The vocabulary is six known types.
+
+## The PTM site report changes the design — ingest it, do not derive it
+
+Brett: *"when we look for PTMs in Spectronaut we always run the PTM workflow, and I want to capture
+this information if possible."*
+
+That is decisive, because Spectronaut's **PTM site report** exists only for experiments analysed
+with the PTM workflow — and if it always is, then FRAN can ingest real site-level data instead of
+reconstructing it from ProForma strings.
+
+Column names below are **verified from the Spectronaut 21 User Manual, Appendix 7.8** (a copy is on
+Hive at `/quobyte/proteomics-grp/brett/User Manual spectronaut 21.pdf`), not from memory.
+
+### Two report types, two grains — do not mix them
+
+| grain | columns | where they go |
+|---|---|---|
+| **precursor** (`EG.*`) | `EG.PTMLocalizationProbabilities`, `EG.PTMAssayProbability`, `EG.PTMProbabilities [Mod-Name]`, `EG.PTMPositions [Mod-Name]`, `EG.PTMSites [Mod-Name]` | add to `FRAN.rs`; ingest to `delimp_precursors` |
+| **site** (`PTM.*`) | the site report, below | a SEPARATE export; ingest to `delimp_ptm_site` |
+
+The manual describes the site report's levels as Experiment → Run → Protein Group → **PTM site**.
+It is a different report, not extra columns on the existing one, which is why mixing `PTM.*` into
+the precursor schema is the grain hazard flagged earlier.
+
+### The site report columns, and what each replaces
+
+| column | manual definition | what it does for FRAN |
+|---|---|---|
+| `PTM.SiteLocation` | "amino acid sequence position of this PTM site in the parent protein sequence" | **Replaces the entire parse-and-map path.** No ProForma parsing, no `peptide.start` arithmetic, no N-terminal off-by-one risk. |
+| `PTM.SiteAA` | "the amino acid that PTM site is modifying" | The residue, from the engine rather than inferred |
+| `PTM.SiteProbability` | "highest observed site probability corresponding to this PTM site in this run/sample" | **The localization confidence Brett asked for**, which `site_localization_probability` was created to hold and never received |
+| `PTM.Stoichiometry` | "the stoichiometry of the PTM site" | **Replaces the approximate occupancy** this spec accepted as a known-flawed Phase 1 limitation (overlapping peptides double-count the denominator). Spectronaut's own figure supersedes it. |
+| `PTM.FlankingRegion` | "flanking region of amino acids around the site location" | Sequence context — makes motif analysis possible, which nothing in FRAN can do today |
+| `PTM.ModificationTitle` | "the title of the modification presented by this PTM site object" | Which modification. **Note: a title string, not a UNIMOD id** — it still needs mapping, and that mapping is the same one that silently dropped GlyGly |
+| `PTM.ProteinId` | "the parent protein ID for this PTM site" | Joins to `delimp_proteins.protein_group` |
+| `PTM.Quantity`, `PTM.QuantityPerProtein`, `PTM.InputNormalizationFactor` | site-level quantitation | Per-site abundance |
+| `PTM.Multiplicity`, `PTM.NrOfCollapsedPeptides`, `PTM.CollapseKey`, `PTM.Group` | how parent peptides were collapsed into the site object | Provenance — how many peptides support this site |
+
+### What this changes
+
+- **`delimp_ptm_site` becomes an INGESTED table, not a derived rollup.** The Phase 2 design had it
+  computed from parsed ProForma strings. Ingesting it instead yields probability, stoichiometry and
+  flanking region, none of which are recoverable by parsing.
+- **Phase 1 stays exactly as built.** The ProForma parser and the coverage-map sites are not wasted:
+  they are the only path that works for the ~2,000 historical searches that will not be re-exported,
+  and for any search not run through the PTM workflow. The two sources coexist, with the site report
+  preferred where present — and the parser remains the fallback that makes the feature work on
+  today's data rather than only after a re-export.
+- **`PTM.ModificationTitle` is a name, not an id.** Mapping it is the same operation that dropped
+  GlyGly, so the ingest must **fail loudly on an unrecognised title** rather than pass it through as
+  prose. That is the actual lesson of the 750,000 invisible ubiquitin remnants.
+
+### Open question this raises
+
+`PTM.SiteProbability` is described as "in this run/sample", i.e. per run. Whether the export is per
+run or collapsed across the experiment determines the table's key. Settle it from the header dump
+and a row count, not from the manual's prose.
+
+## Phase 0 — backfill `search_params_json`
+
+Brett: *"we should backfill the search_params_json."* Agreed, and today demonstrated exactly why.
+
+### Why this is not a nice-to-have
+
+Asked "was GlyGly configured as a variable modification in this search?", FRAN cannot answer.
+`search_params_json` is **0 of 2,086 populated**, and `grep` finds no writer anywhere in `ingest/`
+or `app/` — the column exists only at `schema/fran_schema.sql:367`. So the question had to be
+answered by inference from observed counts, which produced a **wrong hypothesis**: low GlyGly
+yield looked like a settings problem, and the direct evidence showed GlyGly present in 11 of 12
+ubiquitin searches, i.e. configured and searched for, just poorly recovered. Only
+`20231010_155520_Mandell-ubiq-DIA` has no GlyGly at all.
+
+The cost of the missing column is not abstract. Without it, "the search didn't look for it" and
+"the search looked and found little" are indistinguishable, and those two have completely different
+remedies — one is a re-search, the other is a wet-lab conversation.
+
+This is the third schema column found today that is defined and never written:
+
+| column | populated | writer |
+|---|---|---|
+| `search_params_json` | 0 of 2,086 | none |
+| `site_localization_probability` | 0 of 437 M | none |
+| `mods` (jsonb, carries a GIN index) | 1.43% | writes `None` |
+
+That is a pattern worth naming: the schema encodes intentions the pipeline never implemented, and
+each one is a trap, because a column that exists reads as a column that means something.
+
+### Three sources, in ascending order of difficulty
+
+**1. Observed modifications — derivable today, no external dependency, covers all 2,086.**
+
+Not the configured settings, but the empirical vocabulary: which modifications this search actually
+contains. It answers the question that came up today, needs nothing outside the database, and is
+the same aggregate `delimp_ptm_search` already requires in Phase 2 — so it is free. It also
+distinguishes the one genuinely-unconfigured search from the ten under-performing ones, which is
+the distinction that mattered.
+
+It must be stored under a name that says what it is — `modifications_observed`, not
+`search_params_json`. Conflating "what the search found" with "what the search was told to look
+for" would recreate exactly the ambiguity this section exists to remove.
+
+**2. DIA-NN — parseable now, covers 76 searches.**
+
+`report.log.txt` carries the complete command line plus a human-readable settings echo. Verified
+by reading one:
+
+```
+diann-linux --f <raw> --lib <speclib> --threads 10 --qvalue 0.01 --fasta <fasta>
+  --met-excision --cut K*,R* --missed-cleavages 1 --unimod4 --var-mods 1
+  --mass-acc 15 --mass-acc-ms1 15 --window 6 --rt-profiling --pg-level 1
+"Cysteine carbamidomethylation enabled as a fixed modification"
+"Maximum number of variable modifications set to 1"
+```
+
+Everything `search_params_json` should hold: FDR threshold, enzyme and cleavage rules, missed
+cleavages, fixed and variable modifications, mass accuracy, library and FASTA. Parse the command
+line rather than the prose echo — it is machine-generated and stable, whereas the echo is
+human-facing text that changes between versions.
+
+**3. Spectronaut — the hard 96%, and it rides along with the localization re-export.**
+
+The settings live in the `.sne` project files. Two things measured here rather than assumed:
+
+- **664 `.sne` files ARE on Hive**, under `/quobyte/proteomics-grp/SERVICE/`. They are not only on
+  the Windows shares, which is what the `D:\MRS\toshi\...` `output_dir` values suggest.
+- **They cannot be parsed without Spectronaut.** The format is a proprietary binary — a
+  length-prefixed UTF-16 header followed by compressed payload. `strings -e l` over a 78 MB project
+  yields exactly the project name and the raw filenames; no modification name, enzyme, FDR
+  threshold or settings key is recoverable. Searching for `carbamidomethyl`, `oxidation`,
+  `phospho`, `glygly`, `trypsin`, `unimod`, `qvalue`, `fdr`, `missedcleav`, `variablemod`,
+  `fixedmod` and `enzyme` in both UTF-16 and ASCII returned nothing.
+
+So a "just read the `.sne`" shortcut does not exist, and Spectronaut is not installed on Hive
+(`which spectronaut` finds nothing, nothing under `/share/apps`). Extraction must run on a machine
+with a licensed Spectronaut, which is exactly what `ingest/sne_export.py` already drives.
+
+**This is the same operation as the localization recovery, and should be done once, not twice.**
+That re-export already has to happen to populate `site_localization_probability`; adding the
+settings columns to the same report schema means one pass over the `.sne` files yields both. Doing
+them separately would mean re-exporting 2,008 projects twice.
+
+For searches never re-exported, `search_params_json` stays NULL — and NULL must keep meaning
+"unknown", never "no variable modifications". Given the column has been NULL corpus-wide since it
+was created, any consumer that treats NULL as a value rather than an absence will be wrong about
+every historical search.
+
+### Sequencing
+
+Source 1 is independent of everything and lands with Phase 2's rollups. Source 2 is a small
+self-contained script over 76 log files. Source 3 is gated on Brett's Spectronaut report-schema
+change and should be bundled with the localization re-export rather than scheduled on its own.
 
 ## Decisions taken (previously open questions)
 
