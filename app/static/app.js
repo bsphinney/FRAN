@@ -1897,10 +1897,10 @@ async function renderMyData(){
 /* ---------- INTERNAL: collaborator browser (private deployment only) ---------- */
 let __COLLAB_ROWS__ = [];
 async function renderCollaborators(){
-  view.innerHTML=`<section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">🔒 Collaborators <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
-    <p class="text-slate-400 text-sm mt-1">Private core-facility directory — real client / PI / project from search provenance. Click a collaborator to see all their searches with real names + file locations.</p></section>
+  view.innerHTML=`<section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">🔒 Service Dir <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
+    <p class="text-slate-400 text-sm mt-1">Private core-facility directory — one row per service-directory folder, with real client / PI / project from search provenance. Click a folder to see all its searches with real names + file locations.</p></section>
     <div class="relative mb-4 max-w-xl">
-      <input id="collabQ" placeholder="Collaborator, CoreOmics PI, or institute…" oninput="filterCollaborators()"
+      <input id="collabQ" placeholder="Service folder, CoreOmics PI, or institute…" oninput="filterCollaborators()"
         class="w-full bg-ink-800/70 border border-white/10 rounded-xl px-4 py-2.5 pl-10 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50" />
       <svg class="absolute left-3 top-3 text-slate-500" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
     </div>
@@ -1926,8 +1926,8 @@ function renderCollabRows(rows, d){
   const coBadge=c=>c==='confirmed'?'<span class="text-emerald-300" title="confirmed via an existing CoreOmics link">●</span>':c==='suggested'?'<span class="text-amber-300" title="suggested by name match — advisory, unconfirmed">○</span>':'';
   const coCell=r=>r.co_pi?`<span class="text-slate-300">${esc(r.co_pi)}</span> ${coBadge(r.co_confidence)}${r.co_institute?`<div class="text-[10px] text-slate-500">${esc(r.co_institute)}</div>`:''}`:'<span class="text-slate-600">—</span>';
   const foot=`<div class="text-[11px] text-slate-500 mt-3">${fmt(d.n_internal_standard||0)} internal/standard group${(d.n_internal_standard===1)?'':'s'} hidden · ${fmt(d.n_unattributed_searches||0)} searches unattributed (no service folder — standards / QC / staging)</div>`;
-  $('#collabBody').innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(rows.length)} collaborators, most recent work first — by curated service-directory folder · CoreOmics PI is advisory (● confirmed · ○ suggested)</div>`+table(
-    ['Collaborator','Last run','Searches','LIMS-linked','CoreOmics PI · institute','Campus'],
+  $('#collabBody').innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(rows.length)} service folders, most recent work first — by curated service-directory folder · CoreOmics PI is advisory (● confirmed · ○ suggested)</div>`+table(
+    ['Service folder','Last run','Searches','LIMS-linked','CoreOmics PI · institute','Campus'],
     rows.map(r=>[`<span class="font-semibold text-accent-400">${esc(r.client)}</span>`,
       r.last_run?`<span class="font-mono text-xs">${esc(r.last_run)}</span>`:'<span class="text-slate-600">—</span>',
       fmt(r.n_searches),r.n_lims_linked?fmt(r.n_lims_linked):'<span class="text-slate-600">—</span>',coCell(r),r.campus?esc(r.campus):'—']),
@@ -1940,7 +1940,7 @@ function renderCollabRows(rows, d){
 
 /* ---------- INTERNAL: labs-by-institution grid, its own route (moved out of Collaborators) ---------- */
 async function renderLabs(){
-  view.innerHTML=`${crumb([['Collaborators','collaborators'],['Labs by institution',null]])}
+  view.innerHTML=`${crumb([['Service Dir','collaborators'],['Labs by institution',null]])}
     <section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">🏛️ Labs <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
     <p class="text-slate-400 text-sm mt-1">Every CoreOmics lab we hold data for, grouped by institution — including labs whose data sits on the share but is not yet ingested into FRAN.</p></section>
     <div class="glass card p-4 fade-in" id="labsByInst"><div class="skeleton h-32 rounded-xl"></div></div>`;
@@ -1970,7 +1970,7 @@ async function loadLabsByInstitution(){
   }catch(e){ el.innerHTML=`<div class="text-xs text-slate-500">Labs-by-institution unavailable: ${esc((e&&e.message)||'error')}</div>`; }
 }
 async function renderCollaborator(name){
-  view.innerHTML=`${crumb([['Collaborators','collaborators'],[name,null]])}<div class="glass card p-4 fade-in" id="collabBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
+  view.innerHTML=`${crumb([['Service Dir','collaborators'],[name,null]])}<div class="glass card p-4 fade-in" id="collabBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
   try{
     const d=await api(`/api/internal/collaborator/${encodeURIComponent(name)}`); const rows=d.searches||[];
     if(!rows.length){ $('#collabBody').innerHTML=empty('No searches for this collaborator.'); return; }
@@ -2051,7 +2051,7 @@ async function renderSubmission(id){
 }
 
 async function renderLab(pi){
-  view.innerHTML=`${crumb([['Collaborators','collaborators'],[pi,null]])}<div class="glass card p-4 fade-in" id="labBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
+  view.innerHTML=`${crumb([['Service Dir','collaborators'],[pi,null]])}<div class="glass card p-4 fade-in" id="labBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
   try{
     const d=await api(`/api/internal/lab/${encodeURIComponent(pi)}`);
     const subs=d.submissions||[], rows=d.searches||[];
