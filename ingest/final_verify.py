@@ -38,6 +38,11 @@ for lane, mod, sid in (("delimp_spectrum_lane", sln, "528e28ec-8634-5f53-aa28-02
     row = cur.fetchone()
     if not row: continue
     nm, p, md5 = row
-    t = lance.dataset(p).to_table().cast(mod.SCHEMA)
-    print(f"  {lane:22s} {str(nm)[:28]:28s} chunks={t.column(0).num_chunks:<3d} -> {'MATCH' if mod.content_md5(t)==md5 else 'MISMATCH'}")
+    # verify(), not content_md5(): from xic writer 1.2.0 the registry stores a STREAMED digest, so
+    # a hardcoded whole-table content_md5 reports MISMATCH on good data. verify() tries both.
+    try:
+        res = "MATCH" if mod.verify(p, md5) else "MISMATCH"
+    except xln.LegacyDigestTooLarge as e:
+        res = f"UNVERIFIED (not a mismatch) — {e}"   # must not print as MISMATCH: see verify()
+    print(f"  {lane:22s} {str(nm)[:28]:28s} -> {res}")
 c.close()

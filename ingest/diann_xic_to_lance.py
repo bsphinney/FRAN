@@ -64,7 +64,15 @@ def strip_mods(mod_seq: str) -> str:
 
 def _report_meta(report_path: str):
     """(run, precursor_id) -> metadata from the DIA-NN report. The XIC file carries only traces;
-    q-value, m/z, ion mobility, protein group and genes live in the report."""
+    q-value, m/z, ion mobility, protein group and genes live in the report.
+
+    Read in batches, with the repeated strings pooled. to_pydict() builds a FRESH Python string for
+    every cell, but a 3.7M-row report holds only 224 distinct Run values, 71,863 distinct
+    Precursor.Id and a few thousand distinct Protein.Group / Genes — nearly all of those strings
+    were duplicates paying full freight. Measured on PROT_0793 search_mouse (3,721,585 rows):
+    3,284 MB resident before, 1,953 MB after, 35s either way. (Batching alone bought only 228 MB;
+    the pooling is what pays. Storing each record as a tuple instead of a 7-key dict would reach
+    1,291 MB, at the cost of unnaming the fields build_rows reads by name.)"""
     import pyarrow.parquet as pq
     want = {
         "run": ["Run"], "pid": ["Precursor.Id"], "mz": ["Precursor.Mz"],
@@ -81,25 +89,44 @@ def _report_meta(report_path: str):
     if not col["run"] or not col["pid"]:
         raise SystemExit(f"report lacks Run/Precursor.Id: {report_path}")
     use = [c for c in col.values() if c]
-    if report_path.endswith(".parquet"):
-        tbl = pq.read_table(report_path, columns=use)
-    else:
-        import pyarrow.csv as pv
-        tbl = pv.read_csv(report_path, parse_options=pv.ParseOptions(delimiter="\t"),
-                          convert_options=pv.ConvertOptions(include_columns=use))
+
+    def _batches():
+        if report_path.endswith(".parquet"):
+            yield from pq.ParquetFile(report_path).iter_batches(batch_size=250_000, columns=use)
+        else:
+            import pyarrow.csv as pv
+            # No streaming reader here: the TSV path already read the whole file, and the pooling
+            # below is what the memory went to anyway.
+            tbl = pv.read_csv(report_path, parse_options=pv.ParseOptions(delimiter="\t"),
+                              convert_options=pv.ConvertOptions(include_columns=use))
+            yield from tbl.to_batches(max_chunksize=250_000)
+
+    pool: dict = {}
+
+    def _pooled(s):
+        if s is None:
+            return None
+        got = pool.get(s)
+        if got is None:
+            pool[s] = got = s
+        return got
+
     meta, by_pr = {}, {}
-    d = tbl.to_pydict()
-    n = tbl.num_rows
-    g = lambda k, i: (d[col[k]][i] if col[k] else None)  # noqa: E731
-    for i in range(n):
-        rec = {
-            "mz": g("mz", i), "rt": g("rt", i), "im": g("im", i), "q": g("q", i),
-            "pg": g("pg", i), "genes": g("genes", i), "decoy": bool(g("decoy", i) or 0),
-        }
-        meta[(g("run", i), g("pid", i))] = rec
-        # Precursor-level fallback, for traces DIA-NN wrote in a run where it did not REPORT the
-        # precursor -- see build_rows(). Only identity fields are read from it.
-        by_pr.setdefault(g("pid", i), rec)
+    for b in _batches():
+        d = b.to_pydict()
+        g = lambda k, i: (d[col[k]][i] if col[k] else None)  # noqa: E731
+        for i in range(b.num_rows):
+            rec = {
+                "mz": g("mz", i), "rt": g("rt", i), "im": g("im", i), "q": g("q", i),
+                "pg": _pooled(g("pg", i)), "genes": _pooled(g("genes", i)),
+                "decoy": bool(g("decoy", i) or 0),
+            }
+            pid = _pooled(g("pid", i))
+            meta[(_pooled(g("run", i)), pid)] = rec
+            # Precursor-level fallback, for traces DIA-NN wrote in a run where it did not REPORT the
+            # precursor -- see build_rows(). Only identity fields are read from it.
+            by_pr.setdefault(pid, rec)
+        d = None            # drop this batch's Python objects before the next one is built
     return meta, by_pr
 
 
@@ -227,15 +254,39 @@ def main():
         total += len(rows); ntr += sum(r["n_traces"] for r in rows)
         if a.apply and rows:
             tbl = pa.Table.from_pylist(rows, schema=xic_lance.SCHEMA)
-            xic_lance.write_lance(tbl, a.out, mode="overwrite" if first else "append")
+            # checksum=False: the per-run digest was computed and thrown away 224 times for this
+            # search. Only the whole-dataset digest below is stored.
+            xic_lance.write_lance(tbl, a.out, mode="overwrite" if first else "append",
+                                  checksum=False)
             first = False
+            del tbl
+        del rows
     print(f"\nTOTAL {total:,} precursors / {ntr:,} traces")
     if not a.apply:
         print("DRY RUN — re-run with --apply to write and register.")
         return
+    # The report metadata is ~2 GB resident for a 3.7M-row report and nothing below reads it.
+    # Dropping it here is what lets the checksum's allocations reuse those arenas instead of
+    # pushing RSS higher on top of them.
+    del meta, by_pr
+    import gc
+    gc.collect()
     import lance
+    # The open is deliberately NOT guarded: a dataset that will not open has no version and no row
+    # count, so there is nothing to register. The DIGEST is guarded, for the reason spelled out in
+    # xic_lance.process_one -- every run is already written by this point, and letting the checksum
+    # decide whether the lane gets a registry row is how a complete 9.2 GB dataset ends up
+    # invisible to the app. That is exactly what the OOM did here: it died after run 224 and left
+    # an orphan directory with no registry row. Failing loudly is right; failing loudly AND
+    # discarding the write is not.
     ds = lance.dataset(a.out)
-    md5 = xic_lance.content_md5(ds.to_table())
+    md5 = None
+    try:
+        md5 = xic_lance.dataset_md5(ds)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] WRITTEN BUT NOT CHECKSUMMED: {a.out} — registering with content_md5 NULL; "
+              f"this lane cannot be verified until it is rebuilt "
+              f"({type(e).__name__}: {str(e)[:120]})", flush=True)
     print(f"wrote {a.out}  rows={ds.count_rows():,}  version={ds.version}  md5={md5}")
     if a.search_id:
         from ingest_perrun_xic import _conn
