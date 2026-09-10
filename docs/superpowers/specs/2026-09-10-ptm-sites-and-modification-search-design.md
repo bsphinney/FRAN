@@ -393,6 +393,90 @@ rather than becoming a second, parallel search UI.
 - Modification-aware XIC or fragment views.
 - Open/unrestricted modification search. The vocabulary is six known types.
 
+## Phase 0 — backfill `search_params_json`
+
+Brett: *"we should backfill the search_params_json."* Agreed, and today demonstrated exactly why.
+
+### Why this is not a nice-to-have
+
+Asked "was GlyGly configured as a variable modification in this search?", FRAN cannot answer.
+`search_params_json` is **0 of 2,086 populated**, and `grep` finds no writer anywhere in `ingest/`
+or `app/` — the column exists only at `schema/fran_schema.sql:367`. So the question had to be
+answered by inference from observed counts, which produced a **wrong hypothesis**: low GlyGly
+yield looked like a settings problem, and the direct evidence showed GlyGly present in 11 of 12
+ubiquitin searches, i.e. configured and searched for, just poorly recovered. Only
+`20231010_155520_Mandell-ubiq-DIA` has no GlyGly at all.
+
+The cost of the missing column is not abstract. Without it, "the search didn't look for it" and
+"the search looked and found little" are indistinguishable, and those two have completely different
+remedies — one is a re-search, the other is a wet-lab conversation.
+
+This is the third schema column found today that is defined and never written:
+
+| column | populated | writer |
+|---|---|---|
+| `search_params_json` | 0 of 2,086 | none |
+| `site_localization_probability` | 0 of 437 M | none |
+| `mods` (jsonb, carries a GIN index) | 1.43% | writes `None` |
+
+That is a pattern worth naming: the schema encodes intentions the pipeline never implemented, and
+each one is a trap, because a column that exists reads as a column that means something.
+
+### Three sources, in ascending order of difficulty
+
+**1. Observed modifications — derivable today, no external dependency, covers all 2,086.**
+
+Not the configured settings, but the empirical vocabulary: which modifications this search actually
+contains. It answers the question that came up today, needs nothing outside the database, and is
+the same aggregate `delimp_ptm_search` already requires in Phase 2 — so it is free. It also
+distinguishes the one genuinely-unconfigured search from the ten under-performing ones, which is
+the distinction that mattered.
+
+It must be stored under a name that says what it is — `modifications_observed`, not
+`search_params_json`. Conflating "what the search found" with "what the search was told to look
+for" would recreate exactly the ambiguity this section exists to remove.
+
+**2. DIA-NN — parseable now, covers 76 searches.**
+
+`report.log.txt` carries the complete command line plus a human-readable settings echo. Verified
+by reading one:
+
+```
+diann-linux --f <raw> --lib <speclib> --threads 10 --qvalue 0.01 --fasta <fasta>
+  --met-excision --cut K*,R* --missed-cleavages 1 --unimod4 --var-mods 1
+  --mass-acc 15 --mass-acc-ms1 15 --window 6 --rt-profiling --pg-level 1
+"Cysteine carbamidomethylation enabled as a fixed modification"
+"Maximum number of variable modifications set to 1"
+```
+
+Everything `search_params_json` should hold: FDR threshold, enzyme and cleavage rules, missed
+cleavages, fixed and variable modifications, mass accuracy, library and FASTA. Parse the command
+line rather than the prose echo — it is machine-generated and stable, whereas the echo is
+human-facing text that changes between versions.
+
+**3. Spectronaut — the hard 96%, and it rides along with the localization re-export.**
+
+The settings live in the `.sne` project files, which are on the Windows shares, not Hive: the
+phospho search's `output_dir` is `D:\MRS\toshi\20260528_093510_Toshi-uniprot-STY phospho.sne`.
+Extracting them needs a machine with Spectronaut, which is precisely what `ingest/sne_export.py`
+already drives.
+
+**This is the same operation as the localization recovery, and should be done once, not twice.**
+That re-export already has to happen to populate `site_localization_probability`; adding the
+settings columns to the same report schema means one pass over the `.sne` files yields both. Doing
+them separately would mean re-exporting 2,008 projects twice.
+
+For searches never re-exported, `search_params_json` stays NULL — and NULL must keep meaning
+"unknown", never "no variable modifications". Given the column has been NULL corpus-wide since it
+was created, any consumer that treats NULL as a value rather than an absence will be wrong about
+every historical search.
+
+### Sequencing
+
+Source 1 is independent of everything and lands with Phase 2's rollups. Source 2 is a small
+self-contained script over 76 log files. Source 3 is gated on Brett's Spectronaut report-schema
+change and should be bundled with the localization re-export rather than scheduled on its own.
+
 ## Decisions taken (previously open questions)
 
 Brett: *"I don't know how to answer your questions"* — correctly, because they were implementation
