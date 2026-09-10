@@ -774,7 +774,8 @@ def api_protein_coverage(protein_group: str, search_id: str | None = None):
     mapped = cov.map_coverage(seq, data.get("peptides") or [])
     resp = {"accession": acc, "protein_group": protein_group, "gene": data.get("gene"),
             "custom_construct": custom,
-            "sequence": seq, "sequence_available": bool(seq), **mapped}
+            "sequence": seq, "sequence_available": bool(seq), **mapped,
+            "sites": data.get("sites") or []}
     if data.get("scope_unavailable"):
         # The "here" lookup itself failed (see protein_coverage_peptides): peptides carry no "here"
         # key at all here, so the UI must say "comparison unavailable" rather than infer "not found".

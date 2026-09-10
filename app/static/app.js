@@ -636,6 +636,11 @@ function _drawPeptideMap(card, gene){
   const hereRes=new Array(L).fill(false), corpRes=new Array(L).fill(false), anyRes=new Array(L).fill(false);
   peps.forEach(p=>{ for(let i=p.start-1;i<p.end&&i<L;i++){ anyRes[i]=true;
     if(!scopeOff){ if(p.here) hereRes[i]=true; else corpRes[i]=true; } } });
+  // Variable-modification sites, keyed by 1-based protein position. Colour by modification;
+  // phospho is the one people are looking for, so it gets the strongest colour.
+  const MODCOL={21:'#f472b6',1:'#c084fc',35:'#94a3b8',7:'#fbbf24',27:'#fb923c'};
+  const siteAt={};
+  (d.sites||[]).forEach(s=>{ (siteAt[s.pos]=siteAt[s.pos]||[]).push(s); });
   const pctAll=Math.round(1000*anyRes.filter(Boolean).length/L)/10;
   const pctHere=scopeOff?null:Math.round(1000*hereRes.filter(Boolean).length/L)/10;
   const pcts=scopeOff
@@ -649,6 +654,12 @@ function _drawPeptideMap(card, gene){
     : `<span><span style="display:inline-block;width:22px;height:9px;background:#FFCF40;border-radius:2px;vertical-align:middle"></span> peptide found in this experiment</span>
        <span><span style="display:inline-block;width:22px;height:9px;background:#5eead4;border-radius:2px;vertical-align:middle"></span> found by the corpus, not here</span>
        <span class="text-slate-500">click a peptide for its corpus detail · click its sequence to open the FRAN peptide page</span>`;
+  const modLegend=(d.sites||[]).length
+    ? `<span class="ml-1"><span style="display:inline-block;width:10px;height:0;border-bottom:2px solid #f472b6;vertical-align:middle"></span> phospho</span>
+       <span><span style="display:inline-block;width:10px;height:0;border-bottom:2px solid #c084fc;vertical-align:middle"></span> acetyl</span>
+       <span><span style="display:inline-block;width:10px;height:0;border-bottom:2px solid #94a3b8;vertical-align:middle"></span> oxidation</span>
+       <span class="text-slate-500">sites are <b>as reported by the search engine</b> and not independently localized</span>`
+    : '';
   let seqHtml='';
   for(let off=0; off<L; off+=_PEPMAP_PERLINE){
     const end=Math.min(off+_PEPMAP_PERLINE,L);
@@ -664,7 +675,13 @@ function _drawPeptideMap(card, gene){
     const resChars=d.sequence.slice(off,end).split('').map((ch,i)=>{
       const gi=off+i;
       const col = scopeOff ? (anyRes[gi]?'#94a3b8':'#475569') : (hereRes[gi]?'#FFE9A8':(corpRes[gi]?'#a7f3e0':'#475569'));
-      return `<span style="display:inline-block;width:${W}%;text-align:center;color:${col}">${esc(ch)}</span>`;
+      const ss=siteAt[gi+1];
+      if(!ss) return `<span style="display:inline-block;width:${W}%;text-align:center;color:${col}">${esc(ch)}</span>`;
+      const s=ss[0], mc=MODCOL[s.unimod_id]||'#e2e8f0';
+      const occ=s.occupancy==null?'':` · ${Math.round(s.occupancy*100)}% of precursors here`;
+      const tip=`${s.name} on ${esc(ch)}${gi+1}${occ} · ${fmt(s.n_precursors)} precursors in ${fmt(s.n_runs)} runs · engine-reported, not independently localized`;
+      return `<span title="${esc(tip)}" style="display:inline-block;width:${W}%;text-align:center;color:${col};`
+           + `border-bottom:2px solid ${mc};font-weight:700;cursor:help">${esc(ch)}</span>`;
     }).join('');
     const laneHtml=lanes.map(lane=>`<div style="position:relative;height:11px;margin-top:2px">${
       lane.map(p=>{
@@ -683,7 +700,7 @@ function _drawPeptideMap(card, gene){
         <span class="text-slate-500 text-xs font-mono font-normal">${esc(d.accession)} · ${fmt(L)} aa · ${fmt(peps.length)} peptides</span>
         <a onclick="go('gene','${encodeURIComponent(gene)}')" class="cursor-pointer text-xs font-semibold px-2 py-0.5 rounded-lg bg-accent/15 text-accent-400 hover:bg-accent/25 ml-1" title="everything the corpus knows about ${esc(gene)}">${esc(gene)} across the corpus ↗</a></h3>
       ${pcts}</div>
-    <div class="flex flex-wrap gap-4 text-[11px] text-slate-500 my-3">${legend}</div>
+    <div class="flex flex-wrap gap-4 text-[11px] text-slate-500 my-3">${legend}${modLegend}</div>
     <div>${seqHtml}</div>
     <div id="pepmapDetail" class="mt-2"></div>`;
 }
