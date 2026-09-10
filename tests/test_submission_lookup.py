@@ -10,6 +10,7 @@ from datetime import date
 os.environ["DELIMP_INTERNAL_MODE"] = "1"          # internal tables; see app/db.py
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app import queries                            # noqa: E402
+from app import db                                 # noqa: E402  (derive expected counts)
 
 FAILS = []
 def check(name, cond, detail=""):
@@ -94,9 +95,27 @@ L = queries.internal_submissions(limit=25)
 check("list returns submissions", len(L.get("submissions") or []) > 0, str(len(L.get("submissions") or [])))
 # A one-directional >= cannot catch inflation: dropping `co.internal_id IS NOT NULL` from the
 # total COUNT (app/queries.py) makes total 4,488 (every coreomics_submissions_cache row, numbered
-# or not) and >= 790 would still pass — the page header would read "4,488 numbered submissions".
-# 790 is measured against the live DB (2026-09-08); assert equality, not a floor.
-check("list reports a total of exactly 790 numbered submissions", (L.get("total") or 0) == 790, str(L.get("total")))
+# or not) and >= N would still pass — the page header would read "4,488 numbered submissions".
+# So this asserts EQUALITY. But the expected value is DERIVED, not hardcoded: a literal (790, when
+# this was written on 2026-09-08) goes red the moment a real submission arrives, which it did —
+# PROT_0805, then 792 by 2026-09-10. A test that fails on correct data teaches people to ignore it.
+#
+# Two checks, each able to fail on its own:
+#   1. total equals an independently-counted "numbered" population -> catches inflation
+#      (the 4,488 bug leaves this at 792 while total reads 4,488).
+#   2. total is strictly less than EVERY cache row -> catches the same bug from the other side,
+#      without reusing the predicate under test. If these two ever agree, the cache holds only
+#      numbered rows and check 1 has quietly become tautological — so this also guards check 1.
+_n_numbered = db.query(
+    "SELECT COUNT(*) AS n FROM coreomics_submissions_cache WHERE internal_id IS NOT NULL",
+    tables=["coreomics_submissions_cache"], fetch="val")
+_n_all = db.query(
+    "SELECT COUNT(*) AS n FROM coreomics_submissions_cache",
+    tables=["coreomics_submissions_cache"], fetch="val")
+check("list total equals the independently-counted numbered submissions",
+      (L.get("total") or 0) == _n_numbered, f"total={L.get('total')} derived={_n_numbered}")
+check("list total excludes unnumbered cache rows (total < all rows)",
+      0 < (L.get("total") or 0) < _n_all, f"total={L.get('total')} all_rows={_n_all}")
 first = (L.get("submissions") or [{}])[0]
 for k in ("internal_id", "institute", "n_searches", "num_samples", "submitted_at"):
     check(f"row carries {k}", k in first, sorted(first.keys())[:12])
