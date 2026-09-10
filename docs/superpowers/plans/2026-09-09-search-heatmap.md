@@ -308,12 +308,16 @@ git commit -m "ingest: build the corpus-reach table, case-merged and intensity-b
 search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict
 # {"proteins": [{"gene", "protein_group", "n_samples", "is_contaminant",
 #                "reach", "reach_pct_rank", "cells": {sample_id: float}}],
-#  "samples": [{"id", "raw_path", "raw_basename", "acquisition_date"}],
-# NOTE: cells are keyed by the OPAQUE sample id ("s0", "s1", ...), never by a filename.
-# privacy.redact() sanitises string VALUES under privacy._FILE_KEYS; it never renames KEYS, so a
-# filename used as a dict key reaches the public tier untouched. The sample field is likewise
-# `raw_basename`, not `basename` — the sanitiser matches on key name and `basename` is not in the
-# set. Both were found leaking real acquisition filenames to anonymous users during Task 4.
+#  "samples": [{"id"}],
+# NOTE: cells are keyed by the OPAQUE sample id ("s0", "s1", ...), never by a filename, and a
+# sample row is that id and NOTHING else. privacy.redact() sanitises string VALUES under
+# privacy._FILE_KEYS; it never renames KEYS, so a filename used as a dict key reaches the public
+# tier untouched — that leak was found during Task 4. The endpoint is PUBLIC, so the follow-up at
+# the merge gate went further and dropped raw_path/raw_basename/acquisition_date from the row
+# entirely (nothing rendered them; acquisition_date is used only for the server-side sort). The
+# response is now structurally incapable of carrying a filename rather than dependent on the
+# sanitiser continuing to know the right key names. Anything added back here must be covered by
+# privacy._FILE_KEYS AND by the real-path component scan in tests/test_internal_route_gate.py.
 #  "mode", "limit", "n_proteins_total", "n_samples_total",
 #  "floor_pct", "reach_computed_at"}
 # mode ∈ {"cv", "abundance", "rarity", "corpus_abundance"}

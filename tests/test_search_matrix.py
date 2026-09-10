@@ -46,7 +46,10 @@ check("abundance mode excludes the 1-sample outlier Or6c75", "Or6c75" not in nam
 t0 = time.monotonic()
 c = queries.search_protein_matrix(SID, mode="cv", limit=50)
 t_cv2 = time.monotonic() - t0
-print(f"  [timing] mode=cv (2nd)  end-to-end: {t_cv2:.2f}s")
+# Identical arguments to the mode=cv call at the top of this file, so since the F3 fix this is a
+# SLOW_CACHE hit rather than a second ~3s round-trip. The cache block at the end of this file
+# ASSERTS that (identity + a cold/warm timing witness) instead of merely observing it here.
+print(f"  [timing] mode=cv (2nd, cache hit)  end-to-end: {t_cv2:.4f}s")
 cvs = [p.get("cv") for p in c["proteins"]]
 check("cv mode is sorted descending across the whole page",
       all(cvs[i] >= cvs[i + 1] for i in range(len(cvs) - 1)), str(cvs[:4]))
@@ -149,9 +152,46 @@ check("cells reference real sample keys",
       all(k in {s["id"] for s in samps} for p in prots for k in p["cells"]),
       "a cell key is not a returned sample")
 
-# CONTAMINANT + REACH annotations are present on every row.
-check("every row carries is_contaminant", all("is_contaminant" in p for p in prots))
-check("every row carries reach (may be None)", all("reach" in p for p in prots))
+# CONTAMINANT + REACH annotations. These used to be `check("every row carries is_contaminant")`
+# and `check("every row carries reach")` -- assertions that a key written unconditionally in a
+# dict literal a few lines away is present, which cannot go red for any reason except someone
+# deleting the key. Replaced with cross-checks against INDEPENDENTLY computed values, which can.
+#
+# is_contaminant reaches the payload through a two-level bool_or (per_sample, then agg); the
+# query below is a single flat aggregate over the same rows, so a grain error, a lost GROUP BY or
+# a dropped column shows up as a mismatch. Measured on this fixture: exactly 2 of the 50 cv rows
+# are flagged (TPM2, SERPINA1), so the liveness half is not vacuous either -- an aggregate that
+# collapsed every row to False would clear a "matches independent" check trivially if every
+# independent value were False too, and it isn't.
+from app.db import query as _q                                # noqa: E402
+_genes = [p["gene"] for p in prots]
+_ind_cont = {r["gene"]: bool(r["c"]) for r in _q(
+    "SELECT gene, bool_or(is_contaminant) AS c FROM delimp_proteins "
+    "WHERE search_id=%(s)s AND gene = ANY(%(g)s) AND intensity > 0 GROUP BY gene",
+    {"s": SID, "g": _genes}, tables=["delimp_proteins"])}
+_cont_mismatch = [(p["gene"], p["is_contaminant"], _ind_cont.get(p["gene"])) for p in prots
+                  if bool(p["is_contaminant"]) != _ind_cont.get(p["gene"])]
+check("every row's is_contaminant matches an independently computed bool_or over the same rows",
+      not _cont_mismatch, str(_cont_mismatch[:5]))
+_n_flagged = sum(1 for p in prots if p["is_contaminant"])
+check("the contaminant strip is a live signal on this fixture (some rows flagged, not all)",
+      0 < _n_flagged < len(prots), f"{_n_flagged} of {len(prots)} rows flagged")
+
+# reach reaches the payload through `LEFT JOIN delimp_protein_corpus_reach r ON r.gene =
+# upper(a.gene)`. The lookup below reads the same table directly, so a dead join, a wrong column
+# (n_pct_searches for n_searches) or a stale alias shows up as a mismatch on THIS page -- the
+# existing rarity-mode checks only ever exercise mode="rarity". Measured: 50 of 50 cv rows carry
+# a non-null reach on this fixture.
+_ind_reach = {r["gene"]: r["n"] for r in _q(
+    "SELECT gene, n_searches AS n FROM delimp_protein_corpus_reach WHERE gene = ANY(%(g)s)",
+    {"g": [g.upper() for g in _genes]}, tables=["delimp_protein_corpus_reach"])}
+_reach_mismatch = [(p["gene"], p["reach"], _ind_reach.get((p["gene"] or "").upper())) for p in prots
+                   if p["reach"] != _ind_reach.get((p["gene"] or "").upper())]
+check("every row's reach matches a direct lookup in delimp_protein_corpus_reach",
+      not _reach_mismatch, str(_reach_mismatch[:5]))
+check("the reach join is alive on the cv page too (not only in rarity mode)",
+      sum(1 for p in prots if p["reach"] is not None) >= 40,
+      f"{sum(1 for p in prots if p['reach'] is not None)} of {len(prots)} rows have a reach")
 
 # REDACTION MUST COVER THE PUBLIC VIEW (Fix round 1, 3rd revision). Every check above ran with
 # DELIMP_INTERNAL_MODE=1, which sets reveal=True at import (app/main.py:221) — privacy.redact()
@@ -159,34 +199,45 @@ check("every row carries reach (may be None)", all("reach" in p for p in prots))
 # anonymous visitor sees. This block is the FIRST coverage in this file of the actual public
 # (reveal=False) path — it did not exist before this fix round, which is exactly how the original
 # leak got past every check here plus one review round.
-import re                                                     # noqa: E402
+import json, re                                               # noqa: E402
 from app import privacy                                       # noqa: E402
 from app.main import _json_safe                               # noqa: E402
 
 pub = privacy.redact(_json_safe(d), False)          # reveal=False: the anonymous view of `d`
 pub_samples, pub_proteins = pub.get("samples") or [], pub.get("proteins") or []
 
-check("public view: no sample carries a bare 'basename' key",
-      all("basename" not in s for s in pub_samples))
+# STRUCTURAL (F6). A sample row is its opaque positional id and NOTHING else. raw_path,
+# raw_basename and acquisition_date used to ride along unread; dropping them makes this payload
+# structurally incapable of carrying a filename instead of dependent on privacy.redact()
+# continuing to know the right key names. This check goes red the moment a field comes back.
+check("public view: a sample row carries the opaque id and nothing else",
+      all(set(s) == {"id"} for s in pub_samples), str(pub_samples[:2]))
 
-RUN_RE = re.compile(r"^run-[0-9a-f]{6}(\.[A-Za-z0-9]+)?$")
-check("public view: raw_basename is sanitized to the run-xxxxxx shape",
-      all(RUN_RE.match(s.get("raw_basename") or "") for s in pub_samples),
-      str([s.get("raw_basename") for s in pub_samples[:4]]))
-check("public view: raw_path is sanitized to the run-xxxxxx shape",
-      all(RUN_RE.match(s.get("raw_path") or "") for s in pub_samples),
-      str([s.get("raw_path") for s in pub_samples[:4]]))
+# THE GENERIC SCAN, replacing three checks that could not discriminate or have gone stale:
+#   - "no sample carries a bare 'basename' key" caught exactly one historical misspelling; a
+#     future field named path/file_name/dir/folder/source is not in privacy._FILE_KEYS, would
+#     pass through redact() untouched, and that check would have stayed green.
+#   - the two RUN_RE shape checks asserted on raw_path/raw_basename, fields F6 removed.
+# Splitting the REAL paths into components and searching the whole serialized payload subsumes
+# all three AND the old cells-key discriminator: a filename used as a dict KEY (the ed36e2b bug,
+# invisible to redact(), which rewrites values only) lands in this blob just the same, and a full
+# path used as a key trips the separator check. It knows nothing about which field names are
+# filename-shaped, so it cannot go stale.
+real_paths = [r["raw_path"] for r in _q(
+    "SELECT DISTINCT raw_path FROM delimp_proteins WHERE search_id=%s",
+    (SID,), tables=["delimp_proteins"])]
+check("the independent real-path list covers every sample (not a vacuous scan)",
+      len(real_paths) == len(samps), f"{len(real_paths)} real paths vs {len(samps)} samples")
 
-# THE DISCRIMINATOR. Compare cell keys against the REAL (unredacted) basenames from `samps`, not
-# against pub_samples — real filenames obviously don't appear there if redaction worked. This is
-# the check that would have caught the actual bug: cells keyed by filename are invisible to
-# redact() because redact() rewrites string VALUES under known keys, never dict KEYS.
-real_basenames = {s["raw_basename"] for s in samps}
-cell_keys = {k for p in pub_proteins for k in p["cells"]}
-check("public view: no cells key is a real acquisition filename",
-      not (cell_keys & real_basenames), str(list(cell_keys & real_basenames)[:5]))
+blob = json.dumps(pub)
+check("public view: no path separator anywhere in the payload",
+      "/" not in blob and "\\" not in blob, blob[:200])
+comps = {c for rp in real_paths for c in re.split(r"[\\/]+", rp or "") if len(c) > 3}
+leaked = sorted(c for c in comps if c in blob)
+check(f"public view: none of the {len(comps)} real path components survives redaction",
+      not leaked, f"LEAKED: {leaked[:5]}")
 
-# ...and the join must still work under redaction: every cells key is a returned public sample id.
+# ...and the join must still work: every cells key is a returned public sample id.
 pub_ids = {s["id"] for s in pub_samples}
 check("public view: cells keys still match returned sample ids after redaction",
       all(k in pub_ids for p in pub_proteins for k in p["cells"]),
@@ -214,6 +265,64 @@ check("an unknown search returns 200 with an empty matrix",
       missing.status_code == 200
       and not ((missing.json().get("data") or missing.json()).get("proteins")),
       str(missing.status_code))
+
+# F5. A malformed search_id is the caller's mistake (400), not an outage (503). Before this guard
+# psycopg2 raised InvalidTextRepresentation deep in the query and app/main.py's generic handler
+# turned it into 503 {"detail": "InvalidTextRepresentation: invalid input syntax for type uuid:
+# \"not-a-uuid\"\nLINE 4: WHERE p.search_id='not-a-uuid' ..."} -- a fragment of the server's SQL,
+# with the anonymous caller's own input echoed back, rendered by the frontend as "Database
+# unavailable". The sibling coverage route already had this guard; the new PUBLIC route did not.
+# raise_server_exceptions=False so this check observes what a real HTTP client observes. With
+# the default (True), removing the guard makes TestClient re-raise psycopg2's
+# InvalidTextRepresentation and abort this whole file mid-run instead of reporting one clean red
+# -- which hides the very failure the check exists to report, and skips every check after it.
+bad_client = TestClient(app, raise_server_exceptions=False)
+bad_id = bad_client.get("/api/search/not-a-uuid/matrix")
+check("a malformed search_id returns 400, not a 503 'database unavailable'",
+      bad_id.status_code == 400, f"{bad_id.status_code}: {bad_id.text[:200]}")
+check("...and the 400 body echoes no SQL text back to the caller",
+      "SELECT" not in bad_id.text.upper() and "search_id='" not in bad_id.text,
+      bad_id.text[:200])
+
+# --- F3: the matrix is cached ------------------------------------------------------------------
+# The endpoint is PUBLIC and fires on every search-page view. Measured uncached: 2.8-4.0s here,
+# 7.3-8.9s on the largest searches, against a 6-connection pool -- a handful of concurrent
+# viewers saturated it. These checks assert the cache is real, that it is keyed so free text
+# cannot mint entries, and that a DEGRADED result does not stick for the 30-minute TTL.
+from app.db import SLOW_CACHE                                 # noqa: E402
+
+SLOW_CACHE.clear()
+t0 = time.monotonic(); cold = queries.search_protein_matrix(SID, mode="cv", limit=7)
+t_cold = time.monotonic() - t0
+t0 = time.monotonic(); warm = queries.search_protein_matrix(SID, mode="cv", limit=7)
+t_warm = time.monotonic() - t0
+print(f"  [timing] cache cold: {t_cold:.2f}s   warm: {t_warm:.5f}s")
+check("a repeated matrix call returns the cached object itself (no second DB round-trip)",
+      warm is cold, f"cold id={id(cold)} warm id={id(warm)}")
+check("...and the cached call does no measurable work (< 50 ms against a multi-second cold call)",
+      t_warm < 0.05 and t_cold > 0.5, f"cold {t_cold:.2f}s / warm {t_warm:.5f}s")
+
+# THE KEY. mode is normalized to a _MATRIX_MODES member BEFORE it enters the cache key. Keyed on
+# the raw string instead, an anonymous caller could mint unbounded entries from free text --
+# db.TTLCache has no eviction. Both calls below must land on the SAME entry.
+SLOW_CACHE.clear()
+junk = queries.search_protein_matrix(SID, mode="; DROP TABLE delimp_proteins --", limit=7)
+cv7 = queries.search_protein_matrix(SID, mode="cv", limit=7)
+check("an unknown mode shares the cv cache entry (free text cannot mint cache keys)",
+      cv7 is junk, f"junk id={id(junk)} cv id={id(cv7)}")
+
+# THE DEGRADED RESULT MUST NOT STICK. An empty matrix (no sample cleared the presence floor, or
+# the search does not exist / is mid-ingest) is a TRUTHY dict, so SLOW_CACHE.get_or_set would
+# happily cache it for the full 30 minutes -- which is exactly why this uses manual
+# cached()/put() gated on a non-empty `proteins` instead. Identity is the witness: two calls that
+# return DIFFERENT objects prove nothing was stored between them.
+EMPTY_SID = "00000000-0000-0000-0000-000000000000"
+e1 = queries.search_protein_matrix(EMPTY_SID, mode="cv", limit=7)
+e2 = queries.search_protein_matrix(EMPTY_SID, mode="cv", limit=7)
+check("an empty matrix is truthy (so get_or_set WOULD have cached it — this is the trap)",
+      bool(e1) and not e1.get("proteins"), str(list(e1)[:4]))
+check("a degraded/empty matrix is NOT cached (it self-heals instead of sticking for the TTL)",
+      e2 is not e1, "the empty result was cached")
 
 print("\n" + ("ALL PASS" if not FAILS else "FAILURES: " + ", ".join(FAILS)))
 sys.exit(1 if FAILS else 0)

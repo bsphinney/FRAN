@@ -1054,7 +1054,17 @@ def api_search_matrix(search_id: str, mode: str = "cv", limit: int = 50):
     Public-tier: every table it reads is in PUBLIC_TABLES. `mode` is validated inside
     search_protein_matrix() against a fixed dict and falls back to "cv", so an unknown value can
     never reach SQL.
+
+    A malformed search_id is a client error (400), the same guard api_protein_coverage above
+    applies. Without it psycopg2 raises InvalidTextRepresentation deep in the query and the
+    generic handler turns it into a 503 whose detail carries a fragment of the server's SQL with
+    the caller's own input echoed back — which the frontend then renders to an anonymous visitor
+    as "Database unavailable", a false outage for a typo.
     """
+    try:
+        uuid.UUID(search_id)
+    except ValueError:
+        raise HTTPException(400, "search_id must be a valid UUID.")
     return ok(queries.search_protein_matrix(search_id, mode=mode, limit=max(1, min(int(limit), 200))))
 
 

@@ -14,6 +14,14 @@ const INTKEY = (new URLSearchParams(location.search).get('key')) || localStorage
 if(INTKEY && new URLSearchParams(location.search).get('key')) localStorage.setItem('delimp_ikey', INTKEY);
 async function api(path){ const r = await fetch(path, INTKEY?{headers:{'X-Internal-Key':INTKEY}}:{}); if(!r.ok){ const e=await r.json().catch(()=>({detail:r.statusText})); const err=new Error(e.detail||('HTTP '+r.status)); err.status=r.status; throw err; } return r.json(); }
 function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// JS-STRING-INSIDE-AN-HTML-ATTRIBUTE context: onclick="f('${...}')". esc() alone is NOT enough
+// there -- it escapes & < > " but leaves ' untouched, so a value carrying an apostrophe closes
+// the JS string early. HTML-entity escaping the quote would not help either: the attribute is
+// HTML-decoded BEFORE the JS is parsed, so &#39; turns back into a real quote. Backslash-escape
+// the JS layer first (backslashes too, or a trailing \ would eat the escape we just added), then
+// esc() the HTML layer -- the same order as the existing esc((coPI||'').replace(/'/g,"\\'")) call
+// sites. Prefer encodeURIComponent() where the value is a URL component; use this where it isn't.
+function escJs(s){ return esc(String(s??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'")); }
 // clickable gene cell inside a row that already has an onclick (stops row navigation)
 function geneCell(g){ return g?`<span onclick="event.stopPropagation();go('gene','${encodeURIComponent(g)}')" class="cursor-pointer text-accent-400 hover:underline">${esc(g)}</span>`:'—'; }
 function copy(t){ navigator.clipboard.writeText(t); toast('Copied'); }
@@ -527,7 +535,7 @@ async function renderSearchMatrix(searchId, mode){
     const d=await api(`/api/search/${encodeURIComponent(searchId)}/matrix?mode=${encodeURIComponent(_hmMode)}&limit=50`);
     const proteins=d.proteins||[], samples=d.samples||[];
     const modeBtns=_HM_MODES.map(([m,label])=>
-      `<button onclick="renderSearchMatrix('${esc(searchId)}','${m}')" class="px-2.5 py-1 rounded-lg text-xs ${m===_hmMode?'tab-active':'glass text-slate-300'}">${label}</button>`).join('');
+      `<button onclick="renderSearchMatrix('${escJs(searchId)}','${m}')" class="px-2.5 py-1 rounded-lg text-xs ${m===_hmMode?'tab-active':'glass text-slate-300'}">${label}</button>`).join('');
     if(!proteins.length){
       el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
         <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
@@ -594,7 +602,17 @@ async function renderSearchMatrix(searchId, mode){
       <span><span style="display:inline-block;width:11px;height:11px;background:#243049;border-radius:2px;vertical-align:middle"></span> rarity not computed</span>
       <span><b class="text-slate-300">strip 2</b> <span style="display:inline-block;width:11px;height:11px;background:#f43f5e;border-radius:2px;vertical-align:middle"></span> flagged contaminant</span></div>`;
     const scoped=(_hmMode==='rarity'||_hmMode==='corpus_abundance')?'':' — <b>this search only</b>';
-    const note=`<div class="text-[11px] text-slate-500 mt-2">Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_proteins_total)} proteins × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among proteins in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples. Click a gene name for its sequence coverage.</div>`;
+    // CORPUS-REACH SNAPSHOT DATE. The endpoint pays for this on every request (an extra
+    // SELECT max(computed_at)) precisely so the reader can see how fresh the corpus numbers are,
+    // and nothing rendered it — so `rarity` and `corpus_abundance`, two of the four ranking modes
+    // and both served entirely from delimp_protein_corpus_reach, could freeze at an old snapshot
+    // with no signal to anyone. Shown in EVERY mode, not just those two: strip 1 (the rarity
+    // ramp) is drawn on every row whatever the ranking is. Date only — the time of day of a
+    // weekly batch refresh is noise.
+    const asOf=d.reach_computed_at?String(d.reach_computed_at).slice(0,10):null;
+    const corpusNote=asOf?` Corpus reach as of <b class="text-slate-300">${esc(asOf)}</b>.`
+                         :` <span class="text-amber-300">Corpus reach has never been computed</span> — the rarity strip and the two corpus ranking modes are unavailable.`;
+    const note=`<div class="text-[11px] text-slate-500 mt-2">Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_proteins_total)} proteins × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among proteins in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples.${corpusNote} Click a gene name for its sequence coverage.</div>`;
     el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
       <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
       ${legend}
@@ -2372,7 +2390,7 @@ async function renderSubmissions(){
       : (s.run_count!=null || s.service_folder)
         ? `<span class="text-accent-400">📦 ${s.run_count!=null?fmt(s.run_count)+' runs':''} on the share</span>
            ${s.service_folder?`<div class="text-[10px] text-slate-500 font-mono break-all mt-0.5" title="${esc(s.service_folder_win||'')}">${esc(s.service_folder)}</div>`:''}
-           <button onclick="event.stopPropagation();exportReport('${esc(s.submission_id)}',this,'resubmit')" class="mt-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a HIVE/Flinders re-search brief for this un-ingested data">🔄 Re-search this data</button>`
+           <button onclick="event.stopPropagation();exportReport('${escJs(s.submission_id)}',this,'resubmit')" class="mt-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a HIVE/Flinders re-search brief for this un-ingested data">🔄 Re-search this data</button>`
         : `<span class="text-slate-600">— not located</span>`;
     $('#subsBody').innerHTML =
       `<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} numbered submission${d.total===1?'':'s'}${d.locations_as_of?` · share locations as of ${esc(String(d.locations_as_of))}`:''}</div>`
@@ -2384,7 +2402,7 @@ async function renderSubmissions(){
             s.num_samples!=null?fmt(s.num_samples):'—',
             `<span class="font-mono text-xs">${esc(String(s.submitted_at||'—'))}</span>`,
             state(s)]),
-          rows.map(s=>`go('submission','${esc(s.internal_id)}')`));
+          rows.map(s=>`go('submission','${escJs(s.internal_id)}')`));
   }catch(e){ dbError(e,'#subsBody'); }
 }
 

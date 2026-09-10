@@ -4380,7 +4380,7 @@ _MATRIX_MIN_PCT_SEARCHES = 20  # before mean_pct_rank is trusted
 
 
 def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict[str, Any]:
-    """PRIVATE-SAFE: the protein x sample matrix behind a search page's heatmap.
+    """PRIVATE-SAFE: the protein x sample matrix behind a search page's heatmap. CACHED (SLOW).
 
     delimp_proteins is already one row per (search, sample, protein), so this is a read, not a
     derivation. Four ranking modes: two scoped to this search (cv, abundance) and two corpus-wide
@@ -4391,13 +4391,48 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     an olfactory receptor in 1 of 222 samples at 85.4e9 — above albumin in 219.
 
     Reads `intensity`. NOT `normalized_intensity`, which exists for only 4% of searches.
+
+    WHY CACHED, and why this is not optional. The endpoint is PUBLIC and anonymous, and
+    renderSearchDetail() fires it unconditionally on every search-page view (plus once more per
+    mode button). Measured uncached: 2.8-4.0 s on the flagship, 7.3/8.7/8.9 s across the five
+    largest searches, 5.1 s and 625 KB at limit=200. The ranking statement runs with
+    work_mem="256MB", which db.py's own docstring says to use SPARINGLY because the bound is
+    maxconn (6) x that value; with _QUERY_ATTEMPTS=3 a retrying request can hold one of six pooled
+    connections for ~36 s, so a handful of concurrent viewers of a large search saturate the pool
+    and 503 the whole site. Every comparable aggregate in this file already goes through
+    CACHE/SLOW_CACHE (32 call sites) — this was the only new public one that did not.
+
+    SLOW_CACHE (30 min), not CACHE (20 s): a completed search's delimp_proteins rows do not change,
+    and 20 s is far too short to survive the burst of page views this exists to absorb.
+
+    Manual cached()/put() rather than get_or_set(), for the same reason as
+    protein_coverage_peptides: get_or_set can only decide from truthiness, and the DEGRADED result
+    here — no sample cleared the presence floor, or the search does not exist — is a truthy dict.
+    Caching that would stick an empty heatmap for the full 30 minutes on a search that is merely
+    mid-ingest. A hard failure (any of the four statements raising) propagates and never reaches
+    the put() at all, so it is not cached either.
+
+    KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key. Keying on the raw
+    string would let an anonymous caller mint unbounded cache entries from free text (db.TTLCache
+    has no eviction — see the F10 ticket); after normalization the key space is bounded by
+    searches x 4 modes x the route's 1..200 limit clamp.
     """
     if mode not in _MATRIX_MODES:
         mode = "cv"
-    order = _MATRIX_MODES[mode]
+    limit = int(limit)
+    key = f"matrix_{search_id}_{mode}_{limit}"
+    hit = SLOW_CACHE.cached(key)
+    if hit is not None:
+        return hit
+    result = _search_protein_matrix(search_id, mode, limit)
+    if result.get("proteins"):
+        SLOW_CACHE.put(key, result)
+    return result
 
-    def _base(rp: str) -> str:
-        return (rp or "").rstrip("/").split("/")[-1].removesuffix(".d").removesuffix(".raw")
+
+def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, Any]:
+    """The uncached body. `mode` is already validated by the caller above."""
+    order = _MATRIX_MODES[mode]
 
     # n_samples_total used to come from its own `count(DISTINCT raw_path)` (2.69s on the
     # largest search). Fix round 2: this SELECT DISTINCT below yields the identical number
@@ -4417,14 +4452,21 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     # this sorted order. `cells` below is keyed by that id, NOT by filename — privacy.redact()
     # only rewrites string VALUES under known keys (raw_path, raw_basename, ...), it never
     # renames dict KEYS, so a filename-keyed cells dict ships real acquisition filenames to the
-    # public tier no matter what the samples[] field is called. raw_path is kept (it is already
-    # sanitized by redact() and is a key the redactor knows); "basename" is spelled
-    # "raw_basename" so the same sanitizer covers it too — "basename" is not in _FILE_KEYS and
-    # would pass through untouched.
+    # public tier no matter what the samples[] field is called.
+    #
+    # THE OPAQUE ID IS THE WHOLE ROW. raw_path, raw_basename and acquisition_date used to ride
+    # along here and NOTHING read them: the grid has no header row (sample columns are unlabeled),
+    # the renderer touches only s.id and samples.length, and acquisition_date is used solely for
+    # the server-side sort three lines above. On a PUBLIC endpoint an unread field is pure leak
+    # surface — and they were the only reason this response needed privacy.redact() to work at
+    # all. Dropping them makes the public matrix STRUCTURALLY incapable of leaking a filename
+    # rather than dependent on the sanitizer continuing to know the right key names. (They were
+    # also visibly unread: the same sample came back as raw_path "run-19aba2.d" and raw_basename
+    # "run-002736" — two different hashes of two different strings — and nobody noticed.)
+    # If a future change needs a per-sample label, add it back through _FILE_KEYS-covered keys
+    # AND re-check tests/test_internal_route_gate.py's real-path component scan.
     sample_ids = {s["raw_path"]: f"s{i}" for i, s in enumerate(samples)}
-    sample_rows = [{"id": sample_ids[s["raw_path"]], "raw_path": s["raw_path"],
-                    "raw_basename": _base(s["raw_path"]),
-                    "acquisition_date": s["acquisition_date"]} for s in samples]
+    sample_rows = [{"id": sample_ids[s["raw_path"]]} for s in samples]
     n_samples_total = len(sample_rows)
 
     n_proteins_total = query(
