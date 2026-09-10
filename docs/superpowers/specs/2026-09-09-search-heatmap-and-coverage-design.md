@@ -180,7 +180,13 @@ That contrast is itself a result: **the rarity strip predicts how much the corpu
 corpus-common so the corpus knows much more; Mup2 is mouse-specific and rare, so it barely knows more
 than you do.
 
-**(f) Show modified forms, split the same way.** `delimp_precursors` carries `modified_seq_diann`,
+**(f) Show modified forms, split the same way.** **SUPERSEDED 2026-09-10 — not built on the
+search-heatmap branch, and do not build it from this paragraph.** It moved to the `ptm-sites` branch
+and `docs/superpowers/specs/2026-09-10-ptm-sites-and-modification-search-design.md`, which measured
+the columns this paragraph names and found one of them unusable: **`mods` is 1.43% populated** and is
+ruled out by name there in favour of `modified_seq_proforma` (100.00% of 249,978 sampled). The
+sentence below is kept for the worked examples only; take the data source from the PTM spec.
+`delimp_precursors` carries `modified_seq_diann`,
 `mods` and `n_mods`. Real examples pulled for Fabp1: `_YQLQSQENFEPFM[Oxidation (M)]K_`,
 `_[Acetyl (Protein N-term)]MNFSGKYQLQSQENFEPFMK_`,
 `_NEFTLGEEC[Carbamidomethyl (C)]ELETM[Oxidation (M)]TGEK_`. Colour each by whether this experiment saw
@@ -241,10 +247,17 @@ mockup; the section above records what changed and why.
   list of the most abundant proteins in shotgun proteomics, which is the sanity check that says the
   metric is sound.
 
-- **Columns:** samples (`raw_path`, basename shown), in acquisition order where
-  `raw_files.acquisition_date` is available, else name order. Acquisition order makes batch drift and
-  column-wise QC problems visible as vertical bands — the mockup showed exactly such a band on this
-  search, a block of samples where much of the panel drops out.
+- **Columns:** samples, in acquisition order where `raw_files.acquisition_date` is available, else
+  name order. Acquisition order makes batch drift and column-wise QC problems visible as vertical
+  bands — the mockup showed exactly such a band on this search, a block of samples where much of the
+  panel drops out.
+
+  **CORRECTED 2026-09-10, twice.** (1) No filename is shown or shipped: the columns are unlabeled
+  and a sample row carries only an opaque id — see the Interfaces note. Do not implement
+  "basename shown". (2) **The rationale does not hold on this search.** 0 of its 222 samples carry
+  an `acquisition_date` (86% corpus-wide), so the sort falls through to filename order and the
+  "vertical band" the mockup showed is not evidence of batch drift. The panel now states which
+  ordering is actually in force rather than asserting one the data cannot support.
 
 - **Cells always show amount:** log2 `intensity`, z-scored per row so a faint protein is as readable
   as albumin. A missing (protein, sample) pair renders as a distinct "not identified" colour, never
@@ -312,9 +325,23 @@ coverage → peptide → the whole corpus.** The heatmap is only the entry point
 delimp_protein_corpus_reach (gene PK, n_searches, n_samples, computed_at)
 
 queries.search_protein_matrix(search_id, mode='cv', limit=50) -> {
-    proteins: [{protein_group, gene, n_searches, n_samples_corpus, cells:[…]}],
-    samples:  [{raw_path, basename, acquisition_date}],
-    mode, limit, corpus_reach_computed_at, n_proteins_total, n_samples_total }
+    proteins: [{gene, protein_group, n_samples, is_contaminant, cv, mean_int,
+                reach, mean_pct_rank, reach_pct_rank, cells:{sample_id: float}}],
+    samples:  [{id}],
+    mode, limit, reach_computed_at, n_rankable, n_samples_total, n_samples_dated, floor_pct }
+
+# CORRECTED 2026-09-10. This block used to read `samples: [{raw_path, basename, acquisition_date}]`
+# and `cells:[…]`. Both were wrong in ways that SHIPPED as real leaks before being caught:
+#   - `basename` is precisely the key NOT in privacy._FILE_KEYS, so it passes through redact()
+#     untouched and reaches the public tier as a real acquisition filename.
+#   - cells keyed by filename are invisible to redact() at all — it rewrites string VALUES under
+#     known keys and never renames KEYS.
+# The shipped shape keys cells by an OPAQUE positional sample id ("s0", "s1", ...) and a sample row
+# carries that id and nothing else, so the response cannot carry a filename by construction. Do not
+# re-derive the old shape from this spec.
+# `n_proteins_total` (DISTINCT protein_group, floor ignored) was likewise replaced by `n_rankable`
+# (genes clearing the presence floor) — the panel's rows are genes, and 6,388 vs 4,005 named a
+# population the panel does not show.
 
 GET /api/search/{search_id}/matrix?mode=cv|abundance|rarity&limit=50
 GET /api/protein/{pg}/coverage?search_id=…      (search_id optional; omitted == today)

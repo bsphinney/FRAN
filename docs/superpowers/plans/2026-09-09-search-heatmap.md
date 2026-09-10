@@ -892,15 +892,38 @@ git commit -m "ingest: weekly refresh wrapper for the corpus-reach table"
 
 **Spec coverage.** §1 reach table → Tasks 1–2. §1b(a) case-insensitive → Task 1 test + Task 2 SQL.
 (b) presence floor → Task 3 constant + test. (c) rarity as annotation → Task 6 Step 2. (d) contaminant
-strip → Task 3 returns it, Task 6 renders it. (e) peptide map → Task 6 Step 3. (f) modified forms →
-Task 6 Step 3 detail card. (g) `intensity` → Global Constraints + Task 3. (h) corpus abundance →
+strip → Task 3 returns it, Task 6 renders it. (e) peptide map → Task 6 Step 3.
+**(f) modified forms → NOT IMPLEMENTED ON THIS BRANCH. Struck from this matrix at the merge gate
+(2026-09-10), deliberately, rather than left claiming coverage it does not have.** The row said
+"Task 6 Step 3 detail card"; that card ships four rows per side (precursor rows, charge states,
+runs, best q-value) and nothing about modifications, and `modified_seq|n_mods|mods` appears nowhere
+in this branch's `app/`, `ingest/` or `tests/` heatmap code. Two reasons not to implement it here
+instead. First, it now belongs to a sibling branch: `ptm-sites`, with its own measured spec at
+`docs/superpowers/specs/2026-09-10-ptm-sites-and-modification-search-design.md`. Second, and
+decisive — **the spec's prescription for (f) is wrong.** §1b(f) says to read `modified_seq_diann`,
+`mods` and `n_mods`; the PTM spec measured `mods` at **1.43% populated** and rules it out by name
+("`mods` is not a data source ... Read `modified_seq_proforma`", 100.00% of 249,978 sampled).
+Building (f) to this spec at a merge gate would build it on a column that is empty 98.6% of the
+time. Tracked there, not here.
+(g) `intensity` → Global Constraints + Task 3. (h) corpus abundance →
 Task 2 `mean_pct_rank` + Task 3 mode. §2 heatmap → Tasks 3–4, 6. §3 coverage + navigation → Tasks 5–6.
-Staleness → `reach_computed_at` returned in Task 3, rendered in Task 6.
+Staleness → `reach_computed_at` returned in Task 3; **Task 6 never rendered it** — the field went out
+on every response and reached no reader, which is the exact failure §Risks predicted. Rendered in the
+panel footer at the merge gate (2026-09-10).
 
 **Gap found and accepted:** the spec's "acquisition order makes batch drift visible" is implemented
 (Task 3 sorts on `acquisition_date`) but has no test, because the fixture's acquisition dates were
 never verified to be populated. Task 3's implementer should report how many of the 222 samples carry
 one; if it is low, say so rather than claiming the ordering works.
+
+> **ANSWERED at the merge gate, 2026-09-10 — it is not low, it is zero.** **0 of the flagship's 222
+> samples** carry an `acquisition_date` (corpus-wide: 20,026 of 23,387 `raw_files`, 86%). So on the
+> one search this feature was designed and demonstrated against, the sort falls through to filename
+> order and a vertical band is **not** evidence of batch drift — the spec's entire stated rationale
+> for the column ordering does not hold there. Not fixed by reordering (the dates genuinely do not
+> exist); fixed by refusing to claim it: `search_protein_matrix` now returns `n_samples_dated` and
+> the panel footer states which order the reader is actually looking at, naming the no-dates case
+> explicitly. The ordering code is unchanged and still correct wherever dates exist.
 
 **Placeholder scan:** no TBDs. Task 6 has no code block for the renderers — deliberate, and the one
 place this plan states requirements rather than code: it is ~200 lines of DOM construction with no

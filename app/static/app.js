@@ -612,7 +612,17 @@ async function renderSearchMatrix(searchId, mode){
     const asOf=d.reach_computed_at?String(d.reach_computed_at).slice(0,10):null;
     const corpusNote=asOf?` Corpus reach as of <b class="text-slate-300">${esc(asOf)}</b>.`
                          :` <span class="text-amber-300">Corpus reach has never been computed</span> — the rarity strip and the two corpus ranking modes are unavailable.`;
-    const note=`<div class="text-[11px] text-slate-500 mt-2">Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_proteins_total)} proteins × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among proteins in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples.${corpusNote} Click a gene name for its sequence coverage.</div>`;
+    // WHICH ORDER THE COLUMNS ARE ACTUALLY IN. The spec justifies the column ordering by "acquisition
+    // order makes batch drift visible as vertical bands" — true only where raw_files.acquisition_date
+    // exists, and it does not for every search (0 of 222 on the flagship; 86% corpus-wide). Say what
+    // the reader is looking at rather than letting them read a vertical band as batch drift when the
+    // columns are really in filename order.
+    const nDated=d.n_samples_dated;
+    const orderNote = nDated==null ? ''
+      : nDated===samples.length ? ' Columns in acquisition order.'
+      : nDated ? ` Columns in acquisition order for the <b class="text-slate-300">${fmt(nDated)}</b> of ${fmt(samples.length)} samples that carry a date, then by filename.`
+      : ` <span class="text-amber-300">Columns in filename order</span> — no sample in this search carries an acquisition date, so a vertical band here is not evidence of batch drift.`;
+    const note=`<div class="text-[11px] text-slate-500 mt-2">Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_rankable)} genes × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among genes in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples.${corpusNote}${orderNote} Click a gene name for its sequence coverage.</div>`;
     el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
       <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
       ${legend}
