@@ -53,9 +53,74 @@ Modification vocabulary — the entire corpus, as a share of *modified* precurso
 Phospho is 0.13% of *all* precursors, which extrapolates to roughly 570,000 phospho precursors
 corpus-wide.
 
-**The vocabulary being six items is the single most design-relevant fact here.** A general PTM
-search over an open modification space is a hard problem. A search over six known types, five of
-which are artifacts of sample handling and one of which is real biology, is a small one.
+> **CORRECTION, 2026-09-10 — the table above is WRONG and the "six types" claim was a measurement
+> artifact.** See "The unmapped-modification gap" immediately below. The scan that produced it
+> matched `UNIMOD:(\d+)`, so any modification the ingest failed to normalize was invisible to the
+> instrument by construction. Brett asked "what about ubiq gg" and the answer is that GlyGly — the
+> ubiquitin remnant — is present in enormous quantity and absent from that table entirely. The
+> percentages are also sample-unstable (see the Acetyl note under Task 1 in the plan's ledger:
+> 5.9% in one TABLESAMPLE, 0.05% in another, because TABLESAMPLE reads whole blocks and the table
+> is clustered by search). Treat nothing in that table as a corpus fact.
+
+### The unmapped-modification gap — the real finding
+
+`ingest/spectronaut_to_corpus.py:78-79` maps modification names to UNIMOD ids:
+
+```python
+_MOD_UNIMOD = {"Carbamidomethyl": 4, "Oxidation": 35, "Acetyl": 1,
+               "Phospho": 21, "Deamidation": 7, "Gln->pyro-Glu": 28, "Glu->pyro-Glu": 27}
+```
+
+Seven names. `_to_proforma()`'s `repl()` returns `m.group(0)` — the ORIGINAL text — for any name not
+in that dict. So an unmapped modification is stored verbatim, e.g. `K[GlyGly (K)]`, and is
+invisible to every query that looks for `UNIMOD:`.
+
+**GlyGly is not in the dict.** Measured consequence, in the three searches Brett named:
+
+| search | precursors | GG precursors | GG peptides | GG proteins |
+|---|---|---|---|---|
+| 20230803_160004_Bennett_Penn_Ubiq_July_2023 | 579,048 | **356,557 (61.6%)** | 37,866 | 5,393 |
+| 20230810_161326_Bennett_Penn_Ubiq_July_2023 | 60,802 | **40,208 (66.1%)** | 28,117 | 4,707 |
+| 20230810_163055_Bennett_Penn_Ubiq_July_2023 | 572,034 | **352,727 (61.7%)** | 35,302 | 5,312 |
+
+Roughly 750,000 GG precursors in three searches — more than all the phospho found anywhere. Twelve
+ubiquitin-named searches exist (`ubiq|digly|glygly` on `search_name`), and spot checks confirm
+`[GlyGly (K)]` stored as literal text in several.
+
+Two consequences that change this design:
+
+1. **The parser must resolve literal modification names, not only UNIMOD tags.** Fixing
+   `_MOD_UNIMOD` helps future ingests only; ~750,000 existing rows are already stored in literal
+   form, and re-ingesting them to correct a naming issue would be absurd. So `parse_proforma()`
+   needs a name→UNIMOD fallback: `[GlyGly (K)]` → UNIMOD 121, applying the same
+   `.split(" ")[0].split("(")[0]` reduction the ingest uses. The current parser's behaviour on
+   these is *safe but incomplete* — it skips unknown bracket tokens without counting them as
+   residues, so positions stay correct and nothing is corrupted; the sites simply never appear.
+2. **`_MOD_UNIMOD` gains `"GlyGly": 121`** so new ingests normalize properly, and the real fix is
+   to stop silently passing unmapped names through at all — an ingest that cannot name a
+   modification should say so, not store it as prose.
+
+**GG belongs in the variable, biological set.** It is the ubiquitin remnant: the direct readout of
+protein ubiquitination, and more biologically load-bearing than oxidation, which dominates the
+counts above and is mostly sample handling.
+
+### What the enrichment rates tell us about the phospho anomaly
+
+These ubiquitin searches run **61-66% modified**. That is what a real PTM enrichment looks like,
+and it is the comparison the phospho anomaly was missing. Against it, the `STY phospho` search's
+**0.11%** is not merely low — it is three orders of magnitude away from what an enriched experiment
+produces in this same corpus, through the same pipeline, from the same instrument platform. That
+strongly favours "something is wrong with that search or its ingest" over "the enrichment
+underperformed", and it raises the priority of the re-export diagnostic accordingly.
+
+**The methodological lesson, recorded because it is the same one this project keeps paying for.**
+The "six modification types" claim was produced by an instrument that could not have detected a
+seventh: a regex for `UNIMOD:\d+` over data where unnormalized modifications are stored as prose.
+It is the identical defect shape as the thirteen-plus assertion failures in the sibling heatmap
+plan — an observation incapable of discriminating the thing it was trusted to decide. It was caught
+by a domain expert asking an obvious question, not by the measurement. Any future claim about
+"which modifications exist in the corpus" must scan for **bracket tokens generally**, then classify,
+never for the normalized form alone.
 
 ### Position is recoverable; confidence is not
 
