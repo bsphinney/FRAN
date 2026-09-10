@@ -1,4 +1,4 @@
-from app.proforma import parse_proforma, Mod, VARIABLE_MODS
+from app.proforma import parse_proforma, Mod, VARIABLE_MODS, BIOLOGICAL_MODS, sites_in_protein
 
 
 def test_internal_mod_position_is_index_of_preceding_residue():
@@ -51,3 +51,30 @@ def test_carbamidomethyl_is_not_a_variable_mod():
     # offered as a site.
     assert 4 not in VARIABLE_MODS
     assert parse_proforma("AAC[UNIMOD:4]LLPK") == [Mod(4, "C", 3)]
+
+
+def test_glygly_is_a_variable_biological_modification():
+    # UNIMOD 121 is the ubiquitin remnant. Regression guard for a real integration gap: the ingest
+    # gained `"GlyGly": 121` (so re-ingested rows normalise to [UNIMOD:121] instead of the literal
+    # text "[GlyGly (K)]") while VARIABLE_MODS did not. The consequence was invisible by
+    # construction -- parse_proforma returned the site and sites_in_protein silently dropped it, so
+    # ~750,000 ubiquitin remnants would have rendered as unmarked residues.
+    assert 121 in VARIABLE_MODS
+    assert 121 in BIOLOGICAL_MODS          # ubiquitination is biology, not sample handling
+    assert sites_in_protein("_IGSLIDVNQSK[UNIMOD:121]DPEGLR_", 1) == [(121, 11, "K")]
+
+
+def test_every_ingest_mapped_modification_can_become_a_site():
+    # The general form of the bug above: any name the Spectronaut ingest normalises to a UNIMOD id
+    # must be classifiable here, or it parses cleanly and vanishes one layer up. Carbamidomethyl (4)
+    # is the ONE deliberate exception -- a fixed modification, a reagent, 60%+ of all modifications.
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location(
+        "_sn", pathlib.Path(__file__).resolve().parents[1] / "ingest" / "spectronaut_to_corpus.py")
+    try:
+        mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    except Exception:                       # pandas/pyarrow absent -> nothing to check here
+        return
+    unmapped = {uid for uid in mod._MOD_UNIMOD.values()
+                if uid not in VARIABLE_MODS and uid != 4}
+    assert not unmapped, f"ingest maps these UNIMOD ids that can never become sites: {unmapped}"

@@ -19,17 +19,31 @@ from typing import NamedTuple
 # site under cysteine alkylation.
 VARIABLE_MODS: dict[int, str] = {
     21: "Phospho",
+    121: "GlyGly",          # the ubiquitin remnant -- see the note below
     1: "Acetyl",
     35: "Oxidation",
     7: "Deamidated",
     27: "Glu->pyro-Glu",
+    28: "Gln->pyro-Glu",   # found by test_every_ingest_mapped_modification_can_become_a_site
 }
 _FIXED_MODS: dict[int, str] = {4: "Carbamidomethyl"}
+
+# UNIMOD 121 (GlyGly) is the ubiquitin remnant -- the direct readout of protein ubiquitination,
+# and biology, not sample handling. It is here because of a gap that existed for exactly one
+# afternoon and would otherwise have been invisible for much longer:
+# ingest/spectronaut_to_corpus.py gained `"GlyGly": 121` so that re-ingested Spectronaut rows
+# normalise to [UNIMOD:121] instead of the literal text `[GlyGly (K)]`. Without 121 in
+# VARIABLE_MODS, those rows PARSE CLEANLY -- parse_proforma returns Mod(121, 'K', pos) -- and are
+# then silently dropped by sites_in_protein's variable_only filter. A ubiquitylation site would
+# render as an unmarked residue: absent data looking exactly like clean data, which is the failure
+# mode this whole feature exists to avoid. ~750,000 GG precursors sit in the Bennett_Penn_Ubiq
+# searches (61-66% of those runs), so the blast radius was the corpus's entire ubiquitin story.
+# If a modification is added to _MOD_UNIMOD in the ingest, it must be added here too.
 
 # Modifications that are genuinely biological, versus those that are largely sample-handling
 # artifacts. Both are "variable"; only the first group is biology, and the UI should not imply
 # otherwise. Oxidation in particular is 34% of all modifications and is mostly handling.
-BIOLOGICAL_MODS: frozenset[int] = frozenset({21, 1})
+BIOLOGICAL_MODS: frozenset[int] = frozenset({21, 121, 1})
 
 _TOKEN = re.compile(r"\[UNIMOD:(\d+)\]")
 

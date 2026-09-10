@@ -644,12 +644,16 @@ function _drawPeptideMap(card, gene){
   // is reachable as "__proto__"/"toString" today (unimod_id is a Python int filtered through
   // VARIABLE_MODS, pos is integer arithmetic), but a plain-object map makes that a property of
   // the code, not just of today's data (fix round 1, MINOR #12).
-  const MOD_NAMES=Object.assign(Object.create(null),{21:'Phospho',1:'Acetyl',35:'Oxidation',7:'Deamidated',27:'Glu→pyro-Glu'});
-  const MODCOL=Object.assign(Object.create(null),{21:'#f472b6',1:'#c084fc',35:'#94a3b8',7:'#38bdf8',27:'#fb923c'});
-  // Mirrors proforma.py's BIOLOGICAL_MODS: phospho and acetyl are biology; oxidation, deamidation
-  // and Glu->pyro-Glu are largely sample-handling artifacts (proforma.py:29-32). Kept in sync by
-  // hand -- there are only 5 VARIABLE_MODS and they change rarely; not worth a round trip.
-  const BIO_MODS=new Set([21,1]);
+  const MOD_NAMES=Object.assign(Object.create(null),{21:'Phospho',121:'GlyGly (ubiquitin)',1:'Acetyl',35:'Oxidation',7:'Deamidated',27:'Glu→pyro-Glu',28:'Gln→pyro-Glu'});
+  const MODCOL=Object.assign(Object.create(null),{21:'#f472b6',121:'#a3e635',1:'#c084fc',35:'#94a3b8',7:'#38bdf8',27:'#fb923c',28:'#f59e0b'});
+  // Mirrors proforma.py's BIOLOGICAL_MODS: phospho, GlyGly (the ubiquitin remnant) and acetyl are
+  // biology; oxidation, deamidation and Glu->pyro-Glu are largely sample-handling artifacts.
+  // Kept in sync BY HAND with proforma.py, and that sync has already failed once: GlyGly was added
+  // to the ingest's _MOD_UNIMOD without being added to VARIABLE_MODS, so ~750,000 ubiquitin
+  // remnants would have parsed cleanly and then been dropped a layer up -- absent data looking
+  // exactly like clean data. If you add a modification in proforma.py, add it to MODCOL, MOD_NAMES
+  // and BIO_MODS here in the same change.
+  const BIO_MODS=new Set([21,121,1]);
   const siteAt=Object.create(null);
   (d.sites||[]).forEach(s=>{ (siteAt[s.pos]=siteAt[s.pos]||[]).push(s); });
   const pctAll=Math.round(1000*anyRes.filter(Boolean).length/L)/10;
