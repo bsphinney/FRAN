@@ -46,6 +46,30 @@ def test_site_positions_agree_with_the_protein_sequence():
                 f"site claims {s['residue']} at {s['pos']} but sequence has {seq[s['pos']-1]}")
 
 
+def test_scoped_occupancy_uses_the_scoped_denominator_not_the_corpus_one():
+    # Fix round 1, CRITICAL #1: occupancy divided a search-scoped numerator by a corpus-wide
+    # denominator, so every scoped occupancy on a protein seen in >1 search read low by exactly
+    # the corpus/scoped precursor ratio. RS41 is in exactly 2 searches, so the bug's own fixture
+    # displayed "50%" everywhere the true, scoped value is 100% -- pinned here so it cannot
+    # regress silently. Proven able to fail: reverting the `here_n_precursors`-based denominator
+    # in queries.py back to summing corpus-wide n_precursors makes this assert 0.5, not 1.0.
+    d = queries.protein_coverage_peptides(RS41, search_id=PHOSPHO_SEARCH)
+    fully_occupied = {239, 254, 272, 274, 284, 286}  # measured 2026-09-10 against this fixture
+    seen = {s["pos"]: s["occupancy"] for s in d["sites"] if s["pos"] in fully_occupied}
+    assert seen.keys() == fully_occupied, f"expected sites at {fully_occupied}, saw {seen.keys()}"
+    for pos, occ in seen.items():
+        assert occ == 1.0, f"position {pos}: expected occupancy 1.0 (fully scoped), got {occ}"
+
+
+def test_unscoped_call_computes_no_sites():
+    # Fix round 1, MAJOR #6: the sites aggregate is now gated on search_id. Nothing renders sites
+    # on the unscoped standalone protein page (loadCoverage() in app.js never reads d.sites), so
+    # computing them there was pure waste -- measured 2.12s thrown away per uncached BSA load.
+    # RS41 is a real phosphoprotein; if this returns non-empty, the gate has regressed.
+    d = queries.protein_coverage_peptides(RS41)
+    assert d.get("sites") == []
+
+
 def test_unmodified_protein_returns_todays_shape_exactly():
     # The live-regression guard. A protein with no variable modifications must be untouched.
     #

@@ -2892,6 +2892,10 @@ def protein_coverage_peptides(protein_group: str, limit: int = 4000,
     statement shouldn't stick for the whole TTL when the very next request might just work. (Manual
     cached()/put() rather than get_or_set because get_or_set can only decide "cache" vs "don't" from
     truthiness, and this result must be truthy — it carries real peptides — while still not caching.)
+
+    Same rule for sites_unavailable=True (fix round 1, MAJOR #5): a failed sites aggregate must not
+    be cached as "no modifications", or a transient stall sticks for the whole TTL and every viewer
+    in that window sees a clean-looking unmodified protein that was really just a timeout.
     """
     pg = (protein_group or "").strip()
     key = f"covpep_{pg}" if not search_id else f"covpep_{pg}_{search_id}"
@@ -2899,7 +2903,7 @@ def protein_coverage_peptides(protein_group: str, limit: int = 4000,
     if hit is not None:
         return hit
     result = _protein_coverage_peptides(pg, limit, search_id)
-    if result and not result.get("scope_unavailable"):
+    if result and not result.get("scope_unavailable") and not result.get("sites_unavailable"):
         CACHE.put(key, result)
     return result or {"gene": None, "peptides": [], "sites": []}
 
@@ -3019,27 +3023,41 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
     # matches, including one at 3,884/3,884) before trusting it as a filter -- `mods` and
     # `normalized_intensity` are both columns that looked authoritative and were nearly empty, so
     # this one was checked rather than assumed. They agreed everywhere sampled; kept as-is.
+    #
+    # GATED ON search_id (fix round 1, MAJOR #6). The only renderer that reads `sites`
+    # (_drawPeptideMap, behind the search-scoped protein x sample matrix) never runs on the
+    # unscoped standalone protein page -- that page's loadCoverage() ignores d.sites entirely.
+    # Before this gate, every uncached load of that page (the most-visited protein view) paid for
+    # this whole aggregate and threw the result away -- measured 2.12s wasted on P02769 (BSA).
+    # Computing sites only when scoped also means every numerator below is already search-scoped,
+    # which the occupancy fix just below depends on.
     sites: list[dict] = []
-    if peps:
+    if peps and search_id:
         try:
-            params = [pg]
-            scope = ""
-            if search_id:
-                scope = " AND search_id = %s"
-                params.append(search_id)
+            # array_agg(DISTINCT raw_path), not COUNT(DISTINCT raw_path): two modforms of the SAME
+            # site can share runs, and a per-modform MAX (the original shape) understated the
+            # tooltip's "in N runs" as a plain count when it was really the largest single modform's
+            # run set (fix round 1, MINOR #11). The true per-site run count is the UNION of every
+            # modform's run set, which only a per-row set (not a per-row count) can support.
+            # raw_path itself never leaves this function -- only len() of the merged set does.
             modrows = query(
-                f"""SELECT modified_seq_proforma, stripped_seq,
-                           COUNT(*)                 AS n_precursors,
-                           COUNT(DISTINCT raw_path) AS n_runs
-                      FROM delimp_precursors
-                     WHERE protein_group = %s AND n_mods > 0{scope}
-                     GROUP BY modified_seq_proforma, stripped_seq""",
-                tuple(params), tables=["delimp_precursors"], timeout_ms=15000,
+                """SELECT modified_seq_proforma, stripped_seq,
+                          COUNT(*)                     AS n_precursors,
+                          array_agg(DISTINCT raw_path)  AS raw_paths
+                     FROM delimp_precursors
+                    WHERE protein_group = %s AND search_id = %s AND n_mods > 0
+                    GROUP BY modified_seq_proforma, stripped_seq""",
+                (pg, search_id), tables=["delimp_precursors"], timeout_ms=15000,
             )
-        except Exception:  # noqa: BLE001 - a missing sites list degrades the panel, never 503s it
-            modrows = []
+        except Exception:  # noqa: BLE001 - degrade to "sites unavailable", never 503. This is now
+            # (fix round 1, MAJOR #5) distinguished from "queried and found none": modrows=None here
+            # sets sites_unavailable below, rather than falling through to an empty `sites` list that
+            # is indistinguishable from a genuinely unmodified protein and would get cached as one.
+            modrows = None
 
-        if modrows:
+        if modrows is None:
+            result["sites_unavailable"] = True
+        elif modrows:
             # `peps` is the raw stripped_seq aggregate above -- it carries no protein coordinates.
             # Those only exist once a peptide has been mapped onto the CANONICAL sequence, which
             # today happens later, in the /coverage route, after this function returns (it fetches
@@ -3054,7 +3072,10 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
 
             seq = "" if is_custom_accession(pg, gene) else cov.fetch_uniprot_sequence(pg.split(";")[0].strip())
             if seq:
-                mapped_peps = cov.map_coverage(seq, peps)["peptides"]  # new dicts; `peps` untouched
+                mapped_peps = cov.map_coverage(seq, peps)["peptides"]  # new dicts; `peps` untouched,
+                # but "here"/"here_n_precursors" (set on `peps` items above, when the here-lookup
+                # succeeded) are copied forward by map_coverage()'s `{k: p[k] for k in p ...}` -- the
+                # occupancy fix below depends on that carrying through.
                 starts = {p["stripped_seq"]: p["start"] for p in mapped_peps}
                 agg: dict[tuple[int, int], dict] = {}
                 for r in modrows:
@@ -3064,19 +3085,34 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
                     for uid, pos, residue in sites_in_protein(r["modified_seq_proforma"], start):
                         k = (uid, pos)
                         s = agg.setdefault(k, {"pos": pos, "residue": residue, "unimod_id": uid,
-                                               "name": mod_name(uid), "n_precursors": 0, "n_runs": 0})
+                                               "name": mod_name(uid), "n_precursors": 0, "_runs": set()})
                         s["n_precursors"] += int(r["n_precursors"] or 0)
-                        s["n_runs"] = max(s["n_runs"], int(r["n_runs"] or 0))
-                # Occupancy: modified precursors at this position over ALL precursors covering it. A
-                # site shown without this reads as "this residue is phosphorylated", which is not
-                # what partial occupancy means -- and partial is the normal case.
+                        s["_runs"].update(r["raw_paths"] or [])
+                for s in agg.values():
+                    s["n_runs"] = len(s.pop("_runs"))
+                # Occupancy: modified precursors at this position over precursors covering it IN
+                # THE SAME SCOPE as the numerator above (fix round 1, CRITICAL #1). Sites are only
+                # ever computed with search_id set (the gate above), so every numerator here is
+                # already this-search-scoped -- the denominator must be too, or it silently compares
+                # two different populations. Measured before the fix: on P92966 (present in exactly
+                # 2 searches), every scoped occupancy read at exactly half of true, because the old
+                # denominator summed n_precursors corpus-wide (both searches) against a numerator
+                # scoped to one. here_n_precursors is exactly the search-scoped precursor count for
+                # a peptide (set on `peps` by the here-lookup above, before map_coverage() copied it
+                # forward); a peptide absent from this search carries no here_n_precursors key at
+                # all (absence-not-zero, same discipline as "here" itself) and is correctly excluded
+                # from the scoped denominator rather than contributing a lying zero.
                 cover: dict[int, int] = {}
-                for p in mapped_peps:
-                    st, en = p.get("start"), p.get("end")
-                    if not st:
-                        continue
-                    for i in range(st, en + 1):
-                        cover[i] = cover.get(i, 0) + int(p.get("n_precursors") or 0)
+                if not result.get("scope_unavailable"):
+                    for p in mapped_peps:
+                        st, en, n = p.get("start"), p.get("end"), p.get("here_n_precursors")
+                        if not st or n is None:
+                            continue
+                        for i in range(st, en + 1):
+                            cover[i] = cover.get(i, 0) + int(n)
+                # When scope_unavailable is True, cover stays empty and every occupancy below comes
+                # out None -- omitted rather than guessed, because there is no reliable scoped
+                # denominator to guess with.
                 for s in agg.values():
                     tot = cover.get(s["pos"]) or 0
                     s["occupancy"] = round(s["n_precursors"] / tot, 4) if tot else None
