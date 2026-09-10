@@ -65,13 +65,63 @@ Sampling 400 phospho precursors:
 - Residue distribution: **S 81.7%, T 14.1%, Y 4.0%**. That is textbook phosphoproteomics
   (canonical is ~85/13/2). The parse is correct and the underlying data is real biology, not
   search noise.
-- `site_localization_probability` is NULL on every row in the corpus. **FRAN has no site
-  localization confidence and cannot compute one from what it stores.**
+- `site_localization_probability` is NULL on every row in the corpus.
 
-That last point is a hard constraint, not a nuance. A phospho site FRAN displays is *the position
-the search engine reported*, with no independent evidence that the engine put it on the right
-residue. Site localization is the single most contested number in phosphoproteomics. The UI must
-say so, in the interface, not in a doc.
+### Localization is missing because nobody asked for it — and it is recoverable
+
+Brett: *"I do want site localization to be displayed by FRAN."* Chasing why it is empty produced a
+much better answer than "we don't have it". The data was never lost; it was never requested.
+
+The chain, each link verified:
+
+1. **Nothing in `ingest/` writes `site_localization_probability`.** `grep` across every ingest
+   script returns zero hits. The column was created and never populated.
+2. **The Spectronaut report schema FRAN asks for has no localization column.** `COLMAP` in
+   `ingest/spectronaut_to_corpus.py:32-74` maps 30 columns — run, protein group, q-values,
+   fragments, ion mobility — and not one PTM localization field. Spectronaut exports
+   `EG.PTMLocalizationProbabilities` / `EG.PTMAssayProbability` when the schema includes them.
+   FRAN's schema does not include them, so they are absent from every report ever ingested.
+3. **FRAN drives that export itself.** `ingest/sne_export.py` runs
+   `spectronaut manageSNE -sne <file.sne> -o <out> -rs <report_schema>`. The schema is ours. The
+   `.sne` project files are the Spectronaut results, and they are on disk.
+4. **Therefore historical searches are recoverable by re-export, without re-searching.** Add the
+   localization columns to the report schema, re-export the affected `.sne` files, re-ingest.
+
+This matters for the engine mix: **spectronaut 2,008 searches, diann 76, radiant 1, fragpipe 1.**
+Spectronaut is 96% of the corpus, so the Spectronaut path is the one that decides whether FRAN can
+show localization at all.
+
+On the DIA-NN side (76 searches) the columns already exist in `report.parquet`:
+`PTM.Site.Confidence`, `Site.Occupancy.Probabilities`, `Protein.Sites`, `Lib.PTM.Site.Confidence`.
+Measured on one report: `PTM.Site.Confidence` is 100% populated but reads `1.0` on peptides with
+no modification at all, so it defaults rather than meaning anything on unmodified rows;
+`Site.Occupancy.Probabilities` and `Protein.Sites` were 0% populated on that report, which had no
+variable modifications whatsoever. **Populated-but-defaulted is exactly the `mods` trap again:
+presence is not evidence of meaning, and any ingest of these columns must be validated on a report
+that actually contains phospho.**
+
+Until a re-export lands, a site FRAN displays is *the position the search engine reported*, with no
+independent evidence the engine put it on the right residue. Site localization is the most
+contested number in phosphoproteomics. The UI must say so in the interface, not in a doc — and it
+must be built so that adding real localization scores later changes the badge, not the layout.
+
+### An anomaly the re-export will settle
+
+Search `2c4911a3-…` is named `20260528_093510_Toshi-uniprot-STY phospho.sne` — a dedicated STY
+phospho experiment. FRAN holds 454,865 precursors for it and finds **519 phospho** (0.11%), 79
+peptides across 62 proteins. For a phospho-enriched sample that is implausibly low; enrichment
+should make phosphopeptides a large fraction, not a rounding error.
+
+Two possible explanations, and this spec does not guess between them:
+
+- the enrichment underperformed, or the sample was not enriched despite the name, or
+- something between Spectronaut and `delimp_precursors` is dropping phospho identifications.
+
+The `_to_proforma()` conversion is **not** the culprit — `_MOD_UNIMOD` maps `Phospho -> 21` and
+`name.split(" ")[0].split("(")[0]` correctly reduces `[Phospho (STY)]` to `Phospho`, verified by
+reading the code. Beyond that, the re-export is the cheapest discriminator: exporting this one
+`.sne` with a PTM-inclusive schema and comparing its phospho count against FRAN's 519 answers it
+outright. **Do that before building Phase 2 on top of these numbers.**
 
 ### One parsing subtlety that will silently corrupt positions if missed
 
@@ -278,14 +328,42 @@ rather than becoming a second, parallel search UI.
 - Modification-aware XIC or fragment views.
 - Open/unrestricted modification search. The vocabulary is six known types.
 
+## Decisions taken (previously open questions)
+
+Brett: *"I don't know how to answer your questions"* — correctly, because they were implementation
+calls dressed up as product ones. Decided here, with the reasoning, so they can be overturned on
+the merits later.
+
+1. **`idx_prec_mods_gin` and the `mods` column — leave both alone, read `modified_seq_proforma`.**
+   The column is empty *by construction*, not by accident: `ingest/spectronaut_to_corpus.py:199`
+   writes `"mods": None` with the comment `# full mod JSON TODO; proforma carries detail`. Since
+   Spectronaut is 96% of the corpus, that one line is the whole 1.43% figure. Dropping the index is
+   DDL on a 238 GB table and backfilling is a 437 M-row rewrite; neither buys anything this feature
+   needs, because the proforma column is 100% populated and already indexed *by protein group*,
+   which is the access path Phase 1 uses. Recorded as a comment beside the proforma read so the
+   next person does not re-derive this.
+
+2. **Scope to VARIABLE modifications; exclude Carbamidomethyl.** Brett: *"I think we should focus
+   on variable PTMs as those are not reagent based and more biological."* Agreed, and it also
+   solves the sizing risk — Carbamidomethyl is 60.9% of all modifications and would have dominated
+   both `delimp_ptm_site` and every chart on the landscape page while carrying no biological
+   information at all. The five in scope are Oxidation (35), Acetyl (1), Phospho (21), Deamidated
+   (7), Glu->pyro-Glu (27).
+
+   One honesty caveat to carry into the UI rather than bury: *variable* is not the same as
+   *biological*. Oxidation is 34% of modifications and is largely a sample-handling artifact;
+   Glu->pyro-Glu likewise. Phospho and N-terminal Acetyl are the genuinely biological ones. The
+   landscape page should group them by that distinction rather than implying all five are biology.
+
+3. **`delimp_ptm_site` scope decided on the first refresh run.** With Carbamidomethyl excluded the
+   size risk largely evaporates, but the first run still reports its row count before anything is
+   built on top of it.
+
 ## Open questions for Brett
 
-1. **`idx_prec_mods_gin` and the `mods` column** — 1.43% populated with a GIN index on it. Drop the
-   index, backfill the column, or leave both alone? This spec leaves them alone and reads
-   `modified_seq_proforma`, but the dead index is a trap for whoever comes next.
-2. **Fixed modifications on the landscape page** — Carbamidomethyl is 60.9% of all modifications
-   and is a fixed modification, i.e. a reagent, not biology. Show it (honest, but it dominates
-   every chart) or separate fixed from variable modifications?
-3. **Phase 2 scope** — is `delimp_ptm_site` worth building for all six modification types, or only
-   phospho plus whatever is genuinely variable? This can be decided on the first refresh run's
-   measured row count rather than now.
+1. **Re-export scope.** Recovering localization means re-exporting `.sne` files with a
+   PTM-inclusive report schema and re-ingesting. Doing that for all 2,008 Spectronaut searches is a
+   large batch job. Doing it only for searches that already show variable PTMs is far cheaper and
+   covers the actual need. Recommend the latter, starting with the one STY phospho search as the
+   proof — but the report schema change is Brett's to make in Spectronaut, so this needs him
+   either way.
