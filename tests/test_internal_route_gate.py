@@ -7,6 +7,11 @@ code, but only ever exercised the POSITIVE (full-access) path against it. Nothin
 NEGATIVE path — a caller who is NOT full — and scripts/predeploy_check.py's CRITICAL_ROUTES list
 doesn't cover any /api/internal/* route either, so nothing guards the gate itself.
 
+WIDENED (2026-09): the original version of this test exercised only /api/internal/submissions by
+name, so a new internal route inherited zero coverage. It now enumerates every /api/internal/*
+path straight off app.routes and probes each one, so the day a route is added without its own
+`if not db.is_full(): raise HTTPException(404)` guard, this suite goes red on its own.
+
 DELIBERATE DEVIATION from every other test in this suite: those set DELIMP_INTERNAL_MODE=1 before
 importing app.db, because they need to READ the internal tables. THIS test needs the opposite —
 app.db.INTERNAL_MODE must be False (the env var unset) — because it exists to prove that WITHOUT
@@ -60,6 +65,29 @@ with TestClient(app) as client:
           r.status_code == 404, f"{r.status_code}: {r.text[:300]}")
     check("...and the response body carries no submission data",
           "internal_id" not in r.text and "institute" not in r.text, r.text[:300])
+
+    # --- grows with the app: enumerate every /api/internal/* route straight off the live FastAPI
+    # app instead of naming them by hand, so a route added later inherits this coverage on day
+    # one rather than waiting for the next audit to notice it was never gated. Path parameters are
+    # filled with a harmless placeholder purely so the route resolves; the value never reaches SQL
+    # because the gate raises before any query runs.
+    internal_paths = sorted(
+        {getattr(r, "path", "") for r in app.routes if getattr(r, "path", "").startswith("/api/internal/")}
+    )
+    check("at least one /api/internal/* route exists to enumerate "
+          "(if this is empty the loop below would pass vacuously)",
+          len(internal_paths) > 0, str(internal_paths))
+    for p in internal_paths:
+        probe = (p.replace("{submission_id}", "x")
+                   .replace("{name:path}", "x")
+                   .replace("{pi:path}", "x"))
+        # ?q=x satisfies api_internal_people_search's required `q` query param so FastAPI's own
+        # request-validation doesn't pre-empt the gate with a 422 before db.is_full() ever runs
+        # (found live: the bare probe returned 422, not 404, for exactly this route). Every other
+        # route either ignores the extra param or already defaults it.
+        rr = client.get(probe + "?q=x")
+        check(f"GET {p} refuses a non-full caller with 404 (not 200, not 500)",
+              rr.status_code == 404, f"{rr.status_code}: {rr.text[:200]}")
 
     # --- teeth proof, without editing the production security gate ----------------------------
     # The usual teeth-proof pattern in this suite (break production, run, confirm FAIL, restore,

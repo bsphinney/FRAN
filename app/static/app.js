@@ -538,14 +538,25 @@ async function srTab(which){
     if(which==='people'){
       const d=await api(`/api/internal/people_search?q=${encodeURIComponent(q)}&limit=100`);
       if(!d.rows||!d.rows.length){ body.innerHTML=empty('No PI, submitter, submission number, or institute matches. Try a surname (e.g. "Palczewski") or a submission number.'); return; }
-      body.innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} searches matched by PI · submitter · submission · institute (confidential)</div>`+table(
+      body.innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} matches by PI · submitter · submission · institute (confidential)</div>`+table(
         ['Search','CoreOmics PI · institute','Submission','Engine','Precursors'],
         d.rows.map(r=>{
+          // Two row kinds share this table: kind==='search' (from delimp_search_provenance,
+          // institute aliased co_institute, submission id under coreomics_submission_id) and
+          // kind==='submission' (a submission stub with no linked search yet — institute is
+          // unaliased `institute`, and its number lives in `internal_id`, not
+          // coreomics_submission_id, which is None on a stub). See internal_people_search().
+          const isSub=r.kind==='submission';
+          const institute=r.co_institute||r.institute;
           const coPI=[r.pi_first_name,r.pi_last_name].filter(Boolean).join(' ')||[r.submitter_first_name,r.submitter_last_name].filter(Boolean).join(' ')||r.customer_contact||'';
-          const who=coPI?`<span class="text-emerald-300 cursor-pointer hover:underline" onclick="event.stopPropagation();go('lab','${esc((coPI||'').replace(/'/g,"\\'"))}')" title="Open lab page">${esc(coPI)}</span>${r.co_institute?`<div class="text-[10px] text-slate-500">${esc(r.co_institute)}</div>`:''}`:(r.path_hint?`<span class="text-slate-400">path: ${esc(r.path_hint)}</span>`:'<span class="text-slate-600">—</span>');
-          const subCell=r.coreomics_submission_id?`<span onclick="event.stopPropagation();go('submission','${esc(r.coreomics_submission_id)}')" class="text-accent-400 cursor-pointer hover:underline font-mono text-xs" title="Open submission — all its searches">#${esc(r.coreomics_submission_id)}</span>`:'<span class="text-slate-600">—</span>';
+          const who=coPI?`<span class="text-emerald-300 cursor-pointer hover:underline" onclick="event.stopPropagation();go('lab','${esc((coPI||'').replace(/'/g,"\\'"))}')" title="Open lab page">${esc(coPI)}</span>${institute?`<div class="text-[10px] text-slate-500">${esc(institute)}</div>`:''}`:(r.path_hint?`<span class="text-slate-400">path: ${esc(r.path_hint)}</span>`:'<span class="text-slate-600">—</span>');
+          const subId=isSub?r.internal_id:r.coreomics_submission_id;
+          const subCell=subId?`<span onclick="event.stopPropagation();go('submission','${esc((subId||'').replace(/'/g,"\\'"))}')" class="text-accent-400 cursor-pointer hover:underline font-mono text-xs" title="Open submission — all its searches">#${esc(subId)}</span>`:'<span class="text-slate-600">—</span>';
+          const searchCell=isSub
+            ? `<span class="text-accent-400 cursor-pointer hover:underline" onclick="event.stopPropagation();go('submission','${esc((r.internal_id||'').replace(/'/g,"\\'"))}')">📋 ${esc(r.internal_id)}</span><div class="text-[10px] text-slate-500">submission — no linked search yet</div>`
+            : `<span class="text-accent-400 cursor-pointer hover:underline" onclick="event.stopPropagation();go('run','${esc((r.search_id||'').replace(/'/g,"\\'"))}')">${esc(r.real_search_name||'—')}</span>${r.client?`<div class="text-[10px] text-slate-500">${esc(r.client)}</div>`:''}`;
           return [
-            `<span class="text-accent-400 cursor-pointer hover:underline" onclick="event.stopPropagation();go('run','${esc(r.search_id)}')">${esc(r.real_search_name||'—')}</span>${r.client?`<div class="text-[10px] text-slate-500">${esc(r.client)}</div>`:''}`,
+            searchCell,
             who, subCell,
             r.search_engine?esc(r.search_engine):'—', r.n_precursors_total!=null?fmt(r.n_precursors_total):'—'];
         }));
@@ -2134,7 +2145,13 @@ async function renderSubmissions(){
   const q = (window.__SUBS_Q__||'');
   const el = $('#subQ'); if(el){ el.value=q; el.oninput=e=>{ window.__SUBS_Q__=e.target.value; }; }
   try{
-    const d = await api(`/api/internal/submissions?limit=100&q=${encodeURIComponent(q)}`);
+    // Fetch every submission rather than paging: the reviewer measured fetching all 792 as
+    // FASTER than fetching 100 (1.27s vs 1.69s — the n_searches correlated subquery is not the
+    // bottleneck), and this page's whole point is a browsable "every submission" directory, so a
+    // silent 100-row cap under a header claiming the true total left 692 unreachable. 5000 is
+    // comfortably above any size this corpus reaches for the foreseeable future; revisit with
+    // real offset paging (the backend already accepts `offset`) well before it isn't.
+    const d = await api(`/api/internal/submissions?limit=5000&q=${encodeURIComponent(q)}`);
     const rows = d.submissions||[];
     if(!rows.length){ $('#subsBody').innerHTML=empty('No submissions match.'); return; }
     // Three states, never a blank cell. "not located" is the honest answer for anything the
@@ -2149,7 +2166,7 @@ async function renderSubmissions(){
       : (s.run_count!=null || s.service_folder)
         ? `<span class="text-accent-400">📦 ${s.run_count!=null?fmt(s.run_count)+' runs':''} on the share</span>
            ${s.service_folder?`<div class="text-[10px] text-slate-500 font-mono break-all mt-0.5" title="${esc(s.service_folder_win||'')}">${esc(s.service_folder)}</div>`:''}
-           <button onclick="event.stopPropagation();exportReport('${esc(s.submission_id)}',this,'resubmit')" class="mt-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a HIVE/Flinders re-search brief for this un-ingested data">🔄 Re-search this data</button>`
+           <button onclick="event.stopPropagation();exportReport('${esc((s.submission_id||'').replace(/'/g,"\\'"))}',this,'resubmit')" class="mt-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a HIVE/Flinders re-search brief for this un-ingested data">🔄 Re-search this data</button>`
         : `<span class="text-slate-600">— not located</span>`;
     $('#subsBody').innerHTML =
       `<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} numbered submission${d.total===1?'':'s'}${d.locations_as_of?` · share locations as of ${esc(String(d.locations_as_of))}`:''}</div>`
@@ -2161,7 +2178,7 @@ async function renderSubmissions(){
             s.num_samples!=null?fmt(s.num_samples):'—',
             `<span class="font-mono text-xs">${esc(String(s.submitted_at||'—'))}</span>`,
             state(s)]),
-          rows.map(s=>`go('submission','${esc(s.internal_id)}')`));
+          rows.map(s=>`go('submission','${esc((s.internal_id||'').replace(/'/g,"\\'"))}')`));
   }catch(e){ dbError(e,'#subsBody'); }
 }
 

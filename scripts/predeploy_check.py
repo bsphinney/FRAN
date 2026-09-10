@@ -472,6 +472,27 @@ try:
             if "/static/app.js" not in html:
                 block("[5 smoke] rendered page does not reference /static/app.js")
 
+        # Guard the internal-tier GATE, not just route presence. CRITICAL_ROUTES above is a
+        # set-subtraction against {r.path for r in app.routes} — it would still be green if the
+        # `if not db.is_full(): raise HTTPException(404)` guard inside a route were deleted
+        # entirely, because the route itself would still exist. This loop is what actually proves
+        # the gate: every /api/internal/* route must refuse an anonymous, non-full caller (the
+        # DELIMP_INTERNAL_MODE scrub at the top of this file keeps this TestClient exactly that).
+        internal_paths = sorted(p for p in paths if p.startswith("/api/internal/"))
+        if not internal_paths:
+            block("[5 gate] no /api/internal/* routes found to check — if the internal tier was "
+                  "removed entirely, delete this loop too; otherwise something broke enumeration")
+        for p in internal_paths:
+            probe = (p.replace("{submission_id}", "x")
+                       .replace("{name:path}", "x")
+                       .replace("{pi:path}", "x"))
+            # ?q=x satisfies api_internal_people_search's required `q` query param so FastAPI's
+            # own request validation doesn't pre-empt the gate with a 422 before db.is_full()
+            # ever runs; every other route either ignores the extra param or already defaults it.
+            rr = c.get(probe + "?q=x")
+            if rr.status_code != 404:
+                block(f"[5 gate] {p} -> {rr.status_code} for an anonymous caller (expected 404)")
+
         # Both MCP StreamableHTTP mounts need their task group entered by the shared
         # AsyncExitStack lifespan. If one is dropped the app still boots and / still
         # renders 200 — but every request to that mount raises "Task group is not
