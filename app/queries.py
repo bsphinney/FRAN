@@ -2873,18 +2873,37 @@ def peptides_showcase() -> dict[str, Any]:
     return SLOW_CACHE.get_or_set("peptides_showcase", _p)
 
 
-def protein_coverage_peptides(protein_group: str, limit: int = 4000) -> dict[str, Any]:
+def protein_coverage_peptides(protein_group: str, limit: int = 4000,
+                              search_id: str | None = None) -> dict[str, Any]:
     """Candidate observed peptides for a protein group (coverage map). CACHED: api_protein and
     api_protein_coverage BOTH call this for the same page, and a re-load re-calls it — caching means
     one successful scan serves all of them (consistent: no more 'map shows 83 but table shows 0' when
     one of the parallel calls times out). A failed/empty scan returns falsy -> NOT cached (get_or_set
-    skips falsy) -> retried next time, so a transient timeout doesn't stick."""
+    skips falsy) -> retried next time, so a transient timeout doesn't stick.
+
+    With search_id, each peptide gains "here": whether THIS search saw it. Without it the return is
+    unchanged, so every existing caller is untouched. The cache key includes the scope; sharing one
+    key between scoped and unscoped calls would serve one shape to a caller expecting the other.
+
+    A degraded scoped result (the corpus scan succeeded but the "here" lookup itself failed) comes
+    back with peptides but no "here" keys, plus scope_unavailable=True, and is deliberately NOT
+    cached — same reasoning as the falsy-result case below: a transient failure on that one
+    statement shouldn't stick for the whole TTL when the very next request might just work. (Manual
+    cached()/put() rather than get_or_set because get_or_set can only decide "cache" vs "don't" from
+    truthiness, and this result must be truthy — it carries real peptides — while still not caching.)
+    """
     pg = (protein_group or "").strip()
-    cached = CACHE.get_or_set(f"covpep_{pg}", lambda: _protein_coverage_peptides(pg, limit))
-    return cached or {"gene": None, "peptides": []}
+    key = f"covpep_{pg}" if not search_id else f"covpep_{pg}_{search_id}"
+    hit = CACHE.cached(key)
+    if hit is not None:
+        return hit
+    result = _protein_coverage_peptides(pg, limit, search_id)
+    if result and not result.get("scope_unavailable"):
+        CACHE.put(key, result)
+    return result or {"gene": None, "peptides": []}
 
 
-def _protein_coverage_peptides(pg: str, limit: int) -> dict[str, Any] | None:
+def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None) -> dict[str, Any] | None:
     try:  # live table under ingestion load -> tight timeout, degrade to no gene rather than 503
         gene = query(
             "SELECT MAX(gene) AS gene FROM delimp_proteins WHERE protein_group = %s",
@@ -2940,7 +2959,50 @@ def _protein_coverage_peptides(pg: str, limit: int) -> dict[str, Any] | None:
     # page load forever. So gate on whether the query SUCCEEDED, not on whether it returned rows.
     if not ok:
         return None            # falsy -> not cached by get_or_set -> retried next request
-    return {"gene": gene, "peptides": peps}
+    result = {"gene": gene, "peptides": peps}
+    if search_id and peps:
+        try:
+            # One extra indexed lookup, not a re-derivation: idx_prec_protein_group covers this too.
+            # GROUP BY (not SELECT DISTINCT) so the UI can show a real this-experiment vs corpus
+            # comparison ("found in 187 of your runs; the corpus has seen it in 900") instead of a
+            # bare found/not-found flag next to corpus-only numbers — a boolean next to four corpus
+            # aggregates isn't a comparison. Same WHERE clause as before, so the membership test
+            # ("stripped_seq = ANY") that decides "here" is unchanged; this only widens what's
+            # SELECTed for the matched rows. The substring "stripped_seq = ANY" must stay in this
+            # SQL text verbatim -- tests/test_coverage_scope.py's degrade test keys off it to
+            # simulate a failure of only this lookup, not its siblings.
+            here_rows = query(
+                """SELECT stripped_seq,
+                          COUNT(*)                 AS n_precursors,
+                          COUNT(DISTINCT raw_path) AS n_runs,
+                          COUNT(DISTINCT charge)   AS n_charges,
+                          MIN(q_value)             AS best_q_value
+                     FROM delimp_precursors
+                    WHERE protein_group=%s AND search_id=%s AND stripped_seq = ANY(%s)
+                    GROUP BY stripped_seq""",
+                (pg, search_id, [p["stripped_seq"] for p in peps]),
+                tables=["delimp_precursors"],
+                timeout_ms=10000,
+            )
+            here_map = {r["stripped_seq"]: r for r in here_rows}
+            for p in peps:
+                hr = here_map.get(p["stripped_seq"])
+                p["here"] = hr is not None
+                if hr is not None:
+                    # Only set on a hit -- a peptide NOT found here gets no here_* keys at all,
+                    # same absence-not-zero discipline as "here" itself. "0 precursors" here would
+                    # read as "checked, found nothing", which is not what an unmatched row means.
+                    p["here_n_precursors"] = hr["n_precursors"]
+                    p["here_n_runs"] = hr["n_runs"]
+                    p["here_n_charges"] = hr["n_charges"]
+                    p["here_best_q_value"] = hr["best_q_value"]
+        except Exception:  # noqa: BLE001 - degrade: leave "here" (and here_*) ABSENT (never
+            # here=False — that would lie that this search found nothing), flag the scope as
+            # unavailable so the caller can say "comparison unavailable" instead of colouring every
+            # peptide corpus-only, and the caller's cache decision (see protein_coverage_peptides)
+            # skips caching this result.
+            result["scope_unavailable"] = True
+    return result
 
 
 def peptide_charge_distribution(stripped_seq: str) -> dict[str, Any]:
@@ -4302,3 +4364,229 @@ def engine_species_summary(limit: int = 60) -> list[dict[str, Any]]:
             tables=["search_raw_files", "raw_files", "delimp_searches", "delimp_sample_metadata"])
         return [dict(r) for r in rows]
     return SLOW_CACHE.get_or_set(f"engine_species_summary:{limit}", _p)
+
+
+_MATRIX_MODES = {
+    # ORDER BY fragment -> applied after the presence floor. Every one reads `intensity`, never
+    # `normalized_intensity`: the latter is populated for 75 of 2,086 searches (4%), so a matrix
+    # keyed on it renders for 4% of searches and is blank for the rest.
+    "cv":               "cv DESC NULLS LAST",
+    "abundance":        "mean_int DESC NULLS LAST",
+    "rarity":           "reach ASC NULLS LAST, n_samples DESC",
+    "corpus_abundance": "mean_pct_rank DESC NULLS LAST",
+}
+_MATRIX_FLOOR = 0.2          # of the search's sample count
+_MATRIX_MIN_PCT_SEARCHES = 20  # before mean_pct_rank is trusted
+
+
+def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict[str, Any]:
+    """PRIVATE-SAFE: the protein x sample matrix behind a search page's heatmap. CACHED (SLOW).
+
+    delimp_proteins is already one row per (search, sample, protein), so this is a read, not a
+    derivation. Four ranking modes: two scoped to this search (cv, abundance) and two corpus-wide
+    (rarity, corpus_abundance) served from delimp_protein_corpus_reach because they take 121 s and
+    97 s live.
+
+    PRESENCE FLOOR of 20% of samples applies to every mode. Without it mean intensity puts Or6c75 —
+    an olfactory receptor in 1 of 222 samples at 85.4e9 — above albumin in 219.
+
+    Reads `intensity`. NOT `normalized_intensity`, which exists for only 4% of searches.
+
+    WHY CACHED, and why this is not optional. The endpoint is PUBLIC and anonymous, and
+    renderSearchDetail() fires it unconditionally on every search-page view (plus once more per
+    mode button). Measured uncached: 2.8-4.0 s on the flagship, 7.3/8.7/8.9 s across the five
+    largest searches, 5.1 s and 625 KB at limit=200. The ranking statement runs with
+    work_mem="256MB", which db.py's own docstring says to use SPARINGLY because the bound is
+    maxconn (6) x that value; with _QUERY_ATTEMPTS=3 a retrying request can hold one of six pooled
+    connections for ~36 s, so a handful of concurrent viewers of a large search saturate the pool
+    and 503 the whole site. Every comparable aggregate in this file already goes through
+    CACHE/SLOW_CACHE (32 call sites) — this was the only new public one that did not.
+
+    SLOW_CACHE (30 min), not CACHE (20 s): a completed search's delimp_proteins rows do not change,
+    and 20 s is far too short to survive the burst of page views this exists to absorb.
+
+    Manual cached()/put() rather than get_or_set(), for the same reason as
+    protein_coverage_peptides: get_or_set can only decide from truthiness, and the DEGRADED result
+    here — no sample cleared the presence floor, or the search does not exist — is a truthy dict.
+    Caching that would stick an empty heatmap for the full 30 minutes on a search that is merely
+    mid-ingest. A hard failure (any of the four statements raising) propagates and never reaches
+    the put() at all, so it is not cached either.
+
+    KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key. Keying on the raw
+    string would let an anonymous caller mint unbounded cache entries from free text (db.TTLCache
+    has no eviction — see the F10 ticket); after normalization the key space is bounded by
+    searches x 4 modes x the route's 1..200 limit clamp.
+    """
+    if mode not in _MATRIX_MODES:
+        mode = "cv"
+    limit = int(limit)
+    key = f"matrix_{search_id}_{mode}_{limit}"
+    hit = SLOW_CACHE.cached(key)
+    if hit is not None:
+        return hit
+    result = _search_protein_matrix(search_id, mode, limit)
+    if result.get("proteins"):
+        SLOW_CACHE.put(key, result)
+    return result
+
+
+def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, Any]:
+    """The uncached body. `mode` is already validated by the caller above."""
+    order = _MATRIX_MODES[mode]
+
+    # n_samples_total used to come from its own `count(DISTINCT raw_path)` (2.69s on the
+    # largest search). Fix round 2: this SELECT DISTINCT below yields the identical number
+    # (222) for the identical predicate at 0.23s — a twelve-fold difference for the same
+    # information — and it runs anyway to build the samples list, so derive the count from it
+    # instead of paying for a second full scan+sort. Moved above the floor/params build
+    # because the presence floor's arithmetic depends on n_samples_total.
+    samples = query(
+        """SELECT DISTINCT p.raw_path, rf.acquisition_date
+             FROM delimp_proteins p
+             LEFT JOIN raw_files rf ON rf.raw_path = p.raw_path
+            WHERE p.search_id=%(sid)s""",
+        {"sid": search_id}, tables=["delimp_proteins", "raw_files"])
+    # Acquisition order where known, name order otherwise: batch drift then reads as vertical bands.
+    samples.sort(key=lambda s: (s["acquisition_date"] is None, s["acquisition_date"], s["raw_path"]))
+    # Fix round 1 (3rd revision): every sample gets an opaque positional id ("s0", "s1", ...) in
+    # this sorted order. `cells` below is keyed by that id, NOT by filename — privacy.redact()
+    # only rewrites string VALUES under known keys (raw_path, raw_basename, ...), it never
+    # renames dict KEYS, so a filename-keyed cells dict ships real acquisition filenames to the
+    # public tier no matter what the samples[] field is called.
+    #
+    # THE OPAQUE ID IS THE WHOLE ROW. raw_path, raw_basename and acquisition_date used to ride
+    # along here and NOTHING read them: the grid has no header row (sample columns are unlabeled),
+    # the renderer touches only s.id and samples.length, and acquisition_date is used solely for
+    # the server-side sort three lines above. On a PUBLIC endpoint an unread field is pure leak
+    # surface — and they were the only reason this response needed privacy.redact() to work at
+    # all. Dropping them makes the public matrix STRUCTURALLY incapable of leaking a filename
+    # rather than dependent on the sanitizer continuing to know the right key names. (They were
+    # also visibly unread: the same sample came back as raw_path "run-19aba2.d" and raw_basename
+    # "run-002736" — two different hashes of two different strings — and nobody noticed.)
+    # If a future change needs a per-sample label, add it back through _FILE_KEYS-covered keys
+    # AND re-check tests/test_internal_route_gate.py's real-path component scan.
+    sample_ids = {s["raw_path"]: f"s{i}" for i, s in enumerate(samples)}
+    sample_rows = [{"id": sample_ids[s["raw_path"]]} for s in samples]
+    n_samples_total = len(sample_rows)
+
+    n_proteins_total = query(
+        "SELECT count(DISTINCT protein_group) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
+        {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
+    if not n_samples_total:
+        return {"proteins": [], "samples": [], "mode": mode, "limit": limit,
+                "n_proteins_total": 0, "n_samples_total": 0,
+                "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": None}
+
+    params = {"sid": search_id, "limit": int(limit),
+              "floor": _MATRIX_FLOOR * n_samples_total,
+              "minpct": _MATRIX_MIN_PCT_SEARCHES}
+    # MEASURED cost of this two-level aggregate on the largest search (480k rows, 6,340 genes):
+    # 3.1-5.7s across the four ranking modes (range across repeated runs on a shared cluster, not
+    # a single sample), in line with the ~4s the old single-level aggregate took. EXPLAIN shows
+    # HashAggregate over HashAggregate with no sort at either level (the old COUNT(DISTINCT
+    # raw_path) was what forced sorting; there is no DISTINCT here). work_mem="256MB" bounds the
+    # two hash tables so neither level spills.
+    # Two remedies considered and rejected for counting samples AT THE ROW GRAIN, i.e. directly
+    # over delimp_proteins rows, skipping per_sample: count(*) there is cheap but wrong -- it
+    # over-counts samples wherever one gene maps to multiple protein groups, silently corrupting
+    # the presence floor that is the only thing keeping Or6c75-class 1-sample outliers out of the
+    # ranking. (count(*) IS exact at the per_sample grain the query below actually uses -- see
+    # "count(*) in agg" two paragraphs down.) A precomputed per-search table (a second Tasks 1+2)
+    # is out of scope for a panel that already loads lazily, after the Runs table, so a slow
+    # matrix never blocks the page.
+    #
+    # Fix round 2, CRITICAL: delimp_proteins is one row per (search, sample, protein_group), so a
+    # gene with more than one protein_group (isoforms, ambiguous groupings, or a real-symbol /
+    # contaminant collision) contributes MULTIPLE rows per sample. Aggregating stddev_pop/avg
+    # directly over those rows -- as this query used to -- mixed between-SAMPLE variation with
+    # between-PROTEIN-GROUP variation of the same gene WITHIN a single sample. Proved on a
+    # 1-sample search (29a34214-8861-5831-8b7a-6af3e4fc405b), where between-sample variation must
+    # be exactly zero: Hnrnpll still came back cv=0.998, because its "variation" was two protein
+    # groups (Q921F4=385, V9GXB6=342,620) in that one sample, not two samples. This affects only
+    # genes carrying more than one protein_group in a given search -- measured 3 of 6,340 genes on
+    # the 222-sample flagship fixture (largest CV change 3.2839->3.2819, 0.06%, top-50 ranking
+    # unchanged) and 102 of 5,567 on a 21-sample search (2 top-50 evictions: Agap3 1.908->1.155,
+    # Kcnma1 1.845->1.174) -- not every CV the panel has ever shown, but every search where such a
+    # gene exists, not only the 1-sample extreme that first surfaced it.
+    #
+    # per_sample first collapses to exactly the grain the CELLS query already uses (gene,
+    # raw_path) -> avg(intensity) -- see the `cells` query below, unchanged. The ranking must
+    # agree with the numbers the grid actually shows, so both sides use avg() at that grain; agg
+    # then computes cv/mean_int over those per-sample values. count(*) in agg is now a true count
+    # of (gene, sample) pairs, i.e. still the same answer count(DISTINCT p.raw_path) gave before
+    # -- only the numerator of `cv` was ever wrong.
+    #
+    # WHAT THIS DOES NOT FIX: when a gene's SET of protein_groups differs across samples (not just
+    # within one sample), per_sample's avg() yields a different quantity in each sample by
+    # construction, and that difference is between-group variation wearing a between-sample
+    # costume -- CV is still not pure between-sample variation for those genes. Measured on the
+    # flagship fixture: C3 is Cont_Q2UVX4 in 49 of 187 samples and P01027 in 181; its post-fix CV
+    # is 3.2819, while P01027 alone (its real mouse group) has CV 2.8876 -- the remaining ~0.4 is
+    # still the bovine contaminant being averaged in for a minority of samples. Picking one
+    # protein_group per gene would remove this residual but would also change what the grid's
+    # cells show, which is a design decision out of scope here, not a bug fix.
+    rows = query(
+        f"""
+        WITH per_sample AS (
+          SELECT gene, raw_path,
+                 avg(intensity)             AS v,
+                 max(protein_group)         AS protein_group,
+                 bool_or(is_contaminant)    AS is_contaminant
+            FROM delimp_proteins
+           WHERE search_id = %(sid)s AND intensity > 0 AND NULLIF(gene,'') IS NOT NULL
+           GROUP BY gene, raw_path),
+        agg AS (
+          SELECT gene,
+                 max(protein_group)                       AS protein_group,
+                 count(*)                                 AS n_samples,
+                 avg(v)                                    AS mean_int,
+                 stddev_pop(v) / NULLIF(avg(v), 0)         AS cv,
+                 bool_or(is_contaminant)                   AS is_contaminant
+            FROM per_sample
+           GROUP BY gene
+          HAVING count(*) >= %(floor)s)
+        SELECT a.*, r.n_searches AS reach,
+               CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank
+          FROM agg a
+          LEFT JOIN delimp_protein_corpus_reach r ON r.gene = upper(a.gene)
+         ORDER BY {order}
+         LIMIT %(limit)s
+        """,
+        params, tables=["delimp_proteins", "delimp_protein_corpus_reach"], work_mem="256MB")
+
+    genes = [r["gene"] for r in rows]
+    cells = query(
+        """SELECT gene, raw_path, avg(intensity) AS v
+             FROM delimp_proteins
+            WHERE search_id=%(sid)s AND gene = ANY(%(genes)s) AND intensity > 0
+            GROUP BY gene, raw_path""",
+        {"sid": search_id, "genes": genes}, tables=["delimp_proteins"]) if genes else []
+
+    by_gene: dict[str, dict[str, float]] = {}
+    for c in cells:
+        sid = sample_ids.get(c["raw_path"])
+        if sid is not None:      # cells is scoped to the same search_id as samples, so this
+            by_gene.setdefault(c["gene"], {})[sid] = float(c["v"])  # should always resolve
+
+    reaches = sorted(r["reach"] for r in rows if r["reach"] is not None)
+    def _pct(v):
+        # Percentile against the DISPLAYED rows, not the corpus: globally 40% of genes are seen once,
+        # which would flatten the scale to a single bin.
+        if v is None or len(reaches) < 2:
+            return None
+        return reaches.index(v) / (len(reaches) - 1)
+
+    proteins = [{"gene": r["gene"], "protein_group": r["protein_group"],
+                 "n_samples": r["n_samples"], "is_contaminant": bool(r["is_contaminant"]),
+                 "cv": float(r["cv"]) if r["cv"] is not None else None,
+                 "mean_int": float(r["mean_int"]) if r["mean_int"] is not None else None,
+                 "reach": r["reach"],
+                 "mean_pct_rank": float(r["mean_pct_rank"]) if r["mean_pct_rank"] is not None else None,
+                 "reach_pct_rank": _pct(r["reach"]),
+                 "cells": by_gene.get(r["gene"], {})} for r in rows]
+
+    as_of = query("SELECT max(computed_at) AS d FROM delimp_protein_corpus_reach",
+                  tables=["delimp_protein_corpus_reach"], fetch="val")
+    return {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
+            "n_proteins_total": n_proteins_total, "n_samples_total": n_samples_total,
+            "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}

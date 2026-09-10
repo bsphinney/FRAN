@@ -95,6 +95,12 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # HGNC approved/alias/previous symbols -> approved protein-coding gene. Makes
         # "% of proteome identified" a real intersection instead of observed-symbols/count.
         "delimp_gene_reference",
+        # per-gene corpus-wide reach (n_searches/n_samples) + mean percent_rank(), keyed on
+        # upper(gene) — powers the search-detail heatmap's "how rare is this protein across the
+        # whole corpus" cell. Precomputed offline: the live scan is 121-637s depending on key,
+        # the percentile 97s. Built by ingest/migrations/2026-09-09_protein_corpus_reach.sql +
+        # its populator; refreshed offline like the delimp_mv_* snapshots above.
+        "delimp_protein_corpus_reach",
     }
 )
 

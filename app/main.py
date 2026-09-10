@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -753,18 +754,32 @@ def api_protein_card(protein_group: str):
 
 
 @app.get("/api/protein/{protein_group:path}/coverage")
-def api_protein_coverage(protein_group: str):
+def api_protein_coverage(protein_group: str, search_id: str | None = None):
     """Sequence coverage map: UniProt sequence + observed corpus peptides mapped
-    onto it. Registered before the catch-all so the /coverage suffix isn't eaten."""
+    onto it. Registered before the catch-all so the /coverage suffix isn't eaten.
+    With search_id, each peptide carries "here" — whether that search saw it. A malformed search_id
+    is a client error (400) — it is NOT silently dropped to an unscoped response, which would hand
+    the caller a different shape than it asked for (the same class of bug the scoped cache key
+    exists to prevent)."""
     from . import coverage as cov
-    data = queries.protein_coverage_peptides(protein_group)
+    if search_id is not None:
+        try:
+            uuid.UUID(search_id)
+        except ValueError:
+            raise HTTPException(400, "search_id must be a valid UUID.")
+    data = queries.protein_coverage_peptides(protein_group, search_id=search_id)
     acc = protein_group.split(";")[0].strip()
     custom = queries.is_custom_accession(protein_group, data.get("gene"))
     seq = "" if custom else cov.fetch_uniprot_sequence(acc)
     mapped = cov.map_coverage(seq, data.get("peptides") or [])
-    return ok({"accession": acc, "protein_group": protein_group, "gene": data.get("gene"),
-               "custom_construct": custom,
-               "sequence": seq, "sequence_available": bool(seq), **mapped})
+    resp = {"accession": acc, "protein_group": protein_group, "gene": data.get("gene"),
+            "custom_construct": custom,
+            "sequence": seq, "sequence_available": bool(seq), **mapped}
+    if data.get("scope_unavailable"):
+        # The "here" lookup itself failed (see protein_coverage_peptides): peptides carry no "here"
+        # key at all here, so the UI must say "comparison unavailable" rather than infer "not found".
+        resp["scope_unavailable"] = True
+    return ok(resp)
 
 
 @app.get("/api/protein/{protein_group:path}")
@@ -1030,6 +1045,27 @@ def api_search_detail(search_id: str):
     if not res["summary"]:
         raise HTTPException(404, "Search not found.")
     return ok(res)
+
+
+@app.get("/api/search/{search_id}/matrix")
+def api_search_matrix(search_id: str, mode: str = "cv", limit: int = 50):
+    """The protein x sample matrix for a search page's heatmap.
+
+    Public-tier: every table it reads is in PUBLIC_TABLES. `mode` is validated inside
+    search_protein_matrix() against a fixed dict and falls back to "cv", so an unknown value can
+    never reach SQL.
+
+    A malformed search_id is a client error (400), the same guard api_protein_coverage above
+    applies. Without it psycopg2 raises InvalidTextRepresentation deep in the query and the
+    generic handler turns it into a 503 whose detail carries a fragment of the server's SQL with
+    the caller's own input echoed back — which the frontend then renders to an anonymous visitor
+    as "Database unavailable", a false outage for a typo.
+    """
+    try:
+        uuid.UUID(search_id)
+    except ValueError:
+        raise HTTPException(400, "search_id must be a valid UUID.")
+    return ok(queries.search_protein_matrix(search_id, mode=mode, limit=max(1, min(int(limit), 200))))
 
 
 if __name__ == "__main__":

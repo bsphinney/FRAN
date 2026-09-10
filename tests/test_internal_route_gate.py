@@ -21,13 +21,18 @@ route return 200 unconditionally and this test would prove nothing. If DELIMP_IN
 in the calling shell's environment, this test cannot do its job and says so loudly instead of
 silently passing.
 
-Uses FastAPI's TestClient (ASGI in-process, no real server, no real DB) — the route gate
-(`if not db.is_full(): raise HTTPException(404)`) runs and returns before any SQL is issued, so
-this needs no DB credential at all.
+Uses FastAPI's TestClient (ASGI in-process, no real server). The route-gate checks need no DB
+credential — `if not db.is_full(): raise HTTPException(404)` runs and returns before any SQL is
+issued. The PUBLIC-TIER MATRIX block at the end of this file DOES need one: it is here, rather
+than in tests/test_search_matrix.py, because this is the only test file that runs with
+DELIMP_INTERNAL_MODE unset, i.e. on the real anonymous path where privacy.redact() is not a
+no-op — so it is the only place an assertion about what an anonymous visitor actually receives
+can mean anything. It fails loudly (SKIP-INVALID, exit 2) rather than passing vacuously if the
+credential is missing.
 
-Run:  python tests/test_internal_route_gate.py
+Run:  DELIMP_PG_TOKEN_FILE=/Users/brettphinney/.pgfarm_token python3 tests/test_internal_route_gate.py
 """
-import os, sys
+import json, os, re, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 FAILS = []
@@ -113,6 +118,71 @@ with TestClient(app) as client:
     r2 = client.get("/api/internal/submissions")
     check("post-restore: the real gate still returns 404 (clean restore, not a half-revert)",
           r2.status_code == 404, f"{r2.status_code}: {r2.text[:300]}")
+
+    # --- the PUBLIC search-matrix endpoint must not ship acquisition filenames ------------------
+    # WHY THIS LIVES HERE AND NOT IN tests/test_search_matrix.py. That file's public-view checks
+    # call privacy.redact(_json_safe(d), False) DIRECTLY, which proves the payload SHAPE is safe
+    # but never exercises api_search_matrix -> ok() -> privacy.get_reveal() — because that whole
+    # file runs under DELIMP_INTERNAL_MODE=1, where reveal=True makes redact() a no-op. So a future
+    # edit returning JSONResponse(_json_safe(...)) instead of ok(...) — a one-word change, with a
+    # precedent in the same module (api_my_data deliberately bypasses the sanitizer) — would leave
+    # every check in that file green while the endpoint shipped real acquisition filenames to
+    # anonymous callers. THIS file is the only one that runs with DELIMP_INTERNAL_MODE unset, i.e.
+    # on the real production anonymous path (_auth_mw -> set_reveal(False)), so the assertion
+    # belongs here. Proven able to fail: swapping ok(...) for JSONResponse(_json_safe(...)) in
+    # api_search_matrix turns the two scan checks below red while the rest of both files stay
+    # green (fix-report.md, F4).
+    #
+    # NEEDS A DB (unlike everything above, which returns before any SQL): the endpoint reads
+    # delimp_proteins. Run:
+    #   DELIMP_PG_TOKEN_FILE=/Users/brettphinney/.pgfarm_token python3 tests/test_internal_route_gate.py
+    SID = "8221f5fc-492e-5c9d-a08d-542cfdb48791"   # PROT_0793_search_mouse: 222 samples
+    N_SAMPLES = 222
+
+    # The real, UNREDACTED paths come from the DB, NOT from the endpoint's own response. Comparing
+    # the response against itself is how a leak check passes vacuously; an independent source is
+    # the only thing that can witness "a real filename reached the public tier".
+    try:
+        from app.db import query                                  # noqa: E402
+        real_paths = [r["raw_path"] for r in query(
+            "SELECT DISTINCT raw_path FROM delimp_proteins WHERE search_id=%s",
+            (SID,), tables=["delimp_proteins"])]
+    except Exception as e:                                        # noqa: BLE001
+        print(f"  SKIP-INVALID  cannot read the fixture's real raw paths ({type(e).__name__}: {e}"
+              f"). This block compares the public payload against the REAL filenames, so without "
+              f"them it would pass vacuously. Set DELIMP_PG_TOKEN_FILE and re-run.")
+        sys.exit(2)
+
+    mr = client.get(f"/api/search/{SID}/matrix", params={"mode": "cv", "limit": 20})
+    check("public tier: the matrix endpoint returns 200", mr.status_code == 200,
+          f"{mr.status_code}: {mr.text[:300]}")
+    mbody = mr.json()
+    mbody = mbody.get("data", mbody)
+    msamps, mprots = mbody.get("samples") or [], mbody.get("proteins") or []
+
+    # NOT VACUOUS. Every scan below is over the response body; an empty/degraded body would make
+    # all of them pass trivially. Assert the endpoint really returned this search's full matrix
+    # first, and that the independent path list is the one this fixture is documented to have.
+    check("public tier: the matrix response is genuinely populated (not an empty degraded body)",
+          len(msamps) == N_SAMPLES and len(mprots) == 20,
+          f"{len(msamps)} samples, {len(mprots)} proteins")
+    check("public tier: the independent real-path list is the full fixture",
+          len(real_paths) == N_SAMPLES, f"{len(real_paths)} real raw paths")
+
+    blob = json.dumps(mbody)
+    check("public tier: no path separator anywhere in the matrix payload",
+          "/" not in blob and "\\" not in blob, blob[:300])
+
+    # THE DISCRIMINATOR. Split every real path into its components — the client/PI directory
+    # (PROT_0793), the project folder (search_mouse), the acquisition filename — and look for each
+    # one anywhere in the payload: as a value, as a dict KEY (redact() rewrites values only, never
+    # keys — that was the real bug in ed36e2b), or embedded in a longer string. Nothing about this
+    # depends on knowing which field names are filename-shaped, so it cannot go stale the way a
+    # literal-key guard does.
+    comps = {c for rp in real_paths for c in re.split(r"[\\/]+", rp or "") if len(c) > 3}
+    leaked = sorted(c for c in comps if c in blob)
+    check(f"public tier: none of the {len(comps)} real path components appears in the payload",
+          not leaked, f"LEAKED: {leaked[:5]}")
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
