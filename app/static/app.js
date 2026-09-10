@@ -539,8 +539,8 @@ async function renderSearchMatrix(searchId, mode){
     // rendered as a ~105px sliver in a ~1200px card. Fill the available width when there's room;
     // once samples.length would need less than 5px each, floor at 5px and let the wrapper's
     // overflow-x-auto scroll, exactly as the 222-sample case already does. LABEL_W/ANN_W/ANN2_W
-    // must match the sticky column widths/offsets used below (96 / 9 / 7) -- they are the same
-    // three numbers in both places on purpose, not independently chosen.
+    // are interpolated into the sticky column widths/offsets in the row markup below (not just
+    // duplicated as matching literals) so the two can't drift out of sync.
     //
     // The <table> itself must carry an explicit pixel width (not just each <td>'s width style)
     // plus table-layout:fixed. Measured: without it, a <table> with empty cells and no width of
@@ -548,7 +548,10 @@ async function renderSearchMatrix(searchId, mode){
     // specified width to fit the wrapper when the columns' declared total would overflow -- i.e.
     // the exact squash this fix exists to stop, just moved from "always 5px, too narrow to fill"
     // to "silently shrinks under 5px, never scrolls" for any search wide enough to need scrolling.
-    // An explicit table width forces the wrapper to actually overflow (and scroll) instead.
+    // An explicit table width forces the wrapper to actually overflow (and scroll) instead. This
+    // is also why the sticky-column arithmetic below holds exactly: table-layout:fixed makes each
+    // column's declared width its BORDER-BOX width, so the label cell's `padding:0 9px` lives
+    // inside its LABEL_W, rather than adding to it the way content-box padding normally would.
     const LABEL_W=96, ANN_W=9, ANN2_W=7, WRAP_BORDER=2;
     const cardStyle=getComputedStyle(el);
     const padX=parseFloat(cardStyle.paddingLeft||0)+parseFloat(cardStyle.paddingRight||0);
@@ -570,10 +573,10 @@ async function renderSearchMatrix(searchId, mode){
       const rpTitle = p.reach==null ? 'corpus reach: not computed' : `corpus reach: ${fmt(p.reach)} searches`;
       const gname=esc(p.gene||p.protein_group);
       rows+=`<tr class="row-hover">
-        <td style="position:sticky;left:0;z-index:2;width:96px;max-width:96px;overflow:hidden;background:#0e1626;color:#FFCF40;font-size:11px;font-weight:600;padding:0 9px;white-space:nowrap;border-right:1px solid rgba(255,255,255,.09);font-family:ui-monospace,monospace">
+        <td style="position:sticky;left:0;z-index:2;width:${LABEL_W}px;max-width:${LABEL_W}px;overflow:hidden;background:#0e1626;color:#FFCF40;font-size:11px;font-weight:600;padding:0 9px;white-space:nowrap;border-right:1px solid rgba(255,255,255,.09);font-family:ui-monospace,monospace">
           <span onclick="renderPeptideMap('${encodeURIComponent(p.protein_group)}','${encodeURIComponent(p.gene||'')}','${encodeURIComponent(searchId)}')" class="cursor-pointer hover:text-white hover:underline" title="${gname} — in ${fmt(p.n_samples)}/${fmt(samples.length)} samples · corpus: ${p.reach!=null?fmt(p.reach)+' searches':'unknown'}${p.is_contaminant?' · CONTAMINANT':''}">${gname}</span></td>
-        <td style="position:sticky;left:96px;z-index:2;width:9px;padding:0;border-left:1px solid #0b1220;background:${rpColour}" title="${esc(rpTitle)}"></td>
-        <td style="position:sticky;left:105px;z-index:2;width:7px;padding:0;border-right:1px solid rgba(255,255,255,.09);background:${p.is_contaminant?'#f43f5e':'transparent'}" title="${p.is_contaminant?'flagged contaminant':'not a contaminant'}"></td>`;
+        <td style="position:sticky;left:${LABEL_W}px;z-index:2;width:${ANN_W}px;padding:0;border-left:1px solid #0b1220;background:${rpColour}" title="${esc(rpTitle)}"></td>
+        <td style="position:sticky;left:${LABEL_W+ANN_W}px;z-index:2;width:${ANN2_W}px;padding:0;border-right:1px solid rgba(255,255,255,.09);background:${p.is_contaminant?'#f43f5e':'transparent'}" title="${p.is_contaminant?'flagged contaminant':'not a contaminant'}"></td>`;
       for(const s of samples){
         const v=p.cells[s.id]; let bg;
         if(v==null||v<=0){ bg='#111a2b'; }

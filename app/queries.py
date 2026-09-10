@@ -4438,33 +4438,51 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     params = {"sid": search_id, "limit": int(limit),
               "floor": _MATRIX_FLOOR * n_samples_total,
               "minpct": _MATRIX_MIN_PCT_SEARCHES}
-    # MEASURED cost of this aggregate on the largest search (480k rows): ~4s, CPU-bound on the
-    # GroupAggregate's own COUNT(DISTINCT raw_path) sorting/deduping ~478k rows per gene — not
-    # disk I/O (work_mem="256MB" below converts the sort to in-memory quicksort and the hash
-    # join to a single batch, confirmed via EXPLAIN, but wall-clock barely moves). Kept
-    # work_mem anyway: it removes real disk-contention risk on this shared cluster even though
-    # it isn't the fix for this endpoint's latency. Two remedies considered and rejected:
-    # count(*) instead of count(DISTINCT raw_path) is cheap but wrong — it over-counts samples
-    # wherever one gene maps to multiple protein groups, silently corrupting the presence floor
-    # that is the only thing keeping Or6c75-class 1-sample outliers out of the ranking. A
-    # precomputed per-search table (a second Tasks 1+2) is out of scope for a panel that
-    # already loads lazily, after the Runs table, so a slow matrix never blocks the page.
+    # MEASURED cost of this two-level aggregate on the largest search (480k rows, 6,340 genes):
+    # 3.1-4.5s across the four ranking modes -- unchanged or slightly better than the ~4s the old
+    # single-level aggregate took, because the per_sample CTE's GROUP BY (gene, raw_path) does the
+    # one real sort over ~478k rows, and the outer `agg` GROUP BY gene runs for free against that
+    # already-sorted stream (confirmed via EXPLAIN; work_mem="256MB" below converts both levels'
+    # sorts to in-memory quicksort rather than disk, though wall-clock barely moves on that alone).
+    # Two remedies considered and rejected for counting samples AT THE ROW GRAIN, i.e. directly
+    # over delimp_proteins rows, skipping per_sample: count(*) there is cheap but wrong -- it
+    # over-counts samples wherever one gene maps to multiple protein groups, silently corrupting
+    # the presence floor that is the only thing keeping Or6c75-class 1-sample outliers out of the
+    # ranking. (count(*) IS exact at the per_sample grain the query below actually uses -- see
+    # "count(*) in agg" two paragraphs down.) A precomputed per-search table (a second Tasks 1+2)
+    # is out of scope for a panel that already loads lazily, after the Runs table, so a slow
+    # matrix never blocks the page.
+    #
     # Fix round 2, CRITICAL: delimp_proteins is one row per (search, sample, protein_group), so a
-    # gene with more than one protein_group (isoforms, ambiguous groupings) contributes MULTIPLE
-    # rows per sample. Aggregating stddev_pop/avg directly over those rows -- as this query used
-    # to -- mixes between-SAMPLE variation with between-PROTEIN-GROUP variation of the same gene.
-    # Proved on a 1-sample search (29a34214-8861-5831-8b7a-6af3e4fc405b), where between-sample
-    # variation must be exactly zero: Hnrnpll still came back cv=0.998, because its "variation"
-    # was two protein groups (Q921F4=385, V9GXB6=342,620) in that one sample, not two samples.
-    # "Varies most -- your samples" was measuring something else entirely, and every multi-sample
-    # search's CV was a contaminated mixture of the two, not just the 1-sample extreme case.
+    # gene with more than one protein_group (isoforms, ambiguous groupings, or a real-symbol /
+    # contaminant collision) contributes MULTIPLE rows per sample. Aggregating stddev_pop/avg
+    # directly over those rows -- as this query used to -- mixed between-SAMPLE variation with
+    # between-PROTEIN-GROUP variation of the same gene WITHIN a single sample. Proved on a
+    # 1-sample search (29a34214-8861-5831-8b7a-6af3e4fc405b), where between-sample variation must
+    # be exactly zero: Hnrnpll still came back cv=0.998, because its "variation" was two protein
+    # groups (Q921F4=385, V9GXB6=342,620) in that one sample, not two samples. This affects only
+    # genes carrying more than one protein_group in a given search -- measured 3 of 6,340 genes on
+    # the 222-sample flagship fixture (largest CV change 3.2839->3.2819, 0.06%, top-50 ranking
+    # unchanged) and 102 of 5,567 on a 21-sample search (2 top-50 evictions: Agap3 1.908->1.155,
+    # Kcnma1 1.845->1.174) -- not every CV the panel has ever shown, but every search where such a
+    # gene exists, not only the 1-sample extreme that first surfaced it.
     #
     # per_sample first collapses to exactly the grain the CELLS query already uses (gene,
     # raw_path) -> avg(intensity) -- see the `cells` query below, unchanged. The ranking must
     # agree with the numbers the grid actually shows, so both sides use avg() at that grain; agg
-    # then computes cv/mean_int over those per-sample values, which is real between-sample
-    # variation. count(*) in agg is now a true count of (gene, sample) pairs, i.e. still the same
-    # answer count(DISTINCT p.raw_path) gave before -- only the numerator of `cv` was ever wrong.
+    # then computes cv/mean_int over those per-sample values. count(*) in agg is now a true count
+    # of (gene, sample) pairs, i.e. still the same answer count(DISTINCT p.raw_path) gave before
+    # -- only the numerator of `cv` was ever wrong.
+    #
+    # WHAT THIS DOES NOT FIX: when a gene's SET of protein_groups differs across samples (not just
+    # within one sample), per_sample's avg() yields a different quantity in each sample by
+    # construction, and that difference is between-group variation wearing a between-sample
+    # costume -- CV is still not pure between-sample variation for those genes. Measured on the
+    # flagship fixture: C3 is Cont_Q2UVX4 in 49 of 187 samples and P01027 in 181; its post-fix CV
+    # is 3.2819, while P01027 alone (its real mouse group) has CV 2.8876 -- the remaining ~0.4 is
+    # still the bovine contaminant being averaged in for a minority of samples. Picking one
+    # protein_group per gene would remove this residual but would also change what the grid's
+    # cells show, which is a design decision out of scope here, not a bug fix.
     rows = query(
         f"""
         WITH per_sample AS (
