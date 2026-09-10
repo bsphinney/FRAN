@@ -4587,13 +4587,18 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
     sample_ids = {s["raw_path"]: f"s{i}" for i, s in enumerate(samples)}
     sample_rows = [{"id": sample_ids[s["raw_path"]]} for s in samples]
     n_samples_total = len(sample_rows)
-
-    n_proteins_total = query(
-        "SELECT count(DISTINCT protein_group) AS n FROM delimp_proteins WHERE search_id=%(sid)s",
-        {"sid": search_id}, tables=["delimp_proteins"], fetch="val") or 0
+    # HOW MANY COLUMNS ARE ACTUALLY IN ACQUISITION ORDER. The spec's whole rationale for the column
+    # ordering — "acquisition order makes batch drift visible as vertical bands" — holds only where
+    # raw_files.acquisition_date exists, and the plan explicitly asked the implementer to report how
+    # many of the fixture's samples carry one "rather than claiming the ordering works". Measured
+    # 2026-09-10: 0 of 222 on the flagship (PROT_0793_search_mouse), against 20,026 of 23,387 (86%)
+    # corpus-wide. So on that search the sort silently collapses to filename order and a vertical
+    # band means nothing about batch drift. Ship the count so the UI can say which order the reader
+    # is actually looking at instead of asserting one the data cannot support.
+    n_samples_dated = sum(1 for s in samples if s["acquisition_date"] is not None)
     if not n_samples_total:
         return {"proteins": [], "samples": [], "mode": mode, "limit": limit,
-                "n_proteins_total": 0, "n_samples_total": 0,
+                "n_rankable": 0, "n_samples_total": 0, "n_samples_dated": 0,
                 "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": None}
 
     params = {"sid": search_id, "limit": int(limit),
@@ -4665,7 +4670,13 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
            GROUP BY gene
           HAVING count(*) >= %(floor)s)
         SELECT a.*, r.n_searches AS reach,
-               CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank
+               CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank,
+               -- THE RANKABLE POPULATION (see the return dict): rows in `agg`, i.e. genes clearing
+               -- the presence floor, counted BEFORE the LIMIT. A window function is evaluated after
+               -- the aggregate and before LIMIT, so this is exact and costs nothing extra — `agg`
+               -- is already materialized. It replaces a separate count(DISTINCT protein_group)
+               -- round-trip that measured 0.57-1.83 s and answered a different question.
+               count(*) OVER ()                          AS n_rankable
           FROM agg a
           LEFT JOIN delimp_protein_corpus_reach r ON r.gene = upper(a.gene)
          ORDER BY {order}
@@ -4706,6 +4717,14 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
 
     as_of = query("SELECT max(computed_at) AS d FROM delimp_protein_corpus_reach",
                   tables=["delimp_protein_corpus_reach"], fetch="val")
+    # n_rankable, NOT the old n_proteins_total. The panel's rows are GENES that cleared the 20%
+    # presence floor; n_proteins_total counted DISTINCT protein_group over the whole search and
+    # ignored the floor, so "Showing 50 of 6,388 proteins" mixed two populations and named neither:
+    # measured on the flagship, 6,388 protein_groups vs 6,340 genes vs 4,005 genes actually
+    # rankable. 4,005 is the number the reader's "of N" should be against — it is the spec's own
+    # figure — and it is the only one consistent with the "in at least 20% of samples" clause in
+    # the same sentence.
     return {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
-            "n_proteins_total": n_proteins_total, "n_samples_total": n_samples_total,
+            "n_rankable": rows[0]["n_rankable"] if rows else 0,
+            "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
             "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}

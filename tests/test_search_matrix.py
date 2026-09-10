@@ -9,6 +9,7 @@ import os, sys, time
 os.environ.setdefault("DELIMP_INTERNAL_MODE", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app import queries                                      # noqa: E402
+from app.db import query as _q                               # noqa: E402
 
 SID = "8221f5fc-492e-5c9d-a08d-542cfdb48791"
 FAILS = []
@@ -24,8 +25,41 @@ print(f"  [timing] mode=cv     end-to-end: {t_cv:.2f}s")
 prots, samps = d.get("proteins") or [], d.get("samples") or []
 check("returns 50 proteins", len(prots) == 50, str(len(prots)))
 check("returns all 222 samples", len(samps) == 222, str(len(samps)))
-check("reports the true protein total", d.get("n_proteins_total") == 6388, str(d.get("n_proteins_total")))
 check("reports when reach was computed", d.get("reach_computed_at") is not None)
+
+# THE "OF N" THE PANEL SHOWS (F17). This used to assert n_proteins_total == 6388, a
+# count(DISTINCT protein_group) over the whole search that ignored the presence floor -- so the
+# footer read "Showing 50 of 6,388 proteins" while every row displayed was a GENE that had cleared
+# the floor. Three different populations on this fixture: 6,388 protein_groups, 6,340 genes, 4,005
+# genes actually rankable. Only the last is consistent with the "in at least 20% of samples" clause
+# in the same sentence, and it is the spec's own figure. Cross-checked against an independent
+# aggregate rather than a hardcoded 4005, so it cannot rot when the corpus grows.
+_floor = 0.2 * len(samps)
+_rankable_ind = _q("""WITH per_sample AS (
+                        SELECT gene, raw_path FROM delimp_proteins
+                         WHERE search_id=%(s)s AND intensity > 0 AND NULLIF(gene,'') IS NOT NULL
+                         GROUP BY gene, raw_path)
+                      SELECT count(*) AS n FROM (
+                        SELECT gene FROM per_sample GROUP BY gene HAVING count(*) >= %(f)s) x""",
+                   {"s": SID, "f": _floor}, tables=["delimp_proteins"], fetch="val")
+check("reports the RANKABLE population, not every protein_group in the search",
+      d.get("n_rankable") == _rankable_ind, f"{d.get('n_rankable')} vs {_rankable_ind} independent")
+check("...and that population is genuinely narrower than the raw protein_group count",
+      d.get("n_rankable") < 6388, f"n_rankable={d.get('n_rankable')}")
+
+# ACQUISITION ORDER: DO NOT CLAIM WHAT THE DATA CANNOT SUPPORT (F16). The spec justifies the column
+# ordering by "acquisition order makes batch drift visible as vertical bands", and the plan asked
+# the implementer to report how many samples actually carry a date. On this fixture the answer is
+# ZERO of 222 -- the sort falls through to filename order and a vertical band means nothing about
+# batch drift. The panel reads n_samples_dated to say which order is really in force.
+_dated_ind = _q("""SELECT count(rf.acquisition_date) AS n
+                     FROM (SELECT DISTINCT raw_path FROM delimp_proteins WHERE search_id=%(s)s) p
+                     LEFT JOIN raw_files rf ON rf.raw_path = p.raw_path""",
+                {"s": SID}, tables=["delimp_proteins", "raw_files"], fetch="val")
+check("reports how many samples carry an acquisition_date, matching the DB",
+      d.get("n_samples_dated") == _dated_ind, f"{d.get('n_samples_dated')} vs {_dated_ind} independent")
+check("this fixture is the no-dates case the footer must name (0 of 222)",
+      d.get("n_samples_dated") == 0, str(d.get("n_samples_dated")))
 
 # THE PRESENCE FLOOR. Without it Or6c75 (1 of 222 samples, 85.4e9 mean) outranks albumin.
 # Assert the floor held, not that some arbitrary gene is absent.
@@ -163,7 +197,6 @@ check("cells reference real sample keys",
 # are flagged (TPM2, SERPINA1), so the liveness half is not vacuous either -- an aggregate that
 # collapsed every row to False would clear a "matches independent" check trivially if every
 # independent value were False too, and it isn't.
-from app.db import query as _q                                # noqa: E402
 _genes = [p["gene"] for p in prots]
 _ind_cont = {r["gene"]: bool(r["c"]) for r in _q(
     "SELECT gene, bool_or(is_contaminant) AS c FROM delimp_proteins "
