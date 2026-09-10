@@ -10,6 +10,7 @@ from datetime import date
 os.environ["DELIMP_INTERNAL_MODE"] = "1"          # internal tables; see app/db.py
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app import queries
+from app import db
 from app.db import query                            # noqa: E402
 
 FAILS = []
@@ -240,8 +241,24 @@ check("PROT_0652 is present via q=0652",
 # would count all 378 FK-linked searches in the corpus and >= 1 would still pass — the whole
 # tri-state page would collapse to "everything is in FRAN". PROT_0652 has exactly 6, measured
 # against the live DB (2026-09-08); assert equality.
-check("PROT_0652 shows exactly its 6 genuinely FK-linked searches",
-      sub652.get("n_searches") == 6, sub652.get("n_searches"))
+# Assert equality -- but DERIVE the expected value rather than pinning it. `== 6` was measured on
+# 2026-09-08 and rots the day PROT_0652 gains a seventh search: a test that fails on healthy data,
+# the same defect the `total == 790` check above already had (it read 792 by 2026-09-10). The
+# derived count comes from delimp_search_provenance directly, so it still discriminates -- if the
+# subquery lost its correlation, n_searches jumps to the corpus-wide FK-linked total while the
+# derived value stays at PROT_0652's own handful.
+_sub652_id = sub652.get("submission_id")
+_exp652 = db.query("SELECT COUNT(*) AS n FROM delimp_search_provenance "
+                   "WHERE coreomics_submission_id = %s",
+                   (_sub652_id,), tables=["delimp_search_provenance"], fetch="val")
+_all_linked = db.query("SELECT COUNT(*) AS n FROM delimp_search_provenance "
+                       "WHERE coreomics_submission_id IS NOT NULL",
+                       tables=["delimp_search_provenance"], fetch="val") or 0
+check("PROT_0652 shows exactly its own FK-linked searches (derived, not pinned)",
+      sub652.get("n_searches") == _exp652,
+      f"page={sub652.get('n_searches')} derived={_exp652}")
+check("the derived count is far below the corpus-wide total (de-correlation witness)",
+      0 < (_exp652 or 0) < _all_linked, f"derived={_exp652} corpus_linked={_all_linked}")
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
