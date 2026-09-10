@@ -60,6 +60,8 @@ function route(){
     case 'engines': return renderEngines(param);
     case 'enginerun': return renderEngineRun(param);
     case 'collaborators': return renderCollaborators();
+    case 'submissions': return renderSubmissions();
+    case 'labs': return renderLabs();
     case 'mydata': return renderMyData();
     case 'collab': return renderCollaborator(param);
     case 'submission': return renderSubmission(param);
@@ -536,14 +538,25 @@ async function srTab(which){
     if(which==='people'){
       const d=await api(`/api/internal/people_search?q=${encodeURIComponent(q)}&limit=100`);
       if(!d.rows||!d.rows.length){ body.innerHTML=empty('No PI, submitter, submission number, or institute matches. Try a surname (e.g. "Palczewski") or a submission number.'); return; }
-      body.innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} searches matched by PI · submitter · submission · institute (confidential)</div>`+table(
+      body.innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} matches by PI · submitter · submission · institute (confidential)</div>`+table(
         ['Search','CoreOmics PI · institute','Submission','Engine','Precursors'],
         d.rows.map(r=>{
+          // Two row kinds share this table: kind==='search' (from delimp_search_provenance,
+          // institute aliased co_institute, submission id under coreomics_submission_id) and
+          // kind==='submission' (a submission stub with no linked search yet — institute is
+          // unaliased `institute`, and its number lives in `internal_id`, not
+          // coreomics_submission_id, which is None on a stub). See internal_people_search().
+          const isSub=r.kind==='submission';
+          const institute=r.co_institute||r.institute;
           const coPI=[r.pi_first_name,r.pi_last_name].filter(Boolean).join(' ')||[r.submitter_first_name,r.submitter_last_name].filter(Boolean).join(' ')||r.customer_contact||'';
-          const who=coPI?`<span class="text-emerald-300 cursor-pointer hover:underline" onclick="event.stopPropagation();go('lab','${esc((coPI||'').replace(/'/g,"\\'"))}')" title="Open lab page">${esc(coPI)}</span>${r.co_institute?`<div class="text-[10px] text-slate-500">${esc(r.co_institute)}</div>`:''}`:(r.path_hint?`<span class="text-slate-400">path: ${esc(r.path_hint)}</span>`:'<span class="text-slate-600">—</span>');
-          const subCell=r.coreomics_submission_id?`<span onclick="event.stopPropagation();go('submission','${esc(r.coreomics_submission_id)}')" class="text-accent-400 cursor-pointer hover:underline font-mono text-xs" title="Open submission — all its searches">#${esc(r.coreomics_submission_id)}</span>`:'<span class="text-slate-600">—</span>';
+          const who=coPI?`<span class="text-emerald-300 cursor-pointer hover:underline" onclick="event.stopPropagation();go('lab','${esc((coPI||'').replace(/'/g,"\\'"))}')" title="Open lab page">${esc(coPI)}</span>${institute?`<div class="text-[10px] text-slate-500">${esc(institute)}</div>`:''}`:(r.path_hint?`<span class="text-slate-400">path: ${esc(r.path_hint)}</span>`:'<span class="text-slate-600">—</span>');
+          const subId=isSub?r.internal_id:r.coreomics_submission_id;
+          const subCell=subId?`<span onclick="event.stopPropagation();go('submission','${esc((subId||'').replace(/'/g,"\\'"))}')" class="text-accent-400 cursor-pointer hover:underline font-mono text-xs" title="Open submission — all its searches">#${esc(subId)}</span>`:'<span class="text-slate-600">—</span>';
+          const searchCell=isSub
+            ? `<span class="text-accent-400 cursor-pointer hover:underline" onclick="event.stopPropagation();go('submission','${esc((r.internal_id||'').replace(/'/g,"\\'"))}')">📋 ${esc(r.internal_id)}</span><div class="text-[10px] text-slate-500">submission — no linked search yet</div>`
+            : `<span class="text-accent-400 cursor-pointer hover:underline" onclick="event.stopPropagation();go('run','${esc((r.search_id||'').replace(/'/g,"\\'"))}')">${esc(r.real_search_name||'—')}</span>${r.client?`<div class="text-[10px] text-slate-500">${esc(r.client)}</div>`:''}`;
           return [
-            `<span class="text-accent-400 cursor-pointer hover:underline" onclick="event.stopPropagation();go('run','${esc(r.search_id)}')">${esc(r.real_search_name||'—')}</span>${r.client?`<div class="text-[10px] text-slate-500">${esc(r.client)}</div>`:''}`,
+            searchCell,
             who, subCell,
             r.search_engine?esc(r.search_engine):'—', r.n_precursors_total!=null?fmt(r.n_precursors_total):'—'];
         }));
@@ -1893,23 +1906,56 @@ async function renderMyData(){
 }
 
 /* ---------- INTERNAL: collaborator browser (private deployment only) ---------- */
+let __COLLAB_ROWS__ = [];
 async function renderCollaborators(){
-  view.innerHTML=`<section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">🔒 Collaborators <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
-    <p class="text-slate-400 text-sm mt-1">Private core-facility directory — real client / PI / project from search provenance. Click a collaborator to see all their searches with real names + file locations.</p></section>
+  view.innerHTML=`<section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">🔒 Service Dir <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
+    <p class="text-slate-400 text-sm mt-1">Private core-facility directory — one row per service-directory folder, with real client / PI / project from search provenance. Click a folder to see all its searches with real names + file locations.</p></section>
+    <div class="relative mb-4 max-w-xl">
+      <input id="collabQ" placeholder="Service folder, CoreOmics PI, or institute…" oninput="filterCollaborators()"
+        class="w-full bg-ink-800/70 border border-white/10 rounded-xl px-4 py-2.5 pl-10 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50" />
+      <svg class="absolute left-3 top-3 text-slate-500" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+    </div>
     <div class="glass card p-4 fade-in" id="collabBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
   try{
     const d=await api('/api/internal/collaborators'); const rows=d.collaborators||[];
+    __COLLAB_ROWS__ = rows;
     if(!rows.length){ $('#collabBody').innerHTML=empty('No provenance rows.'); return; }
-    const coBadge=c=>c==='confirmed'?'<span class="text-emerald-300" title="confirmed via an existing CoreOmics link">●</span>':c==='suggested'?'<span class="text-amber-300" title="suggested by name match — advisory, unconfirmed">○</span>':'';
-    const coCell=r=>r.co_pi?`<span class="text-slate-300">${esc(r.co_pi)}</span> ${coBadge(r.co_confidence)}${r.co_institute?`<div class="text-[10px] text-slate-500">${esc(r.co_institute)}</div>`:''}`:'<span class="text-slate-600">—</span>';
-    const foot=`<div class="text-[11px] text-slate-500 mt-3">${fmt(d.n_internal_standard||0)} internal/standard group${(d.n_internal_standard===1)?'':'s'} hidden · ${fmt(d.n_unattributed_searches||0)} searches unattributed (no service folder — standards / QC / staging)</div>`;
-    $('#collabBody').innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(rows.length)} collaborators — by curated service-directory folder · CoreOmics PI is advisory (● confirmed · ○ suggested)</div>`+table(
-      ['Collaborator','Searches','PIs','LIMS-linked','CoreOmics PI · institute','Campus'],
-      rows.map(r=>[`<span class="font-semibold text-accent-400">${esc(r.client)}</span>`,fmt(r.n_searches),fmt(r.n_pis),r.n_lims_linked?fmt(r.n_lims_linked):'<span class="text-slate-600">—</span>',coCell(r),r.campus?esc(r.campus):'—']),
-      rows.map(r=>`go('collab','${(r.client||'').replace(/'/g,"\\'")}')`))
-      +foot+`<div id="labsByInst" class="mt-6"><div class="skeleton h-32 rounded-xl"></div></div>`;
-    loadLabsByInstitution();
+    $('#collabBody').innerHTML=`<div id="collabFoot" class="text-[11px] text-slate-500 mt-3"></div>`;   // placeholder, filled by renderCollabRows
+    renderCollabRows(rows, d);
   }catch(e){ dbError(e,'#collabBody'); }
+}
+function filterCollaborators(){
+  const q=($('#collabQ').value||'').trim().toLowerCase();
+  const rows = q
+    ? __COLLAB_ROWS__.filter(r=>[r.client,r.co_pi,r.co_institute].some(v=>(v||'').toLowerCase().includes(q)))
+    : __COLLAB_ROWS__;
+  renderCollabRows(rows, window.__COLLAB_META__||{});
+}
+function renderCollabRows(rows, d){
+  window.__COLLAB_META__ = d;
+  if(!rows.length){ $('#collabBody').innerHTML=empty('No collaborators match.'); return; }
+  const coBadge=c=>c==='confirmed'?'<span class="text-emerald-300" title="confirmed via an existing CoreOmics link">●</span>':c==='suggested'?'<span class="text-amber-300" title="suggested by name match — advisory, unconfirmed">○</span>':'';
+  const coCell=r=>r.co_pi?`<span class="text-slate-300">${esc(r.co_pi)}</span> ${coBadge(r.co_confidence)}${r.co_institute?`<div class="text-[10px] text-slate-500">${esc(r.co_institute)}</div>`:''}`:'<span class="text-slate-600">—</span>';
+  const foot=`<div class="text-[11px] text-slate-500 mt-3">${fmt(d.n_internal_standard||0)} internal/standard group${(d.n_internal_standard===1)?'':'s'} hidden · ${fmt(d.n_unattributed_searches||0)} searches unattributed (no service folder — standards / QC / staging)</div>`;
+  $('#collabBody').innerHTML=`<div class="text-xs text-slate-500 mb-3">${fmt(rows.length)} service folders, most recent work first — by curated service-directory folder · CoreOmics PI is advisory (● confirmed · ○ suggested)</div>`+table(
+    ['Service folder','Last run','Searches','LIMS-linked','CoreOmics PI · institute','Campus'],
+    rows.map(r=>[`<span class="font-semibold text-accent-400">${esc(r.client)}</span>`,
+      r.last_run?`<span class="font-mono text-xs">${esc(r.last_run)}</span>`:'<span class="text-slate-600">—</span>',
+      fmt(r.n_searches),r.n_lims_linked?fmt(r.n_lims_linked):'<span class="text-slate-600">—</span>',coCell(r),r.campus?esc(r.campus):'—']),
+    rows.map(r=>`go('collab','${(r.client||'').replace(/'/g,"\\'")}')`))
+    +foot+`<div class="mt-4 flex items-center justify-between gap-4 p-3 rounded-xl bg-ink-900/40 border border-dashed border-white/10">
+        <div class="text-xs text-slate-400">Labs by institution — every CoreOmics lab we hold data for, including data on the share that is not yet ingested.</div>
+        <button onclick="go('labs')" class="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold text-ink-900" style="background:linear-gradient(180deg,#FFCF40,#FFBF00)">Open labs view →</button>
+      </div>`;
+}
+
+/* ---------- INTERNAL: labs-by-institution grid, its own route (moved out of Collaborators) ---------- */
+async function renderLabs(){
+  view.innerHTML=`${crumb([['Service Dir','collaborators'],['Labs by institution',null]])}
+    <section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">🏛️ Labs <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
+    <p class="text-slate-400 text-sm mt-1">Every CoreOmics lab we hold data for, grouped by institution — including labs whose data sits on the share but is not yet ingested into FRAN.</p></section>
+    <div class="glass card p-4 fade-in" id="labsByInst"><div class="skeleton h-32 rounded-xl"></div></div>`;
+  loadLabsByInstitution();
 }
 
 async function loadLabsByInstitution(){
@@ -1935,7 +1981,7 @@ async function loadLabsByInstitution(){
   }catch(e){ el.innerHTML=`<div class="text-xs text-slate-500">Labs-by-institution unavailable: ${esc((e&&e.message)||'error')}</div>`; }
 }
 async function renderCollaborator(name){
-  view.innerHTML=`${crumb([['Collaborators','collaborators'],[name,null]])}<div class="glass card p-4 fade-in" id="collabBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
+  view.innerHTML=`${crumb([['Service Dir','collaborators'],[name,null]])}<div class="glass card p-4 fade-in" id="collabBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
   try{
     const d=await api(`/api/internal/collaborator/${encodeURIComponent(name)}`); const rows=d.searches||[];
     if(!rows.length){ $('#collabBody').innerHTML=empty('No searches for this collaborator.'); return; }
@@ -2016,7 +2062,7 @@ async function renderSubmission(id){
 }
 
 async function renderLab(pi){
-  view.innerHTML=`${crumb([['Collaborators','collaborators'],[pi,null]])}<div class="glass card p-4 fade-in" id="labBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
+  view.innerHTML=`${crumb([['Service Dir','collaborators'],[pi,null]])}<div class="glass card p-4 fade-in" id="labBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
   try{
     const d=await api(`/api/internal/lab/${encodeURIComponent(pi)}`);
     const subs=d.submissions||[], rows=d.searches||[];
@@ -2086,6 +2132,56 @@ async function renderLab(pi){
   }catch(e){ dbError(e,'#labBody'); }
 }
 
+/* ---------- INTERNAL: submission directory (private deployment only) ---------- */
+async function renderSubmissions(){
+  view.innerHTML=`<section class="mb-5 fade-in"><h1 class="text-2xl font-extrabold text-white tracking-tight">📋 Submissions <span class="text-[11px] font-bold text-rose-300 align-middle">CONFIDENTIAL</span></h1>
+    <p class="text-slate-400 text-sm mt-1">Every CoreOmics submission, newest first — whether its data is in FRAN, still on the share, or not located yet.</p></section>
+    <div class="relative mb-4 max-w-xl">
+      <input id="subQ" placeholder="Submission number, institute, PI, submitter or email…" onkeydown="if(event.key==='Enter')renderSubmissions()"
+        class="w-full bg-ink-800/70 border border-white/10 rounded-xl px-4 py-2.5 pl-10 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-accent/50" />
+      <svg class="absolute left-3 top-3 text-slate-500" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+    </div>
+    <div class="glass card p-4 fade-in" id="subsBody"><div class="skeleton h-64 rounded-xl"></div></div>`;
+  const q = (window.__SUBS_Q__||'');
+  const el = $('#subQ'); if(el){ el.value=q; el.oninput=e=>{ window.__SUBS_Q__=e.target.value; }; }
+  try{
+    // Fetch every submission rather than paging: the reviewer measured fetching all 792 as
+    // FASTER than fetching 100 (1.27s vs 1.69s — the n_searches correlated subquery is not the
+    // bottleneck), and this page's whole point is a browsable "every submission" directory, so a
+    // silent 100-row cap under a header claiming the true total left 692 unreachable. 5000 is
+    // comfortably above any size this corpus reaches for the foreseeable future; revisit with
+    // real offset paging (the backend already accepts `offset`) well before it isn't.
+    const d = await api(`/api/internal/submissions?limit=5000&q=${encodeURIComponent(q)}`);
+    const rows = d.submissions||[];
+    if(!rows.length){ $('#subsBody').innerHTML=empty('No submissions match.'); return; }
+    // Three states, never a blank cell. "not located" is the honest answer for anything the
+    // 2026-06-24 disk-match never saw, which is everything after PROT_0724.
+    // SINGLE definition of "analyzed" (matches internal_lab() / the institution page, and the
+    // submission detail page's sd.in_fran read): n_searches>0 OR in_fran. A linked provenance
+    // search proves it regardless; in_fran alone also counts, since the disk-match sometimes
+    // knows a submission is in FRAN before/without a provenance-linked search_id (bug-logic #6 —
+    // the same submission can't read "analyzed" on one page and "on the share" on this one).
+    const state = s => (s.n_searches>0 || s.in_fran)
+      ? `<span class="text-emerald-300">✅ ${s.n_searches>0?`${fmt(s.n_searches)} search${s.n_searches===1?'':'es'}`:'analyzed in FRAN'}</span>`
+      : (s.run_count!=null || s.service_folder)
+        ? `<span class="text-accent-400">📦 ${s.run_count!=null?fmt(s.run_count)+' runs':''} on the share</span>
+           ${s.service_folder?`<div class="text-[10px] text-slate-500 font-mono break-all mt-0.5" title="${esc(s.service_folder_win||'')}">${esc(s.service_folder)}</div>`:''}
+           <button onclick="event.stopPropagation();exportReport('${esc((s.submission_id||'').replace(/'/g,"\\'"))}',this,'resubmit')" class="mt-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-plum/20 text-plum hover:bg-plum/30" title="Download a HIVE/Flinders re-search brief for this un-ingested data">🔄 Re-search this data</button>`
+        : `<span class="text-slate-600">— not located</span>`;
+    $('#subsBody').innerHTML =
+      `<div class="text-xs text-slate-500 mb-3">${fmt(d.total)} numbered submission${d.total===1?'':'s'}${d.locations_as_of?` · share locations as of ${esc(String(d.locations_as_of))}`:''}</div>`
+      + table(['Submission','Institute','PI · submitter','Samples','Submitted','In FRAN?'],
+          rows.map(s=>[
+            `<span class="font-mono font-semibold text-accent-400">${esc(s.internal_id)}</span>`,
+            esc(s.institute||'—'),
+            `<span class="text-xs text-slate-400">${esc([s.pi,s.submitter].filter(Boolean).join(' · ')||'—')}</span>`,
+            s.num_samples!=null?fmt(s.num_samples):'—',
+            `<span class="font-mono text-xs">${esc(String(s.submitted_at||'—'))}</span>`,
+            state(s)]),
+          rows.map(s=>`go('submission','${esc((s.internal_id||'').replace(/'/g,"\\'"))}')`));
+  }catch(e){ dbError(e,'#subsBody'); }
+}
+
 /* ---------- shared UI bits ---------- */
 function stat(label,val){ return `<div><div class="text-[11px] uppercase tracking-wider text-slate-500">${label}</div><div class="text-xl font-bold text-white kpi-num mt-0.5">${val}</div></div>`; }
 function table(cols, rows, onclicks){
@@ -2128,6 +2224,8 @@ function applyAuth(st){
   window.__FRAN_TIER__ = tier;
   const tog=(id,hide)=>{const e=document.getElementById(id); if(e) e.classList.toggle('hidden', hide);};
   tog('nav_collab', !isFull); tog('nav_collab_m', !isFull);     // Collaborators dir = full only
+  tog('nav_subs', !isFull); tog('nav_subs_m', !isFull);         // Submissions dir = full only
+  tog('nav_labs', !isFull); tog('nav_labs_m', !isFull);         // Labs by institution = full only
   tog('nav_mydata', tier!=='lab'); tog('nav_mydata_m', tier!=='lab'); // My Submissions = lab users
   // tier badge in the navbar
   let badge=document.getElementById('tierBadge');

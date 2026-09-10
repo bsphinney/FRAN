@@ -2119,21 +2119,25 @@ def internal_collaborators() -> dict[str, Any]:
 
     Returns {collaborators: [...keep...], excluded: [...internal/standard...], n_internal_standard,
     n_unattributed_searches}. CoreOmics PI/institute is ADVISORY (confidence confirmed|suggested) and
-    never overrides the folder name."""
+    never overrides the folder name. `keep` is sorted by `last_run` (raw_files.acquisition_date,
+    an ISO date or None — when work was ACQUIRED, not ingested) descending, undated last."""
     rows = query(
         """
-        SELECT service_customer AS raw,
-               COUNT(*) AS n_searches,
-               COUNT(DISTINCT NULLIF(pi,'')) AS n_pis,
-               COUNT(DISTINCT NULLIF(project,'')) AS n_projects,
-               COUNT(*) FILTER (WHERE coreomics_submission_id IS NOT NULL
-                                   OR sample_submission_id IS NOT NULL) AS n_lims_linked,
-               MAX(service_campus) AS campus, MAX(service_source) AS source
-        FROM delimp_search_provenance
-        WHERE service_customer IS NOT NULL
-        GROUP BY service_customer
+        SELECT p.service_customer AS raw,
+               COUNT(DISTINCT p.search_id) AS n_searches,
+               COUNT(DISTINCT NULLIF(p.pi,'')) AS n_pis,
+               COUNT(DISTINCT NULLIF(p.project,'')) AS n_projects,
+               COUNT(DISTINCT p.search_id) FILTER (WHERE p.coreomics_submission_id IS NOT NULL
+                                   OR p.sample_submission_id IS NOT NULL) AS n_lims_linked,
+               MAX(p.service_campus) AS campus, MAX(p.service_source) AS source,
+               MAX(rf.acquisition_date)::date AS last_run
+        FROM delimp_search_provenance p
+        LEFT JOIN search_raw_files srf ON srf.search_id = p.search_id
+        LEFT JOIN raw_files rf ON rf.raw_path = srf.raw_path
+        WHERE p.service_customer IS NOT NULL
+        GROUP BY p.service_customer
         """,
-        tables=["delimp_search_provenance"],
+        tables=["delimp_search_provenance", "search_raw_files", "raw_files"],
     )
     n_unattributed = query(
         "SELECT COUNT(*) FROM delimp_search_provenance WHERE service_customer IS NULL",
@@ -2149,11 +2153,14 @@ def internal_collaborators() -> dict[str, Any]:
                               "campus": info.get("campus") or r["campus"], "scope": "customer",
                               "n_searches": 0, "n_pis": 0, "n_projects": 0, "n_lims_linked": 0,
                               "co_pi": None, "co_institute": None, "co_confidence": None,
-                              "_sources": set()}
+                              "last_run": None, "_sources": set()}
         m["n_searches"] += r["n_searches"] or 0
         m["n_pis"] += r["n_pis"] or 0
         m["n_projects"] += r["n_projects"] or 0
         m["n_lims_linked"] += r["n_lims_linked"] or 0
+        # A canonical collaborator can span several raw service_customer folders — take the MAX
+        # acquisition date across all of them, not just the one from the last row merged in.
+        m["last_run"] = max([x for x in (m.get("last_run"), r["last_run"]) if x], default=None)
         if r["source"]:
             m["_sources"].add(r["source"])
         co = info.get("coreomics")
@@ -2163,8 +2170,11 @@ def internal_collaborators() -> dict[str, Any]:
 
     for m in merged.values():
         m["source"] = ",".join(sorted(m.pop("_sources")))
+    # Most recent acquisition first; collaborators with no dated raw file (no NULLIF-safe join hit)
+    # sort LAST, not first — an undated collaborator must never sit above one acquired last week.
     keep = sorted((m for m in merged.values() if m["flag"] == "keep"),
-                  key=lambda m: (-m["n_searches"], m["client"]))
+                  key=lambda m: (m["last_run"] is not None, m["last_run"] or "", m["n_searches"]),
+                  reverse=True)
     excluded = sorted((m for m in merged.values() if m["flag"] != "keep"),
                       key=lambda m: (-m["n_searches"], m["client"]))
     return {"collaborators": keep, "excluded": excluded,
@@ -2276,6 +2286,7 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
     term = (q or "").strip()
     if len(term) < 2:
         return {"q": term, "total": 0, "rows": []}
+    ref = normalize_submission_ref(term)          # '0793' -> 'PROT_0793', else None
     like = f"%{term}%"
     rows = query(
         """
@@ -2291,6 +2302,7 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
         WHERE co.pi_last_name ILIKE %(like)s OR co.pi_first_name ILIKE %(like)s
            OR co.submitter_last_name ILIKE %(like)s OR co.submitter_first_name ILIKE %(like)s
            OR co.institute ILIKE %(like)s OR p.coreomics_submission_id::text ILIKE %(like)s
+           OR co.internal_id ILIKE %(like)s OR co.internal_id = %(ref)s
            OR p.customer_contact ILIKE %(like)s
            OR p.client ILIKE %(like)s OR p.pi ILIKE %(like)s OR p.project ILIKE %(like)s
            OR p.real_search_name ILIKE %(like)s
@@ -2298,16 +2310,69 @@ def internal_people_search(q: str, limit: int = 80) -> dict[str, Any]:
                  p.real_search_name
         LIMIT %(limit)s
         """,
-        {"like": like, "limit": int(limit)},
+        {"like": like, "ref": ref, "limit": int(limit)},
         tables=["delimp_search_provenance", "coreomics_submissions_cache", "delimp_searches"],
     )
+    subs = query(
+        """
+        SELECT co.submission_id, co.internal_id, co.institute,
+               co.pi_first_name, co.pi_last_name,
+               co.submitter_first_name, co.submitter_last_name,
+               co.submitted_at::date AS co_submitted, co.num_samples AS co_num_samples
+        FROM coreomics_submissions_cache co
+        WHERE co.internal_id IS NOT NULL
+          AND (co.internal_id ILIKE %(like)s OR co.internal_id = %(ref)s
+               OR co.institute ILIKE %(like)s
+               OR co.pi_last_name ILIKE %(like)s OR co.submitter_last_name ILIKE %(like)s)
+        ORDER BY co.submitted_at DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        {"like": like, "ref": ref, "limit": int(limit)},
+        tables=["coreomics_submissions_cache"],
+    )
+    have = {r.get("coreomics_submission_id") for r in rows}
+    for s in subs:
+        if s["submission_id"] not in have:          # do not duplicate a submission already listed
+            s["kind"] = "submission"
+            rows.append(s)
+    for r in rows:
+        r.setdefault("kind", "search")
     return {"q": term, "total": len(rows), "rows": rows}
+
+
+_SUB_REF = re.compile(r"^\s*(?:prot[_-]?)?(\d{1,4})\s*$", re.I)
+
+
+def normalize_submission_ref(ref: str) -> str | None:
+    """'0793' / '793' / 'prot_0793' -> 'PROT_0793'. Anything else -> None.
+
+    Submission numbers are what people actually have in hand — they appear on the folder
+    (PROT_0793), in the CoreOmics UI and in conversation. The hex submission_id is the join key
+    everywhere else and nobody quotes it. Note a hex id like '1ed8b74497e4' must NOT match: it can
+    contain digits, and silently reading it as a number would resolve the wrong submission.
+
+    The {1,4} digit cap above is a safety constraint, not a convenience. Every CoreOmics
+    submission_id is exactly 12 lowercase hex characters (measured across all 4,488 rows on
+    2026-09-08), and 14 of those 4,488 happen to be entirely numeric. A looser digit bound would
+    silently accept one of those 12-digit hex ids as a submission number and resolve into the
+    wrong customer's submission. Widening this bound requires re-checking that invariant first.
+    """
+    m = _SUB_REF.match(ref or "")
+    return f"PROT_{int(m.group(1)):04d}" if m else None
 
 
 def internal_submission(submission_id: str) -> dict[str, Any]:
     """PRIVATE: one CoreOmics submission (PI / submitter / institute / date / samples) plus EVERY
     FRAN search linked to it. Powers the submission-ID page. Returns {submission, searches:[...]}."""
     sid = (submission_id or "").strip()
+    ref = normalize_submission_ref(sid)
+    if ref:
+        # internal_id is the human number; every other table joins on the hex submission_id.
+        hit = query(
+            "SELECT submission_id FROM coreomics_submissions_cache WHERE internal_id = %s",
+            (ref,), tables=["coreomics_submissions_cache"])
+        if hit:
+            sid = hit[0]["submission_id"]
     sub_rows = query(
         """
         SELECT submission_id, pi_first_name, pi_last_name, submitter_first_name, submitter_last_name,
@@ -2347,6 +2412,63 @@ def internal_submission(submission_id: str) -> dict[str, Any]:
     return {"submission_id": sid, "submission": submission,
             "samples": samples, "searches": searches, "n_searches": len(searches),
             "service_dir": (loc[0] if loc else None)}
+
+
+def internal_submissions(q: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """PRIVATE: every numbered CoreOmics submission, newest first, with what FRAN knows about it.
+
+    Three states per row, and none of them is a blank cell: it has searches in FRAN; or its data is
+    located on the share and not ingested; or we have no location for it at all. The third is
+    common and honest — delimp_submission_service_dir was written once on 2026-06-24 and knows
+    nothing after PROT_0724 — so the caller is also told when locations were last determined.
+    """
+    ref = normalize_submission_ref(q or "") if q else None
+    like = f"%{(q or '').strip()}%"
+    where, params = "", {"limit": int(limit), "offset": int(offset)}
+    if q:
+        where = """AND (co.internal_id ILIKE %(like)s OR co.internal_id = %(ref)s
+                        OR co.institute ILIKE %(like)s OR co.pi_last_name ILIKE %(like)s
+                        OR co.submitter_last_name ILIKE %(like)s
+                        OR co.submitter_email ILIKE %(like)s)"""
+        params.update({"like": like, "ref": ref})
+    rows = query(
+        f"""
+        SELECT co.internal_id, co.submission_id, co.institute,
+               NULLIF(TRIM(CONCAT_WS(' ', co.pi_first_name, co.pi_last_name)), '')        AS pi,
+               NULLIF(TRIM(CONCAT_WS(' ', co.submitter_first_name, co.submitter_last_name)), '') AS submitter,
+               co.num_samples, co.submitted_at::date AS submitted_at,
+               (SELECT COUNT(*) FROM delimp_search_provenance p
+                 WHERE p.coreomics_submission_id = co.submission_id)                       AS n_searches,
+               sd.in_fran, sd.run_count, sd.service_folder, sd.service_folder_win
+          FROM coreomics_submissions_cache co
+          LEFT JOIN delimp_submission_service_dir sd ON sd.submission_id = co.submission_id
+         WHERE co.internal_id IS NOT NULL {where}
+         ORDER BY co.submitted_at DESC NULLS LAST, co.internal_id DESC
+         LIMIT %(limit)s OFFSET %(offset)s
+        """,
+        params,
+        tables=["coreomics_submissions_cache", "delimp_search_provenance",
+                "delimp_submission_service_dir"],
+    )
+    total = query(
+        f"""SELECT COUNT(*) FROM coreomics_submissions_cache co
+             WHERE co.internal_id IS NOT NULL {where}""",
+        params, tables=["coreomics_submissions_cache"], fetch="val") or 0
+    with_searches = query(
+        f"""SELECT COUNT(*) FROM coreomics_submissions_cache co
+             WHERE co.internal_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM delimp_search_provenance p
+                            WHERE p.coreomics_submission_id = co.submission_id) {where}""",
+        params, tables=["coreomics_submissions_cache", "delimp_search_provenance"],
+        fetch="val") or 0
+    as_of = query("SELECT MAX(matched_at)::date AS d FROM delimp_submission_service_dir",
+                  tables=["delimp_submission_service_dir"])
+    return {"submissions": rows, "total": int(total),
+            # Corpus-wide under the SAME filter, not a count of the returned page. `total` beside it
+            # is corpus-wide, so a page-scoped sibling in the same dict reads as "0 of 790 have
+            # searches" at the default limit of 100 when the real answer is 160.
+            "n_with_searches": with_searches,
+            "locations_as_of": (as_of[0]["d"] if as_of else None)}
 
 
 _LAB_STOP = {"lab", "laboratory", "the", "dr", "prof", "mr", "ms", "mrs", "group", "core",
