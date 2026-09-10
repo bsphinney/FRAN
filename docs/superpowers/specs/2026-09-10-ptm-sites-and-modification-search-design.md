@@ -456,10 +456,20 @@ human-facing text that changes between versions.
 
 **3. Spectronaut — the hard 96%, and it rides along with the localization re-export.**
 
-The settings live in the `.sne` project files, which are on the Windows shares, not Hive: the
-phospho search's `output_dir` is `D:\MRS\toshi\20260528_093510_Toshi-uniprot-STY phospho.sne`.
-Extracting them needs a machine with Spectronaut, which is precisely what `ingest/sne_export.py`
-already drives.
+The settings live in the `.sne` project files. Two things measured here rather than assumed:
+
+- **664 `.sne` files ARE on Hive**, under `/quobyte/proteomics-grp/SERVICE/`. They are not only on
+  the Windows shares, which is what the `D:\MRS\toshi\...` `output_dir` values suggest.
+- **They cannot be parsed without Spectronaut.** The format is a proprietary binary — a
+  length-prefixed UTF-16 header followed by compressed payload. `strings -e l` over a 78 MB project
+  yields exactly the project name and the raw filenames; no modification name, enzyme, FDR
+  threshold or settings key is recoverable. Searching for `carbamidomethyl`, `oxidation`,
+  `phospho`, `glygly`, `trypsin`, `unimod`, `qvalue`, `fdr`, `missedcleav`, `variablemod`,
+  `fixedmod` and `enzyme` in both UTF-16 and ASCII returned nothing.
+
+So a "just read the `.sne`" shortcut does not exist, and Spectronaut is not installed on Hive
+(`which spectronaut` finds nothing, nothing under `/share/apps`). Extraction must run on a machine
+with a licensed Spectronaut, which is exactly what `ingest/sne_export.py` already drives.
 
 **This is the same operation as the localization recovery, and should be done once, not twice.**
 That re-export already has to happen to populate `site_localization_probability`; adding the
