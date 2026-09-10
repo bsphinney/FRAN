@@ -51,6 +51,26 @@ cvs = [p.get("cv") for p in c["proteins"]]
 check("cv mode is sorted descending across the whole page",
       all(cvs[i] >= cvs[i + 1] for i in range(len(cvs) - 1)), str(cvs[:4]))
 
+# THE CV GRAIN BUG (Fix round 2, CRITICAL). delimp_proteins is one row per (search, sample,
+# protein_group) -- a gene with more than one protein_group contributes multiple rows per
+# sample. Aggregating stddev_pop/avg directly over those rows mixes between-SAMPLE variation
+# with between-PROTEIN-GROUP variation of the same gene. This is the DISCRIMINATOR: on a
+# 1-sample search, between-sample variation must be EXACTLY zero for every row -- there is only
+# one sample. Before the fix, Hnrnpll came back cv=0.998 on this exact fixture (two protein
+# groups, Q921F4=385 and V9GXB6=342,620, in its one sample) despite there being no second sample
+# for it to vary across. Any non-zero, non-null cv on a 1-sample search proves the aggregate is
+# measuring the wrong thing.
+SID_1SAMPLE = "29a34214-8861-5831-8b7a-6af3e4fc405b"
+one = queries.search_protein_matrix(SID_1SAMPLE, mode="cv", limit=50)
+one_prots = one.get("proteins") or []
+check("1-sample fixture returns rows to check", len(one_prots) > 0, str(len(one_prots)))
+check("1-sample fixture really has 1 sample", one.get("n_samples_total") == 1,
+      str(one.get("n_samples_total")))
+bad_cv = [(p["gene"], p["cv"]) for p in one_prots if p.get("cv") not in (None, 0, 0.0)]
+check("a single-sample search yields no non-zero, non-null cv (cv must measure between-SAMPLE "
+      "variation, not between-protein-group variation within one sample)",
+      not bad_cv, str(bad_cv[:5]))
+
 # RARITY MODE must be corpus-scoped and ascending.
 t0 = time.monotonic()
 r = queries.search_protein_matrix(SID, mode="rarity", limit=50)

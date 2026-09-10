@@ -4449,21 +4449,42 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     # that is the only thing keeping Or6c75-class 1-sample outliers out of the ranking. A
     # precomputed per-search table (a second Tasks 1+2) is out of scope for a panel that
     # already loads lazily, after the Runs table, so a slow matrix never blocks the page.
+    # Fix round 2, CRITICAL: delimp_proteins is one row per (search, sample, protein_group), so a
+    # gene with more than one protein_group (isoforms, ambiguous groupings) contributes MULTIPLE
+    # rows per sample. Aggregating stddev_pop/avg directly over those rows -- as this query used
+    # to -- mixes between-SAMPLE variation with between-PROTEIN-GROUP variation of the same gene.
+    # Proved on a 1-sample search (29a34214-8861-5831-8b7a-6af3e4fc405b), where between-sample
+    # variation must be exactly zero: Hnrnpll still came back cv=0.998, because its "variation"
+    # was two protein groups (Q921F4=385, V9GXB6=342,620) in that one sample, not two samples.
+    # "Varies most -- your samples" was measuring something else entirely, and every multi-sample
+    # search's CV was a contaminated mixture of the two, not just the 1-sample extreme case.
+    #
+    # per_sample first collapses to exactly the grain the CELLS query already uses (gene,
+    # raw_path) -> avg(intensity) -- see the `cells` query below, unchanged. The ranking must
+    # agree with the numbers the grid actually shows, so both sides use avg() at that grain; agg
+    # then computes cv/mean_int over those per-sample values, which is real between-sample
+    # variation. count(*) in agg is now a true count of (gene, sample) pairs, i.e. still the same
+    # answer count(DISTINCT p.raw_path) gave before -- only the numerator of `cv` was ever wrong.
     rows = query(
         f"""
-        WITH agg AS (
-          SELECT p.gene,
-                 max(p.protein_group)                     AS protein_group,
-                 count(DISTINCT p.raw_path)               AS n_samples,
-                 avg(p.intensity)                         AS mean_int,
-                 stddev_pop(p.intensity)
-                   / NULLIF(avg(p.intensity), 0)          AS cv,
-                 bool_or(p.is_contaminant)                AS is_contaminant
-            FROM delimp_proteins p
-           WHERE p.search_id = %(sid)s AND p.intensity > 0
-             AND NULLIF(p.gene,'') IS NOT NULL
-           GROUP BY p.gene
-          HAVING count(DISTINCT p.raw_path) >= %(floor)s)
+        WITH per_sample AS (
+          SELECT gene, raw_path,
+                 avg(intensity)             AS v,
+                 max(protein_group)         AS protein_group,
+                 bool_or(is_contaminant)    AS is_contaminant
+            FROM delimp_proteins
+           WHERE search_id = %(sid)s AND intensity > 0 AND NULLIF(gene,'') IS NOT NULL
+           GROUP BY gene, raw_path),
+        agg AS (
+          SELECT gene,
+                 max(protein_group)                       AS protein_group,
+                 count(*)                                 AS n_samples,
+                 avg(v)                                    AS mean_int,
+                 stddev_pop(v) / NULLIF(avg(v), 0)         AS cv,
+                 bool_or(is_contaminant)                   AS is_contaminant
+            FROM per_sample
+           GROUP BY gene
+          HAVING count(*) >= %(floor)s)
         SELECT a.*, r.n_searches AS reach,
                CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank
           FROM agg a
