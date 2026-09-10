@@ -9,7 +9,8 @@ import os, re, sys
 from datetime import date
 os.environ["DELIMP_INTERNAL_MODE"] = "1"          # internal tables; see app/db.py
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from app import queries                            # noqa: E402
+from app import queries
+from app.db import query                            # noqa: E402
 
 FAILS = []
 def check(name, cond, detail=""):
@@ -95,8 +96,18 @@ check("list returns submissions", len(L.get("submissions") or []) > 0, str(len(L
 # A one-directional >= cannot catch inflation: dropping `co.internal_id IS NOT NULL` from the
 # total COUNT (app/queries.py) makes total 4,488 (every coreomics_submissions_cache row, numbered
 # or not) and >= 790 would still pass — the page header would read "4,488 numbered submissions".
-# 790 is measured against the live DB (2026-09-08); assert equality, not a floor.
-check("list reports a total of exactly 790 numbered submissions", (L.get("total") or 0) == 790, str(L.get("total")))
+# The number is DERIVED, not pinned: it was 790 on 2026-09-08 and 791 a day later when PROT_0805
+# arrived, so a hardcoded literal is a test that fails on healthy data. Equality against an
+# independently-computed count keeps the teeth (de-gating makes `total` jump to every submission,
+# ~4,489, while this stays at the numbered subset) without breaking as the corpus grows.
+_numbered = query("SELECT count(*) AS n FROM coreomics_submissions_cache WHERE internal_id IS NOT NULL",
+                  tables=["coreomics_submissions_cache"])[0]["n"]
+check("list total equals the numbered-submission count", (L.get("total") or 0) == _numbered,
+      f'total={L.get("total")} vs numbered={_numbered}')
+check("...and that is a strict subset of all submissions (the gate is doing work)",
+      _numbered < query("SELECT count(*) AS n FROM coreomics_submissions_cache",
+                        tables=["coreomics_submissions_cache"])[0]["n"],
+      str(_numbered))
 first = (L.get("submissions") or [{}])[0]
 for k in ("internal_id", "institute", "n_searches", "num_samples", "submitted_at"):
     check(f"row carries {k}", k in first, sorted(first.keys())[:12])
