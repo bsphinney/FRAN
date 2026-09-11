@@ -63,30 +63,93 @@ check("an unknown filter token is ignored, not fatal",
 # 2,084 a PTM condition matches nothing, so an empty grid would read as "this search has no
 # phosphoproteins" when the truth is that nobody has computed it. That is the specific failure
 # this project keeps producing, and these are the checks that stop it here.
-NO_ROLLUP = "29a34214-8861-5831-8b7a-6af3e4fc405b"   # a real search, deliberately NOT a fixture
+#
+# DERIVED, NOT PINNED. The backfill will eventually populate every search, so a hard-coded
+# "un-backfilled" id rots into a false pass the day someone runs it. Ask the database which search
+# is un-backfilled at the moment the test runs. n_raw_files/n_protein_groups_total keep it small
+# and non-degenerate; ORDER BY id keeps it reproducible between runs.
+from app.db import query as _q                                # noqa: E402
+_cand = _q("""SELECT s.id FROM delimp_searches s
+               WHERE s.n_raw_files BETWEEN 3 AND 10
+                 AND s.n_protein_groups_total > 500
+                 AND NOT EXISTS (SELECT 1 FROM delimp_search_protein_ptm m WHERE m.search_id = s.id)
+                 AND EXISTS (SELECT 1 FROM delimp_proteins p WHERE p.search_id = s.id)
+               ORDER BY s.id LIMIT 1""",
+           tables=["delimp_searches", "delimp_search_protein_ptm", "delimp_proteins"])
+check("a search with no rollup rows exists to test against", bool(_cand),
+      "every search is backfilled — this suite can no longer prove the not-ready path; "
+      "re-point it at a freshly ingested search")
+NO_ROLLUP = str(_cand[0]["id"]) if _cand else None
+print(f"  [fixture] un-backfilled search derived at runtime: {NO_ROLLUP}")
 
-nr = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50, filters="phospho")
-check("a search with no rollup rows still returns proteins, not an empty grid",
-      len(nr["proteins"]) > 0, f'{len(nr["proteins"])} rows — an empty grid here reads as '
-                              f'"no phosphoproteins", which nobody has established')
-check("...and says the PTM filter is unavailable rather than answering 'none'",
-      nr.get("ptm_filters_unavailable") is True, repr(nr.get("ptm_filters_unavailable")))
-check("...and reports phospho as NOT applied, so `filters` never claims a filter that did not run",
-      "phospho" not in nr["filters"], repr(nr["filters"]))
+if NO_ROLLUP:
+    nr = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50, filters="phospho")
+    check("a search with no rollup rows still returns proteins, not an empty grid",
+          len(nr["proteins"]) > 0, f'{len(nr["proteins"])} rows — an empty grid here reads as '
+                                   f'"no phosphoproteins", which nobody has established')
+    check("...and says ptm_rollup_ready is False rather than answering 'none'",
+          nr.get("ptm_rollup_ready") is False, repr(nr.get("ptm_rollup_ready")))
+    check("...and reports phospho as NOT applied, so `filters` never claims a filter that did not run",
+          "phospho" not in nr["filters"], repr(nr["filters"]))
+    # "Phospho (0)" beside a checkbox is the same lie as an empty grid, only harder to spot.
+    check("...and drops the PTM counts rather than reporting them as 0",
+          not ({"ptm", "phospho", "glygly"} & set(nr.get("filter_counts", {}))),
+          repr(nr.get("filter_counts")))
+    check("...while the counts it CAN compute are still reported",
+          nr.get("filter_counts", {}).get("noncontam", 0) > 0, repr(nr.get("filter_counts")))
 
-# The flag must be ABSENT where the rollup IS computed — never False, which a UI could render as
-# a measurement, and never present, which would make "unavailable" the normal state.
-check("the flag is absent on a search whose rollup IS computed",
-      "ptm_filters_unavailable" not in phos, repr(phos.get("ptm_filters_unavailable")))
-check("the flag is absent when no PTM filter was asked for",
-      "ptm_filters_unavailable" not in base, repr(base.get("ptm_filters_unavailable")))
+    # NOT CACHED: the backfill will populate this search, and a cached "not ready" would keep
+    # asserting it for the full 30-minute TTL after the data landed.
+    from app.db import SLOW_CACHE                              # noqa: E402
+    _k = f"matrix_{NO_ROLLUP}_abundance_50_phospho"
+    check("a not-ready result is NOT cached", SLOW_CACHE.cached(_k) is None,
+          "cached — a backfill would then take up to 30 min to become visible")
 
-# An uncomputable PTM token must not throw away the tokens that ARE computable.
-nrc = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50,
-                                    filters="phospho,noncontam")
-check("non-PTM filters still apply when the PTM rollup is missing",
-      nrc["filters"] == ["noncontam"] and all(not p.get("is_contaminant") for p in nrc["proteins"]),
-      repr(nrc["filters"]))
+    # An uncomputable PTM token must not throw away the tokens that ARE computable.
+    nrc = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50,
+                                        filters="phospho,noncontam")
+    check("non-PTM filters still apply when the PTM rollup is missing",
+          nrc["filters"] == ["noncontam"] and all(not p.get("is_contaminant") for p in nrc["proteins"]),
+          repr(nrc["filters"]))
+
+# ready IS reported as True — not merely absent — so `if (!ready)` cannot misread a healthy
+# response. The key stays absent only when no PTM filter was asked for.
+check("ptm_rollup_ready is True on a search whose rollup IS computed",
+      phos.get("ptm_rollup_ready") is True, repr(phos.get("ptm_rollup_ready")))
+check("the key is absent when no PTM filter was asked for",
+      "ptm_rollup_ready" not in base, repr(base.get("ptm_rollup_ready")))
+
+# "computed, and the answer is none" must be distinguishable from "never computed". glygly is
+# genuinely 0 on the phospho fixture, so this is the real case, not a contrived one.
+gg = queries.search_protein_matrix(PHOS, mode="abundance", limit=50, filters="glygly")
+check("a genuinely-empty PTM answer reports ready=True, not the not-computed flag",
+      len(gg["proteins"]) == 0 and gg.get("ptm_rollup_ready") is True,
+      f'{len(gg["proteins"])} rows, ready={gg.get("ptm_rollup_ready")}')
+
+# ---------------------------------------------------------------------------------------------
+# PER-FILTER COUNTS, so Task 3 can put a number beside each checkbox and nobody ticks a box that
+# silently blanks the grid. Each count must equal the n_rankable that same filter produces ALONE —
+# that is what keeps the tally in `tallies` and the predicate in WHERE from drifting apart.
+fc = base["filter_counts"]
+check("every filter has a count", set(fc) == set(queries._MATRIX_FILTERS), repr(sorted(fc)))
+for _t in sorted(fc):
+    _alone = queries.search_protein_matrix(PHOS, mode="abundance", limit=1, filters=_t)
+    check(f"filter_counts[{_t}] equals the population that filter alone leaves",
+          fc[_t] == _alone["n_rankable"], f'count={fc[_t]} vs n_rankable={_alone["n_rankable"]}')
+
+# ---------------------------------------------------------------------------------------------
+# max_peptides_any_run: a MAX over per-run counts. Summing that column overstated a peptide count
+# 56-fold in this project, so the key name has to carry the semantics to whoever renders it.
+check("each protein row carries max_peptides_any_run",
+      all("max_peptides_any_run" in p for p in base["proteins"]))
+check("max_peptides_any_run is a positive integer, not a sum-shaped total",
+      all(isinstance(p["max_peptides_any_run"], int) and p["max_peptides_any_run"] >= 1
+          for p in base["proteins"]),
+      str([p["max_peptides_any_run"] for p in base["proteins"]][:5]))
+check("...and multipeptide keeps only rows where it is >= 2",
+      all(p["max_peptides_any_run"] >= 2 for p in
+          queries.search_protein_matrix(PHOS, mode="abundance", limit=50,
+                                        filters="multipeptide")["proteins"]))
 
 # THE ROUTE, not just the query function — this is the interface the UI task consumes, and a
 # FastAPI handler that forgot the parameter would silently serve the unfiltered matrix forever.
@@ -111,12 +174,16 @@ ibody = inj.json().get("data", inj.json())
 check("an injection-shaped filter token is dropped, not executed",
       inj.status_code == 200 and ibody.get("filters") == [], repr(ibody.get("filters")))
 
-rr = client.get(f"/api/search/{NO_ROLLUP}/matrix",
-                params={"mode": "abundance", "limit": 50, "filters": "phospho"})
-rbody = rr.json().get("data", rr.json())
-check("the route surfaces ptm_filters_unavailable to the UI",
-      rbody.get("ptm_filters_unavailable") is True and len(rbody["proteins"]) > 0,
-      f'flag={rbody.get("ptm_filters_unavailable")}, {len(rbody.get("proteins", []))} rows')
+if NO_ROLLUP:
+    rr = client.get(f"/api/search/{NO_ROLLUP}/matrix",
+                    params={"mode": "abundance", "limit": 50, "filters": "phospho"})
+    rbody = rr.json().get("data", rr.json())
+    check("the route surfaces ptm_rollup_ready=False and still returns rows",
+          rbody.get("ptm_rollup_ready") is False and len(rbody["proteins"]) > 0,
+          f'flag={rbody.get("ptm_rollup_ready")}, {len(rbody.get("proteins", []))} rows')
+    check("the route surfaces filter_counts for the UI's checkbox labels",
+          isinstance(rbody.get("filter_counts"), dict) and "noncontam" in rbody["filter_counts"],
+          repr(rbody.get("filter_counts")))
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
