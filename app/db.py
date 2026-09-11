@@ -101,6 +101,11 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # the percentile 97s. Built by ingest/migrations/2026-09-09_protein_corpus_reach.sql +
         # its populator; refreshed offline like the delimp_mv_* snapshots above.
         "delimp_protein_corpus_reach",
+        # per-(search, protein_group) modification flags for the heatmap PTM filter. Live, "does
+        # this protein carry a modification" costs 16.4-90.9s depending on sample count against a
+        # PUBLIC, anonymous, auto-firing endpoint — so precomputed offline by
+        # ingest/refresh_search_ptm.py. Ids, booleans and counts only — no filename, path, or person.
+        "delimp_search_protein_ptm",
     }
 )
 
