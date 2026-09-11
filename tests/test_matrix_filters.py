@@ -98,12 +98,58 @@ if NO_ROLLUP:
     check("...while the counts it CAN compute are still reported",
           nr.get("filter_counts", {}).get("noncontam", 0) > 0, repr(nr.get("filter_counts")))
 
-    # NOT CACHED: the backfill will populate this search, and a cached "not ready" would keep
-    # asserting it for the full 30-minute TTL after the data landed.
+    # CACHED, BUT THE VERDICT IS RE-CHECKED. Refusing to cache would re-run a 2.15-3.52 s query
+    # on a public anonymous endpoint for the 2,084-search majority; serving the cached verdict
+    # would outlive the backfill by up to 30 minutes. Cache the rows, re-probe the readiness.
     from app.db import SLOW_CACHE                              # noqa: E402
     _k = f"matrix_{NO_ROLLUP}_abundance_50_phospho"
-    check("a not-ready result is NOT cached", SLOW_CACHE.cached(_k) is None,
-          "cached — a backfill would then take up to 30 min to become visible")
+    check("the rows ARE cached, so a PTM tick does not re-run the full matrix every time",
+          SLOW_CACHE.cached(_k) is not None,
+          "uncached — every tick re-runs a 2.15-3.52 s query on a 6-connection pool")
+
+    # THE VERDICT IS NOT SERVED FROM CACHE. Arranging the REAL transition would mean INSERTing
+    # rollup rows for a live search — a production write that belongs to the backfill task — so
+    # what is proved here is the mechanism: the readiness is re-probed on a cache hit, and a
+    # changed answer discards the entry instead of being served. The DB's answer is simulated at
+    # the probe seam; everything downstream of it stays real. (The recomputed result still reports
+    # ready=False, correctly, because the rollup really is still empty — which is exactly why the
+    # assertion below is about the entry being DISCARDED, not about the flag flipping.)
+    _sentinel = SLOW_CACHE.cached(_k)
+    _sentinel["_stale_sentinel"] = True          # mark the exact object the cache is holding
+
+    _real_probe, _calls = queries._matrix_ptm_ready, []
+    def _fake_probe(sid):
+        _calls.append(sid)
+        return True                              # "the backfill just landed"
+    try:
+        queries._matrix_ptm_ready = _fake_probe
+        _after = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50,
+                                               filters="phospho")
+        check("a cache HIT on a not-ready entry re-probes instead of serving the stale verdict",
+              len(_calls) > 0, "no probe — the cached 'not computed' would outlive the backfill")
+        check("...and a changed answer DISCARDS the cached entry rather than returning it",
+              "_stale_sentinel" not in _after,
+              "the stale cached object was served verbatim, backfill or no backfill")
+
+        # AN UNCHANGED ANSWER COSTS ONE PROBE, NOT A REBUILD.
+        queries._matrix_ptm_ready = lambda sid: False        # still not backfilled
+        _again = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50,
+                                               filters="phospho")
+        check("...while an unchanged not-ready answer still serves the cached rows",
+              _again is SLOW_CACHE.cached(_k),
+              "rebuilt anyway — the probe bought nothing and the query ran twice")
+
+        # THE HOT PATH MUST NOT PAY FOR THIS. A plain page view is a cache hit with no PTM filter;
+        # it must not probe, or every anonymous visitor buys a 0.2 s round-trip.
+        queries._matrix_ptm_ready = _fake_probe
+        queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50)   # prime
+        _calls.clear()
+        queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50)   # cache hit
+        check("an unfiltered cache hit does NOT re-probe (the page-view path stays free)",
+              _calls == [], f"{len(_calls)} probe(s) on a plain page view")
+    finally:
+        queries._matrix_ptm_ready = _real_probe
+        SLOW_CACHE.clear()
 
     # An uncomputable PTM token must not throw away the tokens that ARE computable.
     nrc = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50,
@@ -116,8 +162,12 @@ if NO_ROLLUP:
 # response. The key stays absent only when no PTM filter was asked for.
 check("ptm_rollup_ready is True on a search whose rollup IS computed",
       phos.get("ptm_rollup_ready") is True, repr(phos.get("ptm_rollup_ready")))
-check("the key is absent when no PTM filter was asked for",
-      "ptm_rollup_ready" not in base, repr(base.get("ptm_rollup_ready")))
+# Present whenever it is KNOWN, not only when a PTM filter was asked for: filter_counts drops its
+# PTM keys when the rollup is missing, so an unfiltered response depends on this answer too and
+# would otherwise leave three counts unexplained.
+check("ptm_rollup_ready accompanies filter_counts even with no PTM filter requested",
+      base.get("ptm_rollup_ready") is True and "phospho" in base["filter_counts"],
+      f'ready={base.get("ptm_rollup_ready")}, counts={sorted(base.get("filter_counts", {}))}')
 
 # "computed, and the answer is none" must be distinguishable from "never computed". glygly is
 # genuinely 0 on the phospho fixture, so this is the real case, not a contrived one.

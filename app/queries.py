@@ -4528,6 +4528,20 @@ _MATRIX_FILTER_COND = {
 }
 
 
+def _matrix_ptm_ready(search_id: str) -> bool:
+    """Does delimp_search_protein_ptm hold ANY row for this search?
+
+    A primary-key-prefix EXISTS; measured 212 ms un-backfilled / 393 ms backfilled, which is
+    round-trip latency to PG Farm rather than server work. The main ranking statement answers the
+    same question for free as an InitPlan, so this standalone form exists for the two paths that
+    have no ranking statement to ride: an empty filtered result, and re-checking a cached
+    not-ready verdict.
+    """
+    return bool(query("""SELECT EXISTS (SELECT 1 FROM delimp_search_protein_ptm
+                                         WHERE search_id = %(sid)s) AS e""",
+                      {"sid": search_id}, tables=["delimp_search_protein_ptm"], fetch="val"))
+
+
 def _matrix_filter_sql(filters: list[str]) -> str:
     """Build the matrix WHERE clause from an ALREADY-NORMALIZED filter list.
 
@@ -4592,9 +4606,15 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
     glygly keys are DROPPED rather than reported as 0, because "Phospho (0)" is the identical lie
     in a smaller font.
 
-    A NOT-READY RESULT IS NOT CACHED — protein_coverage_peptides' discipline for
-    scope_unavailable/sites_unavailable. The backfill will populate the search, and a cached
-    "not ready" would keep asserting it for the full 30-minute TTL after the data landed.
+    A NOT-READY RESULT IS CACHED, BUT ITS VERDICT IS RE-CHECKED. This departs from
+    protein_coverage_peptides, which refuses to cache scope_unavailable/sites_unavailable at all,
+    and the difference is the point: those flag a TRANSIENT failure, where a cached "unavailable"
+    could outlive recovery by 30 minutes with nothing able to notice. "Not yet backfilled" is
+    stable, stops being true exactly once, and that moment is detectable for ~0.2 s. So the rows
+    are cached (refusing to would re-run a 2.15-3.52 s query on a public anonymous endpoint for
+    the 2,084-search majority, against a 6-connection pool — an availability problem, not a
+    tidiness one) and the readiness is re-probed on the way out of the cache, on PTM-filtered
+    requests only. A plain page view never pays for it.
 
     KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key, and so are the
     filters. Keying on the raw strings would let an anonymous caller mint unbounded cache entries
@@ -4611,15 +4631,28 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
     key = f"matrix_{search_id}_{mode}_{limit}_{'+'.join(_f)}"
     hit = SLOW_CACHE.cached(key)
     if hit is not None:
-        return hit
+        # RE-CHECK A NOT-READY VERDICT INSTEAD OF SERVING IT. The result is cached — not caching it
+        # would make the 99.9% case (2,084 of 2,086 searches carry no rollup rows) re-run a
+        # 2.15-3.52 s query on a PUBLIC, anonymous endpoint against a 6-connection pool, which is
+        # an availability risk, not a tidiness one. What must not be cached is the *verdict*: the
+        # backfill will populate this search and the stale "not computed yet" would outlive it by
+        # up to 30 minutes, handing an operator the footgun of "restart the app or it keeps saying
+        # missing". So re-probe (~0.2 s) and rebuild only once the answer has actually changed.
+        #
+        # ONLY WHEN THIS REQUEST ASKED FOR A PTM FILTER. That is the sole case where the stale
+        # verdict changes what the reader sees, and it is a deliberate click. A plain page view
+        # never pays the probe, which is what keeps the measured 0.00002 s cache hit intact. The
+        # residue: an unfiltered entry cached while not-ready has the ptm/phospho/glygly keys
+        # missing from filter_counts, and keeps them missing until the TTL expires. That is a
+        # missing count beside a checkbox nobody has clicked, and it self-heals in <= 30 min.
+        if (hit.get("ptm_rollup_ready") is False
+                and set(_MATRIX_PTM_COL) & set(_f)
+                and _matrix_ptm_ready(search_id)):
+            hit = None
+        if hit is not None:
+            return hit
     result = _search_protein_matrix(search_id, mode, limit, _f)
-    # A NOT-READY RESULT IS NEVER CACHED, following protein_coverage_peptides' discipline for
-    # scope_unavailable/sites_unavailable: the backfill will populate this search, and a cached
-    # "not ready" would go on asserting it for the full 30-minute TTL after the data arrived.
-    # The cost is real and is the accepted trade — 2,084 of 2,086 searches are un-backfilled, so
-    # every PTM tick on one re-runs the full ~2.3 s matrix. It is bounded by being a deliberate
-    # click rather than a page view, and it disappears as the backfill lands.
-    if result.get("proteins") and result.get("ptm_rollup_ready") is not False:
+    if result.get("proteins"):
         SLOW_CACHE.put(key, result)
     return result
 
@@ -4873,9 +4906,7 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
         # read. That is the one case where the distinction matters most — "glygly found nothing"
         # must not be confused with "glygly was never computed" — and an empty result is rare
         # enough that one extra round-trip for it is free in practice.
-        ptm_ready = bool(query("""SELECT EXISTS (SELECT 1 FROM delimp_search_protein_ptm
-                                                  WHERE search_id = %(sid)s) AS e""",
-                               {"sid": search_id}, tables=["delimp_search_protein_ptm"], fetch="val"))
+        ptm_ready = _matrix_ptm_ready(search_id)
 
     # `filters` reports what was APPLIED, not what was asked for: when the rollup is not ready the
     # SQL suspends the PTM conditions (see _MATRIX_FILTER_COND), so naming them here would claim a
@@ -4899,13 +4930,18 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
                 counts.pop(t, None)
         result["filter_counts"] = counts
 
-    if ptm_asked:
-        # REPORTED TRUE OR FALSE, both, whenever a PTM filter was asked for — deliberately not the
-        # scope_unavailable "present only when broken" shape. An absent key is falsy, so a
-        # present-only-when-broken `ptm_rollup_ready` would make the natural `if (!d.ptm_rollup_ready)`
-        # read "not computed" for healthy responses too. Emitting both values removes that trap for
-        # the only requests where the question was actually asked; when no PTM filter is involved
-        # the key stays absent because nothing probed it. False means NOT COMPUTED FOR THIS SEARCH
-        # YET — the UI must never render it as "no modified proteins".
+    if ptm_ready is not None:
+        # REPORTED TRUE OR FALSE, both — deliberately not the scope_unavailable "present only when
+        # broken" shape. An absent key is falsy, so a present-only-when-broken flag would make the
+        # natural `if (!d.ptm_rollup_ready)` read "not computed" on healthy responses too.
+        #
+        # PRESENT WHENEVER IT IS KNOWN, not only when a PTM filter was requested: filter_counts
+        # drops its ptm/phospho/glygly keys when the rollup is missing, so an unfiltered response
+        # ALSO depends on this answer and would otherwise leave three counts unexplained. It is
+        # known for free on any request that returned rows; it stays absent only when there are no
+        # rows and nobody asked a PTM question, i.e. when nothing probed it.
+        #
+        # False means NOT COMPUTED FOR THIS SEARCH YET. The UI must never render it as "no
+        # modified proteins".
         result["ptm_rollup_ready"] = ptm_ready
     return result
