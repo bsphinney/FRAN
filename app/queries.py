@@ -4591,6 +4591,16 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
     does change). `filters` is a comma-separated subset of _MATRIX_FILTERS; unknown tokens are
     dropped, which is why the route needs no validation of its own.
 
+    A PTM FILTER ON A SEARCH WITH NO ROLLUP ROWS returns the UNFILTERED rows plus
+    ptm_filters_unavailable=True, never an empty grid — see the probe in the body. The result IS
+    cached, unlike the scope_unavailable/sites_unavailable degraded results it otherwise imitates:
+    those flag a TRANSIENT failure that must not stick for a TTL, whereas "this search has not been
+    backfilled" is a stable fact that changes exactly once. Not caching it would instead make the
+    2,084-search common case re-run a 2.3-8.9 s public query on every click, which is precisely the
+    pool-exhaustion hazard the rest of this docstring exists to prevent. The cost of that choice:
+    for up to 30 minutes after someone runs the backfill, an already-viewed search can still report
+    the rollup as missing. It self-heals; a deploy or restart clears it immediately.
+
     KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key, and so are the
     filters. Keying on the raw strings would let an anonymous caller mint unbounded cache entries
     from free text (db.TTLCache has no eviction — see the F10 ticket); after normalization the key
@@ -4673,7 +4683,30 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
               "floor": _MATRIX_FLOOR * n_samples_total,
               "minpct": _MATRIX_MIN_PCT_SEARCHES,
               "ntot": n_samples_total}
-    where_sql, ptm_tables = _matrix_filter_sql(filters)
+
+    # ABSENT DATA MUST NOT LOOK LIKE CLEAN DATA — the failure this codebase keeps producing.
+    # delimp_search_protein_ptm covers 2 of the corpus's 2,086 searches until a human runs the
+    # backfill, and every newly ingested search is uncovered until the weekly refresh reaches it.
+    # On an uncovered search a PTM condition matches nothing, so ticking "Phospho" would return an
+    # empty grid that is INDISTINGUISHABLE from "this search genuinely has no phosphoproteins" —
+    # a reader would reasonably conclude nobody's proteins are modified when in fact nobody has
+    # looked. So probe first, drop the PTM conditions we cannot answer, and say so.
+    #
+    # ONLY WHEN A PTM FILTER IS ASKED FOR. Measured 212 ms (uncovered) / 393 ms (covered) per
+    # probe — that is round-trip latency to PG Farm, not server work, and it is NOT free. This
+    # endpoint is public and fires on every search-page view, so an unconditional probe would tax
+    # every anonymous visitor for a question nobody asked. Behind the `if`, the cost lands only on
+    # a deliberate click, and rides the same SLOW_CACHE entry as the rest of the result.
+    applied, ptm_unavailable = filters, False
+    if set(_MATRIX_PTM_COL) & set(filters):
+        if not query("""SELECT EXISTS (SELECT 1 FROM delimp_search_protein_ptm
+                                        WHERE search_id = %(sid)s) AS e""",
+                     {"sid": search_id}, tables=["delimp_search_protein_ptm"], fetch="val"):
+            ptm_unavailable = True
+            # The NON-PTM tokens are still perfectly answerable, so keep honouring them rather
+            # than throwing the whole filter state away.
+            applied = [f for f in filters if f not in _MATRIX_PTM_COL]
+    where_sql, ptm_tables = _matrix_filter_sql(applied)
     # MEASURED cost of this two-level aggregate on the largest search (480k rows, 6,340 genes):
     # 3.1-5.7s across the four ranking modes (range across repeated runs on a shared cluster, not
     # a single sample), in line with the ~4s the old single-level aggregate took. EXPLAIN shows
@@ -4808,8 +4841,19 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
     # rankable. 4,005 is the number the reader's "of N" should be against — it is the spec's own
     # figure — and it is the only one consistent with the "in at least 20% of samples" clause in
     # the same sentence.
-    return {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
-            "filters": filters,
-            "n_rankable": rows[0]["n_rankable"] if rows else 0,
-            "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
-            "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
+    # `filters` reports what was APPLIED, not what was asked for. On a search with no rollup rows
+    # the requested PTM tokens are missing from it, and ptm_filters_unavailable says why.
+    result = {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
+              "filters": applied,
+              "n_rankable": rows[0]["n_rankable"] if rows else 0,
+              "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
+              "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
+    if ptm_unavailable:
+        # PRESENT ONLY WHEN UNAVAILABLE, and only ever True — the scope_unavailable /
+        # sites_unavailable precedent. The polarity is deliberate and is not a style preference:
+        # a "ptm_rollup_ready" key would be ABSENT on every healthy response, so the natural
+        # `if (!d.ptm_rollup_ready)` reads "not ready" for the 2,084 searches AND for the 2 that
+        # are fine. A key that only ever appears to report trouble cannot be misread that way.
+        # The UI must render "not computed for this search yet", NEVER "no modified proteins".
+        result["ptm_filters_unavailable"] = True
+    return result

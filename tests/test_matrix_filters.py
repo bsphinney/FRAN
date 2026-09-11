@@ -58,6 +58,36 @@ check("an unknown filter token is ignored, not fatal",
       len(queries.search_protein_matrix(PHOS, mode="abundance", limit=5,
                                         filters="not_a_filter")["proteins"]) > 0)
 
+# ---------------------------------------------------------------------------------------------
+# ABSENT DATA vs CLEAN DATA. The rollup covers 2 of the corpus's 2,086 searches. On the other
+# 2,084 a PTM condition matches nothing, so an empty grid would read as "this search has no
+# phosphoproteins" when the truth is that nobody has computed it. That is the specific failure
+# this project keeps producing, and these are the checks that stop it here.
+NO_ROLLUP = "29a34214-8861-5831-8b7a-6af3e4fc405b"   # a real search, deliberately NOT a fixture
+
+nr = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50, filters="phospho")
+check("a search with no rollup rows still returns proteins, not an empty grid",
+      len(nr["proteins"]) > 0, f'{len(nr["proteins"])} rows — an empty grid here reads as '
+                              f'"no phosphoproteins", which nobody has established')
+check("...and says the PTM filter is unavailable rather than answering 'none'",
+      nr.get("ptm_filters_unavailable") is True, repr(nr.get("ptm_filters_unavailable")))
+check("...and reports phospho as NOT applied, so `filters` never claims a filter that did not run",
+      "phospho" not in nr["filters"], repr(nr["filters"]))
+
+# The flag must be ABSENT where the rollup IS computed — never False, which a UI could render as
+# a measurement, and never present, which would make "unavailable" the normal state.
+check("the flag is absent on a search whose rollup IS computed",
+      "ptm_filters_unavailable" not in phos, repr(phos.get("ptm_filters_unavailable")))
+check("the flag is absent when no PTM filter was asked for",
+      "ptm_filters_unavailable" not in base, repr(base.get("ptm_filters_unavailable")))
+
+# An uncomputable PTM token must not throw away the tokens that ARE computable.
+nrc = queries.search_protein_matrix(NO_ROLLUP, mode="abundance", limit=50,
+                                    filters="phospho,noncontam")
+check("non-PTM filters still apply when the PTM rollup is missing",
+      nrc["filters"] == ["noncontam"] and all(not p.get("is_contaminant") for p in nrc["proteins"]),
+      repr(nrc["filters"]))
+
 # THE ROUTE, not just the query function — this is the interface the UI task consumes, and a
 # FastAPI handler that forgot the parameter would silently serve the unfiltered matrix forever.
 from fastapi.testclient import TestClient                    # noqa: E402
@@ -80,6 +110,13 @@ inj = client.get(f"/api/search/{PHOS}/matrix",
 ibody = inj.json().get("data", inj.json())
 check("an injection-shaped filter token is dropped, not executed",
       inj.status_code == 200 and ibody.get("filters") == [], repr(ibody.get("filters")))
+
+rr = client.get(f"/api/search/{NO_ROLLUP}/matrix",
+                params={"mode": "abundance", "limit": 50, "filters": "phospho"})
+rbody = rr.json().get("data", rr.json())
+check("the route surfaces ptm_filters_unavailable to the UI",
+      rbody.get("ptm_filters_unavailable") is True and len(rbody["proteins"]) > 0,
+      f'flag={rbody.get("ptm_filters_unavailable")}, {len(rbody.get("proteins", []))} rows')
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
