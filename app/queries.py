@@ -4496,9 +4496,63 @@ _MATRIX_MODES = {
 }
 _MATRIX_FLOOR = 0.2          # of the search's sample count
 _MATRIX_MIN_PCT_SEARCHES = 20  # before mean_pct_rank is trusted
+# THE CLOSED FILTER VOCABULARY. Nothing outside this tuple ever reaches SQL or the cache key —
+# see the normalization in search_protein_matrix() for why both of those matter.
+_MATRIX_FILTERS = ("ptm", "phospho", "glygly", "noncontam",
+                   "multipeptide", "complete", "patchy", "unique")
 
 
-def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict[str, Any]:
+_MATRIX_PTM_COL = {"ptm": "has_ptm", "phospho": "has_phospho", "glygly": "has_glygly"}
+
+
+def _matrix_filter_sql(filters: list[str]) -> tuple[str, list[str]]:
+    """Build the matrix WHERE clause from an ALREADY-NORMALIZED filter list.
+
+    `filters` must be the output of search_protein_matrix()'s normalization — a subset of
+    _MATRIX_FILTERS. Nothing here is parameterized because nothing here is caller text: the token
+    selects a fixed condition, the token is never itself interpolated. The one value that varies,
+    the search id, rides %(sid)s like everywhere else. Passing a raw request string in here would
+    be a SQL injection, which is why the raw string does not exist past the wrapper.
+
+    Returns (where_clause, extra_tables) — the second is the tables= additions that db.query()
+    validates against the public allowlist, and it must list delimp_search_protein_ptm whenever a
+    PTM condition is present or the query is refused.
+
+    EXISTS, NOT A JOIN, for the PTM flags. delimp_search_protein_ptm is one row per
+    (search, protein_group) and a gene maps to several groups, so a join would multiply the
+    aggregate's rows. The cost is that the filter tests only `a.protein_group` — max() over the
+    gene's groups — so a gene whose modification sits on a non-representative group is missed
+    (~1.8% of genes). Accepted for a discovery filter: the miss renders as the gene being absent,
+    never as a wrong number next to a present one.
+    """
+    conds = []
+    # The rollup table is declared to db.query() only when a PTM condition actually reads it —
+    # tables= is the structural guard, not documentation.
+    tables = ["delimp_search_protein_ptm"] if set(_MATRIX_PTM_COL) & set(filters) else []
+    for t in ("ptm", "phospho", "glygly"):
+        if t in filters:
+            conds.append(f"""EXISTS (SELECT 1 FROM delimp_search_protein_ptm m
+                                      WHERE m.search_id = %(sid)s
+                                        AND m.protein_group = a.protein_group
+                                        AND m.{_MATRIX_PTM_COL[t]})""")
+    if "noncontam" in filters:
+        conds.append("NOT a.is_contaminant")
+    if "multipeptide" in filters:
+        # "at least 2 unique peptides in at least one run" — max_peptides is a max, not a sum.
+        conds.append("a.max_peptides >= 2")
+    if "complete" in filters:
+        conds.append("a.n_samples = %(ntot)s")
+    if "patchy" in filters:
+        conds.append("a.n_samples < %(ntot)s")
+    if "unique" in filters:
+        # A gene with no corpus-reach row is not KNOWN to be unique, and the LEFT JOIN's NULL
+        # correctly drops it rather than claiming it.
+        conds.append("r.n_searches = 1")
+    return ("WHERE " + " AND ".join(conds)) if conds else "", tables
+
+
+def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
+                          filters: str = "") -> dict[str, Any]:
     """PRIVATE-SAFE: the protein x sample matrix behind a search page's heatmap. CACHED (SLOW).
 
     delimp_proteins is already one row per (search, sample, protein), so this is a read, not a
@@ -4531,26 +4585,40 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     mid-ingest. A hard failure (any of the four statements raising) propagates and never reaches
     the put() at all, so it is not cached either.
 
-    KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key. Keying on the raw
-    string would let an anonymous caller mint unbounded cache entries from free text (db.TTLCache
-    has no eviction — see the F10 ticket); after normalization the key space is bounded by
-    searches x 4 modes x the route's 1..200 limit clamp.
+    FILTERS are applied INSIDE the SQL, before the LIMIT — never to the rows it returns. Only 62
+    of this fixture search's 6,284 protein groups carry a phospho site, so filtering the top 50
+    afterwards would leave two or three rows while still looking like it worked (the gene set
+    does change). `filters` is a comma-separated subset of _MATRIX_FILTERS; unknown tokens are
+    dropped, which is why the route needs no validation of its own.
+
+    KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key, and so are the
+    filters. Keying on the raw strings would let an anonymous caller mint unbounded cache entries
+    from free text (db.TTLCache has no eviction — see the F10 ticket); after normalization the key
+    space is bounded by searches x 4 modes x the route's 1..200 limit clamp x 2^8 filter states.
+    Sorting and deduping is what makes "ptm,phospho" and "phospho,ptm,ptm" one entry rather than
+    three. The filter state MUST be in the key: without it two filter states serve each other's
+    results for 30 minutes.
     """
     if mode not in _MATRIX_MODES:
         mode = "cv"
     limit = int(limit)
-    key = f"matrix_{search_id}_{mode}_{limit}"
+    _f = sorted({t.strip() for t in (filters or "").lower().split(",")} & set(_MATRIX_FILTERS))
+    key = f"matrix_{search_id}_{mode}_{limit}_{'+'.join(_f)}"
     hit = SLOW_CACHE.cached(key)
     if hit is not None:
         return hit
-    result = _search_protein_matrix(search_id, mode, limit)
+    result = _search_protein_matrix(search_id, mode, limit, _f)
     if result.get("proteins"):
         SLOW_CACHE.put(key, result)
     return result
 
 
-def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, Any]:
-    """The uncached body. `mode` is already validated by the caller above."""
+def _search_protein_matrix(search_id: str, mode: str, limit: int,
+                           filters: list[str]) -> dict[str, Any]:
+    """The uncached body. `mode` and `filters` are already normalized by the caller above —
+    `filters` arrives as a sorted list drawn only from _MATRIX_FILTERS, which is the ONLY reason
+    the conditions below may be assembled into the SQL text at all. The raw request string must
+    never reach this function."""
     order = _MATRIX_MODES[mode]
 
     # n_samples_total used to come from its own `count(DISTINCT raw_path)` (2.69s on the
@@ -4598,12 +4666,14 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
     n_samples_dated = sum(1 for s in samples if s["acquisition_date"] is not None)
     if not n_samples_total:
         return {"proteins": [], "samples": [], "mode": mode, "limit": limit,
-                "n_rankable": 0, "n_samples_total": 0, "n_samples_dated": 0,
+                "filters": filters, "n_rankable": 0, "n_samples_total": 0, "n_samples_dated": 0,
                 "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": None}
 
     params = {"sid": search_id, "limit": int(limit),
               "floor": _MATRIX_FLOOR * n_samples_total,
-              "minpct": _MATRIX_MIN_PCT_SEARCHES}
+              "minpct": _MATRIX_MIN_PCT_SEARCHES,
+              "ntot": n_samples_total}
+    where_sql, ptm_tables = _matrix_filter_sql(filters)
     # MEASURED cost of this two-level aggregate on the largest search (480k rows, 6,340 genes):
     # 3.1-5.7s across the four ranking modes (range across repeated runs on a shared cluster, not
     # a single sample), in line with the ~4s the old single-level aggregate took. EXPLAIN shows
@@ -4655,7 +4725,12 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
           SELECT gene, raw_path,
                  avg(intensity)             AS v,
                  max(protein_group)         AS protein_group,
-                 bool_or(is_contaminant)    AS is_contaminant
+                 bool_or(is_contaminant)    AS is_contaminant,
+                 -- max(), NEVER sum(). n_unique_peptides is PER RUN, and summing it across runs
+                 -- has overstated a peptide count 56-fold in this codebase before. This is the
+                 -- peptide count "in at least one run", and that is how it must be described
+                 -- anywhere it surfaces. Free: the same scan already runs.
+                 max(n_unique_peptides)     AS max_pep
             FROM delimp_proteins
            WHERE search_id = %(sid)s AND intensity > 0 AND NULLIF(gene,'') IS NOT NULL
            GROUP BY gene, raw_path),
@@ -4665,7 +4740,8 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
                  count(*)                                 AS n_samples,
                  avg(v)                                    AS mean_int,
                  stddev_pop(v) / NULLIF(avg(v), 0)         AS cv,
-                 bool_or(is_contaminant)                   AS is_contaminant
+                 bool_or(is_contaminant)                   AS is_contaminant,
+                 max(max_pep)                              AS max_peptides
             FROM per_sample
            GROUP BY gene
           HAVING count(*) >= %(floor)s)
@@ -4676,13 +4752,21 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
                -- the aggregate and before LIMIT, so this is exact and costs nothing extra — `agg`
                -- is already materialized. It replaces a separate count(DISTINCT protein_group)
                -- round-trip that measured 0.57-1.83 s and answered a different question.
+               -- UNDER A FILTER THIS COUNTS THE FILTERED POPULATION, which is what the header
+               -- must say: a window function is evaluated after WHERE and before LIMIT, so the
+               -- filter narrows it automatically. Leaving the filter out of the WHERE and
+               -- applying it to the rows afterwards would leave this describing the unfiltered
+               -- corpus while the grid showed a handful of rows — the header would lie.
                count(*) OVER ()                          AS n_rankable
           FROM agg a
           LEFT JOIN delimp_protein_corpus_reach r ON r.gene = upper(a.gene)
+         {where_sql}
          ORDER BY {order}
          LIMIT %(limit)s
         """,
-        params, tables=["delimp_proteins", "delimp_protein_corpus_reach"], work_mem="256MB")
+        params,
+        tables=["delimp_proteins", "delimp_protein_corpus_reach"] + ptm_tables,
+        work_mem="256MB")
 
     genes = [r["gene"] for r in rows]
     cells = query(
@@ -4725,6 +4809,7 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
     # figure — and it is the only one consistent with the "in at least 20% of samples" clause in
     # the same sentence.
     return {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
+            "filters": filters,
             "n_rankable": rows[0]["n_rankable"] if rows else 0,
             "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
             "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
