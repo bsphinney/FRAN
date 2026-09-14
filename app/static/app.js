@@ -526,20 +526,69 @@ const _HM_MODE_DESC={cv:'how much each protein varies between your samples',
   abundance:'its mean amount across your samples',
   rarity:'how few corpus searches have ever seen it',
   corpus_abundance:'where it typically ranks within a run, averaged over every corpus search that saw it'};
+// Mirrors app.queries._MATRIX_FILTERS exactly — token, group heading, human label. The server
+// drops anything outside this vocabulary, so a token here that doesn't match a server token just
+// never filters (harmless); a server token missing here would be un-tickable, so keep both lists
+// in sync whenever the server's list changes.
+const _HM_FILTER_GROUPS=[
+  ['MODIFICATIONS',[['ptm','Has any modification'],['phospho','Phospho'],['glygly','Ubiquitin (GlyGly)']]],
+  ['CONFIDENCE',[['noncontam','Hide contaminants'],['multipeptide','≥2 peptides (in at least one run)']]],
+  ['DETECTION',[['complete','In every sample'],['patchy','Patchy (not in all)']]],
+  ['CORPUS',[['unique','Unique to this experiment']]],
+];
+const _HM_FILTER_LABELS=Object.fromEntries(_HM_FILTER_GROUPS.flatMap(([,items])=>items));
+const _HM_PTM_TOKENS=new Set(['ptm','phospho','glygly']);
 let _hmSearchId=null, _hmMode='cv';
+let _hmFilters=new Set();          // requested tokens; server may apply a subset — see _hmPtmReady
+let _hmFilterPanelOpen=false;      // survives across re-renders since innerHTML is rebuilt each time
+// filter_counts is POPULATION-WIDE (computed before any WHERE, same for every mode/filter state on
+// a given search) and is ABSENT from the response exactly when the filtered result is empty — see
+// app.queries.search_protein_matrix. Cache the last non-empty answer per search so the panel can
+// still show real counts (and real readiness) while the grid itself is showing "no matches".
+let _hmFilterCounts=null;
+let _hmTotalRankable=null;         // n_rankable from the last UNFILTERED load — the "of N" denominator
+let _hmPtmReady=true;              // last known ptm_rollup_ready; true/unknown until proven false
 async function renderSearchMatrix(searchId, mode){
+  if(_hmSearchId!==searchId){ _hmFilters=new Set(); _hmFilterCounts=null; _hmTotalRankable=null; _hmPtmReady=true; _hmFilterPanelOpen=false; }
   _hmSearchId=searchId; _hmMode=mode||'cv';
   const el=$('#matrixCard'); if(!el)return;
   el.innerHTML=`<div class="skeleton h-64 rounded-xl"></div>`;
   try{
-    const d=await api(`/api/search/${encodeURIComponent(searchId)}/matrix?mode=${encodeURIComponent(_hmMode)}&limit=50`);
+    const d=await api(`/api/search/${encodeURIComponent(searchId)}/matrix?mode=${encodeURIComponent(_hmMode)}&limit=50&filters=${encodeURIComponent([..._hmFilters].join(','))}`);
+    // Cache what the server actually knew this round, so the panel stays accurate even on a
+    // request whose OWN response can't carry it (a zero-row filtered result omits filter_counts
+    // entirely; a request with no PTM token asked never gets ptm_rollup_ready at all).
+    if(d.filter_counts) _hmFilterCounts=d.filter_counts;
+    if(!(d.filters&&d.filters.length)) _hmTotalRankable=d.n_rankable;
+    if(Object.prototype.hasOwnProperty.call(d,'ptm_rollup_ready')) _hmPtmReady=d.ptm_rollup_ready;
+    else if(d.filter_counts) _hmPtmReady=Object.prototype.hasOwnProperty.call(d.filter_counts,'ptm');
     const proteins=d.proteins||[], samples=d.samples||[];
     const modeBtns=_HM_MODES.map(([m,label])=>
       `<button onclick="renderSearchMatrix('${escJs(searchId)}','${m}')" class="px-2.5 py-1 rounded-lg text-xs ${m===_hmMode?'tab-active':'glass text-slate-300'}">${label}</button>`).join('');
+    const filterBtn=_hmFilterButtonHtml();
+    const filterPanel=_hmFilterPanelHtml(searchId);
+    // ptm_rollup_ready:false means "not computed for this search yet", never "no modified
+    // proteins" — the server already fell back to unfiltered rows for the suspended tokens
+    // (see _MATRIX_FILTER_COND), so say that plainly rather than let a full-looking grid pass
+    // as an answer to the PTM question nobody actually asked the database.
+    const ptmSuspended=d.ptm_rollup_ready===false && [..._hmFilters].some(t=>_HM_PTM_TOKENS.has(t));
+    const ptmBanner=ptmSuspended
+      ? `<div class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mb-3">Modification data (has-any modification / phospho / GlyGly) has not been computed for this search yet — showing unfiltered rows for those filters.</div>`
+      : '';
     if(!proteins.length){
+      // A genuinely empty result (ready:true, 0 rows) and a not-yet-computed one (ready:false)
+      // must never look the same — see ptmBanner above for the latter. This branch is reachable
+      // for either: a real zero (say which filters did it, offer to clear) or a PTM ask alone on
+      // an uncovered search combined with a real zero from some OTHER filter, in which case both
+      // messages show.
+      const activeLabels=(d.filters||[]).map(t=>esc(_HM_FILTER_LABELS[t]||t));
+      const zeroMsg=activeLabels.length
+        ? `No protein matches <b class="text-slate-300">${activeLabels.join(', ')}</b> for this search. <button onclick="_hmClearFilters('${escJs(searchId)}')" class="text-accent-400 hover:underline">Clear filters</button>`
+        : 'No protein passes the presence floor for this search.';
       el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
-        <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
-        ${empty('No protein passes the presence floor for this search.')}`;
+        <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}${filterBtn}</div>
+        ${filterPanel}${ptmBanner}
+        <div class="py-12 text-center text-slate-500"><svg class="mx-auto mb-3 opacity-40" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M3 7h18M3 12h18M3 17h12"/></svg><div class="text-sm">${zeroMsg}</div></div>`;
       return;
     }
     // Cell width adapts to the card's actual width instead of a size tuned only for the corpus's
@@ -622,13 +671,72 @@ async function renderSearchMatrix(searchId, mode){
       : nDated===samples.length ? ' Columns in acquisition order.'
       : nDated ? ` Columns in acquisition order for the <b class="text-slate-300">${fmt(nDated)}</b> of ${fmt(samples.length)} samples that carry a date, then by filename.`
       : ` <span class="text-amber-300">Columns in filename order</span> — no sample in this search carries an acquisition date, so a vertical band here is not evidence of batch drift.`;
-    const note=`<div class="text-[11px] text-slate-500 mt-2">Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_rankable)} genes × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among genes in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples.${corpusNote}${orderNote} Click a gene name for its sequence coverage.</div>`;
+    // `d.filters` (what the SERVER actually applied), not `_hmFilters` (what was requested): a
+    // PTM ask on an uncovered search is requested but suspended, and the grid below is the
+    // unfiltered set even though the user ticked a box — the footer must describe what's on
+    // screen, and ptmBanner above already explains the gap.
+    const filtersApplied=(d.filters||[]).length>0;
+    const leadIn=filtersApplied
+      ? `Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of <b class="text-slate-300">${fmt(d.n_rankable)}</b> matching · <b class="text-slate-300">${fmt(_hmTotalRankable??d.n_rankable)}</b> rankable`
+      : `Showing <b class="text-slate-300">${fmt(proteins.length)}</b> of ${fmt(d.n_rankable)} genes`;
+    const note=`<div class="text-[11px] text-slate-500 mt-2">${leadIn} × <b class="text-slate-300">${fmt(samples.length)}</b> samples, ranked by ${_HM_MODE_DESC[_hmMode]}${scoped}, among genes in at least <b class="text-slate-300">${d.floor_pct}%</b> of samples.${corpusNote}${orderNote} Click a gene name for its sequence coverage.</div>`;
     el.innerHTML=`<h3 class="font-bold text-white mb-3">Protein × sample</h3>
-      <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}</div>
+      <div class="flex flex-wrap items-center gap-2 mb-3"><span class="text-[10px] uppercase tracking-wider text-slate-500">rank rows by</span>${modeBtns}${filterBtn}</div>
+      ${filterPanel}${ptmBanner}
       ${legend}
       <div class="overflow-x-auto rounded-xl border border-white/10" style="background:rgba(0,0,0,.22)"><table style="border-collapse:collapse;table-layout:fixed;width:${tableW}px"><tbody>${rows}</tbody></table></div>
       ${note}`;
   }catch(e){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Protein × sample</h3>${empty('Matrix unavailable: '+esc(e.message))}`; }
+}
+function _hmFilterButtonHtml(){
+  const n=_hmFilters.size;
+  return `<button onclick="_hmToggleFilterPanel()" class="px-2.5 py-1 rounded-lg text-xs ${n?'tab-active':'glass text-slate-300'}">Filter${n?` · ${n}`:''}</button>`;
+}
+// Renders every checkbox from the cached _hmFilterCounts/_hmPtmReady, not from the response that
+// happens to be in scope — a zero-row response has neither, and the panel must stay usable (and
+// honest about why a box is unavailable) exactly then, since that's when someone reaches for it.
+function _hmFilterPanelHtml(searchId){
+  const counts=_hmFilterCounts||{};
+  const modsReady=_hmPtmReady!==false;
+  const groups=_HM_FILTER_GROUPS.map(([group,items])=>{
+    const boxes=items.map(([token,label])=>{
+      const checked=_hmFilters.has(token);
+      const notReady=_HM_PTM_TOKENS.has(token)&&!modsReady;
+      const hasCount=Object.prototype.hasOwnProperty.call(counts,token);
+      const zero=hasCount&&counts[token]===0;
+      // NOTHING is hard-disabled: every state a box can report — not computed, a real zero, an
+      // unknown count — is one renderSearchMatrix() already answers honestly (the PTM banner for
+      // the first, the "no protein matches" branch for the other two), so blocking the click
+      // would hide working, correct behaviour instead of protecting anyone from it. A box the
+      // user hasn't ticked just gets a muted style as a heads-up about what ticking it will show.
+      const muted=!checked&&(notReady||zero||!hasCount);
+      let suffix, title;
+      if(notReady){ suffix=' — not computed yet'; title='Modification data has not been computed for this search yet — ticking it will show unfiltered rows plus a note.'; }
+      else if(!hasCount){ suffix=''; title='Count unavailable.'; }
+      else if(zero){ suffix=' (0)'; title='No proteins match this filter for this search right now — ticking it will show that empty result.'; }
+      else{ suffix=` (${fmt(counts[token])})`; title=`${fmt(counts[token])} proteins match this filter on their own.`; }
+      return `<label title="${esc(title)}" class="flex items-center gap-1.5 text-xs ${muted?'text-slate-400 cursor-pointer':'text-slate-300 cursor-pointer'}">
+        <input type="checkbox" ${checked?'checked':''} onchange="_hmToggleFilter('${escJs(searchId)}','${token}')">
+        ${esc(label)}<span class="${notReady?'text-amber-400/80':'text-slate-500'}">${esc(suffix)}</span></label>`;
+    }).join('');
+    return `<div class="flex flex-col gap-1.5"><div class="text-[10px] uppercase tracking-wider text-slate-500">${esc(group)}</div><div class="flex flex-wrap gap-x-4 gap-y-1.5">${boxes}</div></div>`;
+  }).join('');
+  return `<div id="hmFilterPanel" class="glass rounded-xl p-3 mb-3 flex flex-col gap-3 ${_hmFilterPanelOpen?'':'hidden'}">${groups}</div>`;
+}
+// Toggling the panel is a pure UI state change, not a new question for the server — flip the DOM
+// directly instead of re-fetching, exactly the same shape as toggleIMMode elsewhere in this file.
+function _hmToggleFilterPanel(){
+  _hmFilterPanelOpen=!_hmFilterPanelOpen;
+  const p=$('#hmFilterPanel');
+  if(p) p.classList.toggle('hidden', !_hmFilterPanelOpen);
+}
+function _hmToggleFilter(searchId, token){
+  if(_hmFilters.has(token)) _hmFilters.delete(token); else _hmFilters.add(token);
+  renderSearchMatrix(searchId, _hmMode);
+}
+function _hmClearFilters(searchId){
+  _hmFilters.clear();
+  renderSearchMatrix(searchId, _hmMode);
 }
 
 const _PEPMAP_PERLINE=60;
