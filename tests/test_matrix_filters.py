@@ -5,7 +5,7 @@ carry a phospho site, so filtering the 50 rows the ranking already selected leav
 while every other check here, including "changes which genes are returned", still passes. A
 client-side filter looks like it works. That check is the only one that catches it.
 """
-import os, sys
+import os, sys, time
 os.environ.setdefault("DELIMP_PG_TOKEN_FILE", "/Users/brettphinney/.pgfarm_token")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app import queries                                # noqa: E402
@@ -200,6 +200,37 @@ check("...and multipeptide keeps only rows where it is >= 2",
       all(p["max_peptides_any_run"] >= 2 for p in
           queries.search_protein_matrix(PHOS, mode="abundance", limit=50,
                                         filters="multipeptide")["proteins"]))
+
+# ---------------------------------------------------------------------------------------------
+# A ZERO-ROW FILTERED RESULT MUST BE CACHED. Filters made "no gene matches" reachable on any
+# search, and the UI renders `In every sample (0)` as a clickable box. Uncached it re-runs the
+# two-level aggregate at work_mem=256MB on EVERY request — measured 1.95 s repeated on the
+# flagship and 5.05 s repeated here — on an endpoint that is public, anonymous, unthrottled, and
+# shares a 6-connection pool.
+from app.db import SLOW_CACHE as _SC                           # noqa: E402
+_SC.clear()
+_empty = queries.search_protein_matrix(PHOS, mode="abundance", limit=50, filters="complete,glygly")
+check("the zero-row fixture really is zero-row (else this proves nothing)",
+      len(_empty["proteins"]) == 0, f'{len(_empty["proteins"])} rows')
+check("a zero-row filtered result IS cached",
+      _SC.cached(f"matrix_{PHOS}_abundance_50_complete+glygly") is not None,
+      "uncached — every request re-runs a 2-5 s aggregate on a public unthrottled endpoint")
+
+_t0 = time.time(); queries.search_protein_matrix(PHOS, mode="abundance", limit=50,
+                                                 filters="complete,glygly")
+_warm = time.time() - _t0
+check("...so the repeat call is served from memory, not recomputed", _warm < 0.05,
+      f"{_warm:.2f}s — recomputed")
+
+# The protection that clause replaced must survive: a search with no samples at all is the cheap
+# early return, and caching THAT would stick an empty heatmap on a search that is merely
+# mid-ingest. It never reaches the expensive query, so there is nothing to save by caching it.
+_gone = queries.search_protein_matrix("00000000-0000-0000-0000-000000000000", mode="abundance",
+                                      limit=50)
+check("a search with no samples is still NOT cached (it must self-heal, and it cost nothing)",
+      _gone["n_samples_total"] == 0
+      and _SC.cached("matrix_00000000-0000-0000-0000-000000000000_abundance_50_") is None,
+      repr(_SC.cached("matrix_00000000-0000-0000-0000-000000000000_abundance_50_")))
 
 # THE ROUTE, not just the query function — this is the interface the UI task consumes, and a
 # FastAPI handler that forgot the parameter would silently serve the unfiltered matrix forever.

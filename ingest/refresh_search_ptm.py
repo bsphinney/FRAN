@@ -53,9 +53,31 @@ ON CONFLICT (search_id, protein_group) DO UPDATE SET
        computed_at      = EXCLUDED.computed_at
 """
 
+# PENDING MEANS "CAN PRODUCE ROWS AND HAS NOT YET", not merely "has no rows".
+#
+# Five real searches (223106d8, 58918226, 90d20943, e7bf2b7b, f0501ee6) have delimp_proteins rows
+# and render heatmaps, but hold NO delimp_precursors row with a non-NULL protein_group — so SQL
+# above groups nothing for them and inserts nothing. Under the old predicate they came back
+# PENDING on every run, forever: "nothing to do" could never print, and each weekly run re-scanned
+# them. The job never converged.
+#
+# The second EXISTS is the fix, and it is preferred over the two alternatives because it invents
+# nothing. A sentinel row would converge but would pollute delimp_search_protein_ptm, and the
+# matrix's readiness probe (EXISTS any row for this search) would then read the sentinel as
+# "computed" and let the UI claim these searches have no modified proteins — a claim nobody can
+# support. A processed-watermark table needs DDL and would record these five as done permanently,
+# so a later re-ingest that finally gives them protein_groups would be ignored. This predicate
+# re-includes them the moment they become computable, and excludes them the rest of the time.
+#
+# Cost: one anti-join over delimp_precursors, measured 21.6 s, once per weekly run of a job that
+# takes ~40 minutes. The five stay absent from the rollup, so the matrix keeps reporting
+# ptm_rollup_ready=False for them — which is true: their PTM state has not been computed, and
+# from this data it cannot be. That is the honest answer, and it is never "no modified proteins".
 PENDING = """
 SELECT s.id FROM delimp_searches s
  WHERE NOT EXISTS (SELECT 1 FROM delimp_search_protein_ptm t WHERE t.search_id = s.id)
+   AND EXISTS (SELECT 1 FROM delimp_precursors p
+                WHERE p.search_id = s.id AND p.protein_group IS NOT NULL)
  LIMIT %(lim)s
 """
 
@@ -86,10 +108,11 @@ def main() -> int:
     if a.rebuild:
         ids = [str(r["id"]) for r in query("SELECT id FROM delimp_searches", tables=["delimp_searches"])]
     else:
-        ids = [str(r["id"]) for r in query(PENDING, {"lim": a.limit}, tables=["delimp_searches",
-                                      "delimp_search_protein_ptm"])]
+        ids = [str(r["id"]) for r in query(PENDING, {"lim": a.limit},
+                                           tables=["delimp_searches", "delimp_search_protein_ptm",
+                                                   "delimp_precursors"], timeout_ms=600_000)]
     if not ids:
-        print("nothing to do — every search already has rows"); return 0
+        print("nothing to do — every search that can produce rows has them"); return 0
 
     print(f"{len(ids)} search(es) to process, {a.batch} per batch")
     conn = _conn()

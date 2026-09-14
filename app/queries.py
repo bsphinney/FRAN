@@ -4652,7 +4652,21 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
         if hit is not None:
             return hit
     result = _search_protein_matrix(search_id, mode, limit, _f)
-    if result.get("proteins"):
+    # ZERO-ROW RESULTS ARE CACHED TOO, and the condition is deliberately not `if
+    # result["proteins"]`. Filters made "no gene matches" reachable on any search — the UI renders
+    # `In every sample (0)` as a clickable box — and an empty answer is as stable as a full one for
+    # a given (search, mode, limit, filters). Refusing to cache it meant re-running the two-level
+    # aggregate at work_mem=256MB on EVERY request: measured 1.95 s repeated on the flagship with
+    # `complete,unique` and 5.05 s repeated on the phospho fixture with `complete,glygly`, on an
+    # endpoint that is public, anonymous, auto-fires on every search-page view, has no rate limit
+    # (app/ratelimit.py guards the spectrum route, not this one) and shares a 6-connection pool.
+    #
+    # This SUPERSEDES part of the "why cached" note above: that clause refused to cache an empty
+    # matrix so a mid-ingest search would self-heal rather than stick for 30 minutes. The
+    # n_samples_total test below keeps exactly that protection where it actually applies — the
+    # search does not exist, or has no samples yet — which is the cheap early return that never
+    # reaches this query at all. What is now cached is an empty result that COST 2-5 s to compute.
+    if result.get("n_samples_total"):
         SLOW_CACHE.put(key, result)
     return result
 
@@ -4797,11 +4811,18 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
                  -- delimp_search_protein_ptm is one row per (search, protein_group) and a gene
                  -- maps to several groups, so a join would multiply the aggregate's rows. The
                  -- cost is that this tests only `a.protein_group` — max() over the gene's groups
-                 -- — so a gene whose modification sits on a non-representative group is missed
-                 -- (roughly 18 genes in 1,000). Accepted for a discovery filter: the miss
-                 -- renders as the gene being absent, never as a wrong number next to a present
-                 -- one. NB no bare per-cent sign anywhere in this SQL, comments included --
-                 -- psycopg2 reads one as a parameter placeholder and refuses the statement.
+                 -- — so a gene whose modification sits on a non-representative group is missed.
+                 -- MEASURED over the population this query actually sees (floor-clearing,
+                 -- intensity > 0): 7 of 6,206 genes carry more than one protein_group on the
+                 -- phospho fixture and 23 of 6,180 on the ubiquitin one, i.e. 0.11 and 0.37 in
+                 -- 100. Actual misses are smaller still: 0 of 60 phospho genes, and 1 of 5,280
+                 -- glygly genes. An earlier revision of this comment said "1.8 in 100", which is
+                 -- the figure for ALL genes with no presence floor — a population this query
+                 -- never touches. An overstated caveat misleads exactly like an overstated claim.
+                 -- Accepted for a discovery filter: the miss renders as the gene being absent,
+                 -- never as a wrong number next to a present one. NB no bare per-cent sign
+                 -- anywhere in this SQL, comments included — psycopg2 reads one as a parameter
+                 -- placeholder and refuses the whole statement.
                  -- Computed unconditionally so `tallies` below can count them; measured +0.06 s
                  -- on both the 8-sample fixture and the 222-sample flagship, i.e. inside the
                  -- run-to-run noise of the aggregate it rides on.
