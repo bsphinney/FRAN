@@ -567,13 +567,16 @@ async function renderSearchMatrix(searchId, mode){
       `<button onclick="renderSearchMatrix('${escJs(searchId)}','${m}')" class="px-2.5 py-1 rounded-lg text-xs ${m===_hmMode?'tab-active':'glass text-slate-300'}">${label}</button>`).join('');
     const filterBtn=_hmFilterButtonHtml();
     const filterPanel=_hmFilterPanelHtml(searchId);
-    // ptm_rollup_ready:false means "not computed for this search yet", never "no modified
+    // ptm_rollup_ready:false means "not computed for this search", never "no modified
+    // proteins". Deliberately NOT "yet": five searches have no delimp_precursors rows carrying a
+    // protein_group at all, so their PTM state can never be computed from this data and the refresh
+    // correctly excludes them. "Yet" would promise work that will never happen for them.
     // proteins" — the server already fell back to unfiltered rows for the suspended tokens
     // (see _MATRIX_FILTER_COND), so say that plainly rather than let a full-looking grid pass
     // as an answer to the PTM question nobody actually asked the database.
     const ptmSuspended=d.ptm_rollup_ready===false && [..._hmFilters].some(t=>_HM_PTM_TOKENS.has(t));
     const ptmBanner=ptmSuspended
-      ? `<div class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mb-3">Modification data (has-any modification / phospho / GlyGly) has not been computed for this search yet — showing unfiltered rows for those filters.</div>`
+      ? `<div class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mb-3">Modification data (has-any modification / phospho / GlyGly) has not been computed for this search — showing unfiltered rows for those filters.</div>`
       : '';
     if(!proteins.length){
       // A genuinely empty result (ready:true, 0 rows) and a not-yet-computed one (ready:false)
@@ -711,7 +714,7 @@ function _hmFilterPanelHtml(searchId){
       // user hasn't ticked just gets a muted style as a heads-up about what ticking it will show.
       const muted=!checked&&(notReady||zero||!hasCount);
       let suffix, title;
-      if(notReady){ suffix=' — not computed yet'; title='Modification data has not been computed for this search yet — ticking it will show unfiltered rows plus a note.'; }
+      if(notReady){ suffix=' — not computed'; title='Modification data has not been computed for this search — ticking it will show unfiltered rows plus a note.'; }
       else if(!hasCount){ suffix=''; title='Count unavailable.'; }
       else if(zero){ suffix=' (0)'; title='No proteins match this filter for this search right now — ticking it will show that empty result.'; }
       else{ suffix=` (${fmt(counts[token])})`; title=`${fmt(counts[token])} proteins match this filter on their own.`; }
