@@ -109,6 +109,31 @@ _cols = [c.strip() for c in CI._PREC_COLS.split(",")]
 check("protein_group is not the last column (the .replace() depends on its trailing comma)",
       _cols[-1] != "protein_group", f"order tail: {_cols[-3:]}")
 
+_no_pg = [c.strip() for c in CI._PREC_COLS.replace("protein_group,", "").split(",") if c.strip()]
+check("the no-protein_group column list is exactly one shorter",
+      len(_no_pg) == len(_cols) - 1 and "protein_group" not in _no_pg,
+      f"{len(_no_pg)} vs {len(_cols)}")
+
+
+print("== INSERT tuple arity must match the column list ==")
+
+# Parsed from the source, not executed: both tuples are built inside list comprehensions in
+# ingest(), which needs a live DB, so AST-counting is the only way to check arity without one.
+# Highest-consequence invariant in the file — an off-by-one corrupts every column after the
+# insertion point, and psycopg2 only raises once a re-ingest is already running against prod.
+import ast                                                                        # noqa: E402
+_tree = ast.parse(open(os.path.join(REPO, "ingest", "corpus_ingest.py")).read())
+_tuples = sorted(len(n.elt.elts) for n in ast.walk(_tree)
+                 if isinstance(n, ast.ListComp) and isinstance(n.elt, ast.Tuple)
+                 and len(n.elt.elts) > 15)
+check("exactly two precursor-row tuples exist (write_pg and non-write_pg)", len(_tuples) == 2,
+      f"found arities {_tuples}")
+if len(_tuples) == 2:
+    check("non-write_pg tuple matches the protein_group-less column list",
+          _tuples[0] == len(_cols) - 1, f"{_tuples[0]} values vs {len(_cols) - 1} columns")
+    check("write_pg tuple matches the full column list",
+          _tuples[1] == len(_cols), f"{_tuples[1]} values vs {len(_cols)} columns")
+
 
 print("== the guard itself must fire (proving this test can fail) ==")
 
