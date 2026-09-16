@@ -1,9 +1,26 @@
 #!/bin/bash
 #SBATCH --job-name=fran_mv_refresh
-#SBATCH --account=publicgrp
-#SBATCH --partition=low
-#SBATCH --qos=publicgrp-low-qos
-#SBATCH --nodelist=hive-dc-7-8-54,hive-dc-7-9-44,hive-dc-7-9-51
+#SBATCH --account=genome-center-grp
+#SBATCH --partition=high
+#SBATCH --qos=genome-center-grp-high-qos
+# ACCOUNT/PARTITION, changed 2026-09-16. Was publicgrp/low/publicgrp-low-qos with an explicit
+# --nodelist of three dc-7 nodes. That combination stopped being schedulable: on 2026-09-16 the
+# `low` partition held 440 pending jobs (400 from a single user) and THIS job, queued since the
+# 13th, had an estimated start of the 22nd -- the weekly matview refresh had not run in three days
+# and would not for six more. publicgrp/high was no better: capped at 128 CPUs for the whole group
+# and already saturated (QOSGrpCpuLimit).
+#
+# genome-center-grp carries 64 DEDICATED CPUs per user against a 1303 group ceiling, and is the
+# account this work should have been under all along.
+#
+# THE --nodelist IS GONE, AND THAT NEEDED CHECKING RATHER THAN ASSUMING. It pinned
+# hive-dc-7-8-54/7-9-44/7-9-51 as "empirically confirmed to reach PG Farm:5432 (most compute nodes
+# are firewalled off it)". Those three are in the `low` partition ONLY, so keeping the pin while
+# moving to `high` would have made the job unschedulable outright. 71 other dc-7 nodes ARE in
+# `high`, and reachability was re-verified there rather than inferred from the rack name: a probe
+# job (23500310) landed on hive-dc-7-8-62 and reported "PG FARM REACHABLE". Left unpinned so the
+# scheduler can use any of the 71; if a node ever turns out to be firewalled the symptom is a
+# connection failure in the log, not silent wrong data.
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
