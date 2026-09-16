@@ -1,7 +1,7 @@
 # Deploying the PTM rollup refresh — manual steps
 
 Nothing in this branch reaches Hive on its own. Until these steps are run by hand, the heatmap's
-PTM filters stay unavailable on 2,079 of 2,086 searches and the site shows the amber
+PTM filters stay unavailable on 2,084 of 2,086 searches and the site shows the amber
 "has not been computed for this search" banner whenever one is ticked.
 
 **Nothing here has been executed.** No file was copied, no job submitted, no crontab edited.
@@ -44,17 +44,30 @@ Expect roughly 0.7 h and `2079 search(es) to process, 50 per batch`. The log mus
 ## 3. Verify before scheduling it
 
 ```bash
+# Run this ON HIVE, like the steps above. It deliberately does NOT import app.db -- that
+# module does not exist under fran_ingest/, and importing it is the exact failure this
+# deployment fixes.
 python3 - <<'PY'
-import os, sys; os.environ["DELIMP_PG_TOKEN_FILE"] = os.path.expanduser("~/.pgfarm_token")
-sys.path.insert(0, ".")
-from app.db import query
-print("searches with rollup rows:",
-      query("SELECT count(DISTINCT search_id) FROM delimp_search_protein_ptm",
-            tables=["delimp_search_protein_ptm"], fetch="val"))
+import sys
+sys.path.insert(0, "/quobyte/proteomics-grp/brett/glendon/fran_ingest")
+from coreomics_import import _conn
+with _conn() as cn, cn.cursor() as cur:
+    cur.execute("SELECT count(DISTINCT search_id) FROM delimp_search_protein_ptm")
+    print("searches with rollup rows:", cur.fetchone()[0])
 PY
 ```
 
-Expect 2,079, not 2,086. **Five searches are permanently excluded and that is correct** —
+Expect **2,081** -- not 2,086, and not the 2,079 printed at step 2. Three different numbers are
+in play and conflating them reads as failure:
+
+| number | what it is |
+|---|---|
+| **2,079** | searches the run PROCESSES -- the pending set, and the string the script prints |
+| **2** | already had rows before the backfill (the two fixture searches) |
+| **2,081** | `count(DISTINCT search_id)` AFTERWARDS -- this is the number to expect here |
+| **5** | permanently excluded, so 2,081 + 5 = 2,086 rather than 2,086 outright |
+
+Seeing 2,081 means it worked. **Five searches are permanently excluded and that is correct** --
 `223106d8, 58918226, 90d20943, e7bf2b7b, f0501ee6` hold no `delimp_precursors` row with a
 non-NULL `protein_group`, so nothing can be computed for them. They keep reporting
 `ptm_rollup_ready: false`, which is the honest answer and never "no modified proteins".
