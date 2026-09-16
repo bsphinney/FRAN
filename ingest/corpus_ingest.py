@@ -320,33 +320,55 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         recs = list(_records(report, engine))
     if not recs:
         sys.exit("No precursor records parsed (check the report / --engine).")
-    # Organism: if not given on the CLI, derive it from the report — Spectronaut carries
-    # PEP.AllOccurringOrganisms per peptide, so the dominant species is the experiment organism.
-    if not organism_name:
-        from collections import Counter
-        _TAXON = {"Homo sapiens": 9606, "Mus musculus": 10090, "Rattus norvegicus": 10116,
-                  "Bos taurus": 9913, "Sus scrofa": 9823, "Ovis aries": 9940, "Oryctolagus cuniculus": 9986,
-                  "Macaca mulatta": 9544, "Macaca fascicularis": 9541, "Gallus gallus": 9031,
-                  "Saccharomyces cerevisiae": 559292, "Escherichia coli": 562, "Canis lupus familiaris": 9615}
-        oc = Counter()
-        for x in recs:
-            o = x.get("organism")
-            if o and str(o).strip().lower() not in ("none", "nan", ""):
-                for part in str(o).split(";"):
-                    part = part.strip()
-                    if part:
-                        oc[part] += 1
-        if oc:
-            organism_name = oc.most_common(1)[0][0]
-            taxon = taxon or _TAXON.get(organism_name)
-            print(f"  organism (from report): {organism_name}" + (f" [taxon {taxon}]" if taxon else ""))
     # Canonicalize: junk sentinels ("Unknown"/""/etc) -> NULL (never a string, which would
     # masquerade as a real species on the dashboard); strip Spectronaut "(Common name)"
     # variants so they merge with the bare species. Single source of truth: organism.py.
     try:
-        from organism import canonical_organism
+        from organism import canonical_organism, vote_organism
     except ImportError:  # when run as a module
-        from .organism import canonical_organism
+        from .organism import canonical_organism, vote_organism
+    # Organism, when not given on the CLI. The organism of a search is the species of the
+    # DATABASE it searched, so in order:
+    #   1. the search database's own OS=/OX= headers, when the FASTA is readable here;
+    #   2. a vote over the identifications from that database. Contaminant-library hits
+    #      (Cont_/CON__/cRAP) are excluded: PEP.AllOccurringOrganisms also names the contaminant
+    #      FASTA's species, so a serum-heavy sample used to be recorded as Bos taurus
+    #      (measured 2026-09-16: a human search with 99% contaminant hits was stored as cow);
+    #   3. NULL -- never a contaminant's species.
+    if not organism_name:
+        _TAXON = {"Homo sapiens": 9606, "Mus musculus": 10090, "Rattus norvegicus": 10116,
+                  "Bos taurus": 9913, "Sus scrofa": 9823, "Ovis aries": 9940, "Oryctolagus cuniculus": 9986,
+                  "Macaca mulatta": 9544, "Macaca fascicularis": 9541, "Gallus gallus": 9031,
+                  "Saccharomyces cerevisiae": 559292, "Escherichia coli": 562, "Canis lupus familiaris": 9615}
+        _fa0, _db_species = {}, None
+        try:
+            from engine_fasta import detect as _detect_fasta, fasta_species
+            _fa0 = _detect_fasta(engine, report, output_dir) or {}
+            _db_species = fasta_species(_fa0.get("fasta_path"))
+        except Exception:  # noqa: BLE001 - never fail an ingest over provenance
+            _db_species = None
+        if _db_species:
+            organism_name, _ox, _share = _db_species
+            taxon = taxon or _ox or _TAXON.get(organism_name)
+            print(f"  organism (from search database {os.path.basename(_fa0['fasta_path'])}): "
+                  f"{organism_name} [{_share:.0%} of species-labelled entries]"
+                  + (f" [taxon {taxon}]" if taxon else ""))
+        else:
+            _v = vote_organism((x.get("organism"), x.get("protein_group")) for x in recs)
+            organism_name = _v["organism"]
+            if _v["n_contaminant"]:
+                print(f"  organism vote: {_v['n_contaminant']:,} of {_v['n']:,} precursors "
+                      f"({_v['n_contaminant'] / max(_v['n'], 1):.0%}) are contaminant-library hits "
+                      f"-- excluded")
+            if organism_name:
+                taxon = taxon or _TAXON.get(organism_name)
+                print(f"  organism (from report, contaminants excluded): {organism_name}"
+                      + (f" [taxon {taxon}]" if taxon else "")
+                      + f"  top votes {_v['votes'].most_common(3)}")
+            elif _v["n_contaminant"] or _v["n_unlabelled"]:
+                print(f"  organism: UNRESOLVED -> NULL ({_v['n_unlabelled']:,} precursors carry no "
+                      f"organism, {_v['n_contaminant']:,} are contaminant-library hits). Pass "
+                      f"--organism-name if the sample species is known.")
     organism_name = canonical_organism(organism_name)
     runs = sorted({str(x["run"]) for x in recs if x.get("run")})
     if not search_name:  # name from the raw FILE prefix (faithful to origin), folder as fallback

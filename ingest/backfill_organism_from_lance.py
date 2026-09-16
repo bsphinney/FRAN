@@ -31,8 +31,20 @@ each would let shared peptides decide the answer. Those are tallied separately a
 Contaminants are why a mode is needed at all: measured runs show 'Octopus vulgaris' 1,185 vs
 'Bos taurus' 72 (BSA/trypsin), 'Cicer arietinum' 15,438 vs 'Homo sapiens' 80 (keratin).
 
+A mode is NOT enough when contaminants outnumber the sample (1.1). Rows whose protein group is
+contaminant-library-only (Cont_/CON__/cRAP, organism.is_contaminant_group) no longer vote: in one
+human search measured 2026-09-16, 99% of identifications were Universal Contaminant FASTA hits,
+11,763 of them bovine, and its runs were recorded as Bos taurus.
+
+--recheck scores runs that ALREADY have an organism_name too, and lists the ones the evidence
+contradicts (a different organism wins) or does not support (only contaminant or unlabelled
+identifications). corpus_ingest wrote those names with the same contaminant-blind vote before 1.1,
+so this is how to find every affected search. organism_name is still never modified here -- review
+the list, then re-ingest (corpus_ingest now derives it correctly) or correct it explicitly.
+
     python ingest/backfill_organism_from_lance.py            # dry run
     python ingest/backfill_organism_from_lance.py --apply
+    python ingest/backfill_organism_from_lance.py --recheck  # audit recorded organisms (dry run)
 """
 import argparse
 import functools
@@ -42,11 +54,11 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from organism import canonical_organism  # noqa: E402 — the ONLY place sentinels are defined
+from organism import canonical_organism, is_contaminant_group  # noqa: E402 — one definition each
 
 print = functools.partial(print, flush=True)   # noqa: A001
 
-METHOD = "lance_pep_all_occurring_organisms_unique_mode/1.0"
+METHOD = "lance_pep_all_occurring_organisms_unique_mode/1.1"   # 1.1: contaminant groups excluded
 MIN_SHARE = 0.60      # modal organism must hold this share of organism-unique peptides
 MIN_ROWS = 20         # and the run needs at least this many unique-organism rows
 
@@ -67,6 +79,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--limit-datasets", type=int, default=0)
+    ap.add_argument("--recheck", action="store_true",
+                    help="also score runs that already have organism_name, and list the ones the "
+                         "contaminant-excluded evidence contradicts or does not support")
     a = ap.parse_args()
 
     import lance
@@ -74,38 +89,52 @@ def main():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT DISTINCT rf.raw_basename, lr.lance_path
+        SELECT DISTINCT rf.raw_basename, lr.lance_path, m.organism_name
         FROM delimp_sample_metadata m
         JOIN raw_files rf ON rf.raw_path = m.raw_path
         JOIN delimp_spectrum_lane_runs lr ON lr.run = rf.raw_basename
-        WHERE m.organism_name IS NULL OR m.organism_taxon_id IS NULL""")
+        WHERE %s OR m.organism_name IS NULL OR m.organism_taxon_id IS NULL""", (a.recheck,))
     rows = cur.fetchall()
     by_ds = defaultdict(set)
-    for run, path in rows:
+    recorded = {}
+    for run, path, org in rows:
         by_ds[path].add(run)
-    print(f"gap runs: {len({r[0] for r in rows}):,} across {len(by_ds):,} datasets")
+        if org:
+            recorded[run] = org
+    print(f"{'runs to score' if a.recheck else 'gap runs'}: {len({r[0] for r in rows}):,} "
+          f"across {len(by_ds):,} datasets")
 
     dsets = sorted(by_ds)
     if a.limit_datasets:
         dsets = dsets[:a.limit_datasets]
 
     resolved, weak, missing_ds = {}, {}, 0
+    contam_rows, scored_rows = Counter(), Counter()   # run -> contaminant-only rows / all rows
     for i, path in enumerate(dsets, 1):
         if not os.path.exists(path):
             missing_ds += 1
             continue
         want = by_ds[path]
         try:
-            t = lance.dataset(path).scanner(columns=["run", "organism"]).to_table().to_pydict()
+            ds = lance.dataset(path)
+            has_pg = "protein_group" in ds.schema.names
+            cols = ["run", "organism"] + (["protein_group"] if has_pg else [])
+            t = ds.scanner(columns=cols).to_table().to_pydict()
         except Exception as e:  # noqa: BLE001
             print(f"  skip {os.path.basename(path)[:44]}: {str(e)[:50]}")
             continue
         uniq = defaultdict(Counter)   # run -> organism -> n (organism-UNIQUE peptides only)
         shared = Counter()            # run -> n multi-organism peptides (uninformative)
         runs, orgs = t["run"], t["organism"]
+        groups = t["protein_group"] if has_pg else None
         for j in range(len(runs)):
             r = runs[j]
             if r not in want:
+                continue
+            scored_rows[r] += 1
+            # The contaminant library's species is not the sample's (see module docstring, 1.1).
+            if groups is not None and is_contaminant_group(groups[j]):
+                contam_rows[r] += 1
                 continue
             o = orgs[j]
             if not o:
@@ -146,6 +175,22 @@ def main():
         print("\nleft as NOT PREDICTED (no dominant organism-unique signal):")
         for r, (top, share, tot) in list(weak.items())[:5]:
             print(f"  {r[:34]:36s} share={share:.2f} n={tot} {top}")
+
+    if a.recheck:
+        # Runs whose RECORDED organism the contaminant-excluded evidence does not back.
+        contradicted = {r: (recorded[r], v["name"]) for r, v in resolved.items()
+                        if r in recorded and canonical_organism(recorded[r]) != v["name"]}
+        unsupported = {r: recorded[r] for r in recorded
+                       if r in scored_rows and r not in resolved and r not in weak
+                       and contam_rows[r]}
+        print(f"\nRECHECK: {len(contradicted):,} runs contradicted, {len(unsupported):,} unsupported "
+              f"(recorded organism, but only contaminant/unlabelled identifications)")
+        pairs = Counter(contradicted.values())
+        for (was, now), k in pairs.most_common(25):
+            print(f"  recorded {was[:30]:32s} -> evidence {now[:30]:32s} {k:>6,} runs")
+        for org, k in Counter(unsupported.values()).most_common(15):
+            ex = [r for r in unsupported if unsupported[r] == org][:3]
+            print(f"  recorded {org[:30]:32s} -> NO non-contaminant evidence {k:>6,} runs  e.g. {ex}")
 
     if not a.apply:
         print("\nDRY RUN — re-run with --apply. organism_name is never modified.")

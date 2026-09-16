@@ -195,6 +195,71 @@ def detect(engine: str, report_path: str | None, search_dir: str | None = None,
     return None
 
 
+# UniProt header: ">sp|P02769|ALBU_BOVIN Serum albumin OS=Bos taurus OX=9913 GN=ALB PE=1 SV=4"
+_OS = re.compile(r"\bOS=(.+?)(?=\s+(?:OX|GN|PE|SV)=|\s*$)")
+_OX = re.compile(r"\bOX=(\d+)")
+_SPECIES_CACHE: dict[tuple, tuple[str, int | None, float] | None] = {}
+SPECIES_MIN_SHARE = 0.80      # the top OS= must hold this share of the species-labelled entries
+SPECIES_MIN_LABELLED = 0.50   # and labelled entries must be at least half of the database
+
+
+def fasta_species(path: str | None) -> tuple[str, int | None, float] | None:
+    """(organism_name, taxon_id, share) of a READABLE search database, from its UniProt OS=/OX=
+    headers; None when the file is unreachable or does not name one dominant species.
+
+    This is the species of the database the search ran against, which is what "the organism of
+    this search" means -- better evidence than a vote over identifications whenever the file can
+    be read. Contaminant-library entries (Cont_/CON__/cRAP) are ignored, as they are in
+    organism.vote_organism(). Returns None rather than guessing when:
+      * fewer than SPECIES_MIN_LABELLED of the entries carry OS= (custom ORF / translated
+        databases have none), or
+      * no species holds SPECIES_MIN_SHARE of them (genuinely multi-organism databases, e.g.
+        host + pathogen or entrapment searches; the identification vote decides those).
+    Never raises.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        from organism import canonical_organism, is_contaminant_group
+    except ImportError:  # imported as ingest.engine_fasta
+        from .organism import canonical_organism, is_contaminant_group
+    try:
+        st = os.stat(path)
+        key = (os.path.realpath(path), st.st_size, st.st_mtime_ns)
+        if key in _SPECIES_CACHE:
+            return _SPECIES_CACHE[key]
+        names: dict[str, int] = {}
+        taxa: dict[str, int] = {}
+        n_entries = n_labelled = 0
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if not line.startswith(">"):
+                    continue
+                acc = line[1:].split(None, 1)[0] if len(line) > 1 else ""
+                if is_contaminant_group(acc):
+                    continue
+                n_entries += 1
+                m = _OS.search(line)
+                name = canonical_organism(m.group(1)) if m else None
+                if not name:
+                    continue
+                n_labelled += 1
+                names[name] = names.get(name, 0) + 1
+                x = _OX.search(line)
+                if x and name not in taxa:
+                    taxa[name] = int(x.group(1))
+        result = None
+        if n_entries and n_labelled >= SPECIES_MIN_LABELLED * n_entries:
+            top = max(names, key=names.get)
+            share = names[top] / n_labelled
+            if share >= SPECIES_MIN_SHARE:
+                result = (top, taxa.get(top), share)
+        _SPECIES_CACHE[key] = result
+        return result
+    except Exception:  # noqa: BLE001 - provenance is never worth failing an ingest over
+        return None
+
+
 if __name__ == "__main__":
     import sys
     for arg in sys.argv[1:]:
