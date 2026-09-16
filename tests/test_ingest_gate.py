@@ -229,8 +229,11 @@ for label, files in SHARES.items():
               "UNFAITHFUL" not in o, (o + err)[-400:])
         check(f"[{label}] assert_current runs there at all",
               r.returncode == 0 and "OK" in o, (o + err)[-500:])
+        # assert_current prints from inside, so anything the CLEAN call emitted lands BEFORE the
+        # "CLEAN:" label — that prefix is the window to check. (The deliberate blind call further
+        # down is supposed to say "unreadable"; don't let its message be mistaken for this one's.)
         check(f"[{label}] it READ the manifest rather than failing open",
-              "CLEAN: []" in o and "unreadable" not in o.split("BLIND:")[0], o.strip()[:400])
+              "CLEAN: []" in o and "unreadable" not in o.split("CLEAN:")[0], o.strip()[:400])
         check(f"[{label}] a stale refuse-gated file REFUSES there",
               "REFUSED: True REFUSING TO INGEST" in o, o.strip()[-300:])
     finally:
