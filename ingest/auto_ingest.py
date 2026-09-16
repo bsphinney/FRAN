@@ -18,8 +18,10 @@ output_dir already holds the same raw-file set and precursor count. Selection ab
 the guard from being the only thing standing between a re-export and a duplicate row. When the guard
 does fire, that is logged as SKIPPED-DUPLICATE, not as a failure.
 
-Deliberately NOT enabled here: --lance-dir/--xic-dir. Lane writes are GB-scale per search and this
-runs unattended on a database already at 228 GB; enabling them is a storage decision for a human.
+Deliberately NOT enabled for scan candidates: --lance-dir/--xic-dir. Lane writes are GB-scale per
+search and this runs unattended on a database already at 228 GB; enabling them is a storage decision.
+That decision is made per search by whoever REGISTERS it: a queue row with xic_dir set (fran_queue.py
+add --xic-dir) gets its DIA-NN chromatograms written by _run_xic_lane() after the precursors commit.
 """
 from __future__ import annotations
 
@@ -156,7 +158,11 @@ def _claim_queue(a):
               "n_exports": 1, "n_usable": 1,
               "queue_id": r["id"],
               **({"organism": r["organism_name"]} if r.get("organism_name") else {}),
-              **({"taxon": r["taxon"]} if r.get("taxon") else {})}
+              **({"taxon": r["taxon"]} if r.get("taxon") else {}),
+              # The row's XIC declaration. Without these two keys _run_xic_lane() returns early,
+              # so no DIA-NN trace was ever ingested from the queue (fixed 2026-09-16).
+              **({"xic_dir": r["xic_dir"]} if r.get("xic_dir") else {}),
+              **({"lance_dir": r["lance_dir"]} if r.get("lance_dir") else {})}
              for r in rows]
     if cands:
         print(f"\nqueue: claimed {len(cands)} registered search(es) — these run first", flush=True)
