@@ -47,26 +47,14 @@ rc_mv=$?
     /quobyte/proteomics-grp/brett/glendon/fran_ingest/refresh_corpus_reach.py
 rc_reach=$?
 
-# delimp_search_protein_ptm, the per-(search, protein_group) modification flags behind the search
-# heatmap's PTM filters. Same home, same reasoning as corpus_reach above, plus one of its own:
-# computing these live costs 16.4 s on a 10-sample search and 90.9 s on a 21-sample one, against a
-# PUBLIC endpoint that auto-fires on every search-page view — so they must be precomputed or the
-# filter cannot exist.
+# Every rc, not `$?`. With more than one payload a bare `$?` reports only the last, so a failed
+# matview refresh would be logged as a success whenever the later refresh happened to succeed —
+# precisely the silent-failure mode this job's schedule exists to make noisy.
 #
-# INCREMENTAL by default: it processes only searches with no rows yet, so the weekly run is cheap
-# once the first backfill has landed. The first run is the backfill (~0.7 h for 2,086 searches) and
-# will dominate this job's wall-clock exactly once.
-#
-# --batch 50 is not a tuning knob, it is the design. Measured: 12 searches in ONE batched query take
-# 13.7 s (1.1 s each); the SAME searches queried individually take 16-91 s EACH. One batched pass is
-# a single sequential scan of delimp_precursors, a per-search loop is thousands of index lookups.
-# Lowering this toward 1 reverts a ~40-minute job to a 9-53 HOUR one.
-/quobyte/proteomics-grp/brett/stan_venv/bin/python -u \
-    /quobyte/proteomics-grp/brett/glendon/fran_ingest/refresh_search_ptm.py --batch 50
-rc_ptm=$?
-
-# Every rc, not `$?`. With three payloads a bare `$?` reports only the last, so a failed matview
-# refresh would be logged as a success whenever the later refreshes happened to succeed — precisely
-# the silent-failure mode this job's schedule exists to make noisy.
-echo "===== done mv_rc=$rc_mv corpus_reach_rc=$rc_reach search_ptm_rc=$rc_ptm $(date '+%F %T') ====="
-exit $(( rc_mv | rc_reach | rc_ptm ))
+# THE PTM ROLLUP IS NOT A THIRD PAYLOAD HERE, and that is deliberate. It briefly was; `sacct` shows
+# this job already TIMEOUTs at its own 4-hour wall in four of its last six runs carrying just the
+# one payload above, so a third would usually never start — and when SLURM kills the job mid-payload
+# this very echo never executes, making the rc reporting unreachable exactly when it matters. It
+# lives in ingest/fran_ptm_refresh.sbatch with its own wall and its own cron entry.
+echo "===== done mv_rc=$rc_mv corpus_reach_rc=$rc_reach $(date '+%F %T') ====="
+exit $(( rc_mv | rc_reach ))

@@ -11,20 +11,30 @@ individually = 16-91 s each. One batched pass is a single sequential scan of del
 a per-search loop is thousands of index lookups and sorts. A naive loop over 2,086 searches would
 run 9-53 HOURS against ~40 minutes batched. Do not "simplify" this into a loop.
 
-WRITES DO NOT GO THROUGH app.db.query(): that layer is read-only by design (SELECT/WITH only —
-see its GovernanceError). Like refresh_leaderboards.py and build_protein_peptide_counts.py, this
-script opens its own psycopg2 connection for the INSERT ... ON CONFLICT, reusing
-refresh_leaderboards._token() for the PG Farm credential. Reads (the pending-search list) still go
-through app.db.query() against the public allowlist.
+NOTHING HERE IMPORTS app.*, AND THAT IS A DEPLOYMENT CONSTRAINT, not a style choice. On Hive this
+file runs from /quobyte/proteomics-grp/brett/glendon/fran_ingest/, a flat scp'd directory with no
+`app/` beside or above it — verified 2026-09-16. An earlier revision did `from app.db import query`
+behind a `sys.path.insert(0, "..")`, which resolves in the repo (app/ is a sibling of ingest/) and
+raises ModuleNotFoundError on the cluster. It could not have used that layer anyway: app.db is
+read-only by construction and this script writes.
 
-Run from ingest/fran_mv_refresh.sbatch on the existing weekly schedule. Do NOT add a new cron.
+The one sibling it may import is coreomics_import — the SAME import refresh_corpus_reach.py makes,
+and coreomics_import.py is confirmed present in fran_ingest/. Note refresh_leaderboards is NOT:
+it lives in fran_refresh/, a different directory, so `from refresh_leaderboards import _token`
+would fail here exactly as app.db did. Every statement below is parameterised, so the reads lose
+nothing by going straight through psycopg2.
+tests/test_refresh_search_ptm_imports.py imports this module under a reconstructed Hive sys.path
+and fails if an app.* import ever returns.
+
+Run from ingest/fran_ptm_refresh.sbatch, its OWN weekly SLURM job. It does NOT belong in
+fran_mv_refresh.sbatch: that job already TIMEOUTs at its 4-hour wall in 4 of its last 6 runs with
+one payload (sacct, verified 2026-09-16), so a third payload would usually never start.
 """
 from __future__ import annotations
 import argparse, os, sys, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # ingest/ (for refresh_leaderboards)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from app.db import query                                          # noqa: E402
-from refresh_leaderboards import _token                           # noqa: E402
+# This directory only. No ".." — see the module docstring: there is no app/ above it on Hive.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from coreomics_import import _conn as _base_conn                  # noqa: E402
 
 # GlyGly matches BOTH spellings on purpose. Historical Spectronaut rows store the literal
 # `[GlyGly (K)]` because ingest/spectronaut_to_corpus.py's _MOD_UNIMOD lacked GlyGly until
@@ -83,13 +93,25 @@ SELECT s.id FROM delimp_searches s
 
 
 def _conn(timeout_ms: int = 900_000):
-    import psycopg2
-    return psycopg2.connect(
-        host=os.environ.get("DELIMP_PG_HOST", "pgfarm.library.ucdavis.edu"), port=5432,
-        dbname=os.environ.get("DELIMP_PG_DB", "uc-davis-genome-center-proteomics-core/delimp"),
-        user=os.environ.get("DELIMP_PG_USER", "genome-proteomics-service-account"),
-        password=_token(), sslmode="require", connect_timeout=30,
-        options=f"-c statement_timeout={timeout_ms}")
+    """The shared connection helper, plus a statement timeout this job actually needs.
+
+    coreomics_import._conn() is the same one refresh_corpus_reach.py uses and carries the token
+    convention (DELIMP_PG_TOKEN_FILE -> JWT exchange); it sets no statement_timeout, and the
+    default would kill both the batched INSERT and the PENDING anti-join. SET rather than a
+    connect option so there is one connection helper on this cluster, not two.
+    """
+    con = _base_conn()
+    with con.cursor() as cur:
+        cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
+    con.commit()
+    return con
+
+
+def _rows(con, sql: str, params: dict) -> list[str]:
+    """Read a one-column id list. Parameterised, like every statement in this file."""
+    with con.cursor() as cur:
+        cur.execute(sql, params)
+        return [str(r[0]) for r in cur.fetchall()]
 
 
 def _run_batch(conn, ids: list[str]) -> None:
@@ -105,18 +127,17 @@ def main() -> int:
     ap.add_argument("--rebuild", action="store_true", help="reprocess every search, not just new ones")
     a = ap.parse_args()
 
+    conn = _conn()
+    conn.autocommit = False
     if a.rebuild:
-        ids = [str(r["id"]) for r in query("SELECT id FROM delimp_searches", tables=["delimp_searches"])]
+        ids = _rows(conn, "SELECT id FROM delimp_searches", {})
     else:
-        ids = [str(r["id"]) for r in query(PENDING, {"lim": a.limit},
-                                           tables=["delimp_searches", "delimp_search_protein_ptm",
-                                                   "delimp_precursors"], timeout_ms=600_000)]
+        ids = _rows(conn, PENDING, {"lim": a.limit})
     if not ids:
+        conn.close()
         print("nothing to do — every search that can produce rows has them"); return 0
 
     print(f"{len(ids)} search(es) to process, {a.batch} per batch")
-    conn = _conn()
-    conn.autocommit = False
     done = 0
     try:
         for i in range(0, len(ids), a.batch):

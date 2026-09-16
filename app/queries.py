@@ -4663,9 +4663,17 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
     #
     # This SUPERSEDES part of the "why cached" note above: that clause refused to cache an empty
     # matrix so a mid-ingest search would self-heal rather than stick for 30 minutes. The
-    # n_samples_total test below keeps exactly that protection where it actually applies — the
-    # search does not exist, or has no samples yet — which is the cheap early return that never
-    # reaches this query at all. What is now cached is an empty result that COST 2-5 s to compute.
+    # n_samples_total test below keeps that protection for the case it was written for — the search
+    # does not exist, or has no samples — which is the cheap early return that never reaches this
+    # query at all. What is now cached is an empty result that COST 2-5 s to compute.
+    #
+    # IT IS NOT A PERFECT PARTITION, and the earlier wording here ("exactly where it actually
+    # applies") overstated it. `samples` is built without an intensity predicate while the ranking
+    # aggregate requires intensity > 0, so 32 of 2,086 searches have samples yet no rankable gene
+    # at all: they pass this test and are now cached empty where before they self-healed. Measured,
+    # not estimated. The effect is benign because those 32 are structurally empty rather than
+    # mid-ingest — nothing arrives later to heal into — but the gap is real and is stated here
+    # rather than papered over.
     if result.get("n_samples_total"):
         SLOW_CACHE.put(key, result)
     return result

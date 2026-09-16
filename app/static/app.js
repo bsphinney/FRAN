@@ -568,12 +568,12 @@ async function renderSearchMatrix(searchId, mode){
     const filterBtn=_hmFilterButtonHtml();
     const filterPanel=_hmFilterPanelHtml(searchId);
     // ptm_rollup_ready:false means "not computed for this search", never "no modified
-    // proteins". Deliberately NOT "yet": five searches have no delimp_precursors rows carrying a
-    // protein_group at all, so their PTM state can never be computed from this data and the refresh
-    // correctly excludes them. "Yet" would promise work that will never happen for them.
     // proteins" — the server already fell back to unfiltered rows for the suspended tokens
     // (see _MATRIX_FILTER_COND), so say that plainly rather than let a full-looking grid pass
     // as an answer to the PTM question nobody actually asked the database.
+    // Deliberately NOT "yet": five searches hold no delimp_precursors row carrying a
+    // protein_group at all, so their PTM state can never be computed from this data and the
+    // refresh correctly excludes them. "Yet" would promise work that will never happen for them.
     const ptmSuspended=d.ptm_rollup_ready===false && [..._hmFilters].some(t=>_HM_PTM_TOKENS.has(t));
     const ptmBanner=ptmSuspended
       ? `<div class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mb-3">Modification data (has-any modification / phospho / GlyGly) has not been computed for this search — showing unfiltered rows for those filters.</div>`
