@@ -437,8 +437,14 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # Stamp this run into delimp_component_version before doing any work, so a run that later
         # dies still leaves a record of which code touched the corpus. Never fatal.
         import versions as _V
+        # STALENESS GATE. A stale adapter writes rows that look fine and need re-ingesting later,
+        # so a refuse-gated mismatch stops the run here -- before the engine pre-flight and before
+        # any write. An unreachable manifest does the OPPOSITE and proceeds: this gate exists to
+        # prevent silent corruption, not to make PG Farm a hard dependency of ingestion.
+        _stale = _V.assert_current(cur, ignore_stale=IGNORE_STALE_INGEST)
         _V.record_run(cur, "corpus_ingest", CORPUS_INGEST_VERSION,
-                      notes=f"schema={SCHEMA_VERSION}")
+                      notes=(f"schema={SCHEMA_VERSION}" if not _stale
+                             else f"schema={SCHEMA_VERSION}; RAN STALE: {','.join(_stale)}"))
         conn.commit()
 
         # ENGINE WHITELIST PRE-FLIGHT. delimp_searches.search_engine carries a CHECK constraint
@@ -907,6 +913,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
 
 BULK_COPY = False         # set by --bulk-copy; uses COPY for the big precursor insert (fast on HIVE)
 ALLOW_DUPLICATE = False   # set by --allow-duplicate; bypasses the raw-set duplicate guard in ingest()
+IGNORE_STALE_INGEST = False  # set by --ignore-stale-ingest; downgrades the staleness gate to a warning
 WRITE_FRAGMENTS = True    # write the observed-spectrum Lance lane (Spectronaut fragment-level reports)
 SPECTRUM_LANCE_DIR = None # dir for per-search Lance datasets (set by --lance-dir); None disables the lane
 XIC_DIR = None            # dir of Spectronaut *.xic.db All-XIC dbs (set by --xic-dir); None disables the XIC lane
@@ -998,6 +1005,9 @@ if __name__ == "__main__":
     ap.add_argument("--allow-duplicate", action="store_true",
                     help="ingest even if another output_dir already has the same raw-file set and "
                          "precursor count (default: skip, see the duplicate guard)")
+    ap.add_argument("--ignore-stale-ingest", action="store_true",
+                    help="ingest even though this deployment's ingest scripts do not match the "
+                         "published manifest (recorded as 'RAN STALE' in delimp_component_version)")
     ap.add_argument("--bulk-copy", action="store_true", help="use COPY for the precursor insert (much faster on a fast PG link, e.g. HIVE)")
     ap.add_argument("--no-fragments", action="store_true", help="skip the observed-spectrum Lance lane (precursors only)")
     ap.add_argument("--lance-dir", default=None, help="dir for per-search Lance spectrum datasets (enables the observed-spectrum lane)")
@@ -1006,6 +1016,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     BULK_COPY = a.bulk_copy
     ALLOW_DUPLICATE = a.allow_duplicate
+    IGNORE_STALE_INGEST = a.ignore_stale_ingest
     WRITE_FRAGMENTS = not a.no_fragments
     SPECTRUM_LANCE_DIR = a.lance_dir
     XIC_DIR = a.xic_dir

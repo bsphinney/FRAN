@@ -35,6 +35,7 @@ code is worse than no version, because it is trusted.
 """
 import os
 import subprocess
+import sys
 
 # --- schema (migration) version -------------------------------------------------------------
 # Tracks `delimp_schema_version`, i.e. the shape of the tables. NOT a code version — do not bump it
@@ -197,6 +198,59 @@ def record_run(cur, component, version, notes=None):
     except Exception as e:  # noqa: BLE001
         print(f"  version: could not record {component} {version}: {str(e)[:80]}", flush=True)
         return False
+
+
+def assert_current(cur, ignore_stale: bool = False) -> list[str]:
+    """Refuse to run a stale ingestor. Returns the stale filenames.
+
+    TWO OPPOSITE DEFAULTS, BOTH DELIBERATE:
+      * a hash MISMATCH fails CLOSED -- a stale adapter writes rows that look fine and need
+        re-ingesting later, which is worse than not running at all;
+      * an UNREACHABLE manifest fails OPEN -- this gate exists to prevent silent corruption, not to
+        make PG Farm a hard dependency of ingestion. A database outage must not stop the pipeline.
+
+    Content-addressed, not version-addressed, for the reason publish_manifest.py records: on
+    2026-09-16 the repo and the Windows-node share both declared CORPUS_INGEST_VERSION = "1.3.0"
+    while the files differed. A constant-based check would have passed that.
+
+    Cannot import app.db: on the Windows-node share `fran_ingest/` is a flat scp'd directory with no
+    `app/` parent (proven 2026-09-16). Callers pass a live cursor.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        sys.path.insert(0, here)
+        from publish_manifest import file_md5
+        cur.execute("SELECT file, md5, git_sha, published_at, gate FROM delimp_ingest_manifest")
+        rows = cur.fetchall()
+    except Exception as e:                      # noqa: BLE001 -- FAIL OPEN, see docstring
+        print(f"  ingest-gate: manifest unreadable ({e}); proceeding unchecked", flush=True)
+        return []
+    if not rows:
+        print("  ingest-gate: manifest is empty; proceeding unchecked "
+              "(run ingest/publish_manifest.py from the repo)", flush=True)
+        return []
+
+    stale, refuse = [], []
+    for f, want, sha, published_at, gate in rows:
+        p = os.path.join(here, f)
+        if not os.path.exists(p):
+            continue                            # not deployed here; not this gate's business
+        got = file_md5(p)
+        if got != want:
+            stale.append(f)
+            print(f"  ingest-gate: STALE {f}  local={got[:8]} expected={want[:8]} "
+                  f"(published {published_at:%Y-%m-%d} at {sha})", flush=True)
+            if gate == "refuse":
+                refuse.append(f)
+    if stale:
+        print(f"  ingest-gate: fix with  scp {' '.join(sorted(stale))} "
+              f"<repo>/ingest/ -> this directory", flush=True)
+    if refuse and not ignore_stale:
+        raise SystemExit(
+            f"REFUSING TO INGEST: {len(refuse)} corpus-writing script(s) are stale: "
+            f"{', '.join(sorted(refuse))}. Ingesting with these produces rows that must be "
+            f"re-ingested later. Sync them, or pass --ignore-stale-ingest to override (recorded).")
+    return stale
 
 
 def stamp():
