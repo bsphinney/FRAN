@@ -44,7 +44,11 @@ _CREATE = {
     # never determined; Orbitrap has none) — those would smear a false band along 1/K0=0.
     "delimp_mv_im_scatter": """CREATE MATERIALIZED VIEW IF NOT EXISTS delimp_mv_im_scatter AS
       SELECT rt, irt, im, charge, precursor_mz, intensity_log2 FROM (
-        SELECT DISTINCT ON (stripped_seq, charge) stripped_seq, charge, rt, irt, im, precursor_mz, intensity_log2
+        SELECT DISTINCT ON (stripped_seq, charge) stripped_seq, charge, rt, irt, im, precursor_mz,
+               -- DERIVED, not the delimp_precursors column of the same name: that column has no
+               -- writer and is 100% NULL, so this matview faithfully carried 20,000 NULLs out to
+               -- the Ion Mobility scatter (audit 2026-09-16). Guarded: ln() is undefined at <= 0.
+               CASE WHEN intensity > 0 THEN ln(intensity) / ln(2) END AS intensity_log2
         FROM delimp_precursors WHERE im > 0.3 AND rt IS NOT NULL
           -- drop mis-predicted iRT (corpus has stray -2900 and 3e12 values) so the iRT axis
           -- isn't blown out; real Biognosys-scale iRT sits well within [-100,300].
@@ -121,6 +125,14 @@ def _token():
 
 def main():
     create = "--create" in sys.argv
+    # --rebuild exists because --create CANNOT change a definition. Every entry in _CREATE is a
+    # `CREATE MATERIALIZED VIEW IF NOT EXISTS`, which is a silent no-op once the view exists, and
+    # REFRESH re-runs the definition STORED IN THE CATALOG, not the text in this file. So editing
+    # the SQL here and running --create leaves the old view in place and looks like it worked --
+    # exactly how a corrected delimp_mv_im_scatter would have gone unapplied. DROP is deliberately
+    # not CASCADE: if something depends on a view, that should surface as an error, not be quietly
+    # destroyed. Indexes declared alongside a view in _CREATE are dropped with it and recreated.
+    rebuild = "--rebuild" in sys.argv
     con = psycopg2.connect(host="pgfarm.library.ucdavis.edu", port=5432,
         dbname="uc-davis-genome-center-proteomics-core/delimp",
         user=os.environ.get("DELIMP_PG_USER", "genome-proteomics-service-account"),
@@ -132,7 +144,9 @@ def main():
     for mv in _MVS:
         t = time.time()
         try:
-            if create:
+            if rebuild:
+                cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv}")
+            if create or rebuild:
                 cur.execute(_CREATE[mv])
             cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
             cur.execute(f"SELECT COUNT(*) FROM {mv}")

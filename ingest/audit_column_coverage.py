@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Measure which delimp_precursors columns are actually populated, per engine, and diff it
+against a committed baseline so a silent regression shows up as a number that moved.
+
+WHY THIS EXISTS. On 2026-09-16 an audit found that `delimp_precursors.pep` had been parsed from
+every Spectronaut report and written on none of them, that four DIA-NN fields had quietly stopped
+being carried when the ingest path was consolidated, and that `intensity_log2` was read by two
+user-facing surfaces while having no writer at all. None of it raised an error. The corpus simply
+had columns that were empty, and nothing compared "what we write" against "what is there".
+
+TWO MEASUREMENTS, AND THE DIFFERENCE MATTERS:
+
+  * `pg_stats.null_frac` is a corpus-wide view, free (a catalog read, no table scan), and can be
+    STALE -- delimp_precursors was last analyzed 2026-08-28 when this was written. Good for
+    "which columns are empty across all history", useless for "did last night's ingest break".
+  * The per-engine scoped sample reads the NEWEST search for each engine and is the regression
+    signal. A writer that broke yesterday shows up here today while the corpus-wide fraction
+    barely twitches, because one new search is a rounding error against 416M rows.
+
+Do not replace the second with the first. The whole failure mode this guards against is a change
+that only affects new data.
+
+USAGE
+    python3 ingest/audit_column_coverage.py                      # human-readable report
+    python3 ingest/audit_column_coverage.py --json PATH          # write/refresh the baseline
+    python3 ingest/audit_column_coverage.py --check PATH         # diff vs baseline, exit 1 on regression
+
+Imports only coreomics_import, per the Hive deployment constraint that binds every script in
+this directory (no app.*; fran_ingest/ is a flat scp'd directory with no app/ above it).
+"""
+from __future__ import annotations
+import argparse, json, os, sys, datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from coreomics_import import _conn as _base_conn                                  # noqa: E402
+
+TABLE = "delimp_precursors"
+SAMPLE_ROWS = 50_000          # per search; bounds the scan on a multi-million-row search
+REGRESSION_DROP = 0.20        # a column losing >20 points of coverage vs baseline is a regression
+
+
+def _conn(timeout_ms: int = 300_000):
+    con = _base_conn()
+    with con.cursor() as cur:
+        cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
+    con.commit()
+    return con
+
+
+def columns(cur) -> list[str]:
+    cur.execute("""select column_name from information_schema.columns
+                    where table_name=%s order by ordinal_position""", (TABLE,))
+    return [r[0] for r in cur.fetchall()]
+
+
+def newest_per_engine(cur) -> list[tuple]:
+    """The most recently ingested search for each engine — the regression surface."""
+    cur.execute("""
+        select distinct on (search_engine) search_engine, id, search_name, ingested_at::date
+          from delimp_searches
+         where search_engine is not null and ingested_at is not null
+         order by search_engine, ingested_at desc""")
+    return cur.fetchall()
+
+
+def scoped_coverage(cur, search_id: str, cols: list[str]) -> dict:
+    """Non-null fraction of every column within one search, bounded to SAMPLE_ROWS."""
+    sel = ", ".join(f'count("{c}")' for c in cols)
+    cur.execute(f"""select count(*), {sel} from (
+                      select * from {TABLE} where search_id = %s limit {SAMPLE_ROWS}) t""",
+                (search_id,))
+    row = cur.fetchone()
+    total = row[0] or 0
+    return {c: (row[i + 1] / total if total else None) for i, c in enumerate(cols)}, total
+
+
+def corpus_null_frac(cur) -> dict:
+    """pg_stats view. Free, possibly stale — reported alongside its own staleness."""
+    cur.execute("""select attname, null_frac from pg_stats
+                    where schemaname='public' and tablename=%s""", (TABLE,))
+    return {r[0]: 1.0 - float(r[1]) for r in cur.fetchall()}
+
+
+def build(cur) -> dict:
+    cols = columns(cur)
+    cur.execute("""select greatest(coalesce(last_analyze,'epoch'),
+                                   coalesce(last_autoanalyze,'epoch'))::date
+                     from pg_stat_user_tables where relname=%s""", (TABLE,))
+    r = cur.fetchone()
+    out = {
+        "generated": datetime.date.today().isoformat(),
+        "table": TABLE,
+        "pg_stats_last_analyze": str(r[0]) if r and r[0] else None,
+        "corpus_non_null_frac": corpus_null_frac(cur),
+        "per_engine": {},
+    }
+    for engine, sid, name, ing in newest_per_engine(cur):
+        frac, n = scoped_coverage(cur, sid, cols)
+        out["per_engine"][engine] = {
+            "search_id": str(sid), "search_name": name, "ingested": str(ing),
+            "rows_sampled": n, "non_null_frac": frac,
+        }
+    return out
+
+
+def render(rep: dict) -> str:
+    L = [f"# delimp_precursors column coverage — {rep['generated']}", "",
+         f"pg_stats last ANALYZE: {rep['pg_stats_last_analyze']} "
+         f"(corpus-wide numbers are only as fresh as this)", ""]
+    for engine, blk in sorted(rep["per_engine"].items()):
+        L += [f"## {engine} — newest search `{blk['search_name']}` "
+              f"(ingested {blk['ingested']}, {blk['rows_sampled']:,} rows sampled)", ""]
+        empty = sorted(c for c, f in blk["non_null_frac"].items() if f is not None and f == 0.0)
+        part = sorted((c, f) for c, f in blk["non_null_frac"].items() if f and 0 < f < 1.0)
+        full = sorted(c for c, f in blk["non_null_frac"].items() if f == 1.0)
+        L += [f"- **fully populated ({len(full)})**: {', '.join(full) or '—'}",
+              f"- **partial ({len(part)})**: " +
+              (", ".join(f"{c} {f:.1%}" for c, f in part) or "—"),
+              f"- **EMPTY ({len(empty)})**: {', '.join(empty) or '—'}", ""]
+    return "\n".join(L)
+
+
+def check(rep: dict, baseline: dict) -> int:
+    """Fail when a column that WAS populated for an engine no longer is."""
+    bad = []
+    for engine, blk in rep["per_engine"].items():
+        base = baseline.get("per_engine", {}).get(engine)
+        if not base:
+            print(f"  note: engine {engine!r} absent from baseline — not a regression, "
+                  f"refresh the baseline to start tracking it")
+            continue
+        for col, now in blk["non_null_frac"].items():
+            was = base["non_null_frac"].get(col)
+            if was is None or now is None:
+                continue
+            if was - now > REGRESSION_DROP:
+                bad.append(f"{engine}.{col}: {was:.1%} -> {now:.1%} "
+                           f"(baseline search {base['search_name']}, now {blk['search_name']})")
+    if bad:
+        print("COVERAGE REGRESSION -- a column that used to be written is no longer being written:")
+        for b in sorted(bad):
+            print("  " + b)
+        return 1
+    print("no coverage regression against baseline")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", help="write the measured report here (use to refresh the baseline)")
+    ap.add_argument("--check", help="diff against this baseline; exit 1 on regression")
+    a = ap.parse_args()
+
+    con = _conn(); cur = con.cursor()
+    try:
+        rep = build(cur)
+    finally:
+        con.rollback(); con.close()
+
+    if a.json:
+        with open(a.json, "w") as fh:
+            json.dump(rep, fh, indent=1, sort_keys=True)
+        print(f"wrote {a.json}")
+    if a.check:
+        with open(a.check) as fh:
+            return check(rep, json.load(fh))
+    if not a.json:
+        print(render(rep))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
