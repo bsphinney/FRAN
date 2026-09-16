@@ -13,14 +13,16 @@ CLI:
   python claude_bus.py initdb
   python claude_bus.py checkin <node> --status ACTIVE --lane "R: share .sne" --left 1900 --note "wave 6"
                                        [--host WIN2 --drives "K: R:"]
-  python claude_bus.py who                      # liveness table; flags rows >2h stale as DOWN
+  python claude_bus.py who                      # liveness table; flags rows >2h stale as DOWN,
+                                                  # and rows running mismatched ingest code as STALE
   python claude_bus.py post <from> <to|ALL> "message body"
   python claude_bus.py inbox <node> [--ack]     # messages to <node> or ALL; --ack marks them read
 Token: ~/.pgfarm_token (service-account SECRET auto-exchanged) or $DELIMP_PG_PASSWORD (JWT).
 """
-import os, sys, json, argparse, urllib.request
+import os, re, sys, json, argparse, urllib.request
 
 STALE_MIN = 120  # a heartbeat older than this => node treated as DOWN
+STALE_NOTE_RE = re.compile(r"\(stale: [^)]+\)")  # matches the annotation _ingest_fingerprint appends
 
 
 def _token():
@@ -73,9 +75,65 @@ def initdb():
     c.close()
 
 
+def _ingest_fingerprint(cur):
+    """Short digest of the deployed refuse-gated ingest files, plus which of them are stale
+    against `delimp_ingest_manifest`. Best-effort throughout: a node that cannot compute this (no
+    `versions` module beside it, or the manifest table unreachable) still checks in -- losing the
+    fingerprint is a far better outcome than losing the heartbeat. Reuses the cursor checkin()
+    already opened rather than making this a second consumer of the token.
+
+    Deliberately does NOT import publish_manifest or its REFUSE_FILES -- that module lives in
+    neither deploy target (see versions.assert_current's docstring), and importing it is exactly
+    the mistake that silently turned the ingest gate off in Task 2. The manifest's own `gate`
+    column is authoritative and already one query away from here.
+
+    A SAVEPOINT guards the manifest SELECT: if `delimp_ingest_manifest` doesn't exist (or any
+    other query error), a plain failed statement would poison the rest of this transaction and
+    take the heartbeat INSERT down with it. Rolling back to the savepoint undoes only this query.
+    """
+    try:
+        import hashlib
+        d = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, d)
+        from versions import _file_md5
+
+        cur.execute("SAVEPOINT ingest_fp")
+        try:
+            cur.execute("SELECT file, md5 FROM delimp_ingest_manifest WHERE gate='refuse' ORDER BY file")
+            rows = cur.fetchall()
+            cur.execute("RELEASE SAVEPOINT ingest_fp")
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT ingest_fp")
+            return ""
+        if not rows:
+            return ""
+
+        parts, stale = [], []
+        for f, want in rows:
+            p = os.path.join(d, f)
+            if not os.path.exists(p):
+                continue                      # not deployed here; not this fingerprint's business
+            got = _file_md5(p)
+            parts.append(got)
+            if got != want:
+                stale.append(f)
+        if not parts:
+            return ""
+
+        digest = hashlib.md5("".join(sorted(parts)).encode()).hexdigest()[:8]
+        note = f"ingest={digest}"
+        if stale:
+            note += f" (stale: {','.join(sorted(stale))})"
+        return note
+    except Exception:
+        return ""
+
+
 def checkin(a):
     c = _conn(); cur = c.cursor()
     cur.execute(HEARTBEAT_DDL); cur.execute(MESSAGES_DDL)
+    fp = _ingest_fingerprint(cur)
+    note = f"{a.note} | {fp}" if (a.note and fp) else (fp or a.note)
     cur.execute("""
         INSERT INTO delimp_claude_heartbeat (node,host,drives,status,current_lane,items_left,note,updated_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s, now())
@@ -84,7 +142,7 @@ def checkin(a):
           drives=COALESCE(EXCLUDED.drives, delimp_claude_heartbeat.drives),
           status=EXCLUDED.status, current_lane=EXCLUDED.current_lane,
           items_left=EXCLUDED.items_left, note=EXCLUDED.note, updated_at=now()
-    """, (a.node, a.host, a.drives, a.status, a.lane, a.left, a.note))
+    """, (a.node, a.host, a.drives, a.status, a.lane, a.left, note))
     c.commit(); print(f"[claude_bus] {a.node} checked in: {a.status} | {a.lane} | left={a.left}")
     c.close()
 
@@ -101,8 +159,16 @@ def who():
         print("[claude_bus] no heartbeats yet"); c.close(); return
     print(f"{'node':10} {'live':6} {'status':8} {'age':>8}  lane / note")
     for node, status, lane, left, note, ts, age in rows:
-        live = "DOWN" if age > STALE_MIN else "alive"
-        flag = "🔴" if age > STALE_MIN else "🟢"
+        # 🔴DOWN: heartbeat itself is stale (node quiet >STALE_MIN). 🟡STALE: heartbeat is fresh but
+        # _ingest_fingerprint found the deployed code doesn't match delimp_ingest_manifest -- up,
+        # but running old code. Distinct from quiet on purpose: a human should chase these
+        # differently (nudge vs. sync).
+        if age > STALE_MIN:
+            flag, live = "🔴", "DOWN"
+        elif note and STALE_NOTE_RE.search(note):
+            flag, live = "🟡", "STALE"
+        else:
+            flag, live = "🟢", "alive"
         print(f"{node:10} {flag}{live:5} {str(status or ''):8} {age:6.0f}m  {lane or ''} | left={left} | {note or ''}")
     c.close()
 
