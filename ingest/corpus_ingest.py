@@ -264,7 +264,37 @@ def _diann_rows(df):
         yield row
 
 
+def _stale_ingest_files(ignore_stale=False):
+    """Run the staleness gate on a short-lived connection of its own. Returns the stale filenames.
+
+    Deliberately NOT the ingest's connection. The gate has to fire BEFORE the report is parsed --
+    that parse is ~16 s on the poplar Radiant set but about an hour on a 34 GB Spectronaut report,
+    and telling an operator their code is stale after an hour of waiting is how --ignore-stale-ingest
+    becomes reflexive, which defeats the gate more thoroughly than not having one. The ingest's
+    connection is not opened until long after. One extra connection is cheap against that hour, and
+    it is closed again before any work starts so the gate never holds a pooled connection through
+    the ingest.
+
+    Failing to CONNECT fails open, for the same reason an unreadable manifest does (see
+    versions.assert_current): a PG Farm outage must not stop ingestion. A refusal is a SystemExit
+    and propagates.
+    """
+    import versions as _V
+    try:
+        cn = _conn()
+    except Exception as e:                      # noqa: BLE001 -- FAIL OPEN, see docstring
+        print(f"  ingest-gate: no database connection ({e}); proceeding unchecked", flush=True)
+        return []
+    try:
+        return _V.assert_current(cn.cursor(), ignore_stale=ignore_stale)
+    finally:
+        cn.close()
+
+
 def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
+    # STALENESS GATE, before the report is even located -- see _stale_ingest_files for why it is not
+    # down at the record_run site. record_run still stamps the result at the point it always did.
+    _stale = _stale_ingest_files(IGNORE_STALE_INGEST)
     report = searchdir
     if os.path.isdir(searchdir):
         if engine == "fragpipe":
@@ -437,11 +467,8 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # Stamp this run into delimp_component_version before doing any work, so a run that later
         # dies still leaves a record of which code touched the corpus. Never fatal.
         import versions as _V
-        # STALENESS GATE. A stale adapter writes rows that look fine and need re-ingesting later,
-        # so a refuse-gated mismatch stops the run here -- before the engine pre-flight and before
-        # any write. An unreachable manifest does the OPPOSITE and proceeds: this gate exists to
-        # prevent silent corruption, not to make PG Farm a hard dependency of ingestion.
-        _stale = _V.assert_current(cur, ignore_stale=IGNORE_STALE_INGEST)
+        # _stale came from the gate at the top of this function; an override that left no trace is
+        # how "temporarily" becomes permanent, so it is recorded here with everything else.
         _V.record_run(cur, "corpus_ingest", CORPUS_INGEST_VERSION,
                       notes=(f"schema={SCHEMA_VERSION}" if not _stale
                              else f"schema={SCHEMA_VERSION}; RAN STALE: {','.join(_stale)}"))

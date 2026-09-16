@@ -247,6 +247,53 @@ check("corpus_ingest exposes --ignore-stale-ingest", "--ignore-stale-ingest" in 
 
 src = open(os.path.join(INGEST, "corpus_ingest.py"), encoding="utf-8").read()
 check("corpus_ingest calls the gate", "assert_current(" in src)
+
+# ── the gate must fire BEFORE the report is parsed ────────────────────────────────────────────
+# A refusal that arrives after an hour of parsing a 34 GB report teaches operators to reach for
+# --ignore-stale-ingest by reflex, which defeats the gate more thoroughly than not having one.
+_body = src.split("def ingest(searchdir")[1]
+_gate_at = _body.find("_stale_ingest_files(")
+_parse_at = _body.find('print(f"[{engine}] {search_name}')
+_dry_at = _body.find("if dry:")
+check("the gate call is inside ingest()", _gate_at >= 0)
+check("the gate fires BEFORE the report-parse summary",
+      0 <= _gate_at < _parse_at, f"gate@{_gate_at} parse@{_parse_at}")
+check("the gate fires BEFORE the --dry-run return, so a dry run is gated too",
+      0 <= _gate_at < _dry_at, f"gate@{_gate_at} dry@{_dry_at}")
+
+# ── the gate's OWN connection must fail open ──────────────────────────────────────────────────
+# _stale_ingest_files opens a short-lived connection of its own. That is a new way to be blind, and
+# it has to behave like every other one: a PG Farm outage must not stop ingestion.
+import corpus_ingest as CIG                                                     # noqa: E402
+
+_real_conn = CIG._conn
+try:
+    def _boom():
+        raise OSError("PG Farm is down")
+
+    CIG._conn = _boom
+    buf = io.StringIO()
+    raised = False
+    try:
+        with contextlib.redirect_stdout(buf):
+            out_stale = CIG._stale_ingest_files(False)
+    except SystemExit:
+        raised = True
+    check("a gate that cannot even connect fails OPEN",
+          not raised and out_stale == [], f"{raised} {buf.getvalue()}")
+    check("...and says so out loud", "no database connection" in buf.getvalue(),
+          repr(buf.getvalue()))
+
+    # The opposite: a working connection must actually reach the manifest, not quietly return [].
+    CIG._conn = _real_conn
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        out_stale = CIG._stale_ingest_files(False)
+    check("a working gate connection READS the manifest",
+          out_stale == [] and "no database connection" not in buf.getvalue()
+          and "unreadable" not in buf.getvalue(), f"{out_stale} {buf.getvalue()!r}")
+finally:
+    CIG._conn = _real_conn
 check("an override leaves a durable RAN STALE note", "RAN STALE" in src)
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
