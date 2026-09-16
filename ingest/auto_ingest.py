@@ -18,10 +18,12 @@ output_dir already holds the same raw-file set and precursor count. Selection ab
 the guard from being the only thing standing between a re-export and a duplicate row. When the guard
 does fire, that is logged as SKIPPED-DUPLICATE, not as a failure.
 
-Deliberately NOT enabled for scan candidates: --lance-dir/--xic-dir. Lane writes are GB-scale per
-search and this runs unattended on a database already at 228 GB; enabling them is a storage decision.
-That decision is made per search by whoever REGISTERS it: a queue row with xic_dir set (fran_queue.py
-add --xic-dir) gets its DIA-NN chromatograms written by _run_xic_lane() after the precursors commit.
+Lanes are NOT enabled for scan candidates or --direct jobs. Lane writes are GB-scale per search and
+this runs unattended on a database already at 228 GB; enabling them is a storage decision, made per
+search by whoever REGISTERS it. A diann queue row with xic_dir set (fran_queue.py add --xic-dir) has
+DIA-NN's native *.xic.parquet written to the XIC lane by _run_xic_lane() once its precursors ingest OK
+(not on SKIPPED-DUPLICATE); the outcome goes to xic_status and never re-queues the row. xic_dir on a
+non-diann row is recorded as xic_status 'unsupported' and ignored.
 """
 from __future__ import annotations
 
@@ -247,6 +249,10 @@ def _run_xic_lane(a, c, qcon):
         cur.execute("SELECT id FROM delimp_searches WHERE output_dir = %s",
                     (c.get("identity") or c["dir"],))
         row = cur.fetchone()
+        # psycopg2 does not autocommit, so that SELECT opened a transaction. Close it now: left
+        # open across the lane subprocess (up to --timeout) it holds a lock on delimp_searches
+        # that any ALTER would queue behind, and every page read behind the ALTER.
+        qcon.commit()
         if not row:
             fran_queue.mark_xic(qcon, c["queue_id"], "failed",
                                 "no delimp_searches row for this output_dir")
@@ -338,11 +344,11 @@ def _run(a, chosen, skipped, qcon=None):
             cmd += ["--organism-name", str(c["organism"])]
         if c.get("taxon"):
             cmd += ["--taxon", str(c["taxon"])]
-        # Spectronaut's chromatograms are .xic.db files corpus_ingest reads itself; DIA-NN's are
-        # *.xic.parquet and go through diann_xic_to_lance AFTER the ingest (see _run_xic_lane).
-        if c.get("xic_dir") and c["engine"] == "spectronaut":
-            cmd += ["--xic-dir", c["xic_dir"],
-                    "--lance-dir", c.get("lance_dir") or DEFAULT_XIC_LANCE_DIR]
+        # DIA-NN's chromatograms are *.xic.parquet and go through diann_xic_to_lance AFTER the
+        # ingest (see _run_xic_lane). Spectronaut XICs are NOT taken from the queue: corpus_ingest's
+        # --lance-dir means the OBSERVED-SPECTRUM lane, so passing a row's lance_dir there wrote an
+        # unrequested spectrum lane into the XIC directory, inside this subprocess -- where a kill
+        # after COMMIT sends the row back to 'queued' and re-ingests the whole search.
         t0 = time.time()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
@@ -371,6 +377,16 @@ def _run(a, chosen, skipped, qcon=None):
             _mark(c, "ok")
             if c["engine"] == "diann":
                 _run_xic_lane(a, c, qcon)
+            elif c.get("xic_dir") and qcon is not None and c.get("queue_id"):
+                try:
+                    import fran_queue
+                    fran_queue.mark_xic(qcon, c["queue_id"], "unsupported",
+                                        f"auto_ingest writes XIC lanes for diann rows only, not "
+                                        f"{c['engine']}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"      WARNING: could not record xic status: {e}", flush=True)
+                print(f"      xic lane: UNSUPPORTED for {c['engine']} queue rows "
+                      f"(precursors ingested; xic_dir ignored)", flush=True)
         else:
             fail += 1
             print(f"      FAILED rc={r.returncode} in {el:.0f}s", flush=True)

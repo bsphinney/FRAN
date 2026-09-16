@@ -21,16 +21,29 @@ def check(name, cond, detail=""):
 SEARCH_UUID = "0f0e0d0c-0b0a-4908-8706-050403020100"
 
 
+class FakeConn:
+    """psycopg2 does not autocommit: a SELECT opens a transaction that stays open until commit or
+    rollback. Track that, because a transaction left open across the hours-long lane subprocess
+    holds a lock on delimp_searches the whole time."""
+    def __init__(self):
+        self.in_txn = False
+        self.queries = []
+    def cursor(self):
+        return FakeCursor(self)
+    def commit(self):
+        self.in_txn = False
+    def rollback(self):
+        self.in_txn = False
+
+
 class FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
     def execute(self, sql, params=None):
-        self.sql = sql
+        self.conn.in_txn = True
+        self.conn.queries.append((sql, params))
     def fetchone(self):
         return (SEARCH_UUID,)
-
-
-class FakeConn:
-    def cursor(self):
-        return FakeCursor()
 
 
 def install_fake_queue(rows):
@@ -38,11 +51,14 @@ def install_fake_queue(rows):
     test can assert what the ingester reported back."""
     q = types.ModuleType("fran_queue")
     q.calls = []
-    q._conn = lambda: FakeConn()
+    q.conn = FakeConn()
+    q._conn = lambda: q.conn
     q.claim_batch = lambda con, limit, claimed_by: [dict(r) for r in rows]
     q.mark_done = lambda con, row_id, search_id=None: q.calls.append(("done", row_id))
     q.mark_failed = lambda con, row_id, err: q.calls.append(("failed", row_id)) or "queued"
-    q.mark_xic = lambda con, row_id, status, error=None: q.calls.append(("xic", row_id, status))
+    def mark_xic(con, row_id, status, error=None):       # the real one commits
+        q.calls.append(("xic", row_id, status)); con.commit()
+    q.mark_xic = mark_xic
     sys.modules["fran_queue"] = q
     return q
 
@@ -82,8 +98,12 @@ with tempfile.TemporaryDirectory() as tmp:
     ran = []
     real_run = subprocess.run
 
+    txn_open_during_lane = []
+
     def fake_run(cmd, **kw):
         ran.append(list(cmd))
+        if any(str(x).endswith("diann_xic_to_lance.py") for x in cmd):
+            txn_open_during_lane.append(q.conn.in_txn)
         return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
 
     ai.subprocess.run = fake_run
@@ -106,6 +126,35 @@ with tempfile.TemporaryDirectory() as tmp:
               "--search-id" in argv and argv[argv.index("--search-id") + 1] == SEARCH_UUID, str(argv))
     check("xic outcome recorded on the queue row", ("xic", 7, "done") in q.calls, str(q.calls))
     check("queue row marked done", ("done", 7) in q.calls, str(q.calls))
+    lookups = [p for sql, p in q.conn.queries if "delimp_searches" in sql]
+    check("search_id is looked up by the row's output_dir", lookups == [(sdir,)], str(lookups))
+    check("no DB transaction is held open while the lane runs",
+          txn_open_during_lane == [False], str(txn_open_during_lane))
+
+    # --- 4. a Spectronaut row with xic_dir must not trigger an unrequested spectrum lane ---------
+    # corpus_ingest's --lance-dir means the OBSERVED-SPECTRUM lane dir, not the XIC lane dir, and
+    # that lane runs inside the ingest subprocess: a kill after COMMIT would re-queue and re-ingest
+    # the whole search. auto_ingest does not support Spectronaut XICs from the queue; it must say so
+    # on the row rather than leave it pending forever.
+    sn_dir = os.path.join(tmp, "sn_search")
+    os.makedirs(sn_dir)
+    open(os.path.join(sn_dir, "20260916_120000_pilot_Report.tsv"), "w").write("x\n")
+    q = install_fake_queue([queue_row(sn_dir, id=8, engine="spectronaut", xic_dir=sn_dir,
+                                      lance_dir=ldir)])
+    ran.clear()
+    ai.subprocess.run = fake_run
+    try:
+        cands, con = ai._claim_queue(args)
+        ai._run(args, cands, [], con)
+    finally:
+        ai.subprocess.run = real_run
+    ingest = [c for c in ran if any(str(x).endswith("corpus_ingest.py") for x in c)]
+    check("spectronaut row still ingests its precursors", len(ingest) == 1, str(ran))
+    if ingest:
+        check("spectronaut row does not pass --lance-dir (no unrequested spectrum lane)",
+              "--lance-dir" not in ingest[0], str(ingest[0]))
+    check("spectronaut xic request is marked unsupported, not left pending",
+          any(c[0] == "xic" and c[1] == 8 and c[2] == "unsupported" for c in q.calls), str(q.calls))
 
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)
