@@ -91,18 +91,21 @@ COMMENTS = [
      "co-observation heuristic that silently returned 0 peptides for low-abundance proteins."),
     ("delimp_precursors", "intensity_log2",
      "DO NOT READ THIS COLUMN. 100% NULL corpus-wide and it has NO WRITER: it is absent from "
-     "_PREC_COLS in ingest/corpus_ingest.py, the only insert path. Two app read paths were built "
-     "on it anyway and shipped NULLs to users until 2026-09-16 (an em-dash under the peptide "
-     "page's 'Avg log2 int' header, and a dead intensity dimension on the Ion Mobility scatter). "
-     "Both now derive it as ln(intensity)/ln(2), guarded for intensity <= 0. Use `intensity`."),
+     "_PREC_COLS in ingest/corpus_ingest.py, the only insert path. THREE read paths were built on "
+     "it anyway: the peptide page's 'Avg log2 int' header (an em-dash on every peptide), the Ion "
+     "Mobility scatter's intensity dimension, and the delimp_training_gold ML view, which served "
+     "an all-NULL feature to the training lane. The two app paths now derive it as "
+     "ln(intensity)/ln(2), guarded for intensity <= 0; delimp_training_gold is a DB-only view "
+     "with no source in the repo and STILL SELECTS THE DEAD COLUMN (2026-09-16). Use `intensity`."),
     ("delimp_precursors", "pep",
      "Posterior error probability. Parsed from EG.PEP by the Spectronaut adapter since its first "
      "day but DROPPED at the insert until 2026-09-16, because _PREC_COLS had no matching column "
      "and an unmatched record key is not an error. Populated going forward; ~0.57% historically "
      "(three 2026-06-13 DIA-NN searches only). Re-ingest a search to fill it."),
     ("delimp_precursors", "raw_basename",
-     "100% NULL, no writer and no reader -- every consumer joins delimp_raw_files.raw_basename "
-     "instead. The name invites exactly the join that returns nothing. Do not use it."),
+     "100% NULL, no writer and no reader -- every consumer joins raw_files.raw_basename instead "
+     "(the table is `raw_files`, NOT `delimp_raw_files`, which does not exist). The name invites "
+     "exactly the join that returns nothing. Do not use it."),
     ("delimp_precursors", "library_match",
      "Legacy. Its only values are the constant string 'empirical' on three 2026-06-13 DIA-NN "
      "searches -- a property of the LIBRARY, not a per-precursor measurement from any report "
@@ -209,7 +212,7 @@ SELECT * FROM (VALUES
   (6, 'absent means unrecorded',
       'organism_taxon_id (70.7%) was a hand-typed CLI flag; absence means nobody typed it, not unknown species. best_q_value is ~99.9% NULL so ORDER BY on it returns an arbitrary row. sample_type is the constant ''study_sample''.'),
   (7, 'experimental design',
-      'tissue/disease/cell_line/biological_replicate/sdrf_row_json are 0% populated corpus-wide. Experimental groups DO exist upstream in the Spectronaut reports as R_Condition / R_Replicate but have never been ingested. Do not conclude from an empty column that the information does not exist.'),
+      'tissue/disease/cell_line/biological_replicate/sdrf_row_json are 0% populated corpus-wide IN delimp_sample_metadata -- but experimental groups ARE now ingested, into delimp_run_design (R_Condition / R_Replicate from the Spectronaut reports: replicate 100%, condition ~71% of 18,051 rows). Corrected 2026-09-16; this rule previously said they had ''never been ingested'', which sent readers away from a question the corpus can now answer. Do not conclude from an empty column that the information does not exist -- check delimp_run_design first.'),
   (8, 'meaning changes',
       'delimp_searches.n_proteins_total changed 2026-07-27 from a protein GROUP count to a true protein count (4.75M -> 6.00M). Any protein figure quoted from before that date is a group count. Check COMMENT ON COLUMN before trusting a historical number.'),
   (9, 'stale objects',

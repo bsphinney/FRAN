@@ -129,9 +129,11 @@ def main():
     # `CREATE MATERIALIZED VIEW IF NOT EXISTS`, which is a silent no-op once the view exists, and
     # REFRESH re-runs the definition STORED IN THE CATALOG, not the text in this file. So editing
     # the SQL here and running --create leaves the old view in place and looks like it worked --
-    # exactly how a corrected delimp_mv_im_scatter would have gone unapplied. DROP is deliberately
-    # not CASCADE: if something depends on a view, that should surface as an error, not be quietly
-    # destroyed. Indexes declared alongside a view in _CREATE are dropped with it and recreated.
+    # exactly how a corrected delimp_mv_im_scatter would have gone unapplied.
+    #
+    # THIS IS A LIVE-OUTAGE TOOL. Between the DROP pass and each CREATE the view does not exist,
+    # and app/db.py query() raises on a missing relation -- only im_rt_density_sample has a
+    # fallback. Run it when the site can take a gap, not casually.
     rebuild = "--rebuild" in sys.argv
     con = psycopg2.connect(host="pgfarm.library.ucdavis.edu", port=5432,
         dbname="uc-davis-genome-center-proteomics-core/delimp",
@@ -141,14 +143,34 @@ def main():
         options="-c statement_timeout=7200000")  # 2h — top_peptides/corpus_stats do COUNT(DISTINCT) over ~400M rows
     con.autocommit = True
     cur = con.cursor()
+    if rebuild:
+        # Drop EVERYTHING FIRST, in REVERSE _MVS order, before creating anything.
+        #
+        # _MVS is ordered so a dependent follows its source -- protein_agg reads
+        # species_proteins, which is why the comment at the top of this file says it "must follow
+        # it". Dropping in that same forward order therefore tries to drop species_proteins while
+        # protein_agg still selects from it. DROP is deliberately non-CASCADE (a dependency should
+        # surface, not be silently destroyed), so that raises -- and the per-view `except` below
+        # would have swallowed it, skipping this view's CREATE, REFRESH and count entirely. The
+        # run would then rebuild protein_agg FROM THE STALE species_proteins and report success:
+        # a silent partial refresh, which is the exact failure class this file is being fixed for.
+        for mv in reversed(_MVS):
+            cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv}")
+        print(f"dropped {len(_MVS)} matview(s) in reverse dependency order")
+
     for mv in _MVS:
         t = time.time()
         try:
-            if rebuild:
-                cur.execute(f"DROP MATERIALIZED VIEW IF EXISTS {mv}")
             if create or rebuild:
                 cur.execute(_CREATE[mv])
-            cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
+            # CREATE ... AS SELECT defaults to WITH DATA, so a view we just created is already
+            # populated. REFRESHing it re-runs the identical query -- on top_peptides that is
+            # multiple COUNT(DISTINCT) over ~400M rows run twice, doubling the wall time and the
+            # chance of hitting the 2h statement_timeout this connection sets for exactly it.
+            # Only --rebuild guarantees the CREATE actually created; a bare --create may have
+            # no-opped against an existing view, which still needs the REFRESH.
+            if not rebuild:
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
             cur.execute(f"SELECT COUNT(*) FROM {mv}")
             print(f"{mv}: refreshed in {time.time()-t:.0f}s ({cur.fetchone()[0]} rows)")
         except Exception as e:  # noqa: BLE001
