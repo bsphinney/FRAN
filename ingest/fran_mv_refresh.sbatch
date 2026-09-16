@@ -21,7 +21,14 @@
 # job (23500310) landed on hive-dc-7-8-62 and reported "PG FARM REACHABLE". Left unpinned so the
 # scheduler can use any of the 71; if a node ever turns out to be firewalled the symptom is a
 # connection failure in the log, not silent wrong data.
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
+# TIME LIMIT, raised from 04:00:00 on 2026-09-16. The 4 h wall was not a constraint, it was
+# inherited convention: the `high` partition allows MaxTime=30-00:00:00 and the QOS sets no
+# MaxWall. Meanwhile this job TIMED OUT in four of its last seven runs, all at exactly 04:00:0x,
+# with COMPLETED runs at 02:49 and 02:56 -- i.e. it sits right on the wall and tips over whenever
+# PG Farm is loaded. A timeout here is not a harmless retry: SLURM kills the job mid-payload, so
+# the final `echo done ... rc=` never runs and the failure is recorded as silence rather than as
+# an error. 8 h is ~2.7x the median successful run.
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --output=/quobyte/proteomics-grp/de-limp/fran_refresh/logs/refresh_%j.out
