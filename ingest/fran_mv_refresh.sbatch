@@ -47,8 +47,14 @@ rc_mv=$?
     /quobyte/proteomics-grp/brett/glendon/fran_ingest/refresh_corpus_reach.py
 rc_reach=$?
 
-# Both rcs, not `$?`. With two payloads a bare `$?` reports only the last one, so a failed matview
-# refresh would be logged as a success whenever the corpus-reach refresh happened to succeed —
+# Every rc, not `$?`. With more than one payload a bare `$?` reports only the last, so a failed
+# matview refresh would be logged as a success whenever the later refresh happened to succeed —
 # precisely the silent-failure mode this job's schedule exists to make noisy.
+#
+# THE PTM ROLLUP IS NOT A THIRD PAYLOAD HERE, and that is deliberate. It briefly was; `sacct` shows
+# this job already TIMEOUTs at its own 4-hour wall in four of its last six runs carrying just the
+# one payload above, so a third would usually never start — and when SLURM kills the job mid-payload
+# this very echo never executes, making the rc reporting unreachable exactly when it matters. It
+# lives in ingest/fran_ptm_refresh.sbatch with its own wall and its own cron entry.
 echo "===== done mv_rc=$rc_mv corpus_reach_rc=$rc_reach $(date '+%F %T') ====="
 exit $(( rc_mv | rc_reach ))

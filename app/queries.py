@@ -4496,9 +4496,67 @@ _MATRIX_MODES = {
 }
 _MATRIX_FLOOR = 0.2          # of the search's sample count
 _MATRIX_MIN_PCT_SEARCHES = 20  # before mean_pct_rank is trusted
+# THE CLOSED FILTER VOCABULARY. Nothing outside this tuple ever reaches SQL or the cache key —
+# see the normalization in search_protein_matrix() for why both of those matter.
+_MATRIX_FILTERS = ("ptm", "phospho", "glygly", "noncontam",
+                   "multipeptide", "complete", "patchy", "unique")
 
 
-def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> dict[str, Any]:
+_MATRIX_PTM_COL = {"ptm": "has_ptm", "phospho": "has_phospho", "glygly": "has_glygly"}
+
+
+# token -> the condition it contributes, over the `ranked` CTE's precomputed columns. Keeping the
+# predicate for a token in ONE place is what keeps `filter_counts` honest: the tally in `tallies`
+# and the filter in WHERE are written from the same understanding, and the test asserts each
+# count equals the n_rankable that same filter produces alone.
+_MATRIX_FILTER_COND = {
+    # A PTM condition is SUSPENDED when the rollup has no rows for this search — see the
+    # ptm_rollup_ready contract in search_protein_matrix(). t.ptm_ready is an uncorrelated EXISTS
+    # (a one-shot InitPlan), so "filter unless we never computed the answer" costs nothing and
+    # needs no extra round-trip to decide.
+    "ptm":          "(NOT t.ptm_ready OR a.f_ptm)",
+    "phospho":      "(NOT t.ptm_ready OR a.f_phospho)",
+    "glygly":       "(NOT t.ptm_ready OR a.f_glygly)",
+    "noncontam":    "NOT a.is_contaminant",
+    # "at least 2 unique peptides in at least one run" — max_peptides is a max, not a sum.
+    "multipeptide": "a.max_peptides >= 2",
+    "complete":     "a.n_samples = %(ntot)s",
+    "patchy":       "a.n_samples < %(ntot)s",
+    # A gene with no corpus-reach row is not KNOWN to be unique, and the LEFT JOIN's NULL reach
+    # correctly drops it rather than claiming it.
+    "unique":       "a.reach = 1",
+}
+
+
+def _matrix_ptm_ready(search_id: str) -> bool:
+    """Does delimp_search_protein_ptm hold ANY row for this search?
+
+    A primary-key-prefix EXISTS; measured 212 ms un-backfilled / 393 ms backfilled, which is
+    round-trip latency to PG Farm rather than server work. The main ranking statement answers the
+    same question for free as an InitPlan, so this standalone form exists for the two paths that
+    have no ranking statement to ride: an empty filtered result, and re-checking a cached
+    not-ready verdict.
+    """
+    return bool(query("""SELECT EXISTS (SELECT 1 FROM delimp_search_protein_ptm
+                                         WHERE search_id = %(sid)s) AS e""",
+                      {"sid": search_id}, tables=["delimp_search_protein_ptm"], fetch="val"))
+
+
+def _matrix_filter_sql(filters: list[str]) -> str:
+    """Build the matrix WHERE clause from an ALREADY-NORMALIZED filter list.
+
+    `filters` must be the output of search_protein_matrix()'s normalization — a subset of
+    _MATRIX_FILTERS. Nothing here is parameterized because nothing here is caller text: the token
+    only ever SELECTS a fixed condition from _MATRIX_FILTER_COND, and is never itself interpolated.
+    The values that vary ride %(sid)s / %(ntot)s like everywhere else. Passing a raw request string
+    in here would be a SQL injection, which is why the raw string does not exist past the wrapper.
+    """
+    conds = [_MATRIX_FILTER_COND[t] for t in filters if t in _MATRIX_FILTER_COND]
+    return ("WHERE " + " AND ".join(conds)) if conds else ""
+
+
+def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50,
+                          filters: str = "") -> dict[str, Any]:
     """PRIVATE-SAFE: the protein x sample matrix behind a search page's heatmap. CACHED (SLOW).
 
     delimp_proteins is already one row per (search, sample, protein), so this is a read, not a
@@ -4531,26 +4589,102 @@ def search_protein_matrix(search_id: str, mode: str = "cv", limit: int = 50) -> 
     mid-ingest. A hard failure (any of the four statements raising) propagates and never reaches
     the put() at all, so it is not cached either.
 
-    KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key. Keying on the raw
-    string would let an anonymous caller mint unbounded cache entries from free text (db.TTLCache
-    has no eviction — see the F10 ticket); after normalization the key space is bounded by
-    searches x 4 modes x the route's 1..200 limit clamp.
+    FILTERS are applied INSIDE the SQL, before the LIMIT — never to the rows it returns. Only 62
+    of this fixture search's 6,284 protein groups carry a phospho site, so filtering the top 50
+    afterwards would leave two or three rows while still looking like it worked (the gene set
+    does change). `filters` is a comma-separated subset of _MATRIX_FILTERS; unknown tokens are
+    dropped, which is why the route needs no validation of its own.
+
+    A PTM FILTER ON A SEARCH WITH NO ROLLUP ROWS returns the UNFILTERED rows plus
+    ptm_rollup_ready=False, never an empty grid. delimp_search_protein_ptm covers 2 of the corpus's
+    2,086 searches until a human runs the backfill, and every newly ingested search is uncovered
+    until the weekly refresh reaches it; on those, a PTM condition matches nothing, and an empty
+    grid is INDISTINGUISHABLE from "this search genuinely has no phosphoproteins". A reader would
+    reasonably conclude nobody's proteins are modified when in fact nobody has looked. So the SQL
+    suspends the PTM conditions when the rollup is empty for the search, the response says so, and
+    `filters` names only what actually ran. The same rule governs filter_counts: the ptm/phospho/
+    glygly keys are DROPPED rather than reported as 0, because "Phospho (0)" is the identical lie
+    in a smaller font.
+
+    A NOT-READY RESULT IS CACHED, BUT ITS VERDICT IS RE-CHECKED. This departs from
+    protein_coverage_peptides, which refuses to cache scope_unavailable/sites_unavailable at all,
+    and the difference is the point: those flag a TRANSIENT failure, where a cached "unavailable"
+    could outlive recovery by 30 minutes with nothing able to notice. "Not yet backfilled" is
+    stable, stops being true exactly once, and that moment is detectable for ~0.2 s. So the rows
+    are cached (refusing to would re-run a 2.15-3.52 s query on a public anonymous endpoint for
+    the 2,084-search majority, against a 6-connection pool — an availability problem, not a
+    tidiness one) and the readiness is re-probed on the way out of the cache, on PTM-filtered
+    requests only. A plain page view never pays for it.
+
+    KEY: mode is normalized to a _MATRIX_MODES member BEFORE it enters the key, and so are the
+    filters. Keying on the raw strings would let an anonymous caller mint unbounded cache entries
+    from free text (db.TTLCache has no eviction — see the F10 ticket); after normalization the key
+    space is bounded by searches x 4 modes x the route's 1..200 limit clamp x 2^8 filter states.
+    Sorting and deduping is what makes "ptm,phospho" and "phospho,ptm,ptm" one entry rather than
+    three. The filter state MUST be in the key: without it two filter states serve each other's
+    results for 30 minutes.
     """
     if mode not in _MATRIX_MODES:
         mode = "cv"
     limit = int(limit)
-    key = f"matrix_{search_id}_{mode}_{limit}"
+    _f = sorted({t.strip() for t in (filters or "").lower().split(",")} & set(_MATRIX_FILTERS))
+    key = f"matrix_{search_id}_{mode}_{limit}_{'+'.join(_f)}"
     hit = SLOW_CACHE.cached(key)
     if hit is not None:
-        return hit
-    result = _search_protein_matrix(search_id, mode, limit)
-    if result.get("proteins"):
+        # RE-CHECK A NOT-READY VERDICT INSTEAD OF SERVING IT. The result is cached — not caching it
+        # would make the 99.9% case (2,084 of 2,086 searches carry no rollup rows) re-run a
+        # 2.15-3.52 s query on a PUBLIC, anonymous endpoint against a 6-connection pool, which is
+        # an availability risk, not a tidiness one. What must not be cached is the *verdict*: the
+        # backfill will populate this search and the stale "not computed yet" would outlive it by
+        # up to 30 minutes, handing an operator the footgun of "restart the app or it keeps saying
+        # missing". So re-probe (~0.2 s) and rebuild only once the answer has actually changed.
+        #
+        # ONLY WHEN THIS REQUEST ASKED FOR A PTM FILTER. That is the sole case where the stale
+        # verdict changes what the reader sees, and it is a deliberate click. A plain page view
+        # never pays the probe, which is what keeps the measured 0.00002 s cache hit intact. The
+        # residue: an unfiltered entry cached while not-ready has the ptm/phospho/glygly keys
+        # missing from filter_counts, and keeps them missing until the TTL expires. That is a
+        # missing count beside a checkbox nobody has clicked, and it self-heals in <= 30 min.
+        if (hit.get("ptm_rollup_ready") is False
+                and set(_MATRIX_PTM_COL) & set(_f)
+                and _matrix_ptm_ready(search_id)):
+            hit = None
+        if hit is not None:
+            return hit
+    result = _search_protein_matrix(search_id, mode, limit, _f)
+    # ZERO-ROW RESULTS ARE CACHED TOO, and the condition is deliberately not `if
+    # result["proteins"]`. Filters made "no gene matches" reachable on any search — the UI renders
+    # `In every sample (0)` as a clickable box — and an empty answer is as stable as a full one for
+    # a given (search, mode, limit, filters). Refusing to cache it meant re-running the two-level
+    # aggregate at work_mem=256MB on EVERY request: measured 1.95 s repeated on the flagship with
+    # `complete,unique` and 5.05 s repeated on the phospho fixture with `complete,glygly`, on an
+    # endpoint that is public, anonymous, auto-fires on every search-page view, has no rate limit
+    # (app/ratelimit.py guards the spectrum route, not this one) and shares a 6-connection pool.
+    #
+    # This SUPERSEDES part of the "why cached" note above: that clause refused to cache an empty
+    # matrix so a mid-ingest search would self-heal rather than stick for 30 minutes. The
+    # n_samples_total test below keeps that protection for the case it was written for — the search
+    # does not exist, or has no samples — which is the cheap early return that never reaches this
+    # query at all. What is now cached is an empty result that COST 2-5 s to compute.
+    #
+    # IT IS NOT A PERFECT PARTITION, and the earlier wording here ("exactly where it actually
+    # applies") overstated it. `samples` is built without an intensity predicate while the ranking
+    # aggregate requires intensity > 0, so 32 of 2,086 searches have samples yet no rankable gene
+    # at all: they pass this test and are now cached empty where before they self-healed. Measured,
+    # not estimated. The effect is benign because those 32 are structurally empty rather than
+    # mid-ingest — nothing arrives later to heal into — but the gap is real and is stated here
+    # rather than papered over.
+    if result.get("n_samples_total"):
         SLOW_CACHE.put(key, result)
     return result
 
 
-def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, Any]:
-    """The uncached body. `mode` is already validated by the caller above."""
+def _search_protein_matrix(search_id: str, mode: str, limit: int,
+                           filters: list[str]) -> dict[str, Any]:
+    """The uncached body. `mode` and `filters` are already normalized by the caller above —
+    `filters` arrives as a sorted list drawn only from _MATRIX_FILTERS, which is the ONLY reason
+    the conditions below may be assembled into the SQL text at all. The raw request string must
+    never reach this function."""
     order = _MATRIX_MODES[mode]
 
     # n_samples_total used to come from its own `count(DISTINCT raw_path)` (2.69s on the
@@ -4598,12 +4732,15 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
     n_samples_dated = sum(1 for s in samples if s["acquisition_date"] is not None)
     if not n_samples_total:
         return {"proteins": [], "samples": [], "mode": mode, "limit": limit,
-                "n_rankable": 0, "n_samples_total": 0, "n_samples_dated": 0,
+                "filters": filters, "n_rankable": 0, "n_samples_total": 0, "n_samples_dated": 0,
                 "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": None}
 
     params = {"sid": search_id, "limit": int(limit),
               "floor": _MATRIX_FLOOR * n_samples_total,
-              "minpct": _MATRIX_MIN_PCT_SEARCHES}
+              "minpct": _MATRIX_MIN_PCT_SEARCHES,
+              "ntot": n_samples_total}
+
+    where_sql = _matrix_filter_sql(filters)
     # MEASURED cost of this two-level aggregate on the largest search (480k rows, 6,340 genes):
     # 3.1-5.7s across the four ranking modes (range across repeated runs on a shared cluster, not
     # a single sample), in line with the ~4s the old single-level aggregate took. EXPLAIN shows
@@ -4655,7 +4792,12 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
           SELECT gene, raw_path,
                  avg(intensity)             AS v,
                  max(protein_group)         AS protein_group,
-                 bool_or(is_contaminant)    AS is_contaminant
+                 bool_or(is_contaminant)    AS is_contaminant,
+                 -- max(), NEVER sum(). n_unique_peptides is PER RUN, and summing it across runs
+                 -- has overstated a peptide count 56-fold in this codebase before. This is the
+                 -- peptide count "in at least one run", and that is how it must be described
+                 -- anywhere it surfaces. Free: the same scan already runs.
+                 max(n_unique_peptides)     AS max_pep
             FROM delimp_proteins
            WHERE search_id = %(sid)s AND intensity > 0 AND NULLIF(gene,'') IS NOT NULL
            GROUP BY gene, raw_path),
@@ -4665,24 +4807,81 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
                  count(*)                                 AS n_samples,
                  avg(v)                                    AS mean_int,
                  stddev_pop(v) / NULLIF(avg(v), 0)         AS cv,
-                 bool_or(is_contaminant)                   AS is_contaminant
+                 bool_or(is_contaminant)                   AS is_contaminant,
+                 max(max_pep)                              AS max_peptides
             FROM per_sample
            GROUP BY gene
-          HAVING count(*) >= %(floor)s)
-        SELECT a.*, r.n_searches AS reach,
-               CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank,
+          HAVING count(*) >= %(floor)s),
+        ranked AS (
+          SELECT a.*, r.n_searches AS reach,
+                 CASE WHEN r.n_pct_searches >= %(minpct)s THEN r.mean_pct_rank END AS mean_pct_rank,
+                 -- THE PTM FLAGS, RESOLVED ONCE PER GENE. EXISTS, never a join:
+                 -- delimp_search_protein_ptm is one row per (search, protein_group) and a gene
+                 -- maps to several groups, so a join would multiply the aggregate's rows. The
+                 -- cost is that this tests only `a.protein_group` — max() over the gene's groups
+                 -- — so a gene whose modification sits on a non-representative group is missed.
+                 -- MEASURED over the population this query actually sees (floor-clearing,
+                 -- intensity > 0): 7 of 6,206 genes carry more than one protein_group on the
+                 -- phospho fixture and 23 of 6,180 on the ubiquitin one, i.e. 0.11 and 0.37 in
+                 -- 100. Actual misses are smaller still: 0 of 60 phospho genes, and 1 of 5,280
+                 -- glygly genes. An earlier revision of this comment said "1.8 in 100", which is
+                 -- the figure for ALL genes with no presence floor — a population this query
+                 -- never touches. An overstated caveat misleads exactly like an overstated claim.
+                 -- Accepted for a discovery filter: the miss renders as the gene being absent,
+                 -- never as a wrong number next to a present one. NB no bare per-cent sign
+                 -- anywhere in this SQL, comments included — psycopg2 reads one as a parameter
+                 -- placeholder and refuses the whole statement.
+                 -- Computed unconditionally so `tallies` below can count them; measured +0.06 s
+                 -- on both the 8-sample fixture and the 222-sample flagship, i.e. inside the
+                 -- run-to-run noise of the aggregate it rides on.
+                 EXISTS (SELECT 1 FROM delimp_search_protein_ptm m WHERE m.search_id = %(sid)s
+                           AND m.protein_group = a.protein_group AND m.has_ptm)     AS f_ptm,
+                 EXISTS (SELECT 1 FROM delimp_search_protein_ptm m WHERE m.search_id = %(sid)s
+                           AND m.protein_group = a.protein_group AND m.has_phospho) AS f_phospho,
+                 EXISTS (SELECT 1 FROM delimp_search_protein_ptm m WHERE m.search_id = %(sid)s
+                           AND m.protein_group = a.protein_group AND m.has_glygly)  AS f_glygly
+            FROM agg a
+            LEFT JOIN delimp_protein_corpus_reach r ON r.gene = upper(a.gene)),
+        tallies AS (
+          -- HOW MANY GENES EACH FILTER WOULD LEAVE, so the UI can put a count beside every
+          -- checkbox and nobody ticks a box that silently blanks the grid (`unique` leaves 0 on
+          -- one fixture and 2 on the other). Each count is the filter ALONE against the
+          -- floor-clearing population — NOT "what you would get if you ticked this now, on top of
+          -- what is already ticked". One extra pass over an already-materialized CTE.
+          SELECT count(*) FILTER (WHERE f_ptm)                AS c_ptm,
+                 count(*) FILTER (WHERE f_phospho)            AS c_phospho,
+                 count(*) FILTER (WHERE f_glygly)             AS c_glygly,
+                 count(*) FILTER (WHERE NOT is_contaminant)   AS c_noncontam,
+                 count(*) FILTER (WHERE max_peptides >= 2)    AS c_multipeptide,
+                 count(*) FILTER (WHERE n_samples = %(ntot)s) AS c_complete,
+                 count(*) FILTER (WHERE n_samples < %(ntot)s) AS c_patchy,
+                 count(*) FILTER (WHERE reach = 1)            AS c_unique,
+                 -- Does this search have ANY rollup row? Uncorrelated, so PG evaluates it once as
+                 -- an InitPlan — readiness for free, with no extra round-trip. It is what
+                 -- suspends the PTM conditions above and what nulls the PTM counts below.
+                 EXISTS (SELECT 1 FROM delimp_search_protein_ptm m
+                          WHERE m.search_id = %(sid)s)        AS ptm_ready
+            FROM ranked)
+        SELECT a.*, t.*,
                -- THE RANKABLE POPULATION (see the return dict): rows in `agg`, i.e. genes clearing
                -- the presence floor, counted BEFORE the LIMIT. A window function is evaluated after
                -- the aggregate and before LIMIT, so this is exact and costs nothing extra — `agg`
                -- is already materialized. It replaces a separate count(DISTINCT protein_group)
                -- round-trip that measured 0.57-1.83 s and answered a different question.
+               -- UNDER A FILTER THIS COUNTS THE FILTERED POPULATION, which is what the header
+               -- must say: a window function is evaluated after WHERE and before LIMIT, so the
+               -- filter narrows it automatically. Leaving the filter out of the WHERE and
+               -- applying it to the rows afterwards would leave this describing the unfiltered
+               -- corpus while the grid showed a handful of rows — the header would lie.
                count(*) OVER ()                          AS n_rankable
-          FROM agg a
-          LEFT JOIN delimp_protein_corpus_reach r ON r.gene = upper(a.gene)
+          FROM ranked a CROSS JOIN tallies t
+         {where_sql}
          ORDER BY {order}
          LIMIT %(limit)s
         """,
-        params, tables=["delimp_proteins", "delimp_protein_corpus_reach"], work_mem="256MB")
+        params,
+        tables=["delimp_proteins", "delimp_protein_corpus_reach", "delimp_search_protein_ptm"],
+        work_mem="256MB")
 
     genes = [r["gene"] for r in rows]
     cells = query(
@@ -4708,6 +4907,11 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
 
     proteins = [{"gene": r["gene"], "protein_group": r["protein_group"],
                  "n_samples": r["n_samples"], "is_contaminant": bool(r["is_contaminant"]),
+                 # MAX over PER-RUN counts, hence the name. Summing delimp_proteins.n_unique_peptides
+                 # across runs overstated a peptide count 56-fold in this project, so the key says
+                 # what the number is: the most any single run saw. Anything rendering it must read
+                 # "in at least one run" — it is NOT the search's peptide count for this protein.
+                 "max_peptides_any_run": r["max_peptides"],
                  "cv": float(r["cv"]) if r["cv"] is not None else None,
                  "mean_int": float(r["mean_int"]) if r["mean_int"] is not None else None,
                  "reach": r["reach"],
@@ -4724,7 +4928,49 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int) -> dict[str, A
     # rankable. 4,005 is the number the reader's "of N" should be against — it is the spec's own
     # figure — and it is the only one consistent with the "in at least 20% of samples" clause in
     # the same sentence.
-    return {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
-            "n_rankable": rows[0]["n_rankable"] if rows else 0,
-            "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
-            "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
+    ptm_asked = bool(set(_MATRIX_PTM_COL) & set(filters))
+    ptm_ready = bool(rows[0]["ptm_ready"]) if rows else None
+    if ptm_ready is None and ptm_asked:
+        # Only reachable when the filtered result is EMPTY, so `tallies` came back with no row to
+        # read. That is the one case where the distinction matters most — "glygly found nothing"
+        # must not be confused with "glygly was never computed" — and an empty result is rare
+        # enough that one extra round-trip for it is free in practice.
+        ptm_ready = _matrix_ptm_ready(search_id)
+
+    # `filters` reports what was APPLIED, not what was asked for: when the rollup is not ready the
+    # SQL suspends the PTM conditions (see _MATRIX_FILTER_COND), so naming them here would claim a
+    # filter that did not run. The NON-PTM tokens are still perfectly answerable and still applied.
+    applied = filters if ptm_ready is not False else [f for f in filters if f not in _MATRIX_PTM_COL]
+
+    result = {"proteins": proteins, "samples": sample_rows, "mode": mode, "limit": int(limit),
+              "filters": applied,
+              "n_rankable": rows[0]["n_rankable"] if rows else 0,
+              "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
+              "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
+
+    if rows:
+        # HOW MANY GENES EACH FILTER LEAVES ON ITS OWN — for a count beside each checkbox.
+        counts = {t: int(rows[0][f"c_{t}"]) for t in _MATRIX_FILTERS}
+        if not ptm_ready:
+            # 0 here would be the same lie as an empty grid, only harder to spot: "Phospho (0)"
+            # reads as "this search has no phosphoproteins" when nobody has computed it. Drop the
+            # keys instead — absence, not a zero that poses as a measurement.
+            for t in _MATRIX_PTM_COL:
+                counts.pop(t, None)
+        result["filter_counts"] = counts
+
+    if ptm_ready is not None:
+        # REPORTED TRUE OR FALSE, both — deliberately not the scope_unavailable "present only when
+        # broken" shape. An absent key is falsy, so a present-only-when-broken flag would make the
+        # natural `if (!d.ptm_rollup_ready)` read "not computed" on healthy responses too.
+        #
+        # PRESENT WHENEVER IT IS KNOWN, not only when a PTM filter was requested: filter_counts
+        # drops its ptm/phospho/glygly keys when the rollup is missing, so an unfiltered response
+        # ALSO depends on this answer and would otherwise leave three counts unexplained. It is
+        # known for free on any request that returned rows; it stays absent only when there are no
+        # rows and nobody asked a PTM question, i.e. when nothing probed it.
+        #
+        # False means NOT COMPUTED FOR THIS SEARCH YET. The UI must never render it as "no
+        # modified proteins".
+        result["ptm_rollup_ready"] = ptm_ready
+    return result

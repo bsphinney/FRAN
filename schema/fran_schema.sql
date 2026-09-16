@@ -313,6 +313,16 @@ CREATE TABLE IF NOT EXISTS delimp_schema_version (
     "notes" text
 );
 
+CREATE TABLE IF NOT EXISTS delimp_search_protein_ptm (
+    "search_id" uuid NOT NULL,
+    "protein_group" text NOT NULL,
+    "has_ptm" boolean NOT NULL,
+    "has_phospho" boolean NOT NULL,
+    "has_glygly" boolean NOT NULL,
+    "n_mod_precursors" integer NOT NULL,
+    "computed_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS delimp_search_provenance (
     "search_id" uuid NOT NULL,
     "real_search_name" text,
@@ -603,6 +613,7 @@ ALTER TABLE delimp_sample_metadata ADD CONSTRAINT delimp_sample_metadata_sample_
 ALTER TABLE delimp_sample_metadata ADD CONSTRAINT delimp_sample_metadata_predicted_organism_method_check CHECK (((predicted_organism_method IS NULL) OR (predicted_organism_method = ANY (ARRAY['diamond_blast_diann_peps'::text, 'diamond_blast_casanovo_denovo'::text, 'manual_override'::text]))));
 ALTER TABLE delimp_sample_metadata ADD CONSTRAINT delimp_sample_metadata_pkey PRIMARY KEY (raw_path);
 ALTER TABLE delimp_schema_version ADD CONSTRAINT delimp_schema_version_pkey PRIMARY KEY (version);
+ALTER TABLE delimp_search_protein_ptm ADD CONSTRAINT delimp_search_protein_ptm_pkey PRIMARY KEY (search_id, protein_group);
 ALTER TABLE delimp_search_provenance ADD CONSTRAINT delimp_search_provenance_pkey PRIMARY KEY (search_id);
 ALTER TABLE delimp_search_sources ADD CONSTRAINT delimp_search_sources_pkey PRIMARY KEY (search_id, file_role, path);
 ALTER TABLE delimp_searches ADD CONSTRAINT delimp_searches_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'completed'::text, 'failed'::text, 'cancelled'::text])));

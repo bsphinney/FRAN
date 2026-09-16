@@ -1054,12 +1054,17 @@ def api_search_detail(search_id: str):
 
 
 @app.get("/api/search/{search_id}/matrix")
-def api_search_matrix(search_id: str, mode: str = "cv", limit: int = 50):
+def api_search_matrix(search_id: str, mode: str = "cv", limit: int = 50, filters: str = ""):
     """The protein x sample matrix for a search page's heatmap.
 
     Public-tier: every table it reads is in PUBLIC_TABLES. `mode` is validated inside
     search_protein_matrix() against a fixed dict and falls back to "cv", so an unknown value can
     never reach SQL.
+
+    `filters` is a comma-separated subset of _MATRIX_FILTERS, passed through UNTOUCHED and
+    UNINTERPOLATED. It is normalized inside search_protein_matrix() — dropped to the known tokens
+    before it reaches either the SQL or the cache key — so a second validation here would only be
+    a second place to get it wrong. What this route must NOT do is build any string from it.
 
     A malformed search_id is a client error (400), the same guard api_protein_coverage above
     applies. Without it psycopg2 raises InvalidTextRepresentation deep in the query and the
@@ -1071,7 +1076,8 @@ def api_search_matrix(search_id: str, mode: str = "cv", limit: int = 50):
         uuid.UUID(search_id)
     except ValueError:
         raise HTTPException(400, "search_id must be a valid UUID.")
-    return ok(queries.search_protein_matrix(search_id, mode=mode, limit=max(1, min(int(limit), 200))))
+    return ok(queries.search_protein_matrix(search_id, mode=mode,
+                                           limit=max(1, min(int(limit), 200)), filters=filters))
 
 
 if __name__ == "__main__":
