@@ -97,6 +97,10 @@ fix is currently *partial*, which is worse than untouched if nobody knows.
    reproduces exactly the bug this pass fixes.
 4. **`predicted_organism_*`** needs a `backfill_organism_from_lance.py --apply` run.
 5. **Localization re-ingests**: 2 of 7 candidate searches done.
+6. **The `denovo` worktree holds a stale `corpus_ingest.py`** with its own copy of the precursor
+   tuple. It needs the same `_PREC_COLS` change when that branch merges, or merging silently
+   reverts `pep` and the three DIA-NN fields to being dropped again. `tests/
+   test_precursor_column_coverage.py` will catch it, which is the point of having it.
 
 ## Legitimately empty — do not "fix" these
 
