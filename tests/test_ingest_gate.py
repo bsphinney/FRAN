@@ -142,31 +142,99 @@ check("the live manifest is exactly as it was found", AFTER == BEFORE,
       f"changed={[k for k in BEFORE if BEFORE[k] != AFTER.get(k)]}")
 
 # ── the gate must run where it guards ─────────────────────────────────────────────────────────
-# versions.py is deployed to the Windows-node share and to Hive's fran_ingest/ as a FLAT directory
-# with no app/ parent. An `import app.db` anywhere in this path breaks it there and nowhere here.
-flat = subprocess.run(
-    [sys.executable, "-c",
-     # cwd is /, PYTHONPATH is empty and the repo root is nowhere on sys.path, so ingest/ is the
-     # only part of FRAN this interpreter can see -- the Windows-node share and Hive's
-     # fran_ingest/ exactly. Prove app/ really is out of reach before trusting what follows.
-     "import sys; sys.path.insert(0, r'%s')\n"
-     "try:\n"
-     "    import app\n"
-     "    sys.exit('app/ is importable here, so this proves nothing about the flat deployment')\n"
-     "except ImportError:\n"
-     "    pass\n"
-     "import versions, coreomics_import\n"
-     "cn = coreomics_import._conn()\n"
-     "print('STALE:', versions.assert_current(cn.cursor()))\n"
-     "print('BLIND:', versions.assert_current(None))\n"
-     "assert 'app' not in sys.modules, sorted(m for m in sys.modules if m.startswith('app'))\n"
-     "print('OK')" % INGEST],
-    cwd="/", capture_output=True, text=True, env={**os.environ, "PYTHONPATH": ""})
-check("versions.assert_current works with ONLY ingest/ on sys.path (no app/ parent)",
-      flat.returncode == 0 and "OK" in flat.stdout,
-      (flat.stdout + flat.stderr)[-600:])
-check("the flat-directory run reports no stale files either",
-      "STALE: []" in flat.stdout, flat.stdout.strip())
+# versions.py is deployed to two FLAT directories whose contents differ from each other and from the
+# repo. Running this probe against the repo's own ingest/ proves NOTHING: the repo has every module,
+# so an import inside assert_current() succeeds here and raises on the nodes -- where the fail-open
+# except would swallow it and the gate would never fire, silently, everywhere it matters. So
+# RECONSTRUCT each share: copy in only the files that target actually has, publish_manifest.py not
+# among them.
+import shutil                                                                   # noqa: E402
+import tempfile                                                                 # noqa: E402
+
+# The inlined digest is a deliberate duplicate of publish_manifest's. If the two ever disagree the
+# gate calls every file stale, so pin them together here, where both modules exist.
+import publish_manifest as PM                                                   # noqa: E402
+
+_probe_file = os.path.join(INGEST, "corpus_ingest.py")
+check("versions._file_md5 agrees with publish_manifest.file_md5",
+      V._file_md5(_probe_file) == PM.file_md5(_probe_file))
+_body = open(os.path.join(INGEST, "versions.py"), encoding="utf-8").read().split("def assert_current")[1]
+check("assert_current imports no FRAN module at all",
+      not any(m in _body for m in ("import publish_manifest", "from publish_manifest",
+                                   "import coreomics_import", "from coreomics_import",
+                                   "import refresh_leaderboards", "from app", "import app")),
+      _body[:400])
+
+SHARES = {
+    # R:\Data\FRAN_SNE_export — corpus_ingest.py there has its OWN _conn via refresh_leaderboards
+    "windows share": ["versions.py", "corpus_ingest.py", "refresh_leaderboards.py", "organism.py"],
+    # /quobyte/proteomics-grp/brett/glendon/fran_ingest/
+    "hive fran_ingest": ["versions.py", "corpus_ingest.py", "coreomics_import.py",
+                         "refresh_corpus_reach.py"],
+}
+
+# Do the PG Farm token exchange out here and hand the subprocess the result. The claim under test is
+# that versions.py imports nothing — not that a caller cannot open its own connection, which is
+# exactly what corpus_ingest.py does on the share via refresh_leaderboards._token.
+import coreomics_import as CI                                                   # noqa: E402
+
+_tok = CI._pg_token()
+
+PROBE = r'''
+import os, sys
+D = sys.argv[1]
+sys.path.insert(0, D)
+# Prove the reconstruction is faithful BEFORE trusting what it reports. If these are importable the
+# probe is really running against the repo and cannot see the bug it exists to catch.
+for m in ("publish_manifest", "app"):
+    try:
+        __import__(m)
+        print("UNFAITHFUL:", m)
+        raise SystemExit(3)
+    except ImportError:
+        pass
+import psycopg2, versions
+assert os.path.dirname(os.path.abspath(versions.__file__)) == D, versions.__file__
+cn = psycopg2.connect(host="pgfarm.library.ucdavis.edu", port=5432,
+                      dbname="uc-davis-genome-center-proteomics-core/delimp",
+                      user="genome-proteomics-service-account",
+                      password=os.environ["DELIMP_PG_PASSWORD"], sslmode="require",
+                      connect_timeout=30)
+cur = cn.cursor()
+print("CLEAN:", versions.assert_current(cur))
+print("BLIND:", versions.assert_current(None))
+# ...and the opposite. Make this deployment genuinely stale and demand a refusal -- without it the
+# probe would pass just as happily on a gate that had silently failed open.
+with open(os.path.join(D, "corpus_ingest.py"), "a") as fh:
+    fh.write("\n# a node that did not sync\n")
+raised, msg = False, ""
+try:
+    versions.assert_current(cur)
+except SystemExit as e:
+    raised, msg = True, str(e.code)
+print("REFUSED:", raised, msg[:40])
+print("OK")
+'''
+
+for label, files in SHARES.items():
+    d = tempfile.mkdtemp(prefix="share_")
+    try:
+        for f in files:
+            shutil.copy(os.path.join(INGEST, f), os.path.join(d, f))
+        r = subprocess.run([sys.executable, "-c", PROBE, d], cwd="/", capture_output=True,
+                           text=True, env={**os.environ, "PYTHONPATH": "",
+                                           "DELIMP_PG_PASSWORD": _tok})
+        o, err = r.stdout, r.stderr
+        check(f"[{label}] reconstruction is faithful: no publish_manifest.py, no app/",
+              "UNFAITHFUL" not in o, (o + err)[-400:])
+        check(f"[{label}] assert_current runs there at all",
+              r.returncode == 0 and "OK" in o, (o + err)[-500:])
+        check(f"[{label}] it READ the manifest rather than failing open",
+              "CLEAN: []" in o and "unreadable" not in o.split("BLIND:")[0], o.strip()[:400])
+        check(f"[{label}] a stale refuse-gated file REFUSES there",
+              "REFUSED: True REFUSING TO INGEST" in o, o.strip()[-300:])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 # ── the wiring ────────────────────────────────────────────────────────────────────────────────
 h = subprocess.run([sys.executable, os.path.join(INGEST, "corpus_ingest.py"), "--help"],

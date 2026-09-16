@@ -33,9 +33,9 @@ Two mechanisms, deliberately separate:
 Bump the constant in the same commit that changes the component's behaviour. A version that lags the
 code is worse than no version, because it is trusted.
 """
+import hashlib
 import os
 import subprocess
-import sys
 
 # --- schema (migration) version -------------------------------------------------------------
 # Tracks `delimp_schema_version`, i.e. the shape of the tables. NOT a code version — do not bump it
@@ -200,6 +200,17 @@ def record_run(cur, component, version, notes=None):
         return False
 
 
+def _file_md5(path: str) -> str:
+    """Content digest of one ingest file. A deliberate duplicate of publish_manifest.file_md5 --
+    that module is on neither deploy target, and importing it would make this gate fail open (i.e.
+    never fire) exactly where it is supposed to work. Keep the two byte-identical in behaviour."""
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def assert_current(cur, ignore_stale: bool = False) -> list[str]:
     """Refuse to run a stale ingestor. Returns the stale filenames.
 
@@ -213,13 +224,27 @@ def assert_current(cur, ignore_stale: bool = False) -> list[str]:
     2026-09-16 the repo and the Windows-node share both declared CORPUS_INGEST_VERSION = "1.3.0"
     while the files differed. A constant-based check would have passed that.
 
-    Cannot import app.db: on the Windows-node share `fran_ingest/` is a flat scp'd directory with no
-    `app/` parent (proven 2026-09-16). Callers pass a live cursor.
+    IMPORTS NOTHING BUT THE STANDARD LIBRARY, deliberately. This module is deployed to two flat
+    directories whose contents differ from each other and from the repo:
+
+      R:/Data/FRAN_SNE_export (Windows nodes) -- has refresh_leaderboards.py, organism.py;
+                                                 has NO coreomics_import.py, NO publish_manifest.py
+      fran_ingest/ (Hive)                     -- has coreomics_import.py, refresh_corpus_reach.py;
+                                                 has NO refresh_leaderboards.py, NO app/,
+                                                 NO publish_manifest.py
+
+    An import of ANY of those raises on at least one target, and because this function fails open on
+    exception it would then pass silently on every node -- a gate that never fires, which is worse
+    than no gate because it is trusted. So the md5 helper is inlined below rather than imported from
+    publish_manifest.py (tests/test_ingest_gate.py asserts the two agree), and the caller supplies
+    the cursor rather than this module reaching for app.db / coreomics_import / refresh_leaderboards.
+
+    The `gate` COLUMN decides refuse-vs-warn, not publish_manifest.REFUSE_FILES: the manifest row is
+    authoritative at check time, so re-gating a file takes effect on the next publish without
+    redeploying this file.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     try:
-        sys.path.insert(0, here)
-        from publish_manifest import file_md5
         cur.execute("SELECT file, md5, git_sha, published_at, gate FROM delimp_ingest_manifest")
         rows = cur.fetchall()
     except Exception as e:                      # noqa: BLE001 -- FAIL OPEN, see docstring
@@ -235,7 +260,7 @@ def assert_current(cur, ignore_stale: bool = False) -> list[str]:
         p = os.path.join(here, f)
         if not os.path.exists(p):
             continue                            # not deployed here; not this gate's business
-        got = file_md5(p)
+        got = _file_md5(p)
         if got != want:
             stale.append(f)
             print(f"  ingest-gate: STALE {f}  local={got[:8]} expected={want[:8]} "
