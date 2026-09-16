@@ -810,7 +810,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                   _irt(x.get("irt")), _im(x["im"]), _im(x.get("iim")), _flt(x["q_value"]), _flt(x["global_q_value"]), _flt(x["pg_q_value"]),
                   _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
                   _flt(x.get("pep")), _flt(x.get("empirical_quality")),
-                  (str(x["precursor_id_diann"]) if x.get("precursor_id_diann") else None), _flt(x.get("peak_fwhm")),
+                  _clean_text(x.get("precursor_id_diann")), _flt(x.get("peak_fwhm")),
                   _pg(x), SCHEMA_VERSION) for x in recs]
         else:
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
@@ -818,7 +818,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                   _irt(x.get("irt")), _im(x["im"]), _im(x.get("iim")), _flt(x["q_value"]), _flt(x["global_q_value"]), _flt(x["pg_q_value"]),
                   _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
                   _flt(x.get("pep")), _flt(x.get("empirical_quality")),
-                  (str(x["precursor_id_diann"]) if x.get("precursor_id_diann") else None), _flt(x.get("peak_fwhm")),
+                  _clean_text(x.get("precursor_id_diann")), _flt(x.get("peak_fwhm")),
                   SCHEMA_VERSION) for x in recs]
         prec_cols = _PREC_COLS if write_pg else _PREC_COLS.replace("protein_group,", "")
         if BULK_COPY:
@@ -1007,6 +1007,12 @@ def _clean_gene(g):
         return None
     s = str(g).strip()
     return None if s.lower() in ("nan", "none", "na", "null", "") else s
+
+
+# The same trap, for non-gene text columns (precursor_id_diann). A pandas NaN is TRUTHY, so the
+# obvious `str(x) if x.get(k) else None` writes the literal string "nan" into a text column.
+# Aliased rather than reimplemented: one cleaner, two honest call-site names.
+_clean_text = _clean_gene
 
 
 def _flt(v):

@@ -38,6 +38,22 @@ TABLE = "delimp_precursors"
 SAMPLE_ROWS = 50_000          # per search; bounds the scan on a multi-million-row search
 REGRESSION_DROP = 0.20        # a column losing >20 points of coverage vs baseline is a regression
 
+# Columns whose emptiness is a property of the INSTRUMENT or the SEARCH CONFIGURATION, not of the
+# writer. The gate compares the baseline's search against whatever is NEWEST for that engine now,
+# so these move legitimately the moment a different kind of experiment is ingested -- the first
+# Orbitrap DIA-NN search would report `diann.im: 100% -> 0%` and exit 1. A gate that fires on
+# correct behaviour teaches people to ignore it, which is worse than no gate.
+#
+# They are still MEASURED and still appear in the report; they just cannot fail the check.
+#   im / iim  -- ion mobility: timsTOF has it, Orbitrap does not
+#   mods      -- the jsonb; DIA-NN populates it, the Spectronaut adapter sets None on purpose
+#   normalized_intensity -- NULL for Spectronaut by adapter design (refuses per-fragment areas)
+#   irt       -- depends on whether the library carries iRT
+#   site_localization_probability -- only when the search enabled PTM localization
+CONFIG_DEPENDENT = frozenset({
+    "im", "iim", "mods", "normalized_intensity", "irt", "site_localization_probability",
+})
+
 
 def _conn(timeout_ms: int = 300_000):
     con = _base_conn()
@@ -121,21 +137,35 @@ def render(rep: dict) -> str:
 
 
 def check(rep: dict, baseline: dict) -> int:
-    """Fail when a column that WAS populated for an engine no longer is."""
-    bad = []
+    """Fail when a WRITER-CONTROLLED column that was populated for an engine no longer is.
+
+    Movement in a CONFIG_DEPENDENT column is reported but never fails: see that constant for why
+    a gate that fires on a legitimate instrument change is worse than no gate at all.
+    """
+    bad, informational = [], []
     for engine, blk in rep["per_engine"].items():
         base = baseline.get("per_engine", {}).get(engine)
         if not base:
             print(f"  note: engine {engine!r} absent from baseline — not a regression, "
                   f"refresh the baseline to start tracking it")
             continue
+        same_search = base.get("search_id") == blk.get("search_id")
         for col, now in blk["non_null_frac"].items():
             was = base["non_null_frac"].get(col)
-            if was is None or now is None:
+            if was is None or now is None or was - now <= REGRESSION_DROP:
                 continue
-            if was - now > REGRESSION_DROP:
-                bad.append(f"{engine}.{col}: {was:.1%} -> {now:.1%} "
-                           f"(baseline search {base['search_name']}, now {blk['search_name']})")
+            line = (f"{engine}.{col}: {was:.1%} -> {now:.1%} "
+                    f"(baseline search {base['search_name']}, now {blk['search_name']})")
+            # A drop within the SAME search is always the writer's doing — no instrument or config
+            # changed underneath it — so it fails even for a config-dependent column.
+            if col in CONFIG_DEPENDENT and not same_search:
+                informational.append(line)
+            else:
+                bad.append(line)
+    if informational:
+        print("instrument/config-dependent movement (NOT failing — see CONFIG_DEPENDENT):")
+        for b in sorted(informational):
+            print("  " + b)
     if bad:
         print("COVERAGE REGRESSION -- a column that used to be written is no longer being written:")
         for b in sorted(bad):
