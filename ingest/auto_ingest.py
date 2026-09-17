@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -143,7 +144,7 @@ def _claim_queue(a):
     try:
         import fran_queue
         con = fran_queue._conn()
-        rows = fran_queue.claim_batch(con, a.limit, os.uname().nodename)
+        rows = fran_queue.claim_batch(con, a.limit, platform.node())
     except Exception as e:  # noqa: BLE001
         print(f"  queue unavailable ({type(e).__name__}: {e}); continuing with scan only",
               flush=True)
@@ -178,7 +179,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=10800, help="per-search timeout, seconds")
     a = ap.parse_args()
 
-    print(f"===== auto_ingest {time.strftime('%F %T')} on {os.uname().nodename} =====", flush=True)
+    print(f"===== auto_ingest {time.strftime('%F %T')} on {platform.node()} =====", flush=True)
 
     if a.direct:
         jobs = json.load(open(a.direct))

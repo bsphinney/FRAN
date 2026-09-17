@@ -34,6 +34,7 @@ Bump the constant in the same commit that changes the component's behaviour. A v
 code is worse than no version, because it is trusted.
 """
 import os
+import platform
 import subprocess
 
 # --- schema (migration) version -------------------------------------------------------------
@@ -184,13 +185,22 @@ def ensure_table(cur):
         cur.execute(stmt)
 
 
+def hostname() -> str:
+    """The ingest host, on every platform. `os.uname` is POSIX-only: on Windows it raises
+    AttributeError, record_run() swallowed it, and every Windows ingest silently recorded
+    NOTHING in delimp_component_version -- the one question this module exists to answer.
+    Measured 2026-09-17 on win-2: "could not record corpus_ingest 1.4.0: module 'os' has no
+    attribute 'uname'" on every run, while the ingests themselves succeeded."""
+    return (platform.node() or os.environ.get("COMPUTERNAME") or "unknown")[:64]
+
+
 def record(cur, component, version, notes=None):
     """Append one component-version observation. Cheap; call once per run, not per row."""
     ensure_table(cur)
     cur.execute(
         """INSERT INTO delimp_component_version (component, version, git_sha, host, notes)
            VALUES (%s,%s,%s,%s,%s)""",
-        (component, version, git_sha(), os.uname().nodename[:64], notes))
+        (component, version, git_sha(), hostname(), notes))
 
 
 def record_run(cur, component, version, notes=None):
