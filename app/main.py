@@ -548,6 +548,15 @@ def api_species_showcase():
     return ok({"showcase": _safe(queries.species_showcase, {})})
 
 
+@app.get("/api/ptm_landscape")
+def api_ptm_landscape():
+    """PTM landscape — per-search modified-precursor rate, so a reader can see which PTM
+    enrichments worked. PUBLIC and anonymous, like the other showcase pages.
+
+    Reads the precomputed rollup only, never delimp_precursors (a >15-minute corpus scan)."""
+    return ok({"landscape": _safe(queries.ptm_landscape, {})})
+
+
 # FULL (core staff) ONLY — the cross-lab directory. Lab users are NOT admitted here (they'd see other
 # labs' people); their own data is served, scoped, by /api/my. Hence is_full(), not is_internal().
 @app.get("/api/internal/collaborators")

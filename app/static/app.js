@@ -66,6 +66,7 @@ function route(){
     case 'peptides': return renderPeptidesShowcase();
     case 'allspecies': return renderSpeciesShowcase();
     case 'engines': return renderEngines(param);
+    case 'ptm': return renderPTM();
     case 'enginerun': return renderEngineRun(param);
     case 'collaborators': return renderCollaborators();
     case 'submissions': return renderSubmissions();
@@ -1907,6 +1908,146 @@ async function renderProteinsShowcase(){
         options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`${fmt(c.parsed.x)} protein groups`}}},
           scales:{x:{title:{display:true,text:'protein groups',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}},y:{grid:{display:false},ticks:{color:cc.tick}}},maintainAspectRatio:false}}); } }
   }catch(e){ const el=$('#ps_body'); if(el) el.innerHTML=empty('Showcase unavailable: '+esc(e.message)); }
+}
+
+/* ---------- PTM LANDSCAPE — per-search modified-precursor rate ---------- */
+async function renderPTM(){
+  view.innerHTML = `<div class="glass card p-5 fade-in"><h1 class="text-2xl font-extrabold text-white">PTM landscape</h1>
+    <div class="text-slate-400 text-sm mt-2">Loading…</div></div>`;
+  // This fetch is the largest and slowest in the app (~731 KB, ~3.5 s cold), so it is the one
+  // where navigating away mid-load visibly paints this page over the destination. route() has no
+  // render token anywhere, so guard locally: remember the hash we started on and bail if it moved.
+  const _h = location.hash;
+  let d;
+  try { d = (await api('/api/ptm_landscape')).landscape; }
+  catch(e){ dbError(e); return; }
+
+  if (location.hash !== _h) return;          // user navigated away while the fetch was in flight
+  const cov = d.coverage||{}, sm = d.summary||{}, rows = d.searches||[];
+  // COVERAGE IS NOT DECORATION. The uncovered searches cannot be computed from their own data
+  // (they carry no precursor with a protein group) — that is different from "not computed yet",
+  // and saying it wrong turns an absence into an implied zero.
+  // Do NOT assert WHY a search is missing. Absence from the rollup is two states that look
+  // identical from here: a search whose precursors carry no protein_group (the rollup can never
+  // produce a row) and one the refresh job has not reached yet. The refresh is NOT on Hive's
+  // crontab, so the second kind appears with every new ingest -- an explanation that is true of
+  // today's 5 would become false for each new arrival.
+  const covLine = cov.n_not_in_rollup
+    ? `Covering <b>${fmt(cov.n_searches_covered)}</b> of ${fmt(cov.n_searches_total)} searches.
+       ${fmt(cov.n_not_in_rollup)} are not in the rollup — either not yet computed, or holding no
+       precursor with a protein group; this page cannot tell those apart.`
+    : `Covering all ${fmt(cov.n_searches_covered)} searches.`;
+
+  // Only TWO labels exist plus no-label — see _ptm_verdict() in app/queries.py. The middle band
+  // deliberately carries none: it would have covered 1,900 of 2,107 searches, because the corpus
+  // median (~20%) is background methionine oxidation, not enrichment.
+  const verdictChip = (v, rate) => {
+    if(!v) return `<span class="text-slate-500" title="${rate==null
+        ? 'No precursor total recorded for this search, so no rate can be computed. This is an absence, not a zero.'
+        : 'No label: this rate sits in the ordinary range for the corpus, where most modification is background oxidation rather than enrichment. Read the rate against the median above.'}">—</span>`;
+    const cls = v==='enriched' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-600/30 text-slate-300';
+    const tip = `${(rate*100).toFixed(1)}% of precursors carry a modification. Classified by rate alone — FRAN cannot tell a failed enrichment from a sample that was never enriched.`;
+    return `<span class="px-2 py-0.5 rounded text-xs font-semibold ${cls}" title="${esc(tip)}">${esc(v)}</span>`;
+  };
+  const medPct = sm.median_rate==null ? null : (sm.median_rate*100).toFixed(1)+'%';
+
+  view.innerHTML = `
+    ${crumb([['Dashboard','dashboard'],['PTM landscape',null]])}
+    <div class="glass card p-5 fade-in">
+      <h1 class="text-2xl font-extrabold text-white">PTM landscape</h1>
+      <div class="mt-2 text-sm text-amber-200/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+        <b>The rate counts ANY modification.</b> The "modified rate" column is the fraction of
+        precursors carrying any modification at all — largely background methionine oxidation,
+        not enrichment. Only the <i>flags</i> are specific: this table knows phospho and GlyGly
+        and cannot distinguish oxidation, acetyl or deamidation. A high rate is therefore not by
+        itself a phospho or GlyGly result, and an absent flag is not proof a modification was absent.
+      </div>
+      <div class="mt-2 text-xs text-slate-400">${covLine}</div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 mt-4">
+        ${stat('Searches with a modification', fmt(sm.n_searches_any_ptm))}
+        ${stat('Searches with phospho', fmt(sm.n_searches_phospho))}
+        ${stat('Searches with GlyGly', fmt(sm.n_searches_glygly))}
+        ${stat('Protein groups modified', fmt(sm.n_groups_any_ptm))}
+        ${stat('…with phospho', fmt(sm.n_groups_phospho))}
+        ${stat('…with GlyGly', fmt(sm.n_groups_glygly))}
+      </div>
+    </div>
+
+    <div class="glass card p-5 fade-in mt-4">
+      <h3 class="font-bold text-white mb-1">Modified-precursor rate by search</h3>
+      <div class="text-xs text-slate-400 mb-3">
+        <b>The corpus median is ${medPct||'—'}</b>, most of it background methionine
+        oxidation rather than enrichment — so read a single search against that, not against zero.
+        Only the clear extremes are labelled; a search in the ordinary range shows its rate and no
+        verdict, because FRAN does not know whether an enrichment was attempted.
+        <span class="text-slate-500">Search names are shown as <code>search-xxxxxx</code> unless you are signed in.</span>
+      </div>
+      <div class="flex flex-wrap gap-2 items-center mb-3">
+        <input id="ptmFilter" placeholder="filter by name, species, instrument…"
+               class="bg-slate-800/70 border border-slate-700 rounded-lg px-3 py-1 text-sm text-slate-200 w-64"
+               oninput="__ptmRender()">
+        <select id="ptmVerdict" onchange="__ptmRender()"
+                class="bg-slate-800/70 border border-slate-700 rounded-lg px-2 py-1 text-sm text-slate-200">
+          <option value="">all verdicts</option>
+          <option value="enriched">enriched</option>
+          <option value="incidental">incidental</option>
+          <option value="none">no label</option>
+        </select>
+        <select id="ptmSort" onchange="__ptmRender()"
+                class="bg-slate-800/70 border border-slate-700 rounded-lg px-2 py-1 text-sm text-slate-200">
+          <option value="desc">highest rate first</option>
+          <option value="asc">lowest rate first</option>
+        </select>
+        <span id="ptmCount" class="text-xs text-slate-500"></span>
+      </div>
+      <div id="ptmTable" class="overflow-x-auto"></div>
+    </div>`;
+
+  // THE TABLE IS FILTERED AND SORTABLE, NOT A FIXED TOP-N, AND THAT IS THE POINT.
+  // An earlier revision rendered rows.slice(0,400) of a rate-descending list. Measured against
+  // real data that hid EVERY low-rate search: the first "incidental" row sits at index 1940 of
+  // 2,107, so all 167 of them fell past the cap. The page exists to surface enrichments that did
+  // NOT work, so a view that can only show the winners defeats its own purpose. The cap remains
+  // (2,107 rows of DOM is wasteful) but it now applies AFTER filtering and sorting, so both ends
+  // of the range are reachable.
+  const CAP = 300;
+  window.__ptmRender = function(){
+    const q = ($('#ptmFilter')?.value || '').trim().toLowerCase();
+    const wantV = $('#ptmVerdict')?.value || '';
+    const asc = ($('#ptmSort')?.value || 'desc') === 'asc';
+    let list = rows.filter(r=>{
+      if(wantV === 'none'){ if(r.verdict) return false; }
+      else if(wantV && r.verdict !== wantV) return false;
+      if(!q) return true;
+      return [r.search_name, r.organism, r.instrument, r.search_engine]
+             .some(v => (v||'').toLowerCase().includes(q));
+    });
+    // Rows with no rate sort last in BOTH directions — an absent measurement is not a low one.
+    list = list.slice().sort((a,b)=>{
+      if(a.modified_rate==null && b.modified_rate==null) return 0;
+      if(a.modified_rate==null) return 1;
+      if(b.modified_rate==null) return -1;
+      return asc ? a.modified_rate-b.modified_rate : b.modified_rate-a.modified_rate;
+    });
+    const shown = list.slice(0, CAP);
+    $('#ptmCount').textContent = list.length > CAP
+      ? `showing ${shown.length} of ${list.length} matching (narrow the filter to see the rest)`
+      : `${list.length} matching`;
+    $('#ptmTable').innerHTML = table(
+      ['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
+      shown.map(r=>[
+        `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${escJs(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
+        r.completed_at
+          ? `<span title="${r.date_is_ingest?'Ingest date — this search records no completion date (only 3 of 2,112 do).':'Search completion date.'}">${esc(r.completed_at.slice(0,10))}${r.date_is_ingest?'<span class="text-slate-600">*</span>':''}</span>`
+          : '<span class="text-slate-500">—</span>',
+        esc(r.organism||'—'),
+        esc(r.instrument||'—'),
+        fmt(r.n_ptm), fmt(r.n_phospho), fmt(r.n_glygly),
+        r.modified_rate==null ? '<span class="text-slate-500">—</span>' : (r.modified_rate*100).toFixed(1)+'%',
+        verdictChip(r.verdict, r.modified_rate),
+      ]));
+  };
+  window.__ptmRender();
 }
 
 /* ---------- SPECIES SHOWCASE — a cross-species tour of every organism ---------- */
