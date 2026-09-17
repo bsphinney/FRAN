@@ -271,7 +271,11 @@ git commit -m "ptm: per-search modified-precursor rate aggregate for the landsca
 
 **Interfaces:**
 - Consumes: `queries.ptm_landscape()` from Task 1, `ok()`, `_safe()` (both already in `app/main.py`)
-- Produces: `GET /api/ptm_landscape` → `{"ok": true, "landscape": {...}}`
+- Produces: `GET /api/ptm_landscape` → `{"landscape": {...}}`.
+  **Note (corrected during execution):** `app.main.ok()` does NOT add an `"ok": true` key —
+  it is `JSONResponse(privacy.redact(_json_safe(data), reveal))` and nothing more. Verified:
+  zero occurrences of `"ok": True` in `app/main.py`, and the live response's only top-level
+  key is `landscape`. Do not assert an `ok` field.
 
 - [ ] **Step 1: Write the failing test**
 
