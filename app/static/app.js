@@ -1914,10 +1914,15 @@ async function renderProteinsShowcase(){
 async function renderPTM(){
   view.innerHTML = `<div class="glass card p-5 fade-in"><h1 class="text-2xl font-extrabold text-white">PTM landscape</h1>
     <div class="text-slate-400 text-sm mt-2">Loading…</div></div>`;
+  // This fetch is the largest and slowest in the app (~731 KB, ~3.5 s cold), so it is the one
+  // where navigating away mid-load visibly paints this page over the destination. route() has no
+  // render token anywhere, so guard locally: remember the hash we started on and bail if it moved.
+  const _h = location.hash;
   let d;
   try { d = (await api('/api/ptm_landscape')).landscape; }
   catch(e){ dbError(e); return; }
 
+  if (location.hash !== _h) return;          // user navigated away while the fetch was in flight
   const cov = d.coverage||{}, sm = d.summary||{}, rows = d.searches||[];
   // COVERAGE IS NOT DECORATION. The uncovered searches cannot be computed from their own data
   // (they carry no precursor with a protein group) — that is different from "not computed yet",
@@ -2031,7 +2036,7 @@ async function renderPTM(){
     $('#ptmTable').innerHTML = table(
       ['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
       shown.map(r=>[
-        `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${esc(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
+        `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${escJs(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
         r.completed_at
           ? `<span title="${r.date_is_ingest?'Ingest date — this search records no completion date (only 3 of 2,112 do).':'Search completion date.'}">${esc(r.completed_at.slice(0,10))}${r.date_is_ingest?'<span class="text-slate-600">*</span>':''}</span>`
           : '<span class="text-slate-500">—</span>',

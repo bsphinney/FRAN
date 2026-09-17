@@ -13,8 +13,8 @@ GG_SEARCH = "5d629050-4f68-5e43-8e1f-48bbc3fc0b8f"   # Bennett_Penn_Ubiq — a w
 
 d = queries.ptm_landscape()
 
-check("returns the four top-level keys", set(d) == {"coverage", "summary", "searches"} or
-      {"coverage", "summary", "searches"} <= set(d), str(sorted(d)))
+check("returns the three top-level keys", {"coverage", "summary", "searches"} <= set(d),
+      str(sorted(d)))
 
 cov = d["coverage"]
 check("coverage reports absence without asserting a cause", "n_not_in_rollup" in cov and

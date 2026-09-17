@@ -5025,7 +5025,8 @@ def ptm_landscape() -> dict[str, Any]:
               FROM agg a
               JOIN delimp_searches s ON s.id = a.search_id
               LEFT JOIN meta m       ON m.search_id = a.search_id
-             ORDER BY a.n_ptm DESC
+             -- no ORDER BY: the Python sort below supersedes it, and leaving one here only
+             -- decides tie-break order invisibly through the stable sort.
             """,
             tables=["delimp_search_protein_ptm", "delimp_searches",
                     "search_raw_files", "delimp_sample_metadata", "raw_files"],
