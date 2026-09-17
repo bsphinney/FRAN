@@ -5064,6 +5064,15 @@ def ptm_landscape() -> dict[str, Any]:
                 "n_groups_any_ptm": sum(s["n_ptm"] for s in searches),
                 "n_groups_phospho": sum(s["n_phospho"] for s in searches),
                 "n_groups_glygly": sum(s["n_glygly"] for s in searches),
+                # The corpus baseline, so a reader can calibrate a single search's rate instead
+                # of reading it against an imagined zero. Measured 20.2% on 2026-09-17, and it is
+                # mostly background methionine oxidation rather than any enrichment -- see
+                # _ptm_verdict() for why that is also the reason the middle band carries no label.
+                "median_rate": (
+                    sorted(s["modified_rate"] for s in searches if s["modified_rate"] is not None)
+                    [len([s for s in searches if s["modified_rate"] is not None]) // 2]
+                    if any(s["modified_rate"] is not None for s in searches) else None
+                ),
             },
             "searches": searches,
         }
@@ -5071,16 +5080,34 @@ def ptm_landscape() -> dict[str, Any]:
 
 
 def _ptm_verdict(rate: float | None) -> str | None:
-    """Rate-only classification. NEVER 'failed'.
+    """Rate-only classification, and ONLY at the two informative extremes. NEVER 'failed'.
 
     FRAN cannot distinguish a failed enrichment from a sample that was never enriched, and
     inferring intent from search_name is a guess about a human's naming habits. So this reads the
     rate and nothing else, and the UI states that basis next to the label.
+
+    WHY THE MIDDLE BAND GETS NO LABEL. The design doc proposed a third label,
+    "low for an enrichment", for everything between 5% and 50%. Measured against the real corpus
+    on 2026-09-17 that band holds **1,900 of 2,107 searches** -- 90% of everything FRAN has --
+    because the median search sits at 20.2% modified precursors. That baseline is ordinary
+    background chemistry, not enrichment: on a representative search, 1,451 of 1,897 modified
+    precursors carry Oxidation (UNIMOD:35) and only 18 carry Carbamidomethyl. Methionine
+    oxidation happens in nearly every sample.
+
+    So the label would have been attached to ~1,860 searches that never attempted an enrichment,
+    telling their owners an experiment underperformed when no experiment was run. The design doc's
+    own risk table names this as the page's top risk ("Reader takes 'low for an enrichment' as
+    'the experiment failed'"); applying it to 90% of rows maximises exactly that risk instead of
+    mitigating it, and a label carried by 90% of rows conveys nothing anyway.
+
+    The rate itself is still shown for every search, and the page states the corpus median so a
+    reader can calibrate. Judgement about the middle is left to the reader, who knows whether an
+    enrichment was attempted -- which FRAN does not.
     """
     if rate is None:
         return None
     if rate >= 0.50:
         return "enriched"
-    if rate >= 0.05:
-        return "low for an enrichment"
-    return "incidental"
+    if rate <= 0.05:
+        return "incidental"
+    return None

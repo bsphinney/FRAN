@@ -63,6 +63,28 @@ check("no output_dir / path-shaped value leaks in the public (redacted) view",
       "output_dir" not in blob and ":\\" not in blob and "/Volumes/" not in blob
       and "/nfs/" not in blob and "/quobyte/" not in blob)
 
+
+# THE MIDDLE BAND MUST CARRY NO LABEL.
+# The design doc proposed "low for an enrichment" for 5%-50%. Measured on the real corpus that
+# band is 1,900 of 2,107 searches, because the median search sits at ~20% modified precursors --
+# background methionine oxidation, not enrichment. Labelling 90% of the corpus "low for an
+# enrichment" tells ~1,860 owners an experiment underperformed when none was attempted, which is
+# the page's own top stated risk. Verdicts are therefore only the two informative extremes.
+verdicts = {r["verdict"] for r in d["searches"]}
+check("verdicts are only the allowed labels (or none)",
+      verdicts <= {None, "enriched", "incidental"}, str(sorted(v or "-" for v in verdicts)))
+
+mid = [r for r in d["searches"]
+       if r["modified_rate"] is not None and 0.05 < r["modified_rate"] < 0.50]
+check("the middle band is populated (so this check is not vacuous)", len(mid) > 100, str(len(mid)))
+check("no search in the middle band carries a verdict",
+      all(r["verdict"] is None for r in mid),
+      f"{sum(1 for r in mid if r['verdict'])} labelled, e.g. {[r['verdict'] for r in mid if r['verdict']][:1]}")
+
+med = d["summary"].get("median_rate")
+check("the corpus median rate is reported so a reader can calibrate",
+      med is not None and 0 < med < 1, str(med))
+
 print()
 if FAILS: print(f"FAILED ({len(FAILS)}): {', '.join(FAILS)}"); sys.exit(1)
 print("all checks passed")
