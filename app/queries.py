@@ -3219,6 +3219,18 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
         fetch="one",
     )
     # One row per (modified form, charge) with aggregate coordinates.
+    #
+    # avg_log2_int is DERIVED, not read from delimp_precursors.intensity_log2: that column has no
+    # writer anywhere and is 100% NULL corpus-wide, so this table's "Avg log₂ int" rendered an
+    # em-dash on every peptide until 2026-09-16. `intensity` IS written (99.99% non-null), so the
+    # log is computed here. Guarded because log is undefined at <= 0 and a stray 0 intensity would
+    # abort the whole query.
+    #
+    # These two sentences MUST stay in Python, NOT in the SQL string: the literal % in "100%" and
+    # "99.99%" collides with psycopg2's %s parameter parsing (this query binds stripped_seq and
+    # LIMIT), raising ValueError: unsupported format character before the statement ever reaches
+    # Postgres -- the same fault that 500'd species search site-wide. See the identical note above
+    # species_search(), and scripts/predeploy_check.py rule 3c, which now blocks the deploy on it.
     forms = query(
         """
         SELECT modified_seq_proforma, charge,
@@ -3227,11 +3239,8 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
                AVG(rt) AS avg_rt,
                AVG(im) AS avg_im,
                MIN(q_value) AS best_q_value,
-               -- Derived, NOT read from delimp_precursors.intensity_log2: that column has no
-               -- writer anywhere and is 100% NULL corpus-wide, so this table's "Avg log₂ int"
-               -- rendered an em-dash on every peptide until 2026-09-16. `intensity` IS written
-               -- (99.99% non-null), so the log is computed here. Guarded because log is
-               -- undefined at <= 0 and a stray 0 intensity would abort the whole query.
+               -- Derived, NOT read from intensity_log2 (no writer, all NULL) -- see the note in
+               -- Python above this query, which cannot live here because it quotes percentages.
                AVG(CASE WHEN intensity > 0 THEN ln(intensity) / ln(2) END) AS avg_log2_int,
                MAX(n_engines_confirming) AS max_engines
         FROM delimp_precursors
