@@ -28,12 +28,17 @@ check("no path-shaped value in the public payload",
       and "/nfs/" not in body and "/quobyte/" not in body)
 
 # search_name is redacted at the HTTP boundary for anonymous callers (app/privacy.py _NAME_KEYS).
-# Verdicts must be limited to the three allowed labels, checked on the parsed values rather than
-# the raw body text — a sha1-hashed search_name can contain substrings like "fa" and a redacted
-# name could in principle contain "fail", so a raw-text scan is fragile.
+# Verdicts are checked on the parsed values, not the raw body text — a sha1-hashed search_name
+# can contain substrings like "fa" and a redacted name could in principle contain "fail", so a
+# raw-text scan is fragile.
+#
+# Only TWO labels exist, plus no-label. "low for an enrichment" was deliberately removed: it
+# would have covered 1,900 of 2,107 searches, since the corpus median rate is ~20% background
+# methionine oxidation rather than enrichment. Keeping it in this allowlist would let the label
+# come back without this test noticing. See _ptm_verdict() in app/queries.py.
 verdicts = {(s.get("verdict") or "") for s in (lc.get("searches") or [])}
-check("verdicts are only the three allowed labels",
-      verdicts <= {"", "enriched", "low for an enrichment", "incidental"}, str(sorted(verdicts)))
+check("verdicts are only the two allowed labels (or none)",
+      verdicts <= {"", "enriched", "incidental"}, str(sorted(verdicts)))
 
 print()
 if FAILS: print(f"FAILED ({len(FAILS)}): {', '.join(FAILS)}"); sys.exit(1)
