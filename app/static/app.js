@@ -66,6 +66,7 @@ function route(){
     case 'peptides': return renderPeptidesShowcase();
     case 'allspecies': return renderSpeciesShowcase();
     case 'engines': return renderEngines(param);
+    case 'ptm': return renderPTM();
     case 'enginerun': return renderEngineRun(param);
     case 'collaborators': return renderCollaborators();
     case 'submissions': return renderSubmissions();
@@ -1907,6 +1908,78 @@ async function renderProteinsShowcase(){
         options:{indexAxis:'y',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`${fmt(c.parsed.x)} protein groups`}}},
           scales:{x:{title:{display:true,text:'protein groups',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}},y:{grid:{display:false},ticks:{color:cc.tick}}},maintainAspectRatio:false}}); } }
   }catch(e){ const el=$('#ps_body'); if(el) el.innerHTML=empty('Showcase unavailable: '+esc(e.message)); }
+}
+
+/* ---------- PTM LANDSCAPE — per-search modified-precursor rate ---------- */
+async function renderPTM(){
+  view.innerHTML = `<div class="glass card p-5 fade-in"><h1 class="text-2xl font-extrabold text-white">PTM landscape</h1>
+    <div class="text-slate-400 text-sm mt-2">Loading…</div></div>`;
+  let d;
+  try { d = (await api('/api/ptm_landscape')).landscape; }
+  catch(e){ dbError(e); return; }
+
+  const cov = d.coverage||{}, sm = d.summary||{}, rows = d.searches||[];
+  // COVERAGE IS NOT DECORATION. The uncovered searches cannot be computed from their own data
+  // (they carry no precursor with a protein group) — that is different from "not computed yet",
+  // and saying it wrong turns an absence into an implied zero.
+  const covLine = cov.n_uncomputable
+    ? `Covering <b>${fmt(cov.n_searches_covered)}</b> of ${fmt(cov.n_searches_total)} searches.
+       ${fmt(cov.n_uncomputable)} cannot be computed from their own data (no precursor carries a protein group).`
+    : `Covering all ${fmt(cov.n_searches_covered)} searches.`;
+
+  // Only TWO labels exist plus no-label — see _ptm_verdict() in app/queries.py. The middle band
+  // deliberately carries none: it would have covered 1,900 of 2,107 searches, because the corpus
+  // median (~20%) is background methionine oxidation, not enrichment.
+  const verdictChip = (v, rate) => {
+    if(!v) return `<span class="text-slate-500" title="${rate==null
+        ? 'No precursor total recorded for this search, so no rate can be computed. This is an absence, not a zero.'
+        : 'No label: this rate sits in the ordinary range for the corpus, where most modification is background oxidation rather than enrichment. Read the rate against the median above.'}">—</span>`;
+    const cls = v==='enriched' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-600/30 text-slate-300';
+    const tip = `${(rate*100).toFixed(1)}% of precursors carry a modification. Classified by rate alone — FRAN cannot tell a failed enrichment from a sample that was never enriched.`;
+    return `<span class="px-2 py-0.5 rounded text-xs font-semibold ${cls}" title="${esc(tip)}">${esc(v)}</span>`;
+  };
+  const medPct = sm.median_rate==null ? null : (sm.median_rate*100).toFixed(1)+'%';
+
+  view.innerHTML = `
+    ${crumb([['Dashboard','dashboard'],['PTM landscape',null]])}
+    <div class="glass card p-5 fade-in">
+      <h1 class="text-2xl font-extrabold text-white">PTM landscape</h1>
+      <div class="mt-2 text-sm text-amber-200/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
+        <b>Phospho and GlyGly only.</b> This table records whether a protein carried
+        <i>any</i> modification, phospho, or GlyGly — it does not distinguish oxidation,
+        acetyl or deamidation. Read it as a view of those three, not a census of every modification.
+      </div>
+      <div class="mt-2 text-xs text-slate-400">${covLine}</div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 mt-4">
+        ${stat('Searches with a modification', fmt(sm.n_searches_any_ptm))}
+        ${stat('Searches with phospho', fmt(sm.n_searches_phospho))}
+        ${stat('Searches with GlyGly', fmt(sm.n_searches_glygly))}
+        ${stat('Protein groups modified', fmt(sm.n_groups_any_ptm))}
+        ${stat('…with phospho', fmt(sm.n_groups_phospho))}
+        ${stat('…with GlyGly', fmt(sm.n_groups_glygly))}
+      </div>
+    </div>
+
+    <div class="glass card p-5 fade-in mt-4">
+      <h3 class="font-bold text-white mb-1">Modified-precursor rate by search</h3>
+      <div class="text-xs text-slate-400 mb-3">
+        Sorted by rate. <b>The corpus median is ${medPct||'—'}</b>, most of it background methionine
+        oxidation rather than enrichment — so read a single search against that, not against zero.
+        Only the clear extremes are labelled; a search in the ordinary range shows its rate and no
+        verdict, because FRAN does not know whether an enrichment was attempted.
+        <span class="text-slate-500">Search names are shown as <code>search-xxxxxx</code> unless you are signed in.</span>
+      </div>
+      ${table(['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
+        rows.slice(0,400).map(r=>[
+          `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${esc(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
+          esc((r.completed_at||'').slice(0,10)),
+          esc(r.organism||'—'),
+          esc(r.instrument||'—'),
+          fmt(r.n_ptm), fmt(r.n_phospho), fmt(r.n_glygly),
+          r.modified_rate==null ? '<span class="text-slate-500">—</span>' : (r.modified_rate*100).toFixed(1)+'%',
+          verdictChip(r.verdict, r.modified_rate),
+        ]))}
+    </div>`;
 }
 
 /* ---------- SPECIES SHOWCASE — a cross-species tour of every organism ---------- */
