@@ -488,7 +488,7 @@ async function renderSearchDetail(id){
       ${window.__FRAN_TIER__&&window.__FRAN_TIER__!=='public'?`<div class="mt-3 text-[11px] text-slate-500"><b>report.parquet</b> → upload into <b>DE-LIMP</b> (Hugging Face or local) to run LIMPA. &nbsp;·&nbsp; <b>HIVE brief</b> → a markdown packet (raw-file paths, FASTA to download, conditions) to give a HIVE-connected Claude to re-search with DIA-NN + analyze with LIMPA.</div>`:''}
       <div class="grid grid-cols-2 sm:grid-cols-5 gap-4 mt-5">
         ${stat('Raw files',fmt(s.n_raw_files))}${stat('Precursors',fmt(s.n_precursors_total))}
-        ${stat('Proteins',fmt(s.n_proteins_total))}${s.n_protein_groups_total!=null?stat('Protein groups',fmt(s.n_protein_groups_total)):''}${stat('FASTA proteins',fmt(s.fasta_n_proteins))}
+        ${stat('Proteins',fmt(s.n_proteins_total))}${s.n_protein_groups_total!=null?stat('Protein groups',fmt(s.n_protein_groups_total)):''}${s.fasta_n_proteins!=null?stat('FASTA proteins',fmt(s.fasta_n_proteins)):''}
       </div>
       ${s.fasta_path?`<div class="mt-4 text-xs text-slate-500">FASTA: <code class="text-slate-400">${esc(s.fasta_path)}</code></div>`:''}
       ${s.doi?`<div class="mt-1 text-xs text-slate-500">DOI: ${esc(s.doi)}</div>`:''}
