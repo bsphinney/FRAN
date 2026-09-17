@@ -44,7 +44,11 @@ SCHEMA_VERSION = "1.0.0"
 # --- component (code) versions ---------------------------------------------------------------
 # Semver. Bump patch for fixes that cannot change output, minor for output-affecting changes, major
 # for a format change that makes old artefacts unreadable.
-CORPUS_INGEST_VERSION = "1.3.0"          # 1.3.0: duplicate guard moved BEFORE the writes (it ran
+CORPUS_INGEST_VERSION = "1.4.0"          # 1.4.0: organism = the search database's species; the
+                                         # identification vote excludes contaminant-library hits
+                                         # and yields NULL, never a contaminant's species.
+                                         # Output-affecting (organism_name), hence minor.
+                                         # 1.3.0: duplicate guard moved BEFORE the writes (it ran
                                          # after the precursor COPY and blocked nothing); per-search
                                          # pipeline_version stamping.          # 1.2.0: _platform_from_disk — a Spectronaut BGS-schema report
                                          # (no EG.IonMobility, extension stripped off R.FileName) used to
