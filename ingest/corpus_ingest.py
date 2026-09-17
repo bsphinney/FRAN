@@ -237,6 +237,15 @@ def _diann_rows(df):
     cQ, cGQ, cPGQ = c("Q.Value"), c("Global.Q.Value"), c("PG.Q.Value")
     cInt, cNorm = c("Precursor.Quantity"), c("Precursor.Normalised")
     cPG, cGene = c("Protein.Group", "Protein.Ids"), c("Genes")
+    # Restored 2026-09-16. The 2026-06 one-off DIA-NN loader wrote these four; the consolidated
+    # path dropped them without notice, so they are 100% populated in three June searches and 0%
+    # in everything ingested since. Names verified against the surviving legacy VALUES, not
+    # guessed: precursor_id_diann held Precursor.Id ("(UniMod:1)AAA...K3"), peak_fwhm held FWHM,
+    # empirical_quality held Empirical.Quality, pep held PEP. `library_match` is NOT restored --
+    # its legacy value is the constant 'empirical', a property of the library rather than any
+    # report column, and inventing a mapping would be worse than leaving it NULL.
+    cPEP, cEQ = c("PEP"), c("Empirical.Quality")
+    cPID, cFWHM = c("Precursor.Id"), c("FWHM")
     if not (cR and cStr and cCh):
         raise ValueError(f"DIA-NN report missing Run/Stripped.Sequence/Precursor.Charge; have {list(df.columns)[:20]}")
     if cQ:
@@ -247,6 +256,8 @@ def _diann_rows(df):
                "precursor_mz": cMz, "rt": cRT, "irt": cIRT, "im": cIM, "iim": cIIM,
                "q_value": cQ, "global_q_value": cGQ, "pg_q_value": cPGQ,
                "intensity": cInt, "normalized_intensity": cNorm,
+               "pep": cPEP, "empirical_quality": cEQ,
+               "precursor_id_diann": cPID, "peak_fwhm": cFWHM,
                "protein_group": cPG, "gene": cGene}
     present = {k: v for k, v in mapping.items() if v}
     sub = df[list(present.values())].rename(columns={v: k for k, v in present.items()})
@@ -264,7 +275,37 @@ def _diann_rows(df):
         yield row
 
 
+def _stale_ingest_files(ignore_stale=False):
+    """Run the staleness gate on a short-lived connection of its own. Returns the stale filenames.
+
+    Deliberately NOT the ingest's connection. The gate has to fire BEFORE the report is parsed --
+    that parse is ~16 s on the poplar Radiant set but about an hour on a 34 GB Spectronaut report,
+    and telling an operator their code is stale after an hour of waiting is how --ignore-stale-ingest
+    becomes reflexive, which defeats the gate more thoroughly than not having one. The ingest's
+    connection is not opened until long after. One extra connection is cheap against that hour, and
+    it is closed again before any work starts so the gate never holds a pooled connection through
+    the ingest.
+
+    Failing to CONNECT fails open, for the same reason an unreadable manifest does (see
+    versions.assert_current): a PG Farm outage must not stop ingestion. A refusal is a SystemExit
+    and propagates.
+    """
+    import versions as _V
+    try:
+        cn = _conn()
+    except Exception as e:                      # noqa: BLE001 -- FAIL OPEN, see docstring
+        print(f"  ingest-gate: no database connection ({e}); proceeding unchecked", flush=True)
+        return []
+    try:
+        return _V.assert_current(cn.cursor(), ignore_stale=ignore_stale)
+    finally:
+        cn.close()
+
+
 def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
+    # STALENESS GATE, before the report is even located -- see _stale_ingest_files for why it is not
+    # down at the record_run site. record_run still stamps the result at the point it always did.
+    _stale = _stale_ingest_files(IGNORE_STALE_INGEST)
     report = searchdir
     if os.path.isdir(searchdir):
         if engine == "fragpipe":
@@ -459,8 +500,11 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # Stamp this run into delimp_component_version before doing any work, so a run that later
         # dies still leaves a record of which code touched the corpus. Never fatal.
         import versions as _V
+        # _stale came from the gate at the top of this function; an override that left no trace is
+        # how "temporarily" becomes permanent, so it is recorded here with everything else.
         _V.record_run(cur, "corpus_ingest", CORPUS_INGEST_VERSION,
-                      notes=f"schema={SCHEMA_VERSION}")
+                      notes=(f"schema={SCHEMA_VERSION}" if not _stale
+                             else f"schema={SCHEMA_VERSION}; RAN STALE: {','.join(_stale)}"))
         conn.commit()
 
         # ENGINE WHITELIST PRE-FLIGHT. delimp_searches.search_engine carries a CHECK constraint
@@ -813,17 +857,23 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         def _pg(x):
             v = x.get("protein_group")
             return str(v) if v else None
+        if recs:
+            _warn_unmapped_record_keys(recs[0])
         if write_pg:
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
                   x["mods"], x["n_mods"], int(x["charge"]) if x["charge"] else None, _flt(x["precursor_mz"]), _flt(x["rt"]),
                   _irt(x.get("irt")), _im(x["im"]), _im(x.get("iim")), _flt(x["q_value"]), _flt(x["global_q_value"]), _flt(x["pg_q_value"]),
                   _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
+                  _flt(x.get("pep")), _flt(x.get("empirical_quality")),
+                  _clean_text(x.get("precursor_id_diann")), _flt(x.get("peak_fwhm")),
                   _pg(x), SCHEMA_VERSION) for x in recs]
         else:
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
                   x["mods"], x["n_mods"], int(x["charge"]) if x["charge"] else None, _flt(x["precursor_mz"]), _flt(x["rt"]),
                   _irt(x.get("irt")), _im(x["im"]), _im(x.get("iim")), _flt(x["q_value"]), _flt(x["global_q_value"]), _flt(x["pg_q_value"]),
                   _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
+                  _flt(x.get("pep")), _flt(x.get("empirical_quality")),
+                  _clean_text(x.get("precursor_id_diann")), _flt(x.get("peak_fwhm")),
                   SCHEMA_VERSION) for x in recs]
         prec_cols = _PREC_COLS if write_pg else _PREC_COLS.replace("protein_group,", "")
         if BULK_COPY:
@@ -929,6 +979,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
 
 BULK_COPY = False         # set by --bulk-copy; uses COPY for the big precursor insert (fast on HIVE)
 ALLOW_DUPLICATE = False   # set by --allow-duplicate; bypasses the raw-set duplicate guard in ingest()
+IGNORE_STALE_INGEST = False  # set by --ignore-stale-ingest; downgrades the staleness gate to a warning
 WRITE_FRAGMENTS = True    # write the observed-spectrum Lance lane (Spectronaut fragment-level reports)
 SPECTRUM_LANCE_DIR = None # dir for per-search Lance datasets (set by --lance-dir); None disables the lane
 XIC_DIR = None            # dir of Spectronaut *.xic.db All-XIC dbs (set by --xic-dir); None disables the XIC lane
@@ -936,7 +987,50 @@ XIC_LANCE_DIR = None      # where the .xic.lance datasets go (set by --xic-lance
 
 _PREC_COLS = ("search_id,raw_path,stripped_seq,modified_seq_diann,modified_seq_proforma,mods,n_mods,"
               "charge,precursor_mz,rt,irt,im,iim,q_value,global_q_value,pg_q_value,intensity,"
-              "normalized_intensity,site_localization_probability,protein_group,ingested_schema_version")
+              "normalized_intensity,site_localization_probability,pep,empirical_quality,"
+              "precursor_id_diann,peak_fwhm,protein_group,ingested_schema_version")
+
+# Every key an adapter may put on a precursor record that is deliberately NOT inserted.
+# `run` and `gene` are consumed upstream (run -> raw_path lookup, gene -> delimp_proteins);
+# `fragment` is the fragment-level sub-dict handled by the XIC lanes, not a precursor column.
+# `library_match` is legacy: the 2026-06 DIA-NN loader stored the constant string 'empirical'
+# there, which is a property of the LIBRARY and not a per-precursor measurement read from any
+# report column — so it is left unwritten rather than given an invented mapping.
+# ptm_assay_probability / has_localization_info are carried deliberately: spectronaut_to_corpus.py
+# says so in-line ("for a future column or other consumers but are NOT written to SQL today") and
+# neither column exists on delimp_precursors. Declared here so the warning stays meaningful --
+# a drop nobody chose is the thing worth shouting about.
+# `engine`, `instrument` and `organism` are search/run-level and are consumed into delimp_searches
+# and delimp_sample_metadata, not delimp_precursors.
+#
+# `ccs` and `ce` are the honest entries here: the Spectronaut adapter parses collision cross
+# section and collision energy on every row and delimp_precursors has NO COLUMN for either, so
+# they are discarded. That is a known gap, not a mistake -- recorded so the next person knows the
+# values are already in the report and only a column plus two tuple slots stand between them and
+# the corpus. Surfaced by tests/test_precursor_column_coverage.py, which found them within
+# minutes of being written; the 2026-09-16 audit had not.
+_PREC_DROPPED_OK = frozenset({"run", "gene", "fragment", "library_match",
+                              "ptm_assay_probability", "has_localization_info",
+                              "engine", "instrument", "organism", "ccs", "ce"})
+_PREC_COL_SET = frozenset(c.strip() for c in _PREC_COLS.split(","))
+_warned_unmapped: set[str] = set()
+
+
+def _warn_unmapped_record_keys(rec: dict) -> None:
+    """Announce record keys that no column will receive — the `pep` failure, made loud.
+
+    An adapter builds a dict and the INSERT names its columns explicitly, so a key with no
+    matching column is silently discarded: not an error, no row count change, nothing in a log.
+    That is exactly how `EG.PEP` was parsed on every Spectronaut row from the adapter's first
+    day and written on none of them (audit 2026-09-16), along with three DIA-NN fields that the
+    consolidated path quietly stopped carrying. Warn once per key per process; never raise --
+    an unexpected key must not abort an ingest that is otherwise correct.
+    """
+    extra = set(rec) - _PREC_COL_SET - _PREC_DROPPED_OK - _warned_unmapped
+    if extra:
+        _warned_unmapped.update(extra)
+        print(f"  [ingest] WARNING: record key(s) {sorted(extra)} have no column in _PREC_COLS "
+              f"and are being DISCARDED -- add the column or list it in _PREC_DROPPED_OK", flush=True)
 
 
 def _copy_cell(v):
@@ -969,6 +1063,12 @@ def _clean_gene(g):
         return None
     s = str(g).strip()
     return None if s.lower() in ("nan", "none", "na", "null", "") else s
+
+
+# The same trap, for non-gene text columns (precursor_id_diann). A pandas NaN is TRUTHY, so the
+# obvious `str(x) if x.get(k) else None` writes the literal string "nan" into a text column.
+# Aliased rather than reimplemented: one cleaner, two honest call-site names.
+_clean_text = _clean_gene
 
 
 def _flt(v):
@@ -1020,6 +1120,9 @@ if __name__ == "__main__":
     ap.add_argument("--allow-duplicate", action="store_true",
                     help="ingest even if another output_dir already has the same raw-file set and "
                          "precursor count (default: skip, see the duplicate guard)")
+    ap.add_argument("--ignore-stale-ingest", action="store_true",
+                    help="ingest even though this deployment's ingest scripts do not match the "
+                         "published manifest (recorded as 'RAN STALE' in delimp_component_version)")
     ap.add_argument("--bulk-copy", action="store_true", help="use COPY for the precursor insert (much faster on a fast PG link, e.g. HIVE)")
     ap.add_argument("--no-fragments", action="store_true", help="skip the observed-spectrum Lance lane (precursors only)")
     ap.add_argument("--lance-dir", default=None, help="dir for per-search Lance spectrum datasets (enables the observed-spectrum lane)")
@@ -1028,6 +1131,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     BULK_COPY = a.bulk_copy
     ALLOW_DUPLICATE = a.allow_duplicate
+    IGNORE_STALE_INGEST = a.ignore_stale_ingest
     WRITE_FRAGMENTS = not a.no_fragments
     SPECTRUM_LANCE_DIR = a.lance_dir
     XIC_DIR = a.xic_dir

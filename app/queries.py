@@ -731,17 +731,24 @@ def im_rt_density_sample(search_id: str | None = None, sample_n: int = 6000) -> 
         # Global view (no search_id): read the precomputed sample matview (the live
         # DISTINCT ON over millions of rows times out on PG Farm). Per-search view stays
         # live (small). The mv carries rt+irt so the axis logic below still applies.
-        cols = "rt, im, charge, precursor_mz, intensity_log2" + (", irt" if with_irt else "")
+        # delimp_precursors.intensity_log2 has NO WRITER and is 100% NULL corpus-wide (audit
+        # 2026-09-16), so every read of it straight off the table returned NULL and this scatter
+        # shipped a dead intensity dimension to the browser. Derive it from `intensity`, which is
+        # populated. The matview carries the same derived expression (refresh_leaderboards.py),
+        # so it is still selected there BY NAME — hence two column lists, not one.
+        _log2_int = "CASE WHEN intensity > 0 THEN ln(intensity) / ln(2) END AS intensity_log2"
+        mv_cols = "rt, im, charge, precursor_mz, intensity_log2" + (", irt" if with_irt else "")
+        raw_cols = f"rt, im, charge, precursor_mz, {_log2_int}" + (", irt" if with_irt else "")
         if not search_id:
             try:  # precomputed sample (best)
-                return query(f"SELECT {cols} FROM delimp_mv_im_scatter LIMIT %s",
+                return query(f"SELECT {mv_cols} FROM delimp_mv_im_scatter LIMIT %s",
                              (sample_n,), tables=["delimp_mv_im_scatter"])
             except Exception:  # noqa: BLE001 - mv not built -> fast random TABLESAMPLE (no full scan/sort)
                 return query(
-                    f"SELECT {cols} FROM delimp_precursors TABLESAMPLE SYSTEM (2) "
+                    f"SELECT {raw_cols} FROM delimp_precursors TABLESAMPLE SYSTEM (2) "
                     f"WHERE im > 0.3 AND rt IS NOT NULL LIMIT %s",
                     (sample_n,), tables=["delimp_precursors"], timeout_ms=20000)
-        sel = "stripped_seq, charge, rt, im, precursor_mz, intensity_log2" + (", irt" if with_irt else "")
+        sel = f"stripped_seq, charge, rt, im, precursor_mz, {_log2_int}" + (", irt" if with_irt else "")
         out = "rt, im, charge, precursor_mz, intensity_log2" + (", irt" if with_irt else "")
         return query(
             f"""SELECT {out} FROM (
@@ -3212,6 +3219,18 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
         fetch="one",
     )
     # One row per (modified form, charge) with aggregate coordinates.
+    #
+    # avg_log2_int is DERIVED, not read from delimp_precursors.intensity_log2: that column has no
+    # writer anywhere and is 100% NULL corpus-wide, so this table's "Avg log₂ int" rendered an
+    # em-dash on every peptide until 2026-09-16. `intensity` IS written (99.99% non-null), so the
+    # log is computed here. Guarded because log is undefined at <= 0 and a stray 0 intensity would
+    # abort the whole query.
+    #
+    # These two sentences MUST stay in Python, NOT in the SQL string: the literal % in "100%" and
+    # "99.99%" collides with psycopg2's %s parameter parsing (this query binds stripped_seq and
+    # LIMIT), raising ValueError: unsupported format character before the statement ever reaches
+    # Postgres -- the same fault that 500'd species search site-wide. See the identical note above
+    # species_search(), and scripts/predeploy_check.py rule 3c, which now blocks the deploy on it.
     forms = query(
         """
         SELECT modified_seq_proforma, charge,
@@ -3220,7 +3239,9 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
                AVG(rt) AS avg_rt,
                AVG(im) AS avg_im,
                MIN(q_value) AS best_q_value,
-               AVG(intensity_log2) AS avg_log2_int,
+               -- Derived, NOT read from intensity_log2 (no writer, all NULL) -- see the note in
+               -- Python above this query, which cannot live here because it quotes percentages.
+               AVG(CASE WHEN intensity > 0 THEN ln(intensity) / ln(2) END) AS avg_log2_int,
                MAX(n_engines_confirming) AS max_engines
         FROM delimp_precursors
         WHERE stripped_seq = %s

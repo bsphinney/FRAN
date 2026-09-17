@@ -242,6 +242,24 @@ def main():
     meta, by_pr = _report_meta(rep)
     print(f"report metadata rows: {len(meta):,}  distinct precursors: {len(by_pr):,}", flush=True)
 
+    # Traces join the report on (Run, Precursor.Id). A file stem that is not a report Run joins to
+    # nothing, so every one of its traces would be written with q_value NULL -- "extracted, NOT
+    # reported in this run" -- and the script would still exit 0 and the queue record the lane as
+    # done. Refuse a mismatch in either direction before writing anything. --runs names an explicit
+    # subset (e.g. a Skyline export that carries fewer runs), and then only those must match.
+    report_runs = {r for r, _ in meta}
+    want = keep if keep else report_runs | set(xics)
+    no_report = sorted(r for r in want if r in found and r not in report_runs)
+    no_xic = sorted(r for r in want if r in report_runs and r not in found)
+    if keep:
+        no_xic += sorted(r for r in keep if r not in report_runs and r not in found)
+    if no_report or no_xic:
+        raise SystemExit(
+            f"XIC file names do not match the report's Run column ({rep}):\n"
+            f"  XIC files with no report run ({len(no_report)}): {no_report[:20]}\n"
+            f"  report/--runs runs with no XIC file ({len(no_xic)}): {no_xic[:20]}\n"
+            f"Nothing written. Pass --runs to restrict to an intended subset.")
+
     total, ntr, first = 0, 0, True
     for run in xics:
         if keep and run not in keep:

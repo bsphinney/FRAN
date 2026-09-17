@@ -30,6 +30,8 @@ CLI:
   python fran_queue.py add <searchdir> --engine diann --registered-by mac-clip-fran
                           [--output-dir D] [--name N] [--organism-name O] [--taxon T]
                           [--priority P] [--host hive] [--force]
+                          [--xic-dir D] [--lance-dir D]   # diann only: write DIA-NN's *.xic.parquet
+                                                          # to the XIC lane after the ingest
   python fran_queue.py list [--status queued|claimed|done|parked] [--limit N]
   python fran_queue.py retry <id>       # parked -> queued, attempts reset
   python fran_queue.py park  <id>       # take a row out of circulation by hand
