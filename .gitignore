@@ -12,6 +12,10 @@ app/service_customer_aliases.json
 # oh-my-claudecode session/agent state — machine-local, never committed
 .omc/
 
+# Claude Code local settings and nested worktrees — machine-local. .claude/worktrees/ holds
+# whole checkouts; committing it to this PUBLIC repo would vendor a git tree into itself.
+.claude/
+
 # CONFIDENTIAL working documents — live here for convenience, MUST NOT be published.
 # This repo is PUBLIC (github.com/bsphinney/FRAN). These two name the private-tier tables
 # (coreomics_*, delimp_search_provenance, delimp_pi_profile), explain that a direct psycopg2
