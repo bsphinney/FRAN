@@ -1922,9 +1922,15 @@ async function renderPTM(){
   // COVERAGE IS NOT DECORATION. The uncovered searches cannot be computed from their own data
   // (they carry no precursor with a protein group) — that is different from "not computed yet",
   // and saying it wrong turns an absence into an implied zero.
-  const covLine = cov.n_uncomputable
+  // Do NOT assert WHY a search is missing. Absence from the rollup is two states that look
+  // identical from here: a search whose precursors carry no protein_group (the rollup can never
+  // produce a row) and one the refresh job has not reached yet. The refresh is NOT on Hive's
+  // crontab, so the second kind appears with every new ingest -- an explanation that is true of
+  // today's 5 would become false for each new arrival.
+  const covLine = cov.n_not_in_rollup
     ? `Covering <b>${fmt(cov.n_searches_covered)}</b> of ${fmt(cov.n_searches_total)} searches.
-       ${fmt(cov.n_uncomputable)} cannot be computed from their own data (no precursor carries a protein group).`
+       ${fmt(cov.n_not_in_rollup)} are not in the rollup — either not yet computed, or holding no
+       precursor with a protein group; this page cannot tell those apart.`
     : `Covering all ${fmt(cov.n_searches_covered)} searches.`;
 
   // Only TWO labels exist plus no-label — see _ptm_verdict() in app/queries.py. The middle band
@@ -1945,9 +1951,11 @@ async function renderPTM(){
     <div class="glass card p-5 fade-in">
       <h1 class="text-2xl font-extrabold text-white">PTM landscape</h1>
       <div class="mt-2 text-sm text-amber-200/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
-        <b>Phospho and GlyGly only.</b> This table records whether a protein carried
-        <i>any</i> modification, phospho, or GlyGly — it does not distinguish oxidation,
-        acetyl or deamidation. Read it as a view of those three, not a census of every modification.
+        <b>The rate counts ANY modification.</b> The "modified rate" column is the fraction of
+        precursors carrying any modification at all — largely background methionine oxidation,
+        not enrichment. Only the <i>flags</i> are specific: this table knows phospho and GlyGly
+        and cannot distinguish oxidation, acetyl or deamidation. A high rate is therefore not by
+        itself a phospho or GlyGly result, and an absent flag is not proof a modification was absent.
       </div>
       <div class="mt-2 text-xs text-slate-400">${covLine}</div>
       <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 mt-4">
@@ -2024,7 +2032,9 @@ async function renderPTM(){
       ['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
       shown.map(r=>[
         `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${esc(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
-        esc((r.completed_at||'').slice(0,10)),
+        r.completed_at
+          ? `<span title="${r.date_is_ingest?'Ingest date — this search records no completion date (only 3 of 2,112 do).':'Search completion date.'}">${esc(r.completed_at.slice(0,10))}${r.date_is_ingest?'<span class="text-slate-600">*</span>':''}</span>`
+          : '<span class="text-slate-500">—</span>',
         esc(r.organism||'—'),
         esc(r.instrument||'—'),
         fmt(r.n_ptm), fmt(r.n_phospho), fmt(r.n_glygly),

@@ -17,6 +17,8 @@ check("returns the four top-level keys", set(d) == {"coverage", "summary", "sear
       {"coverage", "summary", "searches"} <= set(d), str(sorted(d)))
 
 cov = d["coverage"]
+check("coverage reports absence without asserting a cause", "n_not_in_rollup" in cov and
+      "n_uncomputable" not in cov, str(sorted(cov)))
 check("coverage counts are present and sane",
       cov["n_searches_covered"] > 0 and cov["n_searches_total"] >= cov["n_searches_covered"],
       str(cov))
@@ -37,9 +39,23 @@ check("no verdict anywhere says 'failed'",
 
 # ABSENCE IS NOT A MEASUREMENT: a search with no usable denominator must have no rate and no
 # verdict, rather than a rate of 0.0 that reads as "nothing was modified".
+# This must be asserted on the FUNCTION, not on corpus rows: zero of the 2,107 live searches
+# lack a denominator, so a row-scan predicate returns 0 offenders whether the behaviour is right
+# or wrong. A review proved exactly that -- simulating the regression (rate 0.0 + verdict
+# "incidental" on every denominator-less row) still left the row-scan passing. Assert the rule
+# where it lives.
+check("_ptm_verdict(None) is None — no denominator means no verdict",
+      queries._ptm_verdict(None) is None, repr(queries._ptm_verdict(None)))
+check("_ptm_verdict still labels the extremes", 
+      (queries._ptm_verdict(0.9), queries._ptm_verdict(0.01)) == ("enriched", "incidental"),
+      str((queries._ptm_verdict(0.9), queries._ptm_verdict(0.01))))
+check("_ptm_verdict(0.0) is 'incidental', not None — a measured zero IS a measurement",
+      queries._ptm_verdict(0.0) == "incidental", repr(queries._ptm_verdict(0.0)))
+
+# and the row-scan is still worth keeping as a corpus-level sanity check
 bad = [r for r in d["searches"]
        if not r.get("n_precursors_total") and (r.get("modified_rate") is not None or r.get("verdict"))]
-check("searches with no precursor denominator carry neither rate nor verdict",
+check("no live search contradicts that rule",
       not bad, f"{len(bad)} offenders, e.g. {bad[:1]}")
 
 # NO FILENAME/PATH LEAK on a public-tier payload.
@@ -84,6 +100,19 @@ check("no search in the middle band carries a verdict",
 med = d["summary"].get("median_rate")
 check("the corpus median rate is reported so a reader can calibrate",
       med is not None and 0 < med < 1, str(med))
+
+
+# THE GROUP TILES MUST BE DISTINCT COUNTS, NOT SUMS OF PER-SEARCH COUNTS.
+# Summing counted each protein group once per search it appeared in and rendered 2,637,809 under
+# a tile reading "Protein groups modified", when the corpus holds 328,046 distinct such groups --
+# an ~8x overstatement on a public page.
+sum_per_search = sum(r["n_ptm"] for r in d["searches"])
+check("the group tile is a corpus distinct count, not a per-search sum",
+      d["summary"]["n_groups_any_ptm"] < sum_per_search,
+      f'tile={d["summary"]["n_groups_any_ptm"]:,} vs per-search sum={sum_per_search:,}')
+check("phospho and glygly tiles are likewise below their per-search sums",
+      d["summary"]["n_groups_phospho"] <= sum(r["n_phospho"] for r in d["searches"]) and
+      d["summary"]["n_groups_glygly"] <= sum(r["n_glygly"] for r in d["searches"]))
 
 print()
 if FAILS: print(f"FAILED ({len(FAILS)}): {', '.join(FAILS)}"); sys.exit(1)

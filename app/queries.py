@@ -5011,7 +5011,14 @@ def ptm_landscape() -> dict[str, Any]:
                 LEFT JOIN raw_files rf              ON rf.raw_path = srf.raw_path
                GROUP BY srf.search_id
             )
-            SELECT a.search_id, s.search_name, s.completed_at, s.search_engine,
+            -- completed_at is populated on 3 of 2,112 searches (measured 2026-09-17) and on ZERO
+            -- of the ones in this rollup, so a Date column built on it alone is blank for every
+            -- row. ingested_at is populated on all 2,112; every other FRAN view dates a search
+            -- that way. COALESCE, so a real completion date still wins where one exists.
+            SELECT a.search_id, s.search_name,
+                   COALESCE(s.completed_at, s.ingested_at) AS completed_at,
+                   (s.completed_at IS NULL)                AS date_is_ingest,
+                   s.search_engine,
                    m.organism, m.instrument,
                    a.n_groups, a.n_ptm, a.n_phospho, a.n_glygly, a.mod_precursors,
                    s.n_precursors_total
@@ -5035,6 +5042,7 @@ def ptm_landscape() -> dict[str, Any]:
                 "search_id": str(r["search_id"]),
                 "search_name": r.get("search_name"),
                 "completed_at": r["completed_at"].isoformat() if r.get("completed_at") else None,
+                "date_is_ingest": bool(r.get("date_is_ingest")),
                 "search_engine": r.get("search_engine"),
                 "organism": r.get("organism"),
                 "instrument": (r.get("instrument") or "").strip() or None,
@@ -5049,21 +5057,42 @@ def ptm_landscape() -> dict[str, Any]:
             })
         searches.sort(key=lambda x: (x["modified_rate"] is None, -(x["modified_rate"] or 0)))
 
+        gcounts = query(
+            """
+            SELECT COUNT(DISTINCT protein_group) FILTER (WHERE has_ptm)     AS g_ptm,
+                   COUNT(DISTINCT protein_group) FILTER (WHERE has_phospho) AS g_phospho,
+                   COUNT(DISTINCT protein_group) FILTER (WHERE has_glygly)  AS g_glygly
+              FROM delimp_search_protein_ptm
+            """,
+            tables=["delimp_search_protein_ptm"], fetch="one") or {}
+
         n_total = query("SELECT COUNT(*) FROM delimp_searches", tables=["delimp_searches"],
                         fetch="val")
         return {
             "coverage": {
                 "n_searches_total": int(n_total or 0),
                 "n_searches_covered": len(searches),
-                "n_uncomputable": max(int(n_total or 0) - len(searches), 0),
+                # NOT "uncomputable": this is simply everything absent from the rollup, which
+                # is TWO different states -- a search whose precursors carry no protein_group (so
+                # the rollup can never produce a row: 5 such today) and a search the refresh job
+                # has not reached yet. They look identical from here, and the second kind appears
+                # every time new data is ingested, because ingest/fran_ptm_refresh.sbatch is NOT
+                # on Hive's crontab (verified 2026-09-17; see ingest/DEPLOY_ptm_refresh.md). The
+                # page must therefore not assert a reason it cannot know.
+                "n_not_in_rollup": max(int(n_total or 0) - len(searches), 0),
             },
             "summary": {
                 "n_searches_any_ptm": sum(1 for s in searches if s["n_ptm"]),
                 "n_searches_phospho": sum(1 for s in searches if s["n_phospho"]),
                 "n_searches_glygly": sum(1 for s in searches if s["n_glygly"]),
-                "n_groups_any_ptm": sum(s["n_ptm"] for s in searches),
-                "n_groups_phospho": sum(s["n_phospho"] for s in searches),
-                "n_groups_glygly": sum(s["n_glygly"] for s in searches),
+                # DISTINCT across the corpus, not a sum of per-search counts. Summing counted a
+                # protein group once per search it appears in and overstated by ~8x: it rendered
+                # 2,637,809 under a tile reading "Protein groups modified" when the corpus holds
+                # 328,046 distinct such groups (measured 2026-09-17). The tile sits directly under
+                # "Searches with a modification", so it reads as a corpus total and must be one.
+                "n_groups_any_ptm": int(gcounts.get("g_ptm") or 0),
+                "n_groups_phospho": int(gcounts.get("g_phospho") or 0),
+                "n_groups_glygly": int(gcounts.get("g_glygly") or 0),
                 # The corpus baseline, so a reader can calibrate a single search's rate instead
                 # of reading it against an imagined zero. Measured 20.2% on 2026-09-17, and it is
                 # mostly background methionine oxidation rather than any enrichment -- see
