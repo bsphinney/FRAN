@@ -4974,3 +4974,113 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
         # modified proteins".
         result["ptm_rollup_ready"] = ptm_ready
     return result
+
+
+def ptm_landscape() -> dict[str, Any]:
+    """Per-search modified-precursor rate — which PTM enrichments actually worked.
+
+    Reads ONLY the rollup + search metadata. NEVER delimp_precursors: computing this live is a
+    >15-minute corpus scan and this page is public and anonymous. The full per-search GROUP BY
+    over the 5.26M-row rollup measured 1.4 s on 2026-09-17.
+
+    The rollup flags only has_ptm / has_phospho / has_glygly, so this CANNOT distinguish
+    oxidation from acetyl from deamidation. The page says so; do not let a caller infer that an
+    absent flag means an absent modification.
+    """
+    def _p() -> dict[str, Any]:
+        rows = query(
+            """
+            WITH agg AS (
+              SELECT search_id,
+                     COUNT(*)                                AS n_groups,
+                     COUNT(*) FILTER (WHERE has_ptm)         AS n_ptm,
+                     COUNT(*) FILTER (WHERE has_phospho)     AS n_phospho,
+                     COUNT(*) FILTER (WHERE has_glygly)      AS n_glygly,
+                     SUM(n_mod_precursors)                   AS mod_precursors
+                FROM delimp_search_protein_ptm
+               GROUP BY search_id
+            ),
+            -- species/instrument are NOT on delimp_searches (verified 2026-09-17); they come
+            -- through the run join. Bounded by runs (23,871 rows), not precursors.
+            meta AS (
+              SELECT srf.search_id,
+                     MODE() WITHIN GROUP (ORDER BY sm.organism_name)   AS organism,
+                     MODE() WITHIN GROUP (ORDER BY rf.instrument_model) AS instrument
+                FROM search_raw_files srf
+                LEFT JOIN delimp_sample_metadata sm ON sm.raw_path = srf.raw_path
+                LEFT JOIN raw_files rf              ON rf.raw_path = srf.raw_path
+               GROUP BY srf.search_id
+            )
+            SELECT a.search_id, s.search_name, s.completed_at, s.search_engine,
+                   m.organism, m.instrument,
+                   a.n_groups, a.n_ptm, a.n_phospho, a.n_glygly, a.mod_precursors,
+                   s.n_precursors_total
+              FROM agg a
+              JOIN delimp_searches s ON s.id = a.search_id
+              LEFT JOIN meta m       ON m.search_id = a.search_id
+             ORDER BY a.n_ptm DESC
+            """,
+            tables=["delimp_search_protein_ptm", "delimp_searches",
+                    "search_raw_files", "delimp_sample_metadata", "raw_files"],
+        )
+
+        searches = []
+        for r in rows:
+            total = r.get("n_precursors_total")
+            modp = int(r.get("mod_precursors") or 0)
+            # A rate needs a real denominator. No denominator -> no rate AND no verdict: a 0.0
+            # here would read as "nothing was modified", which is a claim we cannot make.
+            rate = (modp / total) if (total and total > 0) else None
+            searches.append({
+                "search_id": str(r["search_id"]),
+                "search_name": r.get("search_name"),
+                "completed_at": r["completed_at"].isoformat() if r.get("completed_at") else None,
+                "search_engine": r.get("search_engine"),
+                "organism": r.get("organism"),
+                "instrument": (r.get("instrument") or "").strip() or None,
+                "n_groups": int(r.get("n_groups") or 0),
+                "n_ptm": int(r.get("n_ptm") or 0),
+                "n_phospho": int(r.get("n_phospho") or 0),
+                "n_glygly": int(r.get("n_glygly") or 0),
+                "mod_precursors": modp,
+                "n_precursors_total": int(total) if total else None,
+                "modified_rate": rate,
+                "verdict": _ptm_verdict(rate),
+            })
+        searches.sort(key=lambda x: (x["modified_rate"] is None, -(x["modified_rate"] or 0)))
+
+        n_total = query("SELECT COUNT(*) FROM delimp_searches", tables=["delimp_searches"],
+                        fetch="val")
+        return {
+            "coverage": {
+                "n_searches_total": int(n_total or 0),
+                "n_searches_covered": len(searches),
+                "n_uncomputable": max(int(n_total or 0) - len(searches), 0),
+            },
+            "summary": {
+                "n_searches_any_ptm": sum(1 for s in searches if s["n_ptm"]),
+                "n_searches_phospho": sum(1 for s in searches if s["n_phospho"]),
+                "n_searches_glygly": sum(1 for s in searches if s["n_glygly"]),
+                "n_groups_any_ptm": sum(s["n_ptm"] for s in searches),
+                "n_groups_phospho": sum(s["n_phospho"] for s in searches),
+                "n_groups_glygly": sum(s["n_glygly"] for s in searches),
+            },
+            "searches": searches,
+        }
+    return SLOW_CACHE.get_or_set("ptm_landscape", _p)
+
+
+def _ptm_verdict(rate: float | None) -> str | None:
+    """Rate-only classification. NEVER 'failed'.
+
+    FRAN cannot distinguish a failed enrichment from a sample that was never enriched, and
+    inferring intent from search_name is a guess about a human's naming habits. So this reads the
+    rate and nothing else, and the UI states that basis next to the label.
+    """
+    if rate is None:
+        return None
+    if rate >= 0.50:
+        return "enriched"
+    if rate >= 0.05:
+        return "low for an enrichment"
+    return "incidental"
