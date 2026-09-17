@@ -1963,23 +1963,76 @@ async function renderPTM(){
     <div class="glass card p-5 fade-in mt-4">
       <h3 class="font-bold text-white mb-1">Modified-precursor rate by search</h3>
       <div class="text-xs text-slate-400 mb-3">
-        Sorted by rate. <b>The corpus median is ${medPct||'—'}</b>, most of it background methionine
+        <b>The corpus median is ${medPct||'—'}</b>, most of it background methionine
         oxidation rather than enrichment — so read a single search against that, not against zero.
         Only the clear extremes are labelled; a search in the ordinary range shows its rate and no
         verdict, because FRAN does not know whether an enrichment was attempted.
         <span class="text-slate-500">Search names are shown as <code>search-xxxxxx</code> unless you are signed in.</span>
       </div>
-      ${table(['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
-        rows.slice(0,400).map(r=>[
-          `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${esc(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
-          esc((r.completed_at||'').slice(0,10)),
-          esc(r.organism||'—'),
-          esc(r.instrument||'—'),
-          fmt(r.n_ptm), fmt(r.n_phospho), fmt(r.n_glygly),
-          r.modified_rate==null ? '<span class="text-slate-500">—</span>' : (r.modified_rate*100).toFixed(1)+'%',
-          verdictChip(r.verdict, r.modified_rate),
-        ]))}
+      <div class="flex flex-wrap gap-2 items-center mb-3">
+        <input id="ptmFilter" placeholder="filter by name, species, instrument…"
+               class="bg-slate-800/70 border border-slate-700 rounded-lg px-3 py-1 text-sm text-slate-200 w-64"
+               oninput="__ptmRender()">
+        <select id="ptmVerdict" onchange="__ptmRender()"
+                class="bg-slate-800/70 border border-slate-700 rounded-lg px-2 py-1 text-sm text-slate-200">
+          <option value="">all verdicts</option>
+          <option value="enriched">enriched</option>
+          <option value="incidental">incidental</option>
+          <option value="none">no label</option>
+        </select>
+        <select id="ptmSort" onchange="__ptmRender()"
+                class="bg-slate-800/70 border border-slate-700 rounded-lg px-2 py-1 text-sm text-slate-200">
+          <option value="desc">highest rate first</option>
+          <option value="asc">lowest rate first</option>
+        </select>
+        <span id="ptmCount" class="text-xs text-slate-500"></span>
+      </div>
+      <div id="ptmTable" class="overflow-x-auto"></div>
     </div>`;
+
+  // THE TABLE IS FILTERED AND SORTABLE, NOT A FIXED TOP-N, AND THAT IS THE POINT.
+  // An earlier revision rendered rows.slice(0,400) of a rate-descending list. Measured against
+  // real data that hid EVERY low-rate search: the first "incidental" row sits at index 1940 of
+  // 2,107, so all 167 of them fell past the cap. The page exists to surface enrichments that did
+  // NOT work, so a view that can only show the winners defeats its own purpose. The cap remains
+  // (2,107 rows of DOM is wasteful) but it now applies AFTER filtering and sorting, so both ends
+  // of the range are reachable.
+  const CAP = 300;
+  window.__ptmRender = function(){
+    const q = ($('#ptmFilter')?.value || '').trim().toLowerCase();
+    const wantV = $('#ptmVerdict')?.value || '';
+    const asc = ($('#ptmSort')?.value || 'desc') === 'asc';
+    let list = rows.filter(r=>{
+      if(wantV === 'none'){ if(r.verdict) return false; }
+      else if(wantV && r.verdict !== wantV) return false;
+      if(!q) return true;
+      return [r.search_name, r.organism, r.instrument, r.search_engine]
+             .some(v => (v||'').toLowerCase().includes(q));
+    });
+    // Rows with no rate sort last in BOTH directions — an absent measurement is not a low one.
+    list = list.slice().sort((a,b)=>{
+      if(a.modified_rate==null && b.modified_rate==null) return 0;
+      if(a.modified_rate==null) return 1;
+      if(b.modified_rate==null) return -1;
+      return asc ? a.modified_rate-b.modified_rate : b.modified_rate-a.modified_rate;
+    });
+    const shown = list.slice(0, CAP);
+    $('#ptmCount').textContent = list.length > CAP
+      ? `showing ${shown.length} of ${list.length} matching (narrow the filter to see the rest)`
+      : `${list.length} matching`;
+    $('#ptmTable').innerHTML = table(
+      ['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
+      shown.map(r=>[
+        `<a class="text-accent-300 hover:underline cursor-pointer" onclick="go('run','${esc(r.search_id)}')">${esc(r.search_name||r.search_id)}</a>`,
+        esc((r.completed_at||'').slice(0,10)),
+        esc(r.organism||'—'),
+        esc(r.instrument||'—'),
+        fmt(r.n_ptm), fmt(r.n_phospho), fmt(r.n_glygly),
+        r.modified_rate==null ? '<span class="text-slate-500">—</span>' : (r.modified_rate*100).toFixed(1)+'%',
+        verdictChip(r.verdict, r.modified_rate),
+      ]));
+  };
+  window.__ptmRender();
 }
 
 /* ---------- SPECIES SHOWCASE — a cross-species tour of every organism ---------- */
