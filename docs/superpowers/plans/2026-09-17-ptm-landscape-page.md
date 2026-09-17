@@ -387,14 +387,18 @@ async function renderPTM(){
        ${fmt(cov.n_uncomputable)} cannot be computed from their own data (no precursor carries a protein group).`
     : `Covering all ${fmt(cov.n_searches_covered)} searches.`;
 
+  // Only TWO labels exist plus no-label — see _ptm_verdict() in app/queries.py. The middle band
+  // deliberately carries none: it would have covered 1,900 of 2,107 searches, because the corpus
+  // median (~20%) is background methionine oxidation, not enrichment.
   const verdictChip = (v, rate) => {
-    if(!v) return `<span class="text-slate-500" title="No precursor total recorded for this search, so no rate can be computed. This is an absence, not a zero.">—</span>`;
-    const cls = v==='enriched' ? 'bg-emerald-500/20 text-emerald-300'
-              : v==='low for an enrichment' ? 'bg-amber-500/20 text-amber-300'
-              : 'bg-slate-600/30 text-slate-300';
+    if(!v) return `<span class="text-slate-500" title="${rate==null
+        ? 'No precursor total recorded for this search, so no rate can be computed. This is an absence, not a zero.'
+        : 'No label: this rate sits in the ordinary range for the corpus, where most modification is background oxidation rather than enrichment. Read the rate against the median above.'}">—</span>`;
+    const cls = v==='enriched' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-600/30 text-slate-300';
     const tip = `${(rate*100).toFixed(1)}% of precursors carry a modification. Classified by rate alone — FRAN cannot tell a failed enrichment from a sample that was never enriched.`;
     return `<span class="px-2 py-0.5 rounded text-xs font-semibold ${cls}" title="${esc(tip)}">${esc(v)}</span>`;
   };
+  const medPct = sm.median_rate==null ? null : (sm.median_rate*100).toFixed(1)+'%';
 
   app.innerHTML = `
     <div class="glass card p-5 fade-in">
@@ -417,7 +421,13 @@ async function renderPTM(){
 
     <div class="glass card p-5 fade-in mt-4">
       <h3 class="font-bold text-white mb-1">Modified-precursor rate by search</h3>
-      <div class="text-xs text-slate-400 mb-3">Sorted by rate. A high rate on an enrichment means it worked; a low one means it did not enrich, or was never meant to.</div>
+      <div class="text-xs text-slate-400 mb-3">
+        Sorted by rate. <b>The corpus median is ${medPct||'—'}</b>, most of it background methionine
+        oxidation rather than enrichment — so read a single search against that, not against zero.
+        Only the clear extremes are labelled; a search in the ordinary range shows its rate and no
+        verdict, because FRAN does not know whether an enrichment was attempted.
+        <span class="text-slate-500">Search names are shown as <code>search-xxxxxx</code> unless you are signed in.</span>
+      </div>
       <div class="overflow-x-auto">
       ${table(['Search','Date','Species','Instrument','Groups w/ mod','Phospho','GlyGly','Modified rate','Verdict'],
         rows.slice(0,400).map(r=>[
