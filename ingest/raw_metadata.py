@@ -20,7 +20,14 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
+
+# Same idiom the rest of ingest/ uses to import a sibling module: ingest/ is not
+# a package, and raw_metadata is imported both as a module by corpus_ingest and
+# run directly by record_raw_metadata.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tdf_safe import connect_tdf                            # noqa: E402
 
 TRFP = os.environ.get("FRAN_TRFP", "/quobyte/proteomics-grp/tools/ThermoRawFileParser/ThermoRawFileParser")
 
@@ -78,11 +85,17 @@ def _dir_size(path):
 
 
 def read_bruker(path):
-    """Bruker .d — analysis.tdf GlobalMetadata. Opened read-only so a live acquisition is safe."""
+    """Bruker .d — analysis.tdf GlobalMetadata.
+
+    Opened immutable, not merely read-only. A plain `mode=ro` open reads *through* any
+    stale mid-acquisition analysis.tdf-wal left beside the tdf by an interrupted copy, so
+    the instrument metadata recorded here would silently be mid-acquisition state, and it
+    drops an analysis.tdf-shm inside the raw .d. See ingest/tdf_safe.py.
+    """
     tdf = os.path.join(path, "analysis.tdf")
     if not os.path.exists(tdf):
         return None
-    con = sqlite3.connect(f"file:{tdf}?mode=ro", uri=True)
+    con = connect_tdf(tdf)
     try:
         g = dict(con.execute("SELECT Key, Value FROM GlobalMetadata").fetchall())
         try:
