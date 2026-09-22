@@ -1,0 +1,29 @@
+# bruker_copy deployment manifest
+#
+# CANONICAL SOURCE:  FRAN repo, ingest/windows/   <-- edit HERE
+# THIS COPY:         a deployment target          <-- never edit here
+#
+# The share's own CLAUDE.md, Rule 5: 'fix in the repo -> commit -> sync
+# out'. Editing a script here and copying it back is how this folder
+# drifted three months from the repo once already.
+#
+# Check a deployed copy against the repo:
+#     shasum -a 256 <file>                  # Hive / Mac
+#     certutil -hashfile <file> SHA256      # Windows
+# A line that does not match means the deployed copy is stale or was
+# edited in place. Re-sync from the repo; do not merge.
+#
+deployed_utc:  2026-09-21T21:21:03Z
+repo:          github.com/bsphinney/FRAN  ingest/windows/
+repo_commit:   6b9aacd (working tree; not yet committed)
+tests:         143 copier + 69 swap = 212 assertions, all passing (pwsh 7.6.6 / macOS)
+untested:      robocopy, PowerShell 5.1, schtasks, real timsTOF data. See README.
+
+# sha256                                                            size  file
+c7e077dfd83c5f6cd0b4b12869bd3fa5683a0ad0a0b9b5d473c8ea223a90f29e    52825  bruker_d_copy.ps1
+866a5b1bce7a841f123b346e2943e84a5b72765c820c838693df82447021baaa     1845  copy_raw_d_safe.bat
+08f5669b9f6dfdabcf30c76f988738ec14427b12b34582a6dfc506531c755cbc    27133  swap_to_safe_copier.ps1
+58284237fdb17bd285b1b487cd8c4702dedc313dbc43aa0b2e9692902a76ecb0     6067  rollback_safe_copier.ps1
+675dbd53fb6716813ecc70ad176234fd40c549f561840c90e2ef044aedf75078    39985  test_bruker_d_copy.ps1
+19be654f115335c627ee82079e67057c5c4c8f609e45eff763a0f9fc162a2b8f    16243  test_swap_to_safe_copier.ps1
+8d69762628d44341331ac78827f3279fea90bebf0f95b79a688d8b73258e030d    32737  README.md
