@@ -246,6 +246,11 @@ def _diann_rows(df):
     # report column, and inventing a mapping would be worse than leaving it NULL.
     cPEP, cEQ = c("PEP"), c("Empirical.Quality")
     cPID, cFWHM = c("Precursor.Id"), c("FWHM")
+    # Added 2026-09-23. DIA-NN writes 72 columns and FRAN read 20 of them; these are the 35 that
+    # earn their bytes, chosen from a measurement over all 80 pilot reports (45,058,279 rows) --
+    # see ingest/migrations/2026-09-23_diann_report_columns.sql for what was left out and why.
+    # Every one goes through c(), so a report that predates a column (FragPipe's bundled DIA-NN
+    # 1.8.2b8 has almost none of them) yields None rather than raising.
     if not (cR and cStr and cCh):
         raise ValueError(f"DIA-NN report missing Run/Stripped.Sequence/Precursor.Charge; have {list(df.columns)[:20]}")
     if cQ:
@@ -258,15 +263,89 @@ def _diann_rows(df):
                "intensity": cInt, "normalized_intensity": cNorm,
                "pep": cPEP, "empirical_quality": cEQ,
                "precursor_id_diann": cPID, "peak_fwhm": cFWHM,
-               "protein_group": cPG, "gene": cGene}
+               "protein_group": cPG, "gene": cGene,
+               # --- per-precursor, new 2026-09-23 -------------------------------------------
+               "rt_start": c("RT.Start"), "rt_stop": c("RT.Stop"),
+               # DIA-NN 1.x calls it RT.Predicted and ships no iRT, so cIRT above already falls
+               # back to it; predicted_rt does the same and the two then resolve to ONE report
+               # column. That is the alias case the de-duplication below exists for.
+               "predicted_rt": c("Predicted.RT", "RT.Predicted"),
+               "predicted_irt": c("Predicted.iRT"),
+               "predicted_im": c("Predicted.IM"), "predicted_iim": c("Predicted.iIM"),
+               "ms1_area": c("Ms1.Area"), "ms1_normalised": c("Ms1.Normalised"),
+               "ms1_apex_area": c("Ms1.Apex.Area"),
+               "ms1_apex_mz_delta": c("Ms1.Apex.Mz.Delta"),
+               "ms1_total_signal_before": c("Ms1.Total.Signal.Before"),
+               "ms1_total_signal_after": c("Ms1.Total.Signal.After"),
+               "ms1_profile_corr": c("Ms1.Profile.Corr"),
+               "quantity_quality": c("Quantity.Quality"), "evidence": c("Evidence"),
+               "mass_evidence": c("Mass.Evidence"), "channel_evidence": c("Channel.Evidence"),
+               "averagine": c("Averagine"),
+               "normalisation_factor": c("Normalisation.Factor"),
+               "normalisation_noise": c("Normalisation.Noise"),
+               "best_fr_mz": c("Best.Fr.Mz"), "best_fr_mz_delta": c("Best.Fr.Mz.Delta"),
+               "peptidoform_q_value": c("Peptidoform.Q.Value"),
+               "global_peptidoform_q_value": c("Global.Peptidoform.Q.Value"),
+               "proteotypic": c("Proteotypic"),
+               "ptm_site_confidence": c("PTM.Site.Confidence"),
+               # --- the Lib.* family (2026-09-24). Properties of the spectral-library ENTRY,
+               # constant per Precursor.Id, so they describe the library rather than the sample.
+               # Carried anyway because a library-side q-value is exactly the feature a rescoring
+               # model needs, and it cannot be recovered later without re-reading every report. --
+               "lib_q_value": c("Lib.Q.Value"),
+               "lib_peptidoform_q_value": c("Lib.Peptidoform.Q.Value"),
+               "lib_pg_q_value": c("Lib.PG.Q.Value"),
+               "lib_ptm_site_confidence": c("Lib.PTM.Site.Confidence"),
+               # Protein.Ids is constant within Protein.Group in only 86.8% of groups, so unlike
+               # Protein.Names it is a genuine per-precursor value and is not derivable from
+               # anything else FRAN stores. Protein.Sites is 72-81% empty and is the only column
+               # recording WHERE on the protein a modification sits.
+               "protein_ids": c("Protein.Ids"),
+               "protein_sites": c("Protein.Sites"),
+               # --- protein/gene level: consumed by the delimp_proteins aggregation in
+               # ingest(), NOT inserted into delimp_precursors. Each is constant within
+               # (run, protein_group) or (run, genes) in 100.000% of groups measured, so
+               # carrying it on 532M precursor rows would repeat one number ~12x over. ------
+               "pg_maxlfq": c("PG.MaxLFQ"), "pg_maxlfq_quality": c("PG.MaxLFQ.Quality"),
+               "pg_pep": c("PG.PEP"), "global_pg_q_value": c("Global.PG.Q.Value"),
+               "protein_q_value": c("Protein.Q.Value"),
+               "genes_maxlfq": c("Genes.MaxLFQ"),
+               "genes_maxlfq_unique": c("Genes.MaxLFQ.Unique"),
+               "genes_maxlfq_quality": c("Genes.MaxLFQ.Quality"),
+               "genes_maxlfq_unique_quality": c("Genes.MaxLFQ.Unique.Quality"),
+               "gg_q_value": c("GG.Q.Value")}
     present = {k: v for k, v in mapping.items() if v}
-    sub = df[list(present.values())].rename(columns={v: k for k, v in present.items()})
+    # Two mapping keys can legitimately resolve to the SAME report column: DIA-NN 1.x has
+    # `RT.Predicted` and no `iRT`, so both `irt` and `predicted_rt` can land on it. Selecting a
+    # duplicated column and renaming it would leave the frame with two identically-named columns
+    # and `to_dict("records")` would silently keep only one. Select each source column ONCE and
+    # fan it back out to the other keys afterwards; `aliases` is empty for every DIA-NN 2.x
+    # report, so the normal path pays nothing.
+    first_key: dict = {}
+    for k, v in present.items():
+        first_key.setdefault(v, k)
+    aliases = [(k, first_key[v]) for k, v in present.items() if first_key[v] != k]
+    srcs = list(dict.fromkeys(present.values()))
+    sub = df[srcs].rename(columns=first_key)
     for row in sub.to_dict("records"):
+        for k, src in aliases:
+            row[k] = row.get(src)
         modseq = row.get("modified_seq_diann")
         mods, nmods, pf = parse_mods(modseq)
         row["mods"], row["n_mods"], row["modified_seq_proforma"] = mods, nmods, pf
         for f in mapping:                       # ensure all keys exist
             row.setdefault(f, None)
+        # PTM.Site.Confidence -> the EXISTING site_localization_probability column, which no
+        # DIA-NN search has ever populated. DIA-NN emits a literal 1.0 for every unmodified
+        # precursor (measured: 100% of unmodified rows across 6 reports), and ~78% of rows are
+        # unmodified. Writing those 1.0s would make the column read as "localized with total
+        # confidence" on peptides that have nothing to localize, and the `>0.75` filters that
+        # already read this column would start passing every unmodified precursor. Only a
+        # precursor that actually carries a modification gets a value.
+        # Popped unconditionally — left on the record it would be a key no column receives, and
+        # _warn_unmapped_record_keys would (correctly) shout about it on every ingest.
+        _conf = row.pop("ptm_site_confidence", None)
+        row["site_localization_probability"] = _conf if nmods else None
         if row.get("precursor_mz") is None:     # DIA-NN 1.x has no Precursor.Mz -> compute it
             row["precursor_mz"] = _calc_prec_mz(modseq or row.get("stripped_seq"), row.get("charge"))
         if row.get("run"):                      # DIA-NN 1.7.x File.Name is a full path -> basename
@@ -469,6 +548,17 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         qv = _flt(x.get("pg_q_value"))
         if qv is not None:
             a["pgq"] = qv if a["pgq"] is None else min(a["pgq"], qv)
+        # DIA-NN's own protein- and gene-level numbers (MaxLFQ + the protein FDR family), which
+        # FRAN discarded entirely until 2026-09-23. FIRST NON-NULL WINS, not min/sum: each of
+        # these was measured constant within (run, protein_group) -- or within (run, genes), with
+        # genes itself functionally determined by protein_group -- in 100.000% of groups across
+        # six reports, so every precursor of this group carries the SAME value and aggregating
+        # would only invent a number DIA-NN did not write. Unlike `intensity` above, MaxLFQ is
+        # already a protein-level quant: summing it over precursors would multiply it by the
+        # precursor count.
+        for _k in _PROTEIN_LEVEL_COLS:
+            if a.get(_k) is None:
+                a[_k] = _flt(x.get(_k))
     # PROTEIN GROUPS vs PROTEINS (2026-07-27). Spectronaut reports both and they are NOT the same:
     # a protein group's label is the ';'-joined accessions of its members ("E2RE03;J9P669"), so 635
     # groups can expand to 1,350 proteins. FRAN stored only the group count — in a column named
@@ -596,6 +686,20 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                     cur.execute("ROLLBACK TO SAVEPOINT addcol")
                     print(f"  [skip] could not add {c} now ({type(e).__name__}); a later ingest will")
             cur.execute("RESET lock_timeout")
+        # The 25 DIA-NN report columns are all-or-nothing, and are NEVER auto-added here. Twenty-
+        # five ALTERs inside the ingest transaction is precisely the AccessExclusiveLock pile-up
+        # the comment above is about; they belong in ingest/migrate_diann_columns.py, run once
+        # against a quiet table. If they are absent we simply do not write them -- the ingest
+        # still succeeds, and because a re-ingest is a delete-then-insert, running it again after
+        # the migration is itself the backfill.
+        cur.execute("""SELECT column_name FROM information_schema.columns
+                        WHERE table_name='delimp_precursors' AND column_name = ANY(%s)""",
+                    (list(_DIANN_PREC_COLS),))
+        write_diann = {r[0] for r in cur.fetchall()} == set(_DIANN_PREC_COLS)
+        if not write_diann:
+            print(f"  [precursors] the {len(_DIANN_PREC_COLS)} DIA-NN report columns are not all "
+                  f"present; writing without them. Run ingest/migrate_diann_columns.py --apply, "
+                  f"then re-ingest this search to fill them.", flush=True)
         # write protein_group only if the column exists (so an ingest before the one-time add
         # still succeeds, just without the link until a later run backfills it)
         write_pg = "protein_group" in have_cols
@@ -845,11 +949,26 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                         (rp, taxon, organism_name, SCHEMA_VERSION))
             cur.execute("INSERT INTO search_raw_files (search_id,raw_path,n_precursors) VALUES (%s,%s,%s)",
                         (search_id, rp, sum(1 for x in recs if str(x["run"]) == run)))
+        # The DIA-NN protein/gene columns go on the END of the list, in _PROTEIN_LEVEL_COLS order,
+        # and the tuple appends them the same way. Written only when the columns exist, so an
+        # ingest run before migrate_diann_columns.py has been applied still works -- same
+        # catalog-check-then-narrow discipline as write_pg above.
+        cur.execute("""SELECT column_name FROM information_schema.columns
+                        WHERE table_name='delimp_proteins' AND column_name = ANY(%s)""",
+                    (list(_PROTEIN_LEVEL_COLS),))
+        _have_prot = {r[0] for r in cur.fetchall()}
+        _prot_extra = [c for c in _PROTEIN_LEVEL_COLS if c in _have_prot]
+        if len(_prot_extra) != len(_PROTEIN_LEVEL_COLS):
+            print(f"  [proteins] {len(_PROTEIN_LEVEL_COLS) - len(_prot_extra)} DIA-NN protein "
+                  f"column(s) absent; run ingest/migrate_diann_columns.py --apply to record them")
         psycopg2.extras.execute_values(cur,
-            "INSERT INTO delimp_proteins (search_id,raw_path,protein_group,gene,n_unique_peptides,n_precursors,intensity,normalized_intensity,pg_q_value,is_contaminant,ingested_schema_version) VALUES %s",
+            "INSERT INTO delimp_proteins (search_id,raw_path,protein_group,gene,n_unique_peptides,"
+            "n_precursors,intensity,normalized_intensity,pg_q_value,is_contaminant,"
+            "ingested_schema_version" + "".join("," + c for c in _prot_extra) + ") VALUES %s",
             [(search_id, raw_paths[k[0]], k[1] or "UNKNOWN", a["gene"], len(a["peps"]), a["n"],
               (a["int"] if a["has_int"] else None), (a["nint"] or None), a["pgq"],
-              bool(re.search(r"KRT|keratin|cont_|contaminant", str(k[1]) + str(a["gene"]), re.I)), SCHEMA_VERSION)
+              bool(re.search(r"KRT|keratin|cont_|contaminant", str(k[1]) + str(a["gene"]), re.I)), SCHEMA_VERSION,
+              *(a.get(c) for c in _prot_extra))
              for k, a in prot.items()], page_size=2000)
         # protein_group on each precursor = the peptide<->protein link (enables exact, fast
         # coverage + per-protein quant in the app; see FRAN_REINGEST_AUDIT.md). Included only when
@@ -859,6 +978,34 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             return str(v) if v else None
         if recs:
             _warn_unmapped_record_keys(recs[0])
+        # The DIA-NN block below must stay in the same order as the matching run of names in
+        # _PREC_COLS, and both tuples must carry it identically. tests/test_precursor_column_
+        # coverage.py counts the arity of both against the column list for exactly this reason:
+        # an off-by-one here shifts every column after it and psycopg2 only notices at runtime,
+        # against production.
+        def _diann_block(x):
+            if not write_diann:                 # columns absent -> contribute nothing at all
+                return ()
+            return (_flt(x.get("rt_start")), _flt(x.get("rt_stop")),
+                    _flt(x.get("predicted_rt")), _irt(x.get("predicted_irt")),
+                    _im(x.get("predicted_im")), _im(x.get("predicted_iim")),
+                    _flt(x.get("ms1_area")), _flt(x.get("ms1_normalised")),
+                    _flt(x.get("ms1_apex_area")), _flt(x.get("ms1_apex_mz_delta")),
+                    _flt(x.get("ms1_total_signal_before")), _flt(x.get("ms1_total_signal_after")),
+                    _flt(x.get("ms1_profile_corr")),
+                    _flt(x.get("quantity_quality")), _flt(x.get("evidence")),
+                    _flt(x.get("mass_evidence")), _flt(x.get("channel_evidence")),
+                    _flt(x.get("averagine")),
+                    _flt(x.get("normalisation_factor")), _flt(x.get("normalisation_noise")),
+                    _flt(x.get("best_fr_mz")), _flt(x.get("best_fr_mz_delta")),
+                    _flt(x.get("peptidoform_q_value")),
+                    _flt(x.get("global_peptidoform_q_value")), _bool01(x.get("proteotypic")),
+                    # Same order as the tail of _DIANN_PREC_COLS. The four Lib.* values are
+                    # float32 in every report; protein_ids / protein_sites are text and go
+                    # through _clean_text for the same NUL/encoding reasons as precursor_id_diann.
+                    _flt(x.get("lib_q_value")), _flt(x.get("lib_peptidoform_q_value")),
+                    _flt(x.get("lib_pg_q_value")), _flt(x.get("lib_ptm_site_confidence")),
+                    _clean_text(x.get("protein_ids")), _clean_text(x.get("protein_sites")))
         if write_pg:
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
                   x["mods"], x["n_mods"], int(x["charge"]) if x["charge"] else None, _flt(x["precursor_mz"]), _flt(x["rt"]),
@@ -866,6 +1013,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                   _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
                   _flt(x.get("pep")), _flt(x.get("empirical_quality")),
                   _clean_text(x.get("precursor_id_diann")), _flt(x.get("peak_fwhm")),
+                  *_diann_block(x),
                   _pg(x), SCHEMA_VERSION) for x in recs]
         else:
             prec_rows = [(search_id, raw_paths[str(x["run"])], x["stripped_seq"], x["modified_seq_diann"], x["modified_seq_proforma"],
@@ -874,8 +1022,15 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                   _flt(x["intensity"]), _flt(x["normalized_intensity"]), _flt(x.get("site_localization_probability")),
                   _flt(x.get("pep")), _flt(x.get("empirical_quality")),
                   _clean_text(x.get("precursor_id_diann")), _flt(x.get("peak_fwhm")),
+                  *_diann_block(x),
                   SCHEMA_VERSION) for x in recs]
-        prec_cols = _PREC_COLS if write_pg else _PREC_COLS.replace("protein_group,", "")
+        # Build the header by FILTERING the name list, not by string surgery on it. The old
+        # `.replace("protein_group,", "")` worked only because no other column name ends in
+        # "protein_group"; the same trick applied to the DIA-NN block would rewrite
+        # "mass_evidence," into "mass_," the moment it removed "evidence,".
+        prec_cols = ",".join(c for c in _PREC_COLS.split(",")
+                             if (write_pg or c != "protein_group")
+                             and (write_diann or c not in _DIANN_PREC_COL_SET))
         if BULK_COPY:
             # COPY is the fastest bulk path (esp. on HIVE, campus-LAN to PG Farm). Safe here because
             # the search's prior rows were already deleted by output_dir, so there's no ON CONFLICT.
@@ -985,10 +1140,42 @@ SPECTRUM_LANCE_DIR = None # dir for per-search Lance datasets (set by --lance-di
 XIC_DIR = None            # dir of Spectronaut *.xic.db All-XIC dbs (set by --xic-dir); None disables the XIC lane
 XIC_LANCE_DIR = None      # where the .xic.lance datasets go (set by --xic-lance-dir); defaults to a sibling 'xic_lance' dir
 
+# The DIA-NN report columns carried from 2026-09-23 (migration
+# migrations/2026-09-23_diann_report_columns.sql). NULL on every other engine.
+# ORDER IS LOAD-BEARING: this is spliced into _PREC_COLS and _diann_block() emits its values in
+# exactly this sequence. Keep the two in step or every column after the splice point shifts.
+_DIANN_PREC_COLS = ("rt_start", "rt_stop", "predicted_rt", "predicted_irt", "predicted_im",
+                    "predicted_iim", "ms1_area", "ms1_normalised", "ms1_apex_area",
+                    "ms1_apex_mz_delta", "ms1_total_signal_before", "ms1_total_signal_after",
+                    "ms1_profile_corr", "quantity_quality", "evidence", "mass_evidence",
+                    "channel_evidence", "averagine", "normalisation_factor",
+                    "normalisation_noise", "best_fr_mz", "best_fr_mz_delta",
+                    "peptidoform_q_value", "global_peptidoform_q_value", "proteotypic",
+                    # Appended 2026-09-24 (migrations/2026-09-24_diann_lib_and_protein_columns.sql).
+                    # APPENDED, never inserted: every name before this point keeps its index, so a
+                    # re-read of an older report still lands each value in the same column.
+                    "lib_q_value", "lib_peptidoform_q_value", "lib_pg_q_value",
+                    "lib_ptm_site_confidence", "protein_ids", "protein_sites")
+
 _PREC_COLS = ("search_id,raw_path,stripped_seq,modified_seq_diann,modified_seq_proforma,mods,n_mods,"
               "charge,precursor_mz,rt,irt,im,iim,q_value,global_q_value,pg_q_value,intensity,"
               "normalized_intensity,site_localization_probability,pep,empirical_quality,"
-              "precursor_id_diann,peak_fwhm,protein_group,ingested_schema_version")
+              "precursor_id_diann,peak_fwhm,"
+              + ",".join(_DIANN_PREC_COLS) + ","
+              "protein_group,ingested_schema_version")
+
+# Protein/gene-level keys that _diann_rows puts on every precursor record and that are consumed
+# by the delimp_proteins aggregation in ingest() -- NOT by the precursor INSERT. Each was measured
+# constant within (run, protein_group) or (run, genes) in 100.000% of groups, so delimp_proteins
+# (45M rows) is their correct grain; on delimp_precursors (532M rows) each would repeat one value
+# about twelve times over. Named rather than folded into _PREC_DROPPED_OK so the coverage test can
+# assert they reach a column SOMEWHERE instead of merely being declared droppable.
+# ORDERED, and the order is load-bearing: it is the tail of the delimp_proteins column list and
+# of the tuple built against it. A set would iterate in an order that varies between processes.
+_PROTEIN_LEVEL_COLS = ("pg_maxlfq", "pg_maxlfq_quality", "pg_pep", "global_pg_q_value",
+                       "protein_q_value", "genes_maxlfq", "genes_maxlfq_unique",
+                       "genes_maxlfq_quality", "genes_maxlfq_unique_quality", "gg_q_value")
+_PROTEIN_LEVEL_KEYS = frozenset(_PROTEIN_LEVEL_COLS)
 
 # Every key an adapter may put on a precursor record that is deliberately NOT inserted.
 # `run` and `gene` are consumed upstream (run -> raw_path lookup, gene -> delimp_proteins);
@@ -1011,8 +1198,9 @@ _PREC_COLS = ("search_id,raw_path,stripped_seq,modified_seq_diann,modified_seq_p
 # minutes of being written; the 2026-09-16 audit had not.
 _PREC_DROPPED_OK = frozenset({"run", "gene", "fragment", "library_match",
                               "ptm_assay_probability", "has_localization_info",
-                              "engine", "instrument", "organism", "ccs", "ce"})
+                              "engine", "instrument", "organism", "ccs", "ce"}) | _PROTEIN_LEVEL_KEYS
 _PREC_COL_SET = frozenset(c.strip() for c in _PREC_COLS.split(","))
+_DIANN_PREC_COL_SET = frozenset(_DIANN_PREC_COLS)
 _warned_unmapped: set[str] = set()
 
 
@@ -1096,6 +1284,15 @@ def _im(v):
     0/negative/absurd means 'no ion mobility' -> store NULL so it can't pollute the IM plot."""
     f = _flt(v)
     return f if (f is not None and 0.3 < f < 2.5) else None
+
+
+def _bool01(v):
+    """DIA-NN's 0/1 integer flags -> bool, preserving "absent" as NULL.
+
+    bool(v) is wrong here: it maps None and NaN to False, which would record "this peptide maps to
+    several proteins" for a report that never said so. Only a real 0 or 1 produces a boolean."""
+    f = _flt(v)
+    return None if f is None else bool(f)
 
 
 def _irt(v):
