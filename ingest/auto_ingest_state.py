@@ -186,6 +186,7 @@ class AttemptStore:
         self._token: str | None = None       # owner token of the lock this process holds
         self._break_hook = None              # tests only: called between judging and breaking
         self._second_look = 1.0              # seconds before re-checking an owner-less stale lock
+        self._break_error: str | None = None # why the last attempt to break a stale lock failed
 
     # ---- file IO --------------------------------------------------------------------------------
 
@@ -275,7 +276,13 @@ class AttemptStore:
         directory away, and checks the renamed directory still carries that owner. If it does not,
         the lock changed hands in between (A died, C broke A's lock and took a fresh one, and B --
         who judged A's -- renamed C's live lock); B puts it back and waits like anyone else. And
-        _unlock() removes the directory only if it is still ours."""
+        _unlock() removes the directory only if it is still ours.
+
+        EVERY pass through the loop reaches the deadline check and the sleep. A break attempt lives
+        in _try_break(), which returns whatever happens: when it `continue`d straight back to mkdir
+        instead, a stale lock whose rename kept failing (EACCES on the state dir) spun this loop at
+        100% CPU past lock_wait -- and every claim()/record() goes through here, so the ingest run
+        would have hung until the 8 h SLURM wall."""
         try:
             os.makedirs(os.path.dirname(self.lock_dir) or ".", exist_ok=True)
         except OSError as e:
@@ -283,6 +290,7 @@ class AttemptStore:
             return False
         me = f"{socket.gethostname()}:{os.getpid()}"
         deadline = time.monotonic() + self.lock_wait
+        self._break_error = None
         while True:
             token = f"{me}:{time.time_ns()}"
             try:
@@ -300,50 +308,58 @@ class AttemptStore:
                 except OSError:
                     self._token = None            # held, but unmarked: see _unlock
                 return True
-            try:
-                age = time.time() - os.stat(self.lock_dir).st_mtime
-            except OSError:
-                continue                          # released between our mkdir and stat; retry
-            if age > self.stale_lock:
-                judged = self._read_owner(self.lock_dir)
-                if self._break_hook is not None:
-                    self._break_hook(judged)      # tests: interleave another process here
-                if judged is None:
-                    # An OWNER-LESS lock: either its holder died between mkdir and writing the owner
-                    # file, or -- the race -- someone just broke the dead lock and took a fresh one
-                    # whose owner file is not written yet. Verifying the owner after the rename
-                    # cannot tell those apart (None == None), so look again first: a live new
-                    # holder has written its owner, or at least shows a fresh mtime, by then.
-                    time.sleep(self._second_look)
-                    try:
-                        age2 = time.time() - os.stat(self.lock_dir).st_mtime
-                    except OSError:
-                        continue
-                    if self._read_owner(self.lock_dir) is not None or age2 <= self.stale_lock:
-                        continue
-                grave = f"{self.lock_dir}.stale.{me.replace(':', '.')}.{time.time_ns()}"
-                try:
-                    os.rename(self.lock_dir, grave)
-                except OSError:
-                    continue                      # someone else broke or released it first
-                if self._read_owner(grave) == judged:
-                    shutil.rmtree(grave, ignore_errors=True)
-                    print(f"  attempt memory: broke a lock {age:.0f}s old held by {judged} "
-                          f"({self.lock_dir})", flush=True)
-                else:
-                    try:
-                        os.rename(grave, self.lock_dir)
-                        print(f"  attempt memory: the lock changed hands while being broken; "
-                              f"restored it to its live holder ({self.lock_dir})", flush=True)
-                    except OSError as e:
-                        self._warn(f"moved a live lock aside by mistake and could not restore it "
-                                   f"({e}); it is at {grave}")
-                continue
+            self._try_break(me)
             if time.monotonic() >= deadline:
-                self._warn(f"lock {self.lock_dir} still held after {self.lock_wait:.0f}s; "
+                why = f" (breaking it failed: {self._break_error})" if self._break_error else ""
+                self._warn(f"lock {self.lock_dir} still held after {self.lock_wait:.0f}s{why}; "
                            f"writing unlocked")
                 return False
             time.sleep(0.05 + random.random() * 0.1)
+
+    def _try_break(self, me: str) -> None:
+        """ONE attempt to break the lock if it is stale. Always returns; never loops or raises."""
+        try:
+            age = time.time() - os.stat(self.lock_dir).st_mtime
+        except OSError:
+            return                                # released meanwhile; the caller retries mkdir
+        if age <= self.stale_lock:
+            return
+        judged = self._read_owner(self.lock_dir)
+        if self._break_hook is not None:
+            self._break_hook(judged)              # tests: interleave another process here
+        if judged is None:
+            # An OWNER-LESS lock: either its holder died between mkdir and writing the owner file,
+            # or -- the race -- someone just broke the dead lock and took a fresh one whose owner
+            # file is not written yet. Verifying the owner after the rename cannot tell those apart
+            # (None == None), so look again first: a live new holder has written its owner, or at
+            # least shows a fresh mtime, by then.
+            time.sleep(self._second_look)
+            try:
+                age2 = time.time() - os.stat(self.lock_dir).st_mtime
+            except OSError:
+                return
+            if self._read_owner(self.lock_dir) is not None or age2 <= self.stale_lock:
+                return
+        grave = f"{self.lock_dir}.stale.{me.replace(':', '.')}.{time.time_ns()}"
+        try:
+            os.rename(self.lock_dir, grave)
+        except OSError as e:
+            # Someone else broke or released it first -- or we may not rename at all (EACCES).
+            # Either way: back to the caller's deadline check and sleep, never straight round.
+            self._break_error = f"{type(e).__name__}: {e}"
+            return
+        if self._read_owner(grave) == judged:
+            shutil.rmtree(grave, ignore_errors=True)
+            print(f"  attempt memory: broke a lock {age:.0f}s old held by {judged} "
+                  f"({self.lock_dir})", flush=True)
+            return
+        try:
+            os.rename(grave, self.lock_dir)
+            print(f"  attempt memory: the lock changed hands while being broken; restored it to "
+                  f"its live holder ({self.lock_dir})", flush=True)
+        except OSError as e:
+            self._warn(f"moved a live lock aside by mistake and could not restore it ({e}); it is "
+                       f"at {grave}")
 
     def _unlock(self) -> None:
         """Release the lock -- only if it is still OURS. A write that outlived STALE_LOCK_S may have

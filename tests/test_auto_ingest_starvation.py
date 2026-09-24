@@ -851,6 +851,42 @@ with tempfile.TemporaryDirectory() as tmp:
     y._unlock()
     check("  ...and does remove its own", not os.path.exists(lkd))
 
+    # A stale lock that can NOT be broken (rename -> EACCES: e.g. the state dir went read-only) must
+    # not spin _lock() forever -- every claim()/record() goes through it, so the ingest run would
+    # hang until the SLURM wall. It gives up at lock_wait and never removes the lock.
+    import threading
+    os.makedirs(lkd)
+    open(os.path.join(lkd, "owner"), "w").write("dead:holder:1\n")
+    os.utime(lkd, (time.time() - 3600,) * 2)
+    real_rename = ais.os.rename
+    def no_rename(src, dst, *a, **k):
+        if str(src).rstrip("/") == lkd:
+            raise PermissionError(13, "Permission denied", src)
+        return real_rename(src, dst, *a, **k)
+    ro = ais.AttemptStore(lk, lock_wait=0.6)
+    box = {"out": ""}
+    # NOT redirect_stdout: it swaps sys.stdout for the whole process, so a thread still spinning
+    # inside it (the bug) would swallow every check printed after it. Capture the warning instead.
+    ro._warn = lambda msg: box.__setitem__("out", box["out"] + msg + "\n")
+    def attempt():
+        t0 = time.monotonic()
+        box["got"] = ro._lock()
+        box["secs"] = time.monotonic() - t0
+    ais.os.rename = no_rename
+    try:
+        th = threading.Thread(target=attempt, daemon=True)
+        th.start()
+        th.join(timeout=10)
+    finally:
+        ais.os.rename = real_rename
+    check("an unbreakable stale lock (rename EACCES) does not spin: _lock gives up at lock_wait",
+          not th.is_alive() and box.get("got") is False and box.get("secs", 99) < 0.6 + 1.0,
+          f"alive={th.is_alive()} {box.get('secs')} {box.get('out')}")
+    check("  ...says why, and never removes the lock it could not break",
+          "PermissionError" in box.get("out", "") and os.path.isfile(os.path.join(lkd, "owner"))
+          and open(os.path.join(lkd, "owner")).read().strip() == "dead:holder:1", box.get("out"))
+    shutil.rmtree(lkd, ignore_errors=True)
+
     # The residual race: a dead holder never wrote its owner file, B judges that owner-less lock
     # stale -- and C breaks it and takes a fresh one (owner not written yet) before B acts. B's
     # second look sees a fresh lock and must leave it alone.
