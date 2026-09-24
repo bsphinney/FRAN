@@ -64,6 +64,11 @@ jobs:
       - name: FRAN pre-deploy gate
         run: python scripts/predeploy_check.py
 
+      # Tier decision (public / lab / full) that admits a caller to real PI names. Header-only
+      # fakes + a stubbed CoreOmics lookup: no DB credential, no network, ~1 s.
+      - name: Auth tier resolution (app/auth.py)
+        run: python tests/test_auth_tiers.py
+
       - name: Ruff full lint (advisory -- 13 pre-existing cosmetic findings)
         continue-on-error: true
         run: ruff check app/ --no-cache --output-format github
