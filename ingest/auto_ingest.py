@@ -70,6 +70,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 import auto_ingest_alert as aia  # noqa: E402
 import auto_ingest_state as ais  # noqa: E402
 import find_uningested as fu  # noqa: E402  -- the drop-box contract: DROPBOX_ROOT, read_manifest
+# fran_queue too (stdlib-only at module level; psycopg2 is imported lazily inside it), so a deploy
+# missing fran_queue.py fails here. The functions below still `import fran_queue` locally: that
+# reads sys.modules, which is where the tests put their stand-in for its network edge.
+import fran_queue as _fran_queue_at_startup  # noqa: E402,F401
 
 _TS = re.compile(r"^(\d{8}_\d{4,6})_")
 _SN_REPORT = re.compile(r"_Report.*\.(tsv|parquet)$", re.I)
@@ -723,7 +727,10 @@ def _run(a, chosen, skipped, qcon=None, store=None, held=()):
     ok = dup = fail = systemic = 0
     stopped = None                      # why the run stopped early, if it did
     blocked: dict[str, str] = {}        # engine -> why its remaining candidates are held back
-    progressed: set[str] = set()        # engines with an ingest or a resolved duplicate this run
+    # Engines with a REAL ingest this run. Not duplicates or already-in-corpus resolutions: those
+    # never exercise the engine's adapter, so counting them would reset an engine's block (the alert
+    # would never reach N) and let the same-engine repeat charge fire for a broken adapter.
+    progressed: set[str] = set()
     handled: set[str] = set()           # output_dirs already dealt with in this run
     owner = getattr(a, "owner", None) or f"{platform.node()}:{os.getpid()}"
 
@@ -761,7 +768,6 @@ def _run(a, chosen, skipped, qcon=None, store=None, held=()):
                   f"/{store.max_failures})", flush=True)
 
     def _resolved(c):
-        progressed.add(c["engine"])
         _mark(c, "duplicate")
         _remember(c, "duplicate")
 

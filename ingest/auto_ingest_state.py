@@ -185,6 +185,7 @@ class AttemptStore:
         self._mem: dict | None = None        # last good copy, used when the file cannot be read
         self._token: str | None = None       # owner token of the lock this process holds
         self._break_hook = None              # tests only: called between judging and breaking
+        self._second_look = 1.0              # seconds before re-checking an owner-less stale lock
 
     # ---- file IO --------------------------------------------------------------------------------
 
@@ -307,6 +308,19 @@ class AttemptStore:
                 judged = self._read_owner(self.lock_dir)
                 if self._break_hook is not None:
                     self._break_hook(judged)      # tests: interleave another process here
+                if judged is None:
+                    # An OWNER-LESS lock: either its holder died between mkdir and writing the owner
+                    # file, or -- the race -- someone just broke the dead lock and took a fresh one
+                    # whose owner file is not written yet. Verifying the owner after the rename
+                    # cannot tell those apart (None == None), so look again first: a live new
+                    # holder has written its owner, or at least shows a fresh mtime, by then.
+                    time.sleep(self._second_look)
+                    try:
+                        age2 = time.time() - os.stat(self.lock_dir).st_mtime
+                    except OSError:
+                        continue
+                    if self._read_owner(self.lock_dir) is not None or age2 <= self.stale_lock:
+                        continue
                 grave = f"{self.lock_dir}.stale.{me.replace(':', '.')}.{time.time_ns()}"
                 try:
                     os.rename(self.lock_dir, grave)

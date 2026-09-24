@@ -679,6 +679,29 @@ with tempfile.TemporaryDirectory() as tmp:
     check("  ...and a block that persists alerts on its own (3 runs), whatever else progressed",
           "ALERT DUE (engine:spectronaut)" in outs_e[2], outs_e[2][-300:])
 
+    # An engine's "success" is a REAL ingest only. Each run below resolves a fresh spectronaut
+    # DUPLICATE and then hits the broken adapter: the duplicate must neither reset the engine's
+    # block (else its alert never reaches 3) nor count as the same-engine success that charges the
+    # blocked head (else a broken adapter slowly quarantines its engine's heads).
+    CORPUS.clear()
+    install_fake_queue()
+    err_dir = make_export(reports, "adapter_broken", "20260101_000000_adapter_broken")
+    dstore = ais.AttemptStore(os.path.join(tmp, "sys", "dupblock.json"))
+    outs_d = []
+    for i in range(4):
+        CLOCK[0] = T0 + i * (4 * H + 60)
+        dup_dir = make_export(reports, f"dup_{i}", f"2025010{i}_000000_dup_{i}")
+        ch = ai.select([{"dir": dup_dir, "engine": "spectronaut"},
+                        {"dir": err_dir, "engine": "spectronaut"}])[0]
+        outs_d.append(run_direct(ch, FakeConn(), FakeIngest({f"dup_{i}": "dup",
+                                                            "adapter_broken": "importerr"}),
+                                 store=dstore))
+    check("resolving a duplicate does not reset an engine's block: the alert still comes at run 3",
+          "ALERT DUE (engine:spectronaut)" in outs_d[2], outs_d[2][-300:])
+    rec = dstore.load()["candidates"][ch[1]["attempt_key"]]
+    check("  ...and duplicates are not the 'same-engine success' that charges the blocked head",
+          rec.get("attempts", 0) == 0 and rec.get("systemic_deferrals") == 4, str(rec))
+
     st6 = ais.AttemptStore(os.path.join(tmp, "sys", "repeat.json"))
     for i in range(3):
         st6.record("rk", "systemic", "x", now=T0 + i * 5 * H, reason="module 'x' failed")
@@ -828,6 +851,26 @@ with tempfile.TemporaryDirectory() as tmp:
     y._unlock()
     check("  ...and does remove its own", not os.path.exists(lkd))
 
+    # The residual race: a dead holder never wrote its owner file, B judges that owner-less lock
+    # stale -- and C breaks it and takes a fresh one (owner not written yet) before B acts. B's
+    # second look sees a fresh lock and must leave it alone.
+    os.makedirs(lkd)
+    os.utime(lkd, (time.time() - 3600,) * 2)
+    b2 = ais.AttemptStore(lk, lock_wait=0.5)
+    b2._second_look = 0.05
+    def c_takes_fresh(judged):
+        b2._break_hook = None
+        shutil.rmtree(lkd)
+        os.mkdir(lkd)                              # C's fresh lock: no owner file yet
+        open(os.path.join(lkd, "c_marker"), "w").write("C")
+    b2._break_hook = c_takes_fresh
+    with contextlib.redirect_stdout(io.StringIO()) as w:
+        b2.record("from_b2", "duplicate")
+    check("owner-less race: a fresh owner-less lock taken meanwhile is NOT broken (second look)",
+          os.path.isfile(os.path.join(lkd, "c_marker")) and "broke a lock" not in w.getvalue()
+          and "still held" in w.getvalue(), w.getvalue())
+    shutil.rmtree(lkd)
+
     st = ais.AttemptStore(os.path.join(tmp, "s6", "lease.json"))
     got1 = st.claim("/od/x", "hostA:1", 600, attempt_key="k1", now=T0)
     got2 = st.claim("/od/x", "hostB:2", 600, now=T0 + 10)         # a queue row: no attempt_key
@@ -846,6 +889,18 @@ with tempfile.TemporaryDirectory() as tmp:
     st.claim("/od/y", "hostC:3", 600, now=T0)
     st.release("/od/y", "hostC:3")
     check("release frees the output_dir", "/od/y" not in st.load()["leases"])
+
+    # fran_queue is imported at module top level: a deploy missing fran_queue.py fails at once
+    nofq = os.path.join(tmp, "s6", "ingest_without_fran_queue")
+    shutil.copytree(INGEST, nofq, ignore=shutil.ignore_patterns("fran_queue.py", "__pycache__"))
+    env = {"PATH": os.environ.get("PATH", ""), "DELIMP_PG_TOKEN_FILE": "/nonexistent"}
+    r_no = subprocess.run([sys.executable, "-c", "import auto_ingest"], cwd=nofq, env=env,
+                          capture_output=True, text=True)
+    r_ok = subprocess.run([sys.executable, "-c", "import auto_ingest"], cwd=INGEST, env=env,
+                          capture_output=True, text=True)
+    check("a deploy missing fran_queue.py fails at import, in its first second",
+          r_no.returncode != 0 and "No module named 'fran_queue'" in r_no.stderr, r_no.stderr[-300:])
+    check("  ...and the complete directory imports cleanly", r_ok.returncode == 0, r_ok.stderr[-300:])
 
     # ============ 7. alerts ===================================================================
     print("\n7. alerts")
