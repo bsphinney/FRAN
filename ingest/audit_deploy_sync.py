@@ -35,6 +35,7 @@ Exit 1 if anything in the import closure is missing or differs.
 from __future__ import annotations
 import argparse
 import ast
+import re
 import hashlib
 import json
 import os
@@ -43,8 +44,16 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # What actually gets run on a deployment target. The closure is walked from these.
+# An entry point is a script that is RUN ON ITS OWN and can write to the corpus. Everything
+# reachable from one -- by import or by subprocess -- must be deployed for that path to work.
+# sne_export.py added 2026-09-24: it has its own CLI and launches corpus_ingest.py and
+# sne_xic_ingest.py by filename, so without it those two sat outside the closure and the audit
+# called them "not fatal to an ingest". Deliberately NOT every script with a __main__ -- the
+# backfills and audits are run by hand by someone who will see the traceback, and adding them
+# would grow the closure to most of the directory and make the distinction meaningless.
 ENTRY_POINTS = ("corpus_ingest.py", "auto_ingest.py", "spectronaut_to_corpus.py",
-                "radiant_to_corpus.py", "publish_manifest.py", "versions.py")
+                "radiant_to_corpus.py", "publish_manifest.py", "versions.py",
+                "sne_export.py")
 
 
 def md5(path: str) -> str:
@@ -80,14 +89,46 @@ def local_imports(path: str, known: set[str]) -> set[str]:
     return out
 
 
+def subprocess_targets(path: str, known: set[str]) -> set[str]:
+    """Sibling scripts this file RUNS as a subprocess, named as a string literal.
+
+    Imports are not the only way one ingest file depends on another. auto_ingest.py launches
+    find_uningested.py, diann_xic_to_lance.py and corpus_ingest.py with
+    `[python, os.path.join(HERE, "<name>.py"), ...]`, and sne_export.py launches corpus_ingest.py
+    and sne_xic_ingest.py the same way. An AST import walk cannot see any of them, so before this
+    existed the audit reported five reachable files as "missing but NOT in the closure -- not fatal
+    to an ingest". They are exactly fatal: the subprocess dies with "can't open file", hours in,
+    after the parent has already started work.
+
+    That is the same false reassurance this tool was written to stop -- a check that looks only
+    where it already knows to look. Found 2026-09-24 by the session reviewing the auto-ingest
+    starvation fix, which hit it on diann_xic_to_lance.py -> ingest_perrun_xic.py.
+
+    Matching any "<name>.py" literal is deliberately broad: a filename in a string is evidence of
+    a dependency whether it is exec'd, passed as an argument or logged, and over-including a file
+    costs one unnecessary copy while under-including one costs a run.
+    """
+    out = set()
+    try:
+        src = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return out
+    for m in re.finditer(r'["\']([A-Za-z_][A-Za-z0-9_]*\.py)["\']', src):
+        if m.group(1) in known:
+            out.add(m.group(1))
+    return out
+
+
 def closure(d: str, files: set[str]) -> set[str]:
+    """Everything reachable from an entry point, by import OR by subprocess."""
     seen, stack = set(), [e for e in ENTRY_POINTS if e in files]
     while stack:
         f = stack.pop()
         if f in seen:
             continue
         seen.add(f)
-        stack.extend(local_imports(os.path.join(d, f), files) - seen)
+        fp = os.path.join(d, f)
+        stack.extend((local_imports(fp, files) | subprocess_targets(fp, files)) - seen)
     return seen
 
 
