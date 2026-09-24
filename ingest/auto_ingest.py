@@ -64,8 +64,9 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Imported at start-up, not lazily, so a deploy that forgot to copy them fails the job in its first
-# second rather than hours in (ingest/DEPLOY_auto_ingest.md).
+# Imported at MODULE TOP LEVEL, not lazily: a deploy that forgot to copy one fails the job in its
+# first second rather than hours in, and ingest/audit_deploy_sync.py puts all three in its import
+# closure, so it reads NOT SAFE TO INGEST before anything runs (ingest/DEPLOY_auto_ingest.md).
 import auto_ingest_alert as aia  # noqa: E402
 import auto_ingest_state as ais  # noqa: E402
 import find_uningested as fu  # noqa: E402  -- the drop-box contract: DROPBOX_ROOT, read_manifest

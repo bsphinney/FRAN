@@ -183,6 +183,21 @@ def excluded(path: str, patterns) -> bool:
 QC_NAME_RE = re.compile(r"(?i)(?<![a-z0-9])qc(?![a-z])")
 
 
+_SMB_PREFIX, _HIVE_PREFIX = "/Volumes/proteomics-grp", "/quobyte/proteomics-grp"
+
+
+def _excludes_path(path: str) -> str:
+    """`path` as DEFAULT_EXCLUDES should see it: the laptop's SMB spelling
+    (/Volumes/proteomics-grp/...) mapped to the Hive one (/quobyte/proteomics-grp/...), and a
+    trailing "/" so a root itself -- /quobyte/proteomics-grp/brett/glendon -- matches its
+    "/quobyte/proteomics-grp/brett/glendon/" pattern. Used by qc_reason only; scan() walks real
+    Hive paths below its roots and keeps excluded() as it was."""
+    s = str(path or "").replace("\\", "/").rstrip("/")
+    if s == _SMB_PREFIX or s.startswith(_SMB_PREFIX + "/"):
+        s = _HIVE_PREFIX + s[len(_SMB_PREFIX):]
+    return s + "/"
+
+
 def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
               exclude: bool | None = None) -> str | None:
     """Why FRAN policy keeps this DROP-BOX search out of the corpus, or None.
@@ -205,8 +220,9 @@ def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
         return "manifest says qc: true"
     if exclude is True:
         return "manifest says exclude: true"
+    norm = _excludes_path(path)
     for pat in DEFAULT_EXCLUDES:
-        if pat in (path or ""):
+        if pat in norm:
             return f"output_dir is under {pat} (DEFAULT_EXCLUDES)"
     if qc is False:
         return None

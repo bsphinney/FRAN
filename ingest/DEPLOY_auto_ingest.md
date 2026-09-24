@@ -13,32 +13,72 @@ checkout (`HIVE_SYNC.md`). Nothing about the cron, the sbatch or the wrapper cha
 | `auto_ingest_alert.py` | **new** — the Slack post |
 | `find_uningested.py` | changed: the drop-box contract (`DROPBOX_ROOT`, `read_manifest`, `qc_reason` / `QC_NAME_RE`); `scan()` skips a staged entry whose manifest `output_dir` is already a corpus path, and never enters `incoming/.excluded/` |
 
-`auto_ingest.py` imports the other three **at start-up**, deliberately: a copy that forgets them
-dies in its first second with `ModuleNotFoundError` rather than hours in. Forgetting absent files is
-exactly how every ingest died on 2026-09-23 (a sync copied the 15 files that *differed* and missed the
-5 that were *missing*), so the check below reports MISSING separately from DIFFERS. (A failure that
-early cannot write state or alert; the check and the smoke test are what stand in front of it.)
+`auto_ingest.py` imports `auto_ingest_state`, `auto_ingest_alert` and `find_uningested` at **module
+top level**, deliberately: a copy that forgets one dies in its first second rather than hours in,
+and — more to the point — fran-db's deploy audit sees all three in its import closure, so a
+forgotten copy reads `RESULT: NOT SAFE TO INGEST` before anything runs. Forgetting absent files is
+exactly how every ingest died on 2026-09-23 (a sync copied the 15 files that *differed* and missed
+the 5 that were *missing*). A failure that early cannot write state or alert; the audit is what
+stands in front of it. (`fran_queue` is imported lazily inside functions so the tests can
+substitute its network edge; the audit walks nested imports too — measured below — so it is
+covered.)
 
 ## Steps
 
+The deploy check is fran-db's `ingest/audit_deploy_sync.py` (committed on `fix/tdf-immutable-opens`,
+d5c02b0, and deployed on Hive). One definition: this change ships no checker of its own.
+
 ```bash
-# from the repo root, on the laptop, at the merged commit
-bash ingest/deploy_auto_ingest_check.sh          # print-only; changes nothing
+# 1. In the repo, on the laptop, at the merged commit (with audit_deploy_sync.py merged too):
+python3 ingest/audit_deploy_sync.py --emit /tmp/ingest_manifest.json
+scp /tmp/ingest_manifest.json brettsp@hive.hpc.ucdavis.edu:/tmp/
+
+# 2. On Hive, BEFORE copying. Expect "NOT SAFE TO INGEST" naming exactly this change's files:
+#    auto_ingest_state.py and auto_ingest_alert.py MISSING, auto_ingest.py and find_uningested.py
+#    STALE. Anything else it lists is not this change's -- stop and ask.
+cd /quobyte/proteomics-grp/brett/glendon/fran_ingest
+python3 audit_deploy_sync.py --check /tmp/ingest_manifest.json \
+    --target /quobyte/proteomics-grp/brett/glendon/fran_ingest
+
+# 3. Keep the running copies, then copy all four TOGETHER (from the laptop):
+ssh brettsp@hive.hpc.ucdavis.edu 'cd /quobyte/proteomics-grp/brett/glendon/fran_ingest &&
+    for f in auto_ingest.py find_uningested.py; do cp -p $f $f.bak.$(date +%Y%m%d); done'
+scp ingest/auto_ingest.py ingest/auto_ingest_state.py ingest/auto_ingest_alert.py \
+    ingest/find_uningested.py brettsp@hive.hpc.ucdavis.edu:/quobyte/proteomics-grp/brett/glendon/fran_ingest/
+
+# 4. Re-run step 2 on Hive: the closure must now be intact (no MISSING, no STALE in the closure).
+
+# 5. Smoke test on Hive -- imports and the memory CLI only: no scan, no database, no ingest.
+PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
+$PY -c "import auto_ingest, auto_ingest_state, auto_ingest_alert, find_uningested; print('imports ok')"
+$PY auto_ingest.py --list-quarantine --state-file /tmp/aiq_smoke_$$.json
+
+# 6. Re-run publish_manifest.py from the merged repo, so delimp_ingest_manifest carries the two NEW
+#    modules and the new md5s of auto_ingest.py and find_uningested.py.
+python3 ingest/publish_manifest.py
 ```
 
-It md5-compares the four shipped files **and the whole import closure of `auto_ingest.py` and of
-every script it runs** (`corpus_ingest.py` and whatever it imports, lazily or not) against Hive,
-then prints the backup, `scp` and smoke-test commands to run by hand. Run it again after copying:
-every row it ships must read `same`, and nothing may read MISSING. It never copies anything else: on
-2026-09-24 `raw_metadata.py` already differed on Hive, and that belongs to other work in flight.
+Until step 6, each ingest prints `STALE auto_ingest.py` / `STALE find_uningested.py`: both are gated
+`warn`, not `refuse`, so nothing stops. The audit also reports files that exist on Hive but not in the
+repo ("extra on target": 79 on 2026-09-24). Those are for a human to look at; do not sweep them as
+part of this deploy.
 
-Checked on 2026-09-24 (read-only): Hive's `auto_ingest.py` and `find_uningested.py` are
-byte-identical to `origin/main`, so copying over them loses no local edit; the two new modules are
-MISSING, as expected; nothing else in the closure is missing.
-`ingest/audit_deploy_sync.py` (not in the repo yet) is the whole-directory version of this check.
+State on 2026-09-24: fran-db republished the manifest (d5c02b0) and reports Hive's `fran_ingest` at
+92/92, 0 missing and 0 differing. My own earlier read-only md5 check agreed that `auto_ingest.py` and
+`find_uningested.py` on Hive are byte-identical to `origin/main`, so the copy in step 3 loses no
+local edit.
 
-After merge, re-run `ingest/publish_manifest.py` from the repo as usual. `auto_ingest.py` is gated
-`warn`, not `refuse`, so until then each ingest only prints `STALE auto_ingest.py`.
+**A gap in the audit, for fran-db** (measured: `--emit` on this branch puts 22 files in the closure
+of its 6 entry points, among them `auto_ingest_state.py`, `auto_ingest_alert.py`,
+`find_uningested.py`, and `fran_queue.py`, which `auto_ingest.py` imports only inside functions). The
+audit follows imports, including ones nested in functions, but not a script another script RUNS by
+filename. `auto_ingest.py` runs `diann_xic_to_lance.py` as a subprocess
+for the XIC lane of queue rows that declare an `xic_dir`, and that script lazily imports
+`ingest_perrun_xic.py`. Neither is in the closure, so a missing copy would surface only when such a
+row ingests: the precursors are fine, and the row's `xic_status` is recorded `failed`. Suggested fix:
+add `diann_xic_to_lance.py` to `ENTRY_POINTS`, or follow string literals that name a sibling `.py`.
+`find_uningested.py` is also run by filename, but `auto_ingest.py` now imports it too, so it is
+covered. Nothing in the closure uses `importlib.import_module` / `__import__` today.
 
 ### With Brett's OK only — two drop-box entries
 

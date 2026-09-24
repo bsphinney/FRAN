@@ -393,6 +393,13 @@ with tempfile.TemporaryDirectory() as tmp:
                 ("a QC/scratch ROOT beats qc: false", (glendon, "plain", False, None),
                  "DEFAULT_EXCLUDES"),
                 ("qc: false beats the NAME rule", ("/a/b/c", "Lumos QC", False, None), None),
+                ("the ROOT itself matches its pattern (no trailing slash)",
+                 ("/quobyte/proteomics-grp/brett/glendon", "plain", False, None), "brett/glendon/"),
+                ("the laptop SMB spelling /Volumes/proteomics-grp/... maps to /quobyte/...",
+                 ("/Volumes/proteomics-grp/brett/glendon/scratch/x", "plain", False, None),
+                 "brett/glendon/"),
+                ("an unrelated /Volumes path is not excluded",
+                 ("/Volumes/other-share/brett/glendon_like/x", "plain", False, None), None),
                 ("no flag: the name rule", ("/a/b/c", "Lumos QC", None, None), "QC_NAME_RE")):
             got = fu.qc_reason(*args)
             check(f"QC precedence: {label}", (got is None) if want is None else (want in (got or "")),
