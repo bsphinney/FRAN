@@ -187,23 +187,29 @@ def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
               exclude: bool | None = None) -> str | None:
     """Why FRAN policy keeps this DROP-BOX search out of the corpus, or None.
 
-    The producer's word wins, in this order:
+    In this order (the skill's stage step applies the same one):
       1. manifest "qc": true or "exclude": true  -> excluded
-      2. manifest "qc": false                    -> NOT excluded, whatever the name (the producer
-                                                    overrode a false positive)
-      3. no flag: DEFAULT_EXCLUDES on `path` (the substring test scan() applies to every directory
-         it walks), then QC_NAME_RE on `name` and on the last three components of `path`.
+      2. DEFAULT_EXCLUDES on `path`               -> excluded (the substring test scan() applies to
+                                                    every directory it walks). A QC or scratch ROOT
+                                                    beats the producer's "qc": false: the skill
+                                                    writes qc: false into EVERY manifest it stages,
+                                                    so letting it win would ingest searches staged
+                                                    from STAN/, hela_qcs/, ToFEvoQC/ or brett's
+                                                    scratch and smoke-test trees.
+      3. manifest "qc": false                    -> NOT excluded by name (the producer overrode a
+                                                    false positive of the name rule)
+      4. QC_NAME_RE on `name` and on the last three components of `path`.
     Scope: drop-box candidates only (auto_ingest.select). The FRAN_reports scan is NOT name-filtered.
     A hit is never a failure: nothing is attempted, charged or quarantined."""
     if qc is True:
         return "manifest says qc: true"
     if exclude is True:
         return "manifest says exclude: true"
-    if qc is False:
-        return None
     for pat in DEFAULT_EXCLUDES:
         if pat in (path or ""):
             return f"output_dir is under {pat} (DEFAULT_EXCLUDES)"
+    if qc is False:
+        return None
     parts = [p for p in str(path or "").replace("\\", "/").split("/") if p][-3:]
     for field, text in [("search_name", name or "")] + [("output_dir", p) for p in parts]:
         if QC_NAME_RE.search(text):

@@ -315,8 +315,8 @@ def select(candidates, skip_failed=True):
             elif why:
                 skipped.append((name, f"drop box: {why}"))
                 continue
-            # FRAN keeps QC runs out of the corpus (find_uningested.qc_reason: the producer's flag
-            # wins, else the path and name rules). The entry itself is left in incoming/.
+            # FRAN keeps QC runs out of the corpus (find_uningested.qc_reason: qc/exclude true,
+            # then a QC/scratch root, then qc: false, then the name rule). The entry stays put.
             why = fu.qc_reason(m["output_dir"] if m else c["identity"],
                                m.get("search_name") if m else name,
                                m.get("qc") if m else None, m.get("exclude") if m else None)

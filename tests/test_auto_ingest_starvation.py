@@ -384,7 +384,19 @@ with tempfile.TemporaryDirectory() as tmp:
               len(ch) == 1 and ch[0]["identity"] == os.path.realpath(legacy_real)
               and ch[0].get("identity_from") != "manifest", f"{ch} {sk}")
 
-        # --- QC: the flag wins; else DEFAULT_EXCLUDES, else QC_NAME_RE (vectors pinned by both repos)
+        # --- QC precedence: qc/exclude: true > DEFAULT_EXCLUDES path > qc: false > QC_NAME_RE
+        # (vectors and precedence pinned in both repos)
+        glendon = "/quobyte/proteomics-grp/brett/glendon/scratch/search_out"
+        for label, args, want in (
+                ("qc: true wins over everything", (glendon, "plain", True, None), "qc: true"),
+                ("exclude: true excludes", ("/a/b/c", "plain", None, True), "exclude: true"),
+                ("a QC/scratch ROOT beats qc: false", (glendon, "plain", False, None),
+                 "DEFAULT_EXCLUDES"),
+                ("qc: false beats the NAME rule", ("/a/b/c", "Lumos QC", False, None), None),
+                ("no flag: the name rule", ("/a/b/c", "Lumos QC", None, None), "QC_NAME_RE")):
+            got = fu.qc_reason(*args)
+            check(f"QC precedence: {label}", (got is None) if want is None else (want in (got or "")),
+                  str(got))
         for n in ("chkLUppm_HeLa50_2026 Lumos QC", "QC_run_01", "hela_qc_2", "Exploris QC2"):
             check(f"QC_NAME_RE excludes {n!r}", fu.qc_reason("/a/b/c", n) is not None)
         for n in ("HeLa_digest_timecourse", "aqc_buffer_study", "QCM_study", "Plasma_liver2"):
@@ -398,7 +410,9 @@ with tempfile.TemporaryDirectory() as tmp:
         unflagged, _ = drop("unflagged__13", "Lumos QC but the producer says not", T0 - 24 * H,
                             qc=False)
         stan, _ = drop("stan__15", "s", T0 - 24 * H, output_dir="/quobyte/proteomics-grp/STAN/proc/x")
-        chosen_q, skipped_q = ai.select([qc_entry, hela, flagged, excl, unflagged, stan])
+        scratch, _ = drop("scratch_qcfalse__18", "a scratch search", T0 - 24 * H, qc=False,
+                          output_dir=glendon)
+        chosen_q, skipped_q = ai.select([qc_entry, hela, flagged, excl, unflagged, stan, scratch])
         why = dict(skipped_q)
         names_q = [c["search"] for c in chosen_q]
         check("QC: gabrig's search__9ff203cf is excluded",
@@ -410,6 +424,11 @@ with tempfile.TemporaryDirectory() as tmp:
               "Lumos QC but the producer says not" in names_q, str(names_q))
         check("QC: an output_dir under DEFAULT_EXCLUDES is excluded (no flag)",
               "DEFAULT_EXCLUDES" in why.get("stan__15", ""), str(why))
+        check("QC: a qc: false manifest staged from brett/glendon/ is still excluded, with the path "
+              "reason (the skill writes qc: false into every manifest)",
+              why.get("scratch_qcfalse__18", "") ==
+              "qc: output_dir is under /quobyte/proteomics-grp/brett/glendon/ (DEFAULT_EXCLUDES)",
+              str(why))
         qjson = os.path.join(tmp, "qc.json")
         json.dump([qc_entry], open(qjson, "w"))
         qstate = os.path.join(tmp, "s4", "qc_attempts.json")
