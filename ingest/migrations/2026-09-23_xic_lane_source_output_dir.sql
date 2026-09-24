@@ -1,0 +1,30 @@
+-- delimp_xic_lane.source_output_dir -- the path-based link key for the chromatogram lane.
+--
+-- WHY A COLUMN AND NOT THE MANIFEST. The XIC lane's datasets are currently matched back to their
+-- search through /quobyte/proteomics-grp/brett/glendon/xic_lance/LANE_SOURCES.json, which records
+-- `link_key: "delimp_searches.output_dir == output_dir"` for all 80 of its entries. A file that is
+-- authoritative for linking is exactly how coreomics_*_cache drifted 83 days out of date: nothing
+-- makes the file and the database disagree loudly, so they disagree quietly.
+--
+-- WHY output_dir AND NOT search_name. Verified against the live corpus on 2026-09-23:
+--   delimp_searches: 2,179 rows, 2,179 distinct output_dir, 2,141 distinct search_name.
+-- output_dir is unique across the whole corpus; search_name is NOT -- 38 names are shared by more
+-- than one search, so a name-keyed join silently fans out or picks the wrong row. The lane names
+-- diverge from the search names outright in places (the lane's `10042022_Dietmar_Talipia` ingests
+-- as search_name `10042022_kueltz`), which is the same failure with a friendlier face.
+--
+-- SEPARATE FILE, ON PURPOSE. This has nothing to do with the DIA-NN report columns and must not
+-- wait on that review: 2026-09-23_diann_report_columns.sql is 35 columns pending sign-off, while
+-- this is one column blocking a lane load right now. Keeping them in one file would mean applying
+-- 35 unapproved columns to get this one. Apply it with:
+--   python3 ingest/migrate_diann_columns.py --sql ingest/migrations/2026-09-23_xic_lane_source_output_dir.sql --apply
+--
+-- COST. delimp_xic_lane is 60 rows / 120 kB. Nullable, no DEFAULT, so this is a catalog-only
+-- change here as it is on the big tables -- the rule matters for the habit, not for 60 rows.
+--
+-- BACKFILL. From the manifest, which carries output_dir on all 80 entries, all distinct:
+--   UPDATE delimp_xic_lane SET source_output_dir = %s WHERE lance_path = %s;
+-- Then the lane joins on delimp_searches.output_dir = delimp_xic_lane.source_output_dir, and
+-- LANE_SOURCES.json goes back to being a build artefact rather than a source of truth.
+
+ALTER TABLE delimp_xic_lane ADD COLUMN IF NOT EXISTS source_output_dir text;
