@@ -1,6 +1,8 @@
 import os
-os.environ.setdefault("DELIMP_PG_TOKEN_FILE", "/Users/brettphinney/.pgfarm_token")
-
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _live_db import require_live_db  # noqa: E402
+require_live_db("PTM coverage over the corpus")
 from app import queries
 
 # P92966 = RS41, an Arabidopsis SR splicing factor. Measured 2026-09-10: 6 phosphopeptides,
