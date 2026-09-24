@@ -498,6 +498,12 @@ def _scan_and_run(a, store):
     eligible, held = _mem(store, "gate", chosen, default=(chosen, []))
     _print_held(held)
     queued, qcon = _claim_queue(a)
+    if a.apply and qcon is None:
+        # The queue half failed (no table, no grant, a claim_batch error) -- _claim_queue's own
+        # contract is that the scan half carries on. It still needs a connection for the
+        # pre-ingest corpus re-check; only if THAT fails too is it a systemic stop.
+        print("  opening a separate connection for the pre-ingest corpus re-check", flush=True)
+        qcon = _check_conn()
     return _run(a, queued + eligible, skipped, qcon, store=store, held=held)
 
 
@@ -615,7 +621,7 @@ def _mem(store, method, *args, default=None, **kw):
 
 def _ident(c) -> str:
     """The output_dir a candidate would be ingested as -- what runs lease and de-duplicate on."""
-    return str(c.get("identity") or c["dir"]).rstrip("/")
+    return ais.identity_of(c)
 
 
 def _check_conn():
@@ -738,13 +744,13 @@ def _run(a, chosen, skipped, qcon=None, store=None, held=()):
         except Exception as e:  # noqa: BLE001
             print(f"      WARNING: could not update queue Q{c.get('queue_id')}: {e}", flush=True)
 
-    def _remember(c, outcome, tail="", reason=None):
+    def _remember(c, outcome, tail="", reason=None, scope=None):
         """Record a SCAN candidate's outcome in the attempt memory. Queue rows and --direct jobs
         have no attempt_key: the queue keeps its own attempts, and a direct job is an operator's."""
         key = c.get("attempt_key") if store is not None else None
         if not key:
             return
-        rec = _mem(store, "record", key, outcome, tail, reason=reason,
+        rec = _mem(store, "record", key, outcome, tail, reason=reason, scope=scope,
                    meta={"search": c["search"], "engine": c["engine"], "dir": c["dir"]})
         if rec and outcome not in ("ok", "duplicate"):
             st = rec.get("status")
@@ -866,7 +872,7 @@ def _run(a, chosen, skipped, qcon=None, store=None, held=()):
                 _mark(c, "fail", f"rc={res['rc']}: " + tail[-800:])
                 _remember(c, "fail", tail)
                 continue
-            _remember(c, "systemic", tail, reason=res["reason"])
+            _remember(c, "systemic", tail, reason=res["reason"], scope=res["scope"])
             if qcon is not None and c.get("queue_id"):
                 # Deliberately NOT mark_failed: that burns one of the row's MAX_ATTEMPTS on a fault
                 # that is not the row's. Left 'claimed', the queue's own lease returns it to

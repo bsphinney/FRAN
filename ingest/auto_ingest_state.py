@@ -97,8 +97,11 @@ ELIGIBLE, LEASED = "eligible", "leased"
 _SYSTEMIC = (
     (re.compile(r"(?m)^REFUSING TO INGEST"), "global",
      "ingest code is stale on this host (the manifest gate refused)"),
-    (re.compile(r"(?m)^usage: \S+|: error: (?:unrecognized arguments|"
-                r"the following arguments are required)"), "global",
+    # Only the two phrases that mean "the command line itself is wrong". A bare `usage:` line, or
+    # "error: argument --taxon: invalid int value", can come from a bad value in candidate data --
+    # that is the candidate's failure and is charged like one.
+    (re.compile(r"\berror: (?:unrecognized arguments|the following arguments are required)"),
+     "global",
      "corpus_ingest rejected auto_ingest's command line (the two files are out of step)"),
     (re.compile(r"(?m)^(?:\w+\.)*OperationalError: (?:could not connect to server|"
                 r"connection to server at .* failed|could not translate host name)"), "global",
@@ -150,8 +153,16 @@ def _parse(s) -> datetime | None:
 def _empty() -> dict:
     return {"schema": SCHEMA, "candidates": {}, "leases": {},
             "runs": {"consecutive_zero": 0, "history": [], "in_progress": {},
-                     "engine_blocked": {}, "last_success_at": None},
+                     "engine_blocked": {}, "last_success_at": None,
+                     "last_success_by_engine": {}},
             "alerts": {}}
+
+
+def identity_of(c: dict) -> str:
+    """The output_dir a candidate would be ingested as -- what leases and per-run de-duplication
+    key on. One definition: the gate and auto_ingest._ident both use it, so a trailing slash can
+    never make a leased output_dir look free."""
+    return str(c.get("identity") or c.get("dir") or "").rstrip("/")
 
 
 class _Torn(Exception):
@@ -172,6 +183,8 @@ class AttemptStore:
         self.stale_lock = stale_lock
         self.degraded: str | None = None     # set when the file could not be read or written
         self._mem: dict | None = None        # last good copy, used when the file cannot be read
+        self._token: str | None = None       # owner token of the lock this process holds
+        self._break_hook = None              # tests only: called between judging and breaking
 
     # ---- file IO --------------------------------------------------------------------------------
 
@@ -246,8 +259,22 @@ class AttemptStore:
                 pass
             return False
 
+    def _read_owner(self, d: str):
+        try:
+            with open(os.path.join(d, "owner"), encoding="utf-8") as fh:
+                return fh.read().strip() or None
+        except OSError:
+            return None
+
     def _lock(self) -> bool:
-        """Take the directory lock. True if held; False means proceeding unlocked (warned)."""
+        """Take the directory lock. True if held; False means proceeding unlocked (warned).
+
+        Each acquisition writes a unique owner token into the lock directory. Breaking a stale lock
+        is judge -> rename -> VERIFY: the breaker notes whose lock it judged dead, renames the
+        directory away, and checks the renamed directory still carries that owner. If it does not,
+        the lock changed hands in between (A died, C broke A's lock and took a fresh one, and B --
+        who judged A's -- renamed C's live lock); B puts it back and waits like anyone else. And
+        _unlock() removes the directory only if it is still ours."""
         try:
             os.makedirs(os.path.dirname(self.lock_dir) or ".", exist_ok=True)
         except OSError as e:
@@ -256,34 +283,47 @@ class AttemptStore:
         me = f"{socket.gethostname()}:{os.getpid()}"
         deadline = time.monotonic() + self.lock_wait
         while True:
+            token = f"{me}:{time.time_ns()}"
             try:
                 os.mkdir(self.lock_dir)
-                try:
-                    with open(os.path.join(self.lock_dir, "owner"), "w") as fh:
-                        fh.write(f"{me} {time.time():.0f}\n")
-                except OSError:
-                    pass
-                return True
             except FileExistsError:
                 pass
             except OSError as e:
                 self._warn(f"cannot lock {self.lock_dir} ({e}); writing unlocked")
                 return False
+            else:
+                try:
+                    with open(os.path.join(self.lock_dir, "owner"), "w", encoding="utf-8") as fh:
+                        fh.write(token + "\n")
+                    self._token = token
+                except OSError:
+                    self._token = None            # held, but unmarked: see _unlock
+                return True
             try:
                 age = time.time() - os.stat(self.lock_dir).st_mtime
             except OSError:
                 continue                          # released between our mkdir and stat; retry
             if age > self.stale_lock:
-                # Break a dead holder's lock by RENAMING it: of several breakers only one rename
-                # succeeds, so two of them can never both "win" and then both take the lock.
+                judged = self._read_owner(self.lock_dir)
+                if self._break_hook is not None:
+                    self._break_hook(judged)      # tests: interleave another process here
                 grave = f"{self.lock_dir}.stale.{me.replace(':', '.')}.{time.time_ns()}"
                 try:
                     os.rename(self.lock_dir, grave)
-                    shutil.rmtree(grave, ignore_errors=True)
-                    print(f"  attempt memory: broke a lock {age:.0f}s old ({self.lock_dir})",
-                          flush=True)
                 except OSError:
-                    pass
+                    continue                      # someone else broke or released it first
+                if self._read_owner(grave) == judged:
+                    shutil.rmtree(grave, ignore_errors=True)
+                    print(f"  attempt memory: broke a lock {age:.0f}s old held by {judged} "
+                          f"({self.lock_dir})", flush=True)
+                else:
+                    try:
+                        os.rename(grave, self.lock_dir)
+                        print(f"  attempt memory: the lock changed hands while being broken; "
+                              f"restored it to its live holder ({self.lock_dir})", flush=True)
+                    except OSError as e:
+                        self._warn(f"moved a live lock aside by mistake and could not restore it "
+                                   f"({e}); it is at {grave}")
                 continue
             if time.monotonic() >= deadline:
                 self._warn(f"lock {self.lock_dir} still held after {self.lock_wait:.0f}s; "
@@ -292,7 +332,15 @@ class AttemptStore:
             time.sleep(0.05 + random.random() * 0.1)
 
     def _unlock(self) -> None:
-        shutil.rmtree(self.lock_dir, ignore_errors=True)
+        """Release the lock -- only if it is still OURS. A write that outlived STALE_LOCK_S may have
+        had its lock broken and re-taken; removing the directory then would free someone else's."""
+        owner = self._read_owner(self.lock_dir)
+        if owner == self._token:                  # ours (or unmarked ours: both None)
+            shutil.rmtree(self.lock_dir, ignore_errors=True)
+        else:
+            print(f"  WARNING (attempt memory): lock {self.lock_dir} now belongs to {owner}, not "
+                  f"to this run; left in place", flush=True)
+        self._token = None
 
     def update(self, fn):
         """Read-modify-write under the lock. `fn(data)` mutates data and returns a result."""
@@ -337,7 +385,7 @@ class AttemptStore:
         data = self.load()
         eligible, held = [], []
         for c in cands:
-            if self._live_lease(data, c.get("identity"), now):
+            if self._live_lease(data, identity_of(c), now):
                 held.append((c, LEASED, None))
                 continue
             key = c.get("attempt_key")
@@ -411,8 +459,15 @@ class AttemptStore:
             rec["next_eligible"] = _iso(t + timedelta(hours=h))
 
     def record(self, key: str, outcome: str, error_tail: str = "", meta: dict | None = None,
-               now: float | None = None, reason: str | None = None) -> dict:
-        """Remember one outcome: 'ok' | 'duplicate' | 'fail' | 'timeout' | 'systemic'."""
+               now: float | None = None, reason: str | None = None,
+               scope: str | None = None) -> dict:
+        """Remember one outcome: 'ok' | 'duplicate' | 'fail' | 'timeout' | 'systemic'.
+
+        For 'systemic', `scope` is classify_failure's: after SYSTEMIC_REPEAT_CHARGE deferrals the
+        candidate is charged if OTHERS succeeded since its first deferral -- for an 'engine'-scoped
+        failure, others OF THE SAME ENGINE. A missing adapter module fails every candidate of its
+        engine; judged against other engines' successes it would slowly quarantine that engine's
+        whole backlog, one head at a time."""
         def fn(data):
             t = _utc(now)
             rec = data["candidates"].setdefault(key, {"attempts": 0})
@@ -420,7 +475,9 @@ class AttemptStore:
             if outcome == "systemic":
                 n = int(rec.get("systemic_deferrals", 0))
                 first = _parse(rec.get("first_deferral"))
-                won = _parse(data["runs"].get("last_success_at"))
+                runs = data["runs"]
+                won = _parse(runs.get("last_success_by_engine", {}).get(rec.get("engine"))
+                             if scope == "engine" else runs.get("last_success_at"))
                 if n >= SYSTEMIC_REPEAT_CHARGE and first and won and won > first:
                     self._charge(rec, "systemic-repeat",
                                  f"deferred {n}x as systemic while other candidates succeeded -- "
@@ -540,6 +597,7 @@ class AttemptStore:
                                 "detail": f"{runs['consecutive_zero']} consecutive runs"})
             eb = runs.setdefault("engine_blocked", {})
             for eng in engines_progressed:
+                runs.setdefault("last_success_by_engine", {})[eng] = _iso(t)
                 eb.pop(eng, None)
                 alerts.pop(f"engine:{eng}", None)
             for eng, why in blocked_engines.items():

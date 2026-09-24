@@ -94,10 +94,13 @@ after meeting at a barrier, with a no-lock control each time (logs kept in
 | lock | nodes | lost updates | notes |
 |---|---|---|---|
 | `flock()` (first design) | hive-as-11-2-48 + hive-as-11-4-42 | **578 / 800** | no better than the control (567); readers saw torn JSON |
-| **`mkdir` lock (shipped)** | hive-as-11-4-42 + hive-dc-7-5-50 | **0 / 800** | no torn reads, no warnings |
+| `mkdir` lock | hive-as-11-4-42 + hive-dc-7-5-50 | **0 / 800** | no torn reads, no warnings |
 | none (control) | same pair | 580 / 800 | torn reads persisted through 6 retries |
+| **`mkdir` lock + owner token (shipped)** | hive-as-11-3-51 + hive-dc-7-7-26 | **0 / 800** | no warnings, no stray lock dirs; control lost 657 |
 
-So `flock` does not exclude across nodes on Quobyte, and the shipped lock does. Only one ingest job
+So `flock` does not exclude across nodes on Quobyte, and the shipped lock does. Each lock carries a
+unique owner token: a stale lock is broken by judge → rename → verify-the-owner (restored if it
+changed hands in between), and a run only ever removes a lock that is still its own. Only one ingest job
 runs at a time anyway (`cron_auto_ingest.sh`); this matters when that guard fails, or when someone
 runs `--clear` on the login node during a run.
 
@@ -106,14 +109,17 @@ runs `--clear` on the login node during a run.
 * **Every ingest is re-checked against the corpus first** (`fran_queue._already_ingested`) — scan,
   drop-box, queue and `--direct` alike — because `corpus_ingest` deletes and re-inserts an existing
   output_dir. So a `fran_queue.py add --force` registration of an already-ingested output_dir is now
-  marked done, not re-ingested; `--direct` opens its own connection for the check; and with no
-  connection to check with, the run stops rather than ingest blind.
-* **Systemic failures are not charged.** Stale code, `usage:`/`error: unrecognized arguments` from
-  `corpus_ingest` (auto_ingest and corpus_ingest out of step), an unreachable database or a failed
-  token exchange stop the run. An `ImportError` holds back only that engine's candidates; the
-  others carry on, and Slack hears if the block lasts 3 runs. A queue row hit by any of these is
-  left claimed to lapse back to `queued` (no attempt burned). A candidate deferred 3 times while
-  others succeeded is charged normally after that.
+  marked done, not re-ingested; `--direct` opens its own connection for the check, and so does a
+  run whose queue claim failed (the scan half carries on, as `_claim_queue` promises); only with no
+  connection at all does the run stop rather than ingest blind.
+* **Systemic failures are not charged.** Stale code, argparse's `error: unrecognized arguments` /
+  `error: the following arguments are required` from `corpus_ingest` (the two files out of step),
+  an unreachable database or a failed token exchange stop the run; any other argparse error (a bad
+  value in the candidate's data) is charged normally. An `ImportError` holds back only that
+  engine's candidates; the others carry on, and Slack hears if the block lasts 3 runs. A queue row
+  hit by any of these is left claimed to lapse back to `queued` (no attempt burned). A candidate
+  deferred 3 times while others succeeded is charged normally after that -- for an import failure,
+  only if its OWN engine succeeded meanwhile.
 * **Alerts** (one Slack message per run at most, each condition once per episode, again after 24 h):
   3 consecutive runs with work and no progress (a crash, a failed scan and a run killed at the SLURM
   wall all count); an engine blocked 3 runs running; a drop-box entry whose manifest contradicts its

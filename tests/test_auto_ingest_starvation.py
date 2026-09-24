@@ -568,6 +568,10 @@ with tempfile.TemporaryDirectory() as tmp:
     check("argparse 'unrecognized arguments' (auto_ingest/corpus_ingest skew) is global",
           cls("", "usage: corpus_ingest.py [-h] [--engine ENGINE] searchdir\n"
                   "corpus_ingest.py: error: unrecognized arguments: --bulk-copy\n")[0] == "global")
+    check("argparse 'invalid value' after a usage: line is NOT systemic (bad data in the candidate)",
+          cls("", "usage: corpus_ingest.py [-h] [--taxon TAXON] searchdir\n"
+                  "corpus_ingest.py: error: argument --taxon: invalid int value: 'dog'\n")
+          == (None, None))
     check("argparse 'the following arguments are required' is global",
           cls("", "corpus_ingest.py: error: the following arguments are required: --output-dir\n")[0]
           == "global")
@@ -611,6 +615,34 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the deferred candidate does not hold the head next run",
           fake_next.calls and fake_next.calls[0] != "20201111_113616_talbot_smoker", str(fake_next.calls))
 
+    # a QUEUE-only fault (no table, no grant, a claim_batch error) must not halt the scan half
+    CORPUS.clear()
+    q = install_fake_queue()
+    q.conns = []
+    def new_conn():
+        q.conns.append(FakeConn())
+        return q.conns[-1]
+    def claim_fails(con, limit, claimed_by):
+        raise RuntimeError('relation "delimp_ingest_queue" does not exist')
+    q._conn, q.claim_batch = new_conn, claim_fails
+    one = FakeIngest({})
+    rc, oq = run_main(["--apply", "--candidates", cjson, "--state-file",
+                       os.path.join(tmp, "sys", "queuefault.json"), "--limit", "2", "--no-alert"], one)
+    check("a failed queue claim does not stop the scan half: its candidates still ingest",
+          len(one.calls) == 2 and "SYSTEMIC" not in oq and "queue unavailable" in oq,
+          f"{one.calls}\n{oq[-500:]}")
+    check("  ...re-checking the corpus on a separate, fallback connection",
+          len(q.conns) == 2 and q.conns[1].commits >= 2, f"{len(q.conns)} conns")
+    def no_db():
+        raise OSError("connection to server at pgfarm... failed: timeout expired")
+    q._conn = no_db
+    none_ = FakeIngest({})
+    rc, on = run_main(["--apply", "--candidates", cjson, "--state-file",
+                       os.path.join(tmp, "sys", "queuefault2.json"), "--no-alert"], none_)
+    check("  ...and only if that connection fails too is it a systemic stop (never a blind ingest)",
+          none_.calls == [] and "SYSTEMIC FAILURE" in on and "re-check the corpus" in on, on[-500:])
+    install_fake_queue()
+
     # engine: hold back that engine only; the others carry on; its block alerts on its own
     CORPUS.clear()
     install_fake_queue()
@@ -646,6 +678,19 @@ with tempfile.TemporaryDirectory() as tmp:
     st6.record_run(2, 5, {}, now=T0 + 16 * H)            # others succeed meanwhile
     r = st6.record("rk", "systemic", "x", now=T0 + 20 * H, reason="module 'x' failed")
     check("a candidate deferred 3x as 'systemic' while others succeed is then charged",
+          r["attempts"] == 1 and r["last_outcome"] == "systemic-repeat", str(r))
+    st8 = ais.AttemptStore(os.path.join(tmp, "sys", "repeat3.json"))
+    meta = {"engine": "spectronaut", "search": "s"}
+    for i in range(3):
+        st8.record("sk", "systemic", "x", meta=meta, now=T0 + i * 5 * H, scope="engine")
+    st8.record_run(2, 5, {}, now=T0 + 16 * H, engines_progressed=["diann"])
+    r = st8.record("sk", "systemic", "x", meta=meta, now=T0 + 20 * H, scope="engine")
+    check("an ENGINE-scoped deferral is not charged on another engine's successes (a missing "
+          "adapter would otherwise quarantine its engine's heads one by one)",
+          r["attempts"] == 0 and r["status"] == "deferred", str(r))
+    st8.record_run(1, 5, {}, now=T0 + 21 * H, engines_progressed=["spectronaut"])
+    r = st8.record("sk", "systemic", "x", meta=meta, now=T0 + 25 * H, scope="engine")
+    check("  ...but is, once its OWN engine succeeds in the meantime",
           r["attempts"] == 1 and r["last_outcome"] == "systemic-repeat", str(r))
     st7 = ais.AttemptStore(os.path.join(tmp, "sys", "repeat2.json"))
     for i in range(5):
@@ -734,6 +779,48 @@ with tempfile.TemporaryDirectory() as tmp:
           "impatient" in json.load(open(lp))["candidates"] and "unlocked" in w.getvalue(),
           w.getvalue())
 
+    # A/B/C: A died holding the lock. B judges A's lock stale -- and, before B renames it, C breaks
+    # A's lock and takes a FRESH one. B's rename then moves C's LIVE lock; B must notice (the moved
+    # directory's owner is C, not the A it judged), put it back, and wait like anyone else.
+    lk = os.path.join(tmp, "s6", "abc.json")
+    lkd = lk + ".lockd"
+    os.makedirs(lkd)
+    open(os.path.join(lkd, "owner"), "w").write("A:dead:1\n")
+    os.utime(lkd, (time.time() - 3600,) * 2)
+    b_store = ais.AttemptStore(lk, lock_wait=0.5)
+    def c_interleaves(judged):
+        if b_store._break_hook is None:
+            return
+        b_store._break_hook = None                 # once
+        os.rename(lkd, lkd + ".c_grave")           # C breaks A's stale lock...
+        shutil.rmtree(lkd + ".c_grave")
+        os.mkdir(lkd)                              # ...and takes a fresh one
+        open(os.path.join(lkd, "owner"), "w").write("C:live:2\n")
+    b_store._break_hook = c_interleaves
+    with contextlib.redirect_stdout(io.StringIO()) as w:
+        b_store.record("from_b", "duplicate")
+    owner_now = open(os.path.join(lkd, "owner")).read().strip() if os.path.isdir(lkd) else None
+    check("lock race A/B/C: B restores C's live lock instead of destroying it",
+          owner_now == "C:live:2" and "restored it to its live holder" in w.getvalue(),
+          f"{owner_now}\n{w.getvalue()}")
+    check("  ...waits for it rather than taking it, and leaves no stray directory behind",
+          "still held" in w.getvalue() and
+          [f for f in os.listdir(os.path.dirname(lk)) if f.startswith("abc.json.lockd.")] == [],
+          os.listdir(os.path.dirname(lk)))
+    shutil.rmtree(lkd)
+    x = ais.AttemptStore(lk)
+    assert x._lock()
+    open(os.path.join(lkd, "owner"), "w").write("someone-else\n")   # broken + re-taken meanwhile
+    with contextlib.redirect_stdout(io.StringIO()) as w:
+        x._unlock()
+    check("_unlock removes the lock only if it is still ours",
+          os.path.isdir(lkd) and "left in place" in w.getvalue(), w.getvalue())
+    shutil.rmtree(lkd)
+    y = ais.AttemptStore(lk)
+    assert y._lock()
+    y._unlock()
+    check("  ...and does remove its own", not os.path.exists(lkd))
+
     st = ais.AttemptStore(os.path.join(tmp, "s6", "lease.json"))
     got1 = st.claim("/od/x", "hostA:1", 600, attempt_key="k1", now=T0)
     got2 = st.claim("/od/x", "hostB:2", 600, now=T0 + 10)         # a queue row: no attempt_key
@@ -741,6 +828,9 @@ with tempfile.TemporaryDirectory() as tmp:
           got1 == (True, None) and got2[0] is False, str((got1, got2)))
     e, hld = st.gate([{"identity": "/od/x", "attempt_key": "other"}], now=T0 + 20)
     check("  ...and the gate holds it as leased", hld and hld[0][1] == "leased", str(hld))
+    e, hld = st.gate([{"identity": "/od/x/", "attempt_key": "other"}], now=T0 + 20)
+    check("  ...a trailing slash does not make a leased output_dir look free (identity_of)",
+          hld and hld[0][1] == "leased", str(hld))
     got3 = st.claim("/od/x", "hostB:2", 600, attempt_key="k1", now=T0 + 700)
     rec = st.load()["candidates"]["k1"]
     check("an expired lease with no outcome is charged as an abandoned attempt",
