@@ -90,3 +90,72 @@ cur.execute("""select count(*), count(search_id),
                from delimp_spectrum_lane""")
 print(cur.fetchone())  # (datasets, linked, precursors, fragments, first, last)
 ```
+
+---
+
+# XIC lane — provenance & the `shortcourse_diann19` negative result
+
+> Snapshot **2026-09-23**. The sections above cover the observed-spectrum Lance lane. This one
+> covers its sibling, the **XIC / chromatogram lane** (`delimp_precursor_xic`), which the design
+> docs do not track. Added after a peptide-page mirror plot was traced to an ingest gap.
+
+## `rel_intensity` has TWO incompatible meanings — check `trace_rt_basis` first
+
+`delimp_precursor_xic.fragments[].rel_intensity` is **not one quantity**:
+
+| `trace_rt_basis` | rows | what `rel_intensity` is | safe to compare against the trace? |
+|---|---|---|---|
+| `relative_to_apex` / NULL (consensus) | 442,035 | library value — DIA-NN `Relative.Intensity` (`xic_ingest.py:187`) or Spectronaut `frg_rel` (`sne_xic_ingest.py:127`) | **yes** — independent of the measurement |
+| `absolute` (per-run) | 18,634 | `apex / max(apex)` from the trace itself (`ingest_perrun_xic.py:106`) | **NO — self-referential** |
+
+Plotting the `absolute` form against those same traces compares a thing with a rescaled copy of
+itself: it renders as near-perfect agreement and proves nothing. **Two guards keep it out, and
+both are load-bearing:** the `trace_rt_basis IS DISTINCT FROM 'absolute'` filter in
+`app/queries.py` `peptide_xic()`, and the basis guard on the upsert in `xic_engine_display_set.py`.
+Note `engine_run_xic()` (`/api/engines/run/{raw}/xic`) has **no** such filter and does publish the
+self-referential value — it is not rendered by any client, but do not start plotting it.
+
+## Every DIA-NN group in the XIC lane is an orphan
+
+31 distinct `(search_id, engine, version)` groups; **13 carry name-slugs that do not join to
+`delimp_searches`** — so no `output_dir`, no raw-file list, no date. All 71,336 DIA-NN rows are in
+that orphaned set (`shortcourse_diann19`, `savannah_nov2025`, ten `bat_*`). Every Spectronaut group
+but one joins and has an `output_dir`.
+
+## `shortcourse_diann19` — unsourced, and the UI change IS the fix
+
+13,852 rows / 12,898 peptides / 13,852 precursors, **`rel_intensity` NULL on every fragment of
+every row** — ingested via `xic_ingest.py` `_records_xiconly()`, the fallback taken when no
+`report-lib.parquet` sits beside the DIA-NN output. That path also computes fragment *m/z*
+theoretically from the sequence and sets `precursor_mz` NULL. 10,036 peptide pages open on one of
+these rows.
+
+**Do not re-run the search for the source directory. It was done on 2026-09-23 and came back
+negative.** `find` over `/quobyte/proteomics-grp` and `/nfs/lssc0/flinders/proteomics/Data`
+(pruning `*.d`, `*.raw`, `*.lance`, `.snapshot`):
+
+| scanned / found | count |
+|---|---|
+| `report.log.txt` scanned | 5,321 |
+| DIA-NN 1.8.1 / 1.8.2 / **1.9** / 1.9.1 | 8 / 42 / **5** / 2 |
+| `report-lib.parquet` beside a **1.9** log | **0** (the only 2 are 1.9.1 — Lauren's Ceres_SDS mouse runs, unrelated) |
+| `report_xic.parquet` on the whole estate | **2** — `brett/glendon/diann251_fragexport16` (DIA-NN 2.5.1) and `brett/siegel_glp1_2026-08-12/par/timstof/xic`; **neither is 1.9** |
+
+The source directory is not on the scanned estate. Without its `report_xic.parquet` the ingest
+cannot be re-run, so there is **no precursor correspondence against which to validate any
+substitute library** — a library that covers some of the same sequences is not evidence it is the
+right one. (`lib/UCD_Sample_prep_mouse.empirical.parquet` looks like a candidate and is not: 15%
+precursor coverage, zero `(UniMod:1)` acetyl entries against 53% acetylated precursors in the lane,
+and its searches are DIA-NN **2.6.0**.) The lane is permanently unsourced; the UI change that stops
+drawing an empty predicted half **is the fix, not a stopgap while the data is looked for**.
+
+*Scan caveats:* pruned `*.d`/`*.raw`/`*.lance`; covered those two roots only — not the `/Volumes`
+SMB share, not the Windows `B:`/`S:` drives.
+
+## The process lesson
+
+The `bat_*` cohort came through the same hand-run slug workflow and **kept its library** —
+its rows have full `rel_intensity`. `shortcourse_diann19` did not, and because the ingest recorded
+no `output_dir`, there is now no way to repair it. **An ad-hoc ingest that records no `output_dir`
+produces data that cannot be repaired later.** This is the second time that has bitten. Register
+the search (or at minimum persist its output path) before ingesting a lane from it.

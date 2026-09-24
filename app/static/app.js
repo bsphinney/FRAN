@@ -1294,7 +1294,16 @@ async function loadXIC(seq){
     }
     _xic=x;
     const cd=(x.charge_distribution||[]).map(c=>`<span class="px-2 py-0.5 rounded text-[11px] bg-white/5 text-slate-300">+${c.charge} <span class="text-accent-400 font-semibold">${c.pct}%</span> <span class="text-slate-500">(${fmt(c.n_obs)})</span></span>`).join(' ');
-    const btns=x.precursors.map((p,i)=>`<button id="xicp_${i}" onclick="selectXICPrec(${i})" class="px-3 py-1 rounded-lg text-xs glass text-slate-300">+${p.charge}${p.has_real_trace?'':' <span class="opacity-60">(predicted)</span>'}</button>`).join('');
+    // Three states, matching selectXICPrec()'s hasFragTraces / frags.length split. Keying this
+    // off has_real_trace alone tagged an MS1-only precursor "(predicted)" directly above a
+    // banner saying its MS1 is measured -- the button and the panel contradicted each other.
+    const _precTag=p=>{
+      const fr=p.fragments||[];
+      if(fr.some(f=>(f.trace||[]).length)) return '';                        // real acquired traces
+      if(!fr.length) return ' <span class="opacity-60">(MS1 only)</span>';   // no fragments at all
+      return ' <span class="opacity-60">(predicted)</span>';                 // library ids, modelled shape
+    };
+    const btns=x.precursors.map((p,i)=>`<button id="xicp_${i}" onclick="selectXICPrec(${i})" class="px-3 py-1 rounded-lg text-xs glass text-slate-300">+${p.charge}${_precTag(p)}</button>`).join('');
     el.innerHTML=`
       <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
         <h3 class="font-bold text-white">Extracted-ion chromatogram (XIC) <span class="text-[10px] text-slate-500 font-normal">per precursor · DIA</span></h3>
@@ -1309,54 +1318,95 @@ function selectXICPrec(i){
   const x=_xic; if(!x)return; const p=x.precursors[i]; if(!p)return;
   x.precursors.forEach((_,j)=>{const b=$('#xicp_'+j); if(b) b.className='px-3 py-1 rounded-lg text-xs '+(j===i?'tab-active':'glass text-slate-300');});
   ['xic_ms1','xic_frag','xic_mirror'].forEach(id=>{ if(charts[id]){try{charts[id].destroy()}catch(e){} delete charts[id];} });
-  const synthetic=!p.has_real_trace;
+  // One flag used to drive BOTH panes: `synthetic = !has_real_trace`, where has_real_trace means
+  // "some FRAGMENT has a trace". So a row with a real measured MS1 but no fragments had that MS1
+  // thrown away and replaced with a modelled Gaussian. Each pane now answers for its own data.
+  const frags=(p.fragments||[]);
+  const hasMs1=!!(p.ms1||[]).length;
+  const hasFragTraces=frags.some(f=>(f.trace||[]).length);
+  const synthetic=!hasFragTraces;          // fragment pane only -- NOT the MS1 pane
+  // Do library ("predicted") intensities actually exist on this row? Rows ingested without a
+  // report-lib carry rel_intensity null on every fragment, so the mirror's predicted half has no
+  // source at all. Fall back to inspecting the fragments if the API predates the flag.
+  const hasLibRel=(p.has_library_intensities!=null)?!!p.has_library_intensities
+                                                   :frags.some(f=>f.rel_intensity!=null);
   // Name the library that actually produced these predicted intensities. This was hard-coded to
   // "DIA-NN library" for every peptide, which is wrong for most of a >90% Spectronaut corpus.
+  // Only honest when a library was actually ingested -- see hasLibRel.
   const libLabel=(p.engine?(p.engine+(p.engine_version?' '+p.engine_version:'')+' library'):'spectral library');
   const usage=(p.fragment_usage||[]).slice(0,12).map(u=>`<div class="flex items-center gap-2 text-[11px] py-0.5">
       <span class="font-mono w-12 text-slate-300">${esc(u.label)}</span>
       <div class="flex-1 h-2 rounded bg-white/5 overflow-hidden"><div style="width:${u.pct}%;height:100%;background:#FFBF00"></div></div>
       <span class="text-slate-500 w-9 text-right">${u.pct}%</span></div>`).join('');
+  // Three honest states, not one. The old single banner asserted "fragment identities & relative
+  // intensities are real (spectral library)" over rows that carry ZERO fragments.
+  const banner = !frags.length
+    ? {c:'text-amber-300', t:`⚠ MS1 only — no fragment chromatograms were ingested for this precursor.${hasMs1?' The MS1 trace below is measured.':' No MS1 trace is stored either.'} No fragment identities or intensities are available.`}
+    : synthetic
+      ? {c:'text-amber-300', t:'⚠ Predicted XIC — fragment identities &amp; relative intensities are real (spectral library), the elution peak shape is modeled (synthetic time axis). Not a measured chromatogram.'}
+      : {c:'text-slate-500', t:`Real acquired XIC — apex-aligned <b>average</b> of the acquired runs (each run aligned to its apex, then meaned; axis = ${esc(x.rt_axis||'RT − apex, min')}). Observed in ${fmt(p.n_searches)} search${p.n_searches===1?'':'es'}; pools more acquisitions as additional searches are ingested.`};
+  // Caveats stacked on top of the banner, for rows ingested without a report-lib.
+  const caveats=[];
+  if(frags.length&&!hasLibRel) caveats.push('No library fragment intensities were ingested for this search, so the predicted half of the mirror cannot be drawn. Fragments are ranked by measured trace apex.');
+  if(p.fragment_mz_theoretical) caveats.push('Fragment <i>m/z</i> are <b>theoretical</b>, calculated from the sequence (Cys carbamidomethyl assumed) — not measured, and not library values.');
+  const showMirror = hasFragTraces && hasLibRel;
     $('#xicpane').innerHTML=`
-      <div class="text-[11px] mb-2 ${synthetic?'text-amber-300':'text-slate-500'}">${synthetic
-        ? '⚠ Predicted XIC — fragment identities &amp; relative intensities are real (spectral library), the elution peak shape is modeled (synthetic time axis). Not a measured chromatogram.'
-        : `Real acquired XIC — apex-aligned <b>average</b> of the acquired runs (each run aligned to its apex, then meaned; axis = ${esc(x.rt_axis||'RT − apex, min')}). Observed in ${fmt(p.n_searches)} search${p.n_searches===1?'':'es'}; pools more acquisitions as additional searches are ingested.`}</div>
+      <div class="text-[11px] mb-2 ${banner.c}">${banner.t}</div>
+      ${caveats.length?`<div class="text-[11px] mb-2 text-amber-300">⚠ ${caveats.join('<br>⚠ ')}</div>`:''}
       <div class="grid lg:grid-cols-4 gap-4">
         <div class="lg:col-span-3 space-y-2">
-          <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">MS1 precursor (+${p.charge})</div><div class="h-24"><canvas id="xic_ms1"></canvas></div></div>
-          <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Fragment ions (top ${p.fragments.length} quantified)</div><div class="h-44"><canvas id="xic_frag"></canvas></div></div>
-          ${synthetic?'':`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Predicted (${esc(libLabel)}) ↑ vs acquired (XIC apex) ↓ — mirror</div><div class="h-44"><canvas id="xic_mirror"></canvas></div></div>`}
+          ${hasMs1?`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">MS1 precursor (+${p.charge}) <span class="normal-case text-slate-600">· measured</span></div><div class="h-24"><canvas id="xic_ms1"></canvas></div></div>`:''}
+          ${frags.length?`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Fragment ions (top ${frags.length} quantified)</div><div class="h-44"><canvas id="xic_frag"></canvas></div></div>`:''}
+          ${showMirror?`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Predicted (${esc(libLabel)}) ↑ vs acquired (XIC apex) ↓ — mirror</div><div class="h-44"><canvas id="xic_mirror"></canvas></div></div>`
+            :(hasFragTraces?`<div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Acquired fragment spectrum (XIC apex) — no library to mirror against</div><div class="h-44"><canvas id="xic_mirror"></canvas></div></div>`:'')}
         </div>
-        <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Quant-fragment usage % across searches</div>${usage||empty('—')}</div>
+        <div><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Quant-fragment usage % across searches</div>${usage||empty('—')}
+          ${(!frags.length&&(p.fragment_usage||[]).length)?`<div class="text-[10px] text-slate-500 mt-2">These labels come from the engine's quant report; no chromatogram was ingested for them, so none is charted.</div>`:''}</div>
       </div>`;
   const cc=chartColors();
   const opts=(xt)=>({plugins:{legend:{display:false}},maintainAspectRatio:false,
     scales:{x:{type:'linear',title:{display:!!xt,text:xt,color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick,maxTicksLimit:6}},
             y:{grid:{color:cc.grid},ticks:{color:cc.tick,callback:v=>sci(v),maxTicksLimit:4}}},elements:{point:{radius:0}}});
-  const ms1data = synthetic ? _synthTrace(1) : (p.ms1||[]);
-  charts.xic_ms1=new Chart($('#xic_ms1'),{type:'line',data:{datasets:[{data:ms1data.map(q=>({x:q.rt,y:q.i})),
-    borderColor:'#022851',backgroundColor:'#02285133',fill:true,tension:.35,borderWidth:2,borderDash:synthetic?[4,3]:[]}]},options:opts(null)});
-  charts.xic_frag=new Chart($('#xic_frag'),{type:'line',data:{datasets:(p.fragments||[]).map((f,j)=>({
-    label:f.label,data:(synthetic?_synthTrace(f.rel_intensity||0):(f.trace||[])).map(q=>({x:q.rt,y:q.i})),
-    borderColor:PALETTE[j%PALETTE.length],backgroundColor:'transparent',tension:.35,borderWidth:1.8,borderDash:synthetic?[4,3]:[]}))},
-    options:{...opts(x.rt_axis||'RT − apex (min)'),plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
-    tooltip:{callbacks:{title:items=>`${synthetic?'Δ':''}RT ${fmtF(items[0].parsed.x)} min`}}}}});
+  // The MS1 pane draws the MEASURED trace whenever one exists. It used to be keyed off the
+  // FRAGMENT flag, so rows with a real 41-point MS1 but no fragments had it discarded and a
+  // modelled Gaussian drawn in its place -- fabricated data shown where real data existed.
+  if(hasMs1){
+    charts.xic_ms1=new Chart($('#xic_ms1'),{type:'line',data:{datasets:[{data:(p.ms1||[]).map(q=>({x:q.rt,y:q.i})),
+      borderColor:'#022851',backgroundColor:'#02285133',fill:true,tension:.35,borderWidth:2}]},options:opts(null)});
+  }
+  if(frags.length){
+    charts.xic_frag=new Chart($('#xic_frag'),{type:'line',data:{datasets:frags.map((f,j)=>({
+      label:f.label,data:(synthetic?_synthTrace(f.rel_intensity||0):(f.trace||[])).map(q=>({x:q.rt,y:q.i})),
+      borderColor:PALETTE[j%PALETTE.length],backgroundColor:'transparent',tension:.35,borderWidth:1.8,borderDash:synthetic?[4,3]:[]}))},
+      options:{...opts(x.rt_axis||'RT − apex (min)'),plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
+      tooltip:{callbacks:{title:items=>`${synthetic?'Δ':''}RT ${fmtF(items[0].parsed.x)} min`}}}}});
+  }
   // mirror plot: predicted (spectral-library rel-intensity) up, acquired (XIC peak apex) down,
   // each normalized to its own max so the spectral PATTERNS compare regardless of scale.
-  if(!synthetic){
-    const frg=(p.fragments||[]).filter(f=>f.mz);
+  // GATED ON hasLibRel, not on the acquired traces. The old gate was `!synthetic` -- i.e. "the
+  // ACQUIRED half has data" -- so on a row with no library intensities it still drew the
+  // predicted series as (0 || 0) / 1e-9 == 0 for every ion: an all-zero line sitting exactly on
+  // the axis, captioned as a library that was never ingested. When they are missing we draw the
+  // acquired half ALONE, so nothing implies a comparison was made.
+  if(hasFragTraces){
+    const frg=frags.filter(f=>f.mz);
     const apexOf=f=>Math.max(0,...(f.trace||[]).map(t=>t.i));
-    const maxRel=Math.max(...frg.map(f=>f.rel_intensity||0),1e-9);
     const maxApex=Math.max(...frg.map(apexOf),1e-9);
     const mstem=(fn)=>{const a=[];frg.forEach(f=>{a.push({x:f.mz,y:0});a.push({x:f.mz,y:fn(f),ion:f.ion||f.label});a.push({x:f.mz,y:null});});return a;};
-    charts.xic_mirror=new Chart($('#xic_mirror'),{type:'line',data:{datasets:[
-      {label:'predicted ('+libLabel+')',data:mstem(f=>(f.rel_intensity||0)/maxRel),borderColor:'#00B5E2',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false},
-      {label:'acquired (XIC apex)',data:mstem(f=>-(apexOf(f)/maxApex)),borderColor:'#FFBF00',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false}]},
+    const sign=hasLibRel?-1:1;   // one-sided (upward) when there is nothing to mirror against
+    const ds=[{label:'acquired (XIC apex)',data:mstem(f=>sign*(apexOf(f)/maxApex)),
+               borderColor:'#FFBF00',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false}];
+    if(hasLibRel){
+      const maxRel=Math.max(...frg.map(f=>f.rel_intensity||0),1e-9);
+      ds.unshift({label:'predicted ('+libLabel+')',data:mstem(f=>(f.rel_intensity||0)/maxRel),
+                  borderColor:'#00B5E2',borderWidth:1.8,pointRadius:0,spanGaps:false,tension:0,fill:false});
+    }
+    charts.xic_mirror=new Chart($('#xic_mirror'),{type:'line',data:{datasets:ds},
       options:{plugins:{legend:{position:'bottom',labels:{color:cc.tick,boxWidth:8,font:{size:10}}},
         tooltip:{filter:it=>it.raw&&it.raw.ion,callbacks:{label:c=>`${c.dataset.label}: ${c.raw.ion} (${fmtF(Math.abs(c.parsed.y),3)})`}}},
         scales:{x:{type:'linear',title:{display:true,text:'m/z',color:cc.tick},grid:{color:cc.grid},ticks:{color:cc.tick}},
-          y:{min:-1.1,max:1.1,grid:{color:cc.grid},ticks:{color:cc.tick,callback:v=>Math.abs(v).toFixed(1)},
-             title:{display:true,text:'predicted ↑   acquired ↓',color:cc.tick}}},
+          y:{min:hasLibRel?-1.1:0,max:1.1,grid:{color:cc.grid},ticks:{color:cc.tick,callback:v=>Math.abs(v).toFixed(1)},
+             title:{display:true,text:hasLibRel?'predicted ↑   acquired ↓':'acquired (rel. to strongest)',color:cc.tick}}},
         elements:{point:{radius:0}},maintainAspectRatio:false}});
   }
 }

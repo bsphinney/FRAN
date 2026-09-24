@@ -115,7 +115,20 @@ def main():
         ON CONFLICT (precursor_id) DO UPDATE SET
           rt_apex=EXCLUDED.rt_apex, ms1_apex=EXCLUDED.ms1_apex, ms1=EXCLUDED.ms1,
           fragments=EXCLUDED.fragments, n_fragments_total=EXCLUDED.n_fragments_total,
-          trace_rt_basis=EXCLUDED.trace_rt_basis""", rows, page_size=100)
+          trace_rt_basis=EXCLUDED.trace_rt_basis
+        -- BASIS GUARD -- DO NOT REMOVE. A row of one trace_rt_basis must never overwrite a row
+        -- of another. The rows this script inserts come from ingest_perrun_xic.build_rows(),
+        -- whose fragments[].rel_intensity is apex/max(apex) derived from the trace ITSELF
+        -- (ingest_perrun_xic.py:106) -- NOT a library value. Consensus rows
+        -- (trace_rt_basis 'relative_to_apex' or NULL) instead carry the library
+        -- Relative.Intensity (xic_ingest.py:187) or Spectronaut frg_rel (sne_xic_ingest.py:127).
+        -- Without this clause a precursor_id collision silently replaces a library-backed
+        -- consensus row with a self-referential one, and the peptide page's mirror plot would
+        -- then be comparing the acquired trace against a rescaled copy of itself -- which
+        -- renders as near-perfect agreement and means nothing. See the comment at the top of
+        -- peptide_xic() in app/queries.py.
+        WHERE delimp_precursor_xic.trace_rt_basis IS NOT DISTINCT FROM EXCLUDED.trace_rt_basis""",
+        rows, page_size=100)
     conn.commit()
     cur.execute("""SELECT count(*), count(DISTINCT run) FROM delimp_precursor_xic
                    WHERE run = ANY(%s)""", (sorted(runs),))

@@ -93,7 +93,18 @@ COMMENTS = [
      "Per-ion jsonb: mz, label ('y7^1'), type, series, charge, apex, rel_intensity, score, trace. "
      "trace is 41 points of {i, rt} where **rt is RELATIVE MINUTES FROM THE APEX**, spanning "
      "[-0.5, +0.5] -- NOT an absolute retention time. Add rt_apex to convert, bearing in mind the "
-     "caveat on that column. rel_intensity is computed from the averaged trace."),
+     "caveat on that column. "
+     "**rel_intensity HAS TWO INCOMPATIBLE MEANINGS -- check trace_rt_basis before using it.** "
+     "On the consensus lane (trace_rt_basis 'relative_to_apex' or NULL) it is the LIBRARY "
+     "relative intensity: DIA-NN Relative.Intensity (ingest/xic_ingest.py:187) or Spectronaut "
+     "frg_rel (ingest/sne_xic_ingest.py:127) -- an INDEPENDENT predicted value, and the only "
+     "form safe to compare against the measured trace. On the per-run lane "
+     "(trace_rt_basis = 'absolute') it is instead apex/max(apex) computed from the trace itself "
+     "(ingest/ingest_perrun_xic.py:106) -- SELF-REFERENTIAL, so plotting it against these same "
+     "traces compares a thing with a rescaled copy of itself and shows meaningless near-perfect "
+     "agreement. It is also NULL on every fragment of rows ingested without a report-lib "
+     "(xic_ingest.py:314). An earlier version of this comment said only 'rel_intensity is "
+     "computed from the averaged trace', which describes the per-run writer alone."),
     ("delimp_precursor_xic", "ms1",
      "MS1 isotope trace, same shape and same relative-RT convention as fragments[].trace."),
     ("delimp_precursor_xic", "run",
