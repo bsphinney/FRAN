@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,12 +51,14 @@ DRIVE_MAP = {
 
 REPORTS_ROOT = "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports"
 
+# The drop box. The proteomics skill's fran_deposit.py stages each finished search here as a
+# DIRECTORY holding fran_manifest.json plus symlinks to the real report files (read_manifest below
+# is the contract). Earlier entries were bare symlinks to the output dir, which is why the walk
+# sets followlinks=True -- os.walk does NOT descend into a symlinked directory by default.
+DROPBOX_ROOT = "/quobyte/proteomics-grp/fran/incoming"
+
 DEFAULT_ROOTS = [
-    # The drop box: the proteomics skill SYMLINKS finished search results here. Entries are links
-    # to the real output dirs, which is why the walk below sets followlinks=True -- os.walk does NOT
-    # descend into a symlinked directory by default, so without it every dropped result would be
-    # listed and never looked inside.
-    "/quobyte/proteomics-grp/fran/incoming",
+    DROPBOX_ROOT,
     "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports",
 ]
 # /quobyte/proteomics-grp/brett WAS a root until 2026-09-08. It is a personal working directory,
@@ -146,7 +149,8 @@ def known_keys(conn):
 # dirnames, so os.walk would never yield it and detect_engine would never see it. Silently losing a
 # whole engine's layout is a worse cost than descending into a few of them.
 _PRUNE_SUFFIX = (".d", ".raw", ".wiff", ".wiff2", ".mzml", ".mzxml", ".lance")
-_PRUNE_NAME = {".snapshot", ".git", "__pycache__", ".Trash", "lost+found", ".ipynb_checkpoints"}
+_PRUNE_NAME = {".snapshot", ".git", "__pycache__", ".Trash", "lost+found", ".ipynb_checkpoints",
+               ".excluded"}   # incoming/.excluded/: drop-box entries a human set aside (DEPLOY_auto_ingest.md)
 
 # Whole subtrees that produce engine output which is NOT a corpus search. Without these a full-tree
 # sweep returns 4,493 "candidates", of which 4,427 are these: STAN writes a DIA-NN report.parquet
@@ -164,6 +168,132 @@ DEFAULT_EXCLUDES = [
 
 def excluded(path: str, patterns) -> bool:
     return any(pat in path for pat in patterns)
+
+
+# QC runs are not customer searches -- the reason DEFAULT_EXCLUDES exists. That list recognises QC
+# by WHERE it lives, which says nothing about a drop-box entry: every entry lives in incoming/,
+# whatever it is. So a staged search is also recognised by what it is CALLED: "QC" as a standalone
+# token ("… Lumos QC", "QC_run_01", "hela_qc_2", "Exploris QC2"), never inside a word ("aqc…",
+# "QCM…" -- the lookahead refuses a following letter, not a digit).
+#
+# Deliberately narrower than the lab's raw-FILE classifier, STAN's DEFAULT_QC_PATTERN
+# (stan/watcher/qc_filter.py), whose HeLa branch would also drop customer searches OF HeLa samples,
+# which the corpus holds. The skill's stage step uses this IDENTICAL regex and writes its verdict
+# into the manifest as "qc" / "qc_rule", so the two repos agree; tests pin the same vectors.
+QC_NAME_RE = re.compile(r"(?i)(?<![a-z0-9])qc(?![a-z])")
+
+
+def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
+              exclude: bool | None = None) -> str | None:
+    """Why FRAN policy keeps this DROP-BOX search out of the corpus, or None.
+
+    The producer's word wins, in this order:
+      1. manifest "qc": true or "exclude": true  -> excluded
+      2. manifest "qc": false                    -> NOT excluded, whatever the name (the producer
+                                                    overrode a false positive)
+      3. no flag: DEFAULT_EXCLUDES on `path` (the substring test scan() applies to every directory
+         it walks), then QC_NAME_RE on `name` and on the last three components of `path`.
+    Scope: drop-box candidates only (auto_ingest.select). The FRAN_reports scan is NOT name-filtered.
+    A hit is never a failure: nothing is attempted, charged or quarantined."""
+    if qc is True:
+        return "manifest says qc: true"
+    if exclude is True:
+        return "manifest says exclude: true"
+    if qc is False:
+        return None
+    for pat in DEFAULT_EXCLUDES:
+        if pat in (path or ""):
+            return f"output_dir is under {pat} (DEFAULT_EXCLUDES)"
+    parts = [p for p in str(path or "").replace("\\", "/").split("/") if p][-3:]
+    for field, text in [("search_name", name or "")] + [("output_dir", p) for p in parts]:
+        if QC_NAME_RE.search(text):
+            return f"{field} {text!r} matches QC_NAME_RE"
+    return None
+
+
+MANIFEST = "fran_manifest.json"
+MANIFEST_VERSIONS = (1,)
+ENGINES = ("diann", "spectronaut", "fragpipe", "radiant")
+
+
+def _staged_epoch(v):
+    """A manifest's staged_at as epoch seconds, or None. Accepts epoch numbers and ISO 8601 (a naive
+    ISO time is read as local time; for oldest-first ordering an hour either way does not matter)."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if v > 0 else None
+    try:
+        return float(str(v).strip())
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(str(v).strip().replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def read_manifest(d: str, detected_engine: str | None = None):
+    """(manifest, None) for a drop-box entry's VALID fran_manifest.json, else (None, why-not).
+
+    THE DROP-BOX CONTRACT, read in this one place: scan() uses it to recognise an already-ingested
+    entry, auto_ingest to take the entry's identity. fran_deposit.py stages a real directory, so
+    realpath() of the entry is the drop box itself and cannot say where the search lives; the
+    manifest's output_dir is the search's identity (search_id = uuid5(namespace, output_dir)).
+    Validation is strict for that reason: a manifest that cannot name its output_dir, or names an
+    engine the directory does not look like, is SKIPPED with this reason -- never guessed at, and
+    never charged as an ingest failure.
+
+    Returns output_dir (no trailing slash), engine, search_name, organism, taxon (digits, as str),
+    qc / exclude (True/False, or None when the producer did not say -- see qc_reason), fasta_path and
+    staged_by (or None), and staged_at (epoch seconds, or None -- callers fall back to the
+    manifest's mtime)."""
+    try:
+        with open(os.path.join(d, MANIFEST), encoding="utf-8") as fh:
+            m = json.load(fh)
+    except FileNotFoundError:
+        return None, f"no {MANIFEST}"
+    except (OSError, ValueError) as e:
+        return None, f"{MANIFEST} unreadable ({type(e).__name__})"
+    if not isinstance(m, dict):
+        return None, f"{MANIFEST} is not a JSON object"
+    ver = m.get("fran_manifest_version", 1)
+    if ver not in MANIFEST_VERSIONS:
+        return None, f"{MANIFEST} version {ver!r} is not one this reader understands"
+    od = m.get("output_dir")
+    if not isinstance(od, str) or not od.strip() or not os.path.isabs(od.strip()):
+        return None, f"{MANIFEST} has no absolute output_dir"
+    eng = m.get("engine")
+    if eng is not None:
+        if not isinstance(eng, str) or eng.strip().lower() not in ENGINES:
+            return None, f"{MANIFEST} names an unknown engine {eng!r}"
+        eng = eng.strip().lower()
+        if detected_engine and eng != detected_engine:
+            return None, (f"{MANIFEST} says engine {eng!r}, the directory looks like "
+                          f"{detected_engine!r}")
+    out = {"output_dir": od.strip().rstrip("/"), "engine": eng or detected_engine}
+    for k in ("search_name", "organism"):
+        v = m.get(k)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            return None, f"{MANIFEST} field {k!r} is not a non-empty string"
+        out[k] = v.strip() if v is not None else None
+    tx = m.get("taxon")
+    if tx is None or tx == "":
+        out["taxon"] = None
+    elif isinstance(tx, bool) or not str(tx).strip().isdigit():
+        return None, f"{MANIFEST} taxon {tx!r} is not a numeric NCBI taxon id"
+    else:
+        out["taxon"] = str(tx).strip()
+    for k in ("qc", "exclude"):
+        v = m.get(k)
+        if v is not None and not isinstance(v, bool):
+            return None, f"{MANIFEST} {k} {v!r} is not true/false"
+        out[k] = v
+    for k in ("fasta_path", "staged_by"):
+        v = m.get(k)
+        out[k] = v.strip() if isinstance(v, str) and v.strip() else None
+    out["staged_at"] = _staged_epoch(m.get("staged_at"))
+    return out, None
 
 
 def prune(dirnames: list[str]) -> None:
@@ -251,6 +381,17 @@ def scan(roots, paths, names, bases, max_depth=3, limit=0, engines=None, exclude
                    "parent-name" if pk & (bases | names) else None)
             if hit:
                 continue
+            # A drop-box entry lives at incoming/<name>__<hash>/, which no corpus row records; the
+            # row records the manifest's output_dir. Without this, a search that was staged AND
+            # ingested another way (GallPlasCer/GallPlasStrap: queue rows Q6/Q7, 2026-09-08) stays
+            # a candidate forever -- and corpus_ingest does not refuse an existing output_dir, it
+            # deletes and re-inserts the whole search.
+            if MANIFEST in filenames:
+                man, _ = read_manifest(dirpath)
+                if man and norm_path(man["output_dir"]) in paths:
+                    print(f"  [drop box] {dirpath}: already in the corpus as "
+                          f"{man['output_dir']}; skipped", flush=True)
+                    continue
             found.append({"dir": dirpath, "engine": engine,
                           "real": real if real != dirpath else None})
             if limit and len(found) >= limit:

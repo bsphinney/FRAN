@@ -59,6 +59,9 @@ def install_fake_queue(rows):
     def mark_xic(con, row_id, status, error=None):       # the real one commits
         q.calls.append(("xic", row_id, status)); con.commit()
     q.mark_xic = mark_xic
+    # auto_ingest re-checks the corpus immediately before every ingest (_corpus_has). These rows
+    # are new searches, so the answer is "not ingested yet".
+    q._already_ingested = lambda cur, output_dir: None
     sys.modules["fran_queue"] = q
     return q
 
