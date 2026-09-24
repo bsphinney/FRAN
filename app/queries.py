@@ -4995,3 +4995,170 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
         # modified proteins".
         result["ptm_rollup_ready"] = ptm_ready
     return result
+
+
+def ptm_landscape() -> dict[str, Any]:
+    """Per-search modified-precursor rate — which PTM enrichments actually worked.
+
+    Reads ONLY the rollup + search metadata. NEVER delimp_precursors: computing this live is a
+    >15-minute corpus scan and this page is public and anonymous. The full per-search GROUP BY
+    over the 5.26M-row rollup measured 1.4 s on 2026-09-17.
+
+    The rollup flags only has_ptm / has_phospho / has_glygly, so this CANNOT distinguish
+    oxidation from acetyl from deamidation. The page says so; do not let a caller infer that an
+    absent flag means an absent modification.
+    """
+    def _p() -> dict[str, Any]:
+        rows = query(
+            """
+            WITH agg AS (
+              SELECT search_id,
+                     COUNT(*)                                AS n_groups,
+                     COUNT(*) FILTER (WHERE has_ptm)         AS n_ptm,
+                     COUNT(*) FILTER (WHERE has_phospho)     AS n_phospho,
+                     COUNT(*) FILTER (WHERE has_glygly)      AS n_glygly,
+                     SUM(n_mod_precursors)                   AS mod_precursors
+                FROM delimp_search_protein_ptm
+               GROUP BY search_id
+            ),
+            -- species/instrument are NOT on delimp_searches (verified 2026-09-17); they come
+            -- through the run join. Bounded by runs (23,871 rows), not precursors.
+            meta AS (
+              SELECT srf.search_id,
+                     MODE() WITHIN GROUP (ORDER BY sm.organism_name)   AS organism,
+                     MODE() WITHIN GROUP (ORDER BY rf.instrument_model) AS instrument
+                FROM search_raw_files srf
+                LEFT JOIN delimp_sample_metadata sm ON sm.raw_path = srf.raw_path
+                LEFT JOIN raw_files rf              ON rf.raw_path = srf.raw_path
+               GROUP BY srf.search_id
+            )
+            -- completed_at is populated on 3 of 2,112 searches (measured 2026-09-17) and on ZERO
+            -- of the ones in this rollup, so a Date column built on it alone is blank for every
+            -- row. ingested_at is populated on all 2,112; every other FRAN view dates a search
+            -- that way. COALESCE, so a real completion date still wins where one exists.
+            SELECT a.search_id, s.search_name,
+                   COALESCE(s.completed_at, s.ingested_at) AS completed_at,
+                   (s.completed_at IS NULL)                AS date_is_ingest,
+                   s.search_engine,
+                   m.organism, m.instrument,
+                   a.n_groups, a.n_ptm, a.n_phospho, a.n_glygly, a.mod_precursors,
+                   s.n_precursors_total
+              FROM agg a
+              JOIN delimp_searches s ON s.id = a.search_id
+              LEFT JOIN meta m       ON m.search_id = a.search_id
+             -- no ORDER BY: the Python sort below supersedes it, and leaving one here only
+             -- decides tie-break order invisibly through the stable sort.
+            """,
+            tables=["delimp_search_protein_ptm", "delimp_searches",
+                    "search_raw_files", "delimp_sample_metadata", "raw_files"],
+        )
+
+        searches = []
+        for r in rows:
+            total = r.get("n_precursors_total")
+            modp = int(r.get("mod_precursors") or 0)
+            # A rate needs a real denominator. No denominator -> no rate AND no verdict: a 0.0
+            # here would read as "nothing was modified", which is a claim we cannot make.
+            rate = (modp / total) if (total and total > 0) else None
+            searches.append({
+                "search_id": str(r["search_id"]),
+                "search_name": r.get("search_name"),
+                "completed_at": r["completed_at"].isoformat() if r.get("completed_at") else None,
+                "date_is_ingest": bool(r.get("date_is_ingest")),
+                "search_engine": r.get("search_engine"),
+                "organism": r.get("organism"),
+                "instrument": (r.get("instrument") or "").strip() or None,
+                "n_groups": int(r.get("n_groups") or 0),
+                "n_ptm": int(r.get("n_ptm") or 0),
+                "n_phospho": int(r.get("n_phospho") or 0),
+                "n_glygly": int(r.get("n_glygly") or 0),
+                "mod_precursors": modp,
+                "n_precursors_total": int(total) if total else None,
+                "modified_rate": rate,
+                "verdict": _ptm_verdict(rate),
+            })
+        searches.sort(key=lambda x: (x["modified_rate"] is None, -(x["modified_rate"] or 0)))
+
+        gcounts = query(
+            """
+            SELECT COUNT(DISTINCT protein_group) FILTER (WHERE has_ptm)     AS g_ptm,
+                   COUNT(DISTINCT protein_group) FILTER (WHERE has_phospho) AS g_phospho,
+                   COUNT(DISTINCT protein_group) FILTER (WHERE has_glygly)  AS g_glygly
+              FROM delimp_search_protein_ptm
+            """,
+            tables=["delimp_search_protein_ptm"], fetch="one") or {}
+
+        n_total = query("SELECT COUNT(*) FROM delimp_searches", tables=["delimp_searches"],
+                        fetch="val")
+        return {
+            "coverage": {
+                "n_searches_total": int(n_total or 0),
+                "n_searches_covered": len(searches),
+                # NOT "uncomputable": this is simply everything absent from the rollup, which
+                # is TWO different states -- a search whose precursors carry no protein_group (so
+                # the rollup can never produce a row: 5 such today) and a search the refresh job
+                # has not reached yet. They look identical from here, and the second kind appears
+                # every time new data is ingested, because ingest/fran_ptm_refresh.sbatch is NOT
+                # on Hive's crontab (verified 2026-09-17; see ingest/DEPLOY_ptm_refresh.md). The
+                # page must therefore not assert a reason it cannot know.
+                "n_not_in_rollup": max(int(n_total or 0) - len(searches), 0),
+            },
+            "summary": {
+                "n_searches_any_ptm": sum(1 for s in searches if s["n_ptm"]),
+                "n_searches_phospho": sum(1 for s in searches if s["n_phospho"]),
+                "n_searches_glygly": sum(1 for s in searches if s["n_glygly"]),
+                # DISTINCT across the corpus, not a sum of per-search counts. Summing counted a
+                # protein group once per search it appears in and overstated by ~8x: it rendered
+                # 2,637,809 under a tile reading "Protein groups modified" when the corpus holds
+                # 328,046 distinct such groups (measured 2026-09-17). The tile sits directly under
+                # "Searches with a modification", so it reads as a corpus total and must be one.
+                "n_groups_any_ptm": int(gcounts.get("g_ptm") or 0),
+                "n_groups_phospho": int(gcounts.get("g_phospho") or 0),
+                "n_groups_glygly": int(gcounts.get("g_glygly") or 0),
+                # The corpus baseline, so a reader can calibrate a single search's rate instead
+                # of reading it against an imagined zero. Measured 20.2% on 2026-09-17, and it is
+                # mostly background methionine oxidation rather than any enrichment -- see
+                # _ptm_verdict() for why that is also the reason the middle band carries no label.
+                "median_rate": (
+                    sorted(s["modified_rate"] for s in searches if s["modified_rate"] is not None)
+                    [len([s for s in searches if s["modified_rate"] is not None]) // 2]
+                    if any(s["modified_rate"] is not None for s in searches) else None
+                ),
+            },
+            "searches": searches,
+        }
+    return SLOW_CACHE.get_or_set("ptm_landscape", _p)
+
+
+def _ptm_verdict(rate: float | None) -> str | None:
+    """Rate-only classification, and ONLY at the two informative extremes. NEVER 'failed'.
+
+    FRAN cannot distinguish a failed enrichment from a sample that was never enriched, and
+    inferring intent from search_name is a guess about a human's naming habits. So this reads the
+    rate and nothing else, and the UI states that basis next to the label.
+
+    WHY THE MIDDLE BAND GETS NO LABEL. The design doc proposed a third label,
+    "low for an enrichment", for everything between 5% and 50%. Measured against the real corpus
+    on 2026-09-17 that band holds **1,900 of 2,107 searches** -- 90% of everything FRAN has --
+    because the median search sits at 20.2% modified precursors. That baseline is ordinary
+    background chemistry, not enrichment: on a representative search, 1,451 of 1,897 modified
+    precursors carry Oxidation (UNIMOD:35) and only 18 carry Carbamidomethyl. Methionine
+    oxidation happens in nearly every sample.
+
+    So the label would have been attached to ~1,860 searches that never attempted an enrichment,
+    telling their owners an experiment underperformed when no experiment was run. The design doc's
+    own risk table names this as the page's top risk ("Reader takes 'low for an enrichment' as
+    'the experiment failed'"); applying it to 90% of rows maximises exactly that risk instead of
+    mitigating it, and a label carried by 90% of rows conveys nothing anyway.
+
+    The rate itself is still shown for every search, and the page states the corpus median so a
+    reader can calibrate. Judgement about the middle is left to the reader, who knows whether an
+    enrichment was attempted -- which FRAN does not.
+    """
+    if rate is None:
+        return None
+    if rate >= 0.50:
+        return "enriched"
+    if rate <= 0.05:
+        return "incidental"
+    return None
