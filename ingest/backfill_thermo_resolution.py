@@ -45,15 +45,32 @@ DLL_DIR = os.environ.get("FRAN_THERMO_DLL_DIR",
 SELECT = """
 SELECT DISTINCT hive_path FROM raw_files
 WHERE hive_path ILIKE '%%.raw' AND hive_path <> ''
-  AND (ms1_resolution IS NULL OR ms2_resolution IS NULL OR ms2_resolution < 1000)
+  AND (ms1_resolution IS NULL OR ms2_resolution IS NULL OR ms2_resolution < 1000
+       OR cycle_time_sec IS NULL)
 """
 
+# Why cycle_time_sec is written here, kept OUT of the SQL string on purpose:
+# psycopg2 reads % as parameter binding, so a "11.2%" inside a SQL comment silently changes the
+# placeholder count and execute() dies with "tuple index out of range". That is exactly what
+# happened when this text lived in the string, and it is the same fault as commit ba7a0b0, which
+# 500'd species search from a literal % in the peptide-forms SQL. Prose lives in Python comments.
+#
+# cycle_time_sec sat at 34.4 percent on orbitrap rows against 98.6 on timsTOF, because read_thermo
+# cannot derive it: TRFP's -m 0 output has no scan times, and the only estimate it allows
+# (MS max RT x 60 / n_MS1) measured 11.2 percent mean error over 3,379 runs. The trailer reader
+# opens the file anyway, so the median gap between consecutive MS1 SCANS is free -- and measured
+# 0.4 to 1.4 percent against Spectronaut's own value.
+#
+# Repair rule, same as elsewhere: fill a gap, replace an implausible >20 s value (a stripped
+# decimal separator), never overwrite a good reading.
 UPDATE = """
 UPDATE raw_files SET
   ms1_resolution = CASE WHEN ms1_resolution IS NULL OR ms1_resolution < 1000
                         THEN COALESCE(%s, ms1_resolution) ELSE ms1_resolution END,
   ms2_resolution = CASE WHEN ms2_resolution IS NULL OR ms2_resolution < 1000
-                        THEN COALESCE(%s, ms2_resolution) ELSE ms2_resolution END
+                        THEN COALESCE(%s, ms2_resolution) ELSE ms2_resolution END,
+  cycle_time_sec = CASE WHEN cycle_time_sec IS NULL OR cycle_time_sec > 20
+                        THEN COALESCE(%s, cycle_time_sec) ELSE cycle_time_sec END
 WHERE hive_path = %s
 """
 
@@ -98,16 +115,17 @@ def main():
         if not line.startswith("{"):
             continue
         d = json.loads(line)
-        ms1, ms2, note = d.get("ms1_resolution"), d.get("ms2_resolution"), d.get("note")
+        ms1, ms2 = d.get("ms1_resolution"), d.get("ms2_resolution")
+        cyc, note = d.get("cycle_time_sec"), d.get("note")
         if note and "distinct values" in note:
             mixed += 1
             print(f"  MIXED {os.path.basename(d['path'])[:54]}: {note}")
-        if ms1 is None and ms2 is None:
+        if ms1 is None and ms2 is None and cyc is None:
             none += 1
             continue
         got += 1
         if a.apply:
-            cur.execute(UPDATE, (ms1, ms2, d["path"]))
+            cur.execute(UPDATE, (ms1, ms2, cyc, d["path"]))
             written += cur.rowcount
         if got % 500 == 0:
             if a.apply:
