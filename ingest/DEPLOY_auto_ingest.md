@@ -24,71 +24,104 @@ which is where the tests put their stand-in for its network edge.)
 
 ## Steps
 
-The deploy check is fran-db's `ingest/audit_deploy_sync.py`. It is committed on fran-db's branch
-`fix/tdf-immutable-opens` (d5c02b0) and **not on `main` yet**; it is already deployed on Hive. One
-definition: this change ships no checker of its own. Its verdict is the last line: `RESULT: fully in
-sync`, `RESULT: import closure is intact; N non-closure file(s) out of sync` (both SAFE), or
+**One writer to `fran_ingest` at a time. Coordinate with fran-db before touching it.**
+`fran_ingest` is fran-db's deployment directory; whoever copies into it also publishes the manifest.
+On 2026-09-25 two agents prepared this same deploy minutes apart, and one copied while the other was
+mid-check. Agree who deploys before step 3.
+
+The deploy check is fran-db's `ingest/audit_deploy_sync.py` (on fran-db's branch
+`fix/tdf-immutable-opens`, not on `main` yet; already deployed on Hive). One definition: this change
+ships no checker of its own. Its verdict is the last line: `RESULT: fully in sync`,
+`RESULT: import closure is intact; N non-closure file(s) out of sync` (both SAFE), or
 `RESULT: NOT SAFE TO INGEST …`. **A SAFE result is required before AND after the copy.**
 
+**Emit the manifest from the tree Hive ACTUALLY RUNS, plus the change -- not from `main` alone.**
+Hive can run a branch ahead of `main`. On 2026-09-25 it ran fran-db's `fix/tdf-immutable-opens`,
+including a newer `corpus_ingest.py` (md5 d976cf6: the six-column DIA-NN reader, its migration
+already live) that `main` did not have (`main`: cfaa2b3). Checked against plain `main`, step 2 below
+reported NOT SAFE with five files that were not this change's. Deploying or publishing from `main`
+alone would then have made the ingest gate refuse every ingest, because `corpus_ingest.py` is
+refuse-gated.
+
 ```bash
-# 1. BEFORE: prove Hive runs what main says, before touching it. In the repo, at the commit Hive
-#    currently runs (origin/main before this merge), with audit_deploy_sync.py available:
-python3 ingest/audit_deploy_sync.py --emit /tmp/ingest_manifest_before.json
+# 1. BEFORE: find the baseline -- the commit Hive runs today -- and prove it. Try main, and any branch
+#    fran-db has deployed from. The baseline is the one whose manifest checks SAFE ("fully in sync")
+#    against Hive before anything is copied. (On 2026-09-25: fran-db's b9a9d0b.)
+git archive <baseline> | tar -x -C /tmp/base
+python3 /tmp/base/ingest/audit_deploy_sync.py --emit /tmp/ingest_manifest_before.json
 scp /tmp/ingest_manifest_before.json brettsp@hive.hpc.ucdavis.edu:/tmp/
-#    on Hive -- must be SAFE (fran-db measured 92/92, 0 missing, 0 differing on 2026-09-24):
+#    on Hive -- must be SAFE:
 cd /quobyte/proteomics-grp/brett/glendon/fran_ingest
 python3 audit_deploy_sync.py --check /tmp/ingest_manifest_before.json \
     --target /quobyte/proteomics-grp/brett/glendon/fran_ingest
 
-# 2. At the MERGED commit: emit its manifest. Checked now, before copying, it is NOT SAFE and must
-#    name exactly this change's files -- auto_ingest_state.py and auto_ingest_alert.py MISSING,
-#    auto_ingest.py and find_uningested.py STALE. Anything else it lists is not this change's: stop.
-python3 ingest/audit_deploy_sync.py --emit /tmp/ingest_manifest_after.json
+# 2. The deploy tree = the baseline WITH the change merged in (on 2026-09-25: fran-db merged main,
+#    carrying this change, into its branch as 3eae82e). Emit its manifest. Checked before copying it
+#    is NOT SAFE and must name exactly this change's files -- here auto_ingest_state.py and
+#    auto_ingest_alert.py MISSING, auto_ingest.py and find_uningested.py STALE. Anything else: stop.
+git archive <union> | tar -x -C /tmp/union
+python3 /tmp/union/ingest/audit_deploy_sync.py --emit /tmp/ingest_manifest_after.json
 scp /tmp/ingest_manifest_after.json brettsp@hive.hpc.ucdavis.edu:/tmp/
 
-# 3. Keep the running copies, then copy all four TOGETHER (from the laptop):
-ssh brettsp@hive.hpc.ucdavis.edu 'cd /quobyte/proteomics-grp/brett/glendon/fran_ingest &&
-    for f in auto_ingest.py find_uningested.py; do cp -p $f $f.bak.$(date +%Y%m%d); done'
-scp ingest/auto_ingest.py ingest/auto_ingest_state.py ingest/auto_ingest_alert.py \
-    ingest/find_uningested.py brettsp@hive.hpc.ucdavis.edu:/quobyte/proteomics-grp/brett/glendon/fran_ingest/
+# 3. Keep the running copies OUTSIDE fran_ingest (files there that are not in the repo clutter the
+#    audit's "extra on target"), then copy the change's files TOGETHER from the union tree:
+mkdir -p ~/fran_rollback/<date> && cp -p /quobyte/proteomics-grp/brett/glendon/fran_ingest/{auto_ingest,find_uningested}.py ~/fran_rollback/<date>/
+scp /tmp/union/ingest/{auto_ingest,auto_ingest_state,auto_ingest_alert,find_uningested}.py \
+    brettsp@hive.hpc.ucdavis.edu:/quobyte/proteomics-grp/brett/glendon/fran_ingest/
 
-# 4. AFTER: on Hive, against the merged manifest -- must be SAFE:
+# 4. AFTER: on Hive, against the union manifest -- must be SAFE:
 python3 audit_deploy_sync.py --check /tmp/ingest_manifest_after.json \
     --target /quobyte/proteomics-grp/brett/glendon/fran_ingest
 
-# 5. Smoke test on Hive -- imports and the memory CLI only: no scan, no database, no ingest.
+# 5. Smoke test on Hive -- imports and the memory CLI only: no scan, no database, no ingest, and no
+#    bytecode written into fran_ingest:
 PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
-$PY -c "import auto_ingest, auto_ingest_state, auto_ingest_alert, find_uningested; print('imports ok')"
-$PY auto_ingest.py --list-quarantine --state-file /tmp/aiq_smoke_$$.json
+PYTHONDONTWRITEBYTECODE=1 $PY -c "import auto_ingest, auto_ingest_state, auto_ingest_alert, find_uningested; print('imports ok')"
+PYTHONDONTWRITEBYTECODE=1 $PY auto_ingest.py --list-quarantine
 
-# 6. Re-run publish_manifest.py from the merged repo, so delimp_ingest_manifest carries the two NEW
-#    modules and the new md5s of auto_ingest.py and find_uningested.py.
-python3 ingest/publish_manifest.py
+# 6. Publish the manifest from the UNION tree (the deployer does this -- fran-db on 2026-09-25), so
+#    delimp_ingest_manifest carries the two NEW modules and every md5 Hive now runs. Never from main
+#    alone while Hive runs a branch ahead of it.
+python3 /tmp/union/ingest/publish_manifest.py
 ```
 
 Until step 6, each ingest prints `STALE auto_ingest.py` / `STALE find_uningested.py`: both are gated
-`warn`, not `refuse`, so nothing stops. The audit also reports files that exist on Hive but not in the
-repo ("extra on target": 79 on 2026-09-24). Those are for a human to look at; do not sweep them as
-part of this deploy.
+`warn`, not `refuse`, so nothing stops. The audit also reports files that exist on Hive but not in
+the repo ("extra on target": 79 on 2026-09-25). Those are for a human to look at; do not sweep them
+as part of a deploy.
 
-State on 2026-09-24: fran-db republished the manifest (d5c02b0) and reports Hive's `fran_ingest` at
-92/92, 0 missing and 0 differing. My own earlier read-only md5 check agreed that `auto_ingest.py` and
-`find_uningested.py` on Hive are byte-identical to `origin/main`, so the copy in step 3 loses no
-local edit.
+### Deployed 2026-09-25
 
-**A gap in the audit, for fran-db** (measured: `--emit` on this branch puts 22 files in the closure
-of its 6 entry points, among them `auto_ingest_state.py`, `auto_ingest_alert.py`,
-`find_uningested.py` and `fran_queue.py` -- the last already at ad81863, when auto_ingest imported it
-only inside functions). The audit follows imports, including ones nested in functions, but not a
-script another script RUNS by filename. `auto_ingest.py` runs `diann_xic_to_lance.py` as a subprocess
-for the XIC lane of queue rows that declare an `xic_dir`, and that script lazily imports
-`ingest_perrun_xic.py`. Neither is in the closure, so a missing copy would surface only when such a
-row ingests: the precursors are fine, and the row's `xic_status` is recorded `failed`. Suggested fix:
-add `diann_xic_to_lance.py` to `ENTRY_POINTS`, or follow string literals that name a sibling `.py`.
-`find_uningested.py` is also run by filename, but `auto_ingest.py` now imports it too, so it is
-covered. Nothing in the closure uses `importlib.import_module` / `__import__` today.
+fran-db synced Hive from its union tree `3eae82e` (`main` with this change, merged into
+`fix/tdf-immutable-opens`) at 09:52 and published the manifest at `3eae82e` (94 files; gate 94/94).
+Independent read-only verification afterwards:
+
+* `audit_deploy_sync.py --check` against the `3eae82e` manifest: `RESULT: fully in sync` -- 94
+  present, 0 missing, 0 differing, 79 extra.
+* smoke test on `python3` 3.10 and on the production interpreter (alphadia2, 3.11): imports ok,
+  `--list-quarantine` empty; nothing written to `__pycache__`.
+* a DB-free dry run of the deployed selection over `incoming/` (known corpus paths given, no ingest):
+  Gallegos x2 skipped as already in the corpus; `search__9ff203cf` skipped (`qc: manifest says qc:
+  true`); then `PROT_0793 mouse_mousecont` (its manifest repaired to the mouse FASTA DIA-NN ran),
+  Dupanloup dog CSF, `Silva_LRS_JPH_Kv21_RyR` (msalemi), and the two Siegel `DIA-NN_2.6.0` entries.
+
+**Rollback copies** of the two files this deploy replaced -- the versions Hive ran until 09:52 --
+are kept outside `fran_ingest`, read-only, at
+`~brettsp/fran_nan_diag_20260924/rollback/auto_ingest.py.pre0359978` (md5 a43fe64c) and
+`…/find_uningested.py.pre0359978` (md5 304afaef). Both equal git `e8e2f0c` (and fran-db's
+`b9a9d0b`) and were verified by md5 on Hive. The deploy itself made no `.bak` files in `fran_ingest`.
+
+**The audit's subprocess gap is closed.** fran-db's `8040bb6` ("the deploy audit missed every file
+reached by subprocess") is in `3eae82e`: its closure (30 files, 7 entry points) now includes
+`diann_xic_to_lance.py` and `ingest_perrun_xic.py`, which `auto_ingest.py` reaches only by running
+them. It will be on `main` once `fix/tdf-immutable-opens` merges.
 
 ### With Brett's OK only — two drop-box entries
+
+**Status 2026-09-25: both resolved without these steps.** `search__9ff203cf` was NOT moved: its manifest
+now says `qc: true` / `exclude: true` (set through fran_deposit), so it is excluded by the flag. The
+`search_mouse_mousecont` manifest was repaired to `mouse_UP000000589_mousecont.fasta`, which matches the
+search's own DIA-NN log, so it is eligible. Kept below as the record of what was proposed.
 
 **1. Set gabrig's QC run aside** (reversible; the ingester never moves or deletes anything itself):
 
@@ -202,10 +235,18 @@ searches whose only non-empty export is header-only (including `20220330_153755_
 
 ## Rollback
 
+Coordinate with fran-db first (one writer to `fran_ingest`). Restore the two files from the copies
+kept outside `fran_ingest` -- `install -m 644`, not `cp -p`, because the copies are read-only and a
+read-only file in `fran_ingest` would make the next `scp` fail:
+
 ```bash
-ssh hive 'cd /quobyte/proteomics-grp/brett/glendon/fran_ingest &&
-          cp -p auto_ingest.py.bak.<date> auto_ingest.py &&
-          cp -p find_uningested.py.bak.<date> find_uningested.py'
+ssh brettsp@hive.hpc.ucdavis.edu 'cd /quobyte/proteomics-grp/brett/glendon/fran_ingest &&
+    R=~/fran_nan_diag_20260924/rollback &&
+    install -m 644 $R/auto_ingest.py.pre0359978 auto_ingest.py &&
+    install -m 644 $R/find_uningested.py.pre0359978 find_uningested.py &&
+    md5sum auto_ingest.py find_uningested.py'      # expect a43fe64c... / 304afaef...
 ```
 
-The two new modules are inert without the new `auto_ingest.py`; the state file can stay.
+Then re-run the audit against the manifest of the tree Hive now runs, and have the manifest
+re-published from that tree. The two new modules are inert without the new `auto_ingest.py`; the
+state file can stay.
