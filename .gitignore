@@ -25,3 +25,8 @@ app/service_customer_aliases.json
 # put them in a private repo — do not un-ignore them here.
 FRAN_ANALYST_GUIDE.md
 FRAN_TISSUE_PLAN.md
+
+# Written by .github/workflows/deploy.yml at package time and read by app/main.py to
+# report build_sha. Never committed: a stale committed value would be confusing, and the
+# workflow overwrites it anyway. zip includes it regardless of this file.
+app/BUILD_SHA

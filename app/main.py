@@ -24,6 +24,29 @@ from .mcp_server import build_mcp_app, mcp_lifespan
 from .mcp_server_auth import build_mcp_auth_app, mcp_auth_lifespan
 
 BASE = Path(__file__).parent
+def _build_sha() -> str | None:
+    """The git sha of the artifact actually running, or None when running from a source tree.
+
+    WHY THIS EXISTS. Until 2026-09-25 nothing served by this app identified the BUILD. /version
+    reported APP_VERSION, a constant in this file, so a deploy could only be verified by comparing
+    a version string to itself -- and deploy.yml said so: "a version-equality health gate is a
+    tautology when APP_VERSION was not bumped -- it can pass against the OLD process." Every
+    test-only or bug-fix deploy, which is most of them, was therefore unverifiable: the gate passed
+    whether the new code was live or the old process was still serving.
+
+    The packaging step writes app/BUILD_SHA into the zip. Absent -- a local run, an editable
+    checkout -- this returns None and /version simply omits the field, so development is unaffected
+    and the gate distinguishes "no build stamp" from "the wrong build".
+    """
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "BUILD_SHA")) as fh:
+            return (fh.read().strip() or None)
+    except OSError:
+        return None
+
+
+BUILD_SHA = _build_sha()
+
 APP_VERSION = "0.25.2"  # 0.25.2: peptide "Avg log₂ int" renders a number instead of an em-dash
                         #         on every peptide — intensity_log2 has no writer and is entirely
                         #         NULL corpus-wide, so the log is now derived from `intensity`.
@@ -483,6 +506,10 @@ def version():
     answer "which code produced what I'm looking at" — the question that was unanswerable while the
     ingestor, the XIC extractor and the app each kept a version constant that reached nothing."""
     out = {"version": APP_VERSION, "app": APP_VERSION}
+    # The one field that can prove WHICH build answered. Omitted rather than null when running
+    # from a source tree, so "field absent" and "wrong sha" are distinguishable to the deploy gate.
+    if BUILD_SHA:
+        out["build_sha"] = BUILD_SHA
     try:
         rows = queries.component_versions()
         if rows:

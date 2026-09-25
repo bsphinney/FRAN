@@ -195,6 +195,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # Stamp the build. Without this the deploy cannot be verified at all: /version reports
+          # APP_VERSION, a constant in the source, so comparing it proves only that SOME process is
+          # answering -- the old one included. app/main.py reads this file and exposes it as
+          # build_sha. Written before the zip so it is inside the artifact, never alongside it.
+          printf '%s' "${{ github.sha }}" > app/BUILD_SHA
           zip -r -q dist/fran.zip app requirements.txt \
             -x '*__pycache__*' -x '*.pyc' -x '*.md'
           unzip -l dist/fran.zip
@@ -205,6 +210,9 @@ jobs:
           unzip -l dist/fran.zip | grep -q 'app/static/app.js'
           unzip -l dist/fran.zip | grep -q 'app/templates/index.html'
           unzip -l dist/fran.zip | grep -q 'requirements.txt'
+          # An artifact with no build stamp would deploy fine and be unverifiable, which is the
+          # state this whole change exists to end. Refuse it here rather than discover it later.
+          unzip -l dist/fran.zip | grep -q 'app/BUILD_SHA'
           echo "appjs_bytes=$(stat -c%s app/static/app.js)" >> "$GITHUB_OUTPUT"
           echo "zip_bytes=$(stat -c%s dist/fran.zip)" >> "$GITHUB_OUTPUT"
 
@@ -235,10 +243,28 @@ jobs:
       # Passing 900000 would set a ~250-hour cap, i.e. no effective timeout at all.
       # --track-status polls runtime startup status and FAILS the step if the site does not
       # come up. That is the authoritative "it deployed AND started" signal.
+      #
+      # A 504 HERE IS NOT A FAILED DEPLOY, and treating it as one broke this pipeline for over a
+      # week. Measured: the last four deploys (2026-09-16, 09-17 x2, 09-24) all exited non-zero
+      # with `Error Code : HTTP_504 / Kudu Status : 504` about four minutes in -- yet production
+      # runs 0.25.2, which was COMMITTED ON 2026-09-17 and shipped by one of those "failed" runs.
+      # Kudu's gateway returns 504 while Oryx is still building; the build then completes and the
+      # app swaps in. --timeout cannot help, because the 504 is a response, not a client timeout.
+      #
+      # The damage was not the red X. The deploy step aborting meant every step AFTER it was
+      # skipped -- including the health gate, which has therefore NEVER RUN. Combined with no
+      # rollback on B1, this pipeline was deploying to production with no automated verification
+      # and no way to tell a real failure from this noise.
+      #
+      # So: record the outcome, do not decide on it. The build_sha gate below is the authority --
+      # it can distinguish "the new artifact is live" from "the old process is still answering",
+      # which nothing in this pipeline could do before.
       - name: Deploy to App Service (OneDeploy zip, Oryx remote build)
+        id: deploy
         timeout-minutes: 25
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          set +e
           az webapp deploy \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$AZURE_WEBAPP_NAME" \
@@ -248,6 +274,40 @@ jobs:
             --track-status true \
             --enriched-errors true \
             --timeout 900
+          rc=$?
+          set -e
+          echo "az_rc=${rc}" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Deploy CLI exited ${rc}::Deployment API returned an error (historically HTTP 504 while Oryx was still building). NOT fatal -- the build_sha gate below decides. If that gate fails, this really was a failed deploy."
+          fi
+
+      # THE GATE THAT MAKES A DEPLOY VERIFIABLE. Polls /version until build_sha equals the commit
+      # this run built. That is not a tautology: build_sha comes from app/BUILD_SHA inside the
+      # artifact, so it can only match if THIS zip is what is serving. A stale process answers with
+      # the previous sha, or omits the field entirely if it predates this change, and both fail.
+      #
+      # Fails closed. If the new build never appears within the window, the deploy did not land,
+      # whatever the CLI said -- and that is now a red build for a real reason instead of a red
+      # build for a gateway timeout.
+      - name: Gate — the build we just shipped is the build that is live
+        timeout-minutes: 20
+        run: |
+          set -uo pipefail
+          want='${{ github.sha }}'
+          echo "waiting for build_sha=${want}"
+          deadline=$(( $(date +%s) + 900 ))
+          got=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            got="$(curl -fsS --max-time 20 -H 'Cache-Control: no-cache' "${SITE_URL}/version" 2>/dev/null | jq -r '.build_sha // empty' || true)"
+            if [ "$got" = "$want" ]; then
+              echo "live build_sha matches ($got) — this deploy landed"
+              exit 0
+            fi
+            echo "  live build_sha=${got:-<absent>} — not yet; retrying in 15s"
+            sleep 15
+          done
+          echo "::error title=Deploy did NOT land::/version reports build_sha=${got:-<absent>}, expected ${want}. The running process is not the artifact this run built."
+          exit 1
 
       # Second gate, against the public hostname. Easy Auth on this app is
       # requireAuthentication=false / unauthenticatedClientAction=AllowAnonymous, so these
