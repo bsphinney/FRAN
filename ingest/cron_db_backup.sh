@@ -8,7 +8,8 @@
 # WHY THE QUEUE CHECK. sbatch returns immediately, so `flock` around the submit only prevents two
 # CRON TICKS overlapping; it does nothing about a job still sitting in the queue -- or still
 # dumping -- from the previous tick. The dump runs for hours (38.6 GB took 5.5 h in July, and the
-# database has grown since), so a weekly tick can easily land on top of a run that has not finished.
+# database has grown since). The tick is monthly now (`41 2 1 * *`, see fran_db_backup.sbatch for
+# why), which makes an overlap unlikely, but a stuck or requeued job can still be sitting there.
 # Two concurrent pg_dumps would double the load on PG Farm and race over the same retention window.
 set -uo pipefail
 source /etc/profile.d/modules.sh 2>/dev/null || true

@@ -35,10 +35,18 @@ SIF=/quobyte/proteomics-grp/apptainers/postgres16.sif
 PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
 CODE=/quobyte/proteomics-grp/brett/glendon/fran_ingest
 DEST=/nfs/lssc0/flinders/proteomics/Data/de-limp-db-backups
-# 12 weekly generations ~= 85 days. KEEP=4 gave 28 days, thin cover for what is believed to be
-# the ONLY copy of the corpus: corruption not noticed inside four weeks would have had no clean
-# dump behind it. At ~50 GB a dump that is ~600 GB against 94 TB free, so it is not
-# space-constrained, and the variable stays overridable.
+# MONTHLY, NOT WEEKLY (2026-09-22). PG Farm runs on Google Cloud, where every byte a client reads
+# out is billed egress, and pg_dump compresses on the CLIENT: the 49 GB file is ~500 GB on the wire
+# (measured by PG Farm, Saturdays 2026-08-29 through 09-19). Weekly, that was most of the Library's
+# ~$150/month egress bill. The crontab entry is `41 2 1 * *` -- the 1st of each month -- which puts
+# the worst-case data-loss window at ~31 days of ingest; ask the Library whether PG Farm has its
+# own snapshots before tightening this again.
+#
+# 12 monthly generations ~= one year. (KEEP=12 was chosen when this ran weekly, as ~85 days of cover:
+# KEEP=4 then gave 28 days, thin for what is believed to be the ONLY copy of the corpus, since
+# corruption not noticed inside four weeks would have had no clean dump behind it.) At ~50 GB a
+# dump that is ~600 GB against 94 TB free, so it is not space-constrained, and the variable stays
+# overridable.
 KEEP="${FRAN_BACKUP_KEEP:-12}"
 STAMP=$(date '+%Y%m%d_%H%M')
 OUT="$DEST/delimp_${STAMP}.dump"
@@ -66,7 +74,7 @@ from refresh_leaderboards import _token; print(_token())" 2>/dev/null | tail -1)
 # the dump is running the only surviving process is pg_dump itself and its argv carries no token
 # (verified on the live job: pid 1726107, PGPASSWORD absent from cmdline). But "small" is still a
 # live PG Farm JWT with read access to the whole 228 GB corpus, briefly visible to every other
-# user on the node, once a week, forever. Apptainer forwards APPTAINERENV_<VAR> from the host in
+# user on the node, once a month, forever. Apptainer forwards APPTAINERENV_<VAR> from the host in
 # as <VAR>, which keeps the secret in this job's environment where only its own uid can read it,
 # and costs nothing.
 export APPTAINERENV_PGPASSWORD="$PGPASSWORD"
