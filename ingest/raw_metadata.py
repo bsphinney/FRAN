@@ -20,9 +20,17 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 
+# Same idiom the rest of ingest/ uses to import a sibling module: ingest/ is not
+# a package, and raw_metadata is imported both as a module by corpus_ingest and
+# run directly by record_raw_metadata.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tdf_safe import connect_tdf                            # noqa: E402
+
 TRFP = os.environ.get("FRAN_TRFP", "/quobyte/proteomics-grp/tools/ThermoRawFileParser/ThermoRawFileParser")
+TRFP_DIR = os.path.dirname(TRFP)
 
 # Kept out of instrument_metadata_json: multi-KB blobs that would bloat every row to no benefit.
 _BULKY = {"DigitizerSaturationHandling"}
@@ -77,12 +85,45 @@ def _dir_size(path):
     return tot or None
 
 
+def _cycle_time_sec(con):
+    """Median seconds between consecutive MS1 frames -- one full diaPASEF cycle.
+
+    MEDIAN, not (span / count). Both agree to the 4th decimal on a clean acquisition, but a pause,
+    a segmented method or a truncated analysis.tdf leaves a handful of enormous gaps that drag
+    span/count off while the median per-cycle delta stays correct. The median costs nothing here
+    because the Frames table is already open.
+
+    Validated 2026-09-23 against Spectronaut's own "Cycle Time (MS1)" on 18 runs spanning four
+    instruments and 0.571-1.800 s: median error 0.143%, max 0.574%, 18/18 within 1%.
+
+    Frames.Time is seconds since acquisition start, so no unit conversion. Returns None rather than
+    a guess when there are fewer than two MS1 frames.
+    """
+    try:
+        rows = con.execute("SELECT Time FROM Frames WHERE MsMsType=0 ORDER BY Time").fetchall()
+    except sqlite3.Error:
+        return None
+    t = [r[0] for r in rows if r[0] is not None]
+    if len(t) < 2:
+        return None
+    d = sorted(t[i + 1] - t[i] for i in range(len(t) - 1))
+    n = len(d)
+    med = d[n // 2] if n % 2 else 0.5 * (d[n // 2 - 1] + d[n // 2])
+    return round(float(med), 6) if med and med > 0 else None
+
+
 def read_bruker(path):
-    """Bruker .d — analysis.tdf GlobalMetadata. Opened read-only so a live acquisition is safe."""
+    """Bruker .d — analysis.tdf GlobalMetadata.
+
+    Opened immutable, not merely read-only. A plain `mode=ro` open reads *through* any
+    stale mid-acquisition analysis.tdf-wal left beside the tdf by an interrupted copy, so
+    the instrument metadata recorded here would silently be mid-acquisition state, and it
+    drops an analysis.tdf-shm inside the raw .d. See ingest/tdf_safe.py.
+    """
     tdf = os.path.join(path, "analysis.tdf")
     if not os.path.exists(tdf):
         return None
-    con = sqlite3.connect(f"file:{tdf}?mode=ro", uri=True)
+    con = connect_tdf(tdf)
     try:
         g = dict(con.execute("SELECT Key, Value FROM GlobalMetadata").fetchall())
         try:
@@ -90,6 +131,7 @@ def read_bruker(path):
             n_ms2 = con.execute("SELECT count(*) FROM Frames WHERE MsMsType<>0").fetchone()[0]
         except sqlite3.Error:
             n_ms1 = n_ms2 = None
+        cyc = _cycle_time_sec(con)
     finally:
         con.close()
     return {
@@ -107,10 +149,53 @@ def read_bruker(path):
         "mobility_max": _flt(g.get("OneOverK0AcqRangeUpper")),
         "n_ms1_frames": n_ms1,
         "n_ms2_frames": n_ms2,
+        # Points-per-peak needs this as its denominator, and it was 32% populated corpus-wide
+        # because the only other source is Spectronaut's RunSummaries TSV, which DIA-NN never
+        # writes and 615 of 1,737 archived report dirs do not have.
+        "cycle_time_sec": cyc,
         # The .d carries no gradient; corpus_ingest falls back to the EvoSep SPD map or the RT span.
         "gradient_minutes": None,
         "instrument_metadata_json": json.dumps({k: v for k, v in g.items() if k not in _BULKY}),
     }
+
+
+# Where to find a Python that can load CoreCLR, and the Thermo DLLs. Overridable because the
+# .NET side is an environment concern, not a code one -- and if either is absent the reader
+# degrades to "resolution unknown" rather than failing an ingest.
+_RES_PY = os.environ.get("FRAN_THERMO_RES_PYTHON",
+                         os.path.expanduser("~/trfp_probe/pyn/bin/python"))
+_RES_DLL = os.environ.get("FRAN_THERMO_DLL_DIR", TRFP_DIR)
+
+
+def _thermo_resolution(path):
+    """Real Orbitrap resolving power (ms1, ms2), via thermo_resolution.py in a CHILD process.
+
+    NOT importable inline: pythonnet loads a CoreCLR runtime into whatever process imports it, and
+    raw_metadata is imported by every ingest. A subprocess keeps a broken .NET install from taking
+    down ingestion -- the failure mode is a NULL resolution, which is honest.
+
+    Why this is not read from TRFP like everything else in read_thermo: TRFP's `mass resolution`
+    (MS:1000011, RunHeaderEx.MassResolution) is a constant 0.5 on every Thermo file and is not
+    resolving power at all. The real value is in each scan's trailer extra, which TRFP reads
+    internally and never emits in any output format. Measured before this was added: ms2_resolution
+    was 0 on 6,992 rows and NULL on 18,581 -- not one plausible value corpus-wide.
+
+    Verified 2026-09-24 against six runs: Fusion Lumos 60000/15000, Exploris 480 120000/15000.
+    Both agree with the per-run resolutions the DIA-NN acquisition probe measured independently.
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thermo_resolution.py")
+    if not (os.path.exists(script) and os.path.exists(_RES_PY)):
+        return None, None
+    try:
+        r = subprocess.run([_RES_PY, script, "--dll-dir", _RES_DLL, path],
+                           capture_output=True, text=True, timeout=120)
+        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), None)
+        if not line:
+            return None, None
+        d = json.loads(line)
+        return d.get("ms1_resolution"), d.get("ms2_resolution")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
 
 
 def read_thermo(path):
@@ -138,6 +223,7 @@ def read_thermo(path):
             os.rmdir(out)
         except OSError:
             pass
+    _ms1_res, _ms2_res = _thermo_resolution(path)
     # Key names and formats below are MEASURED from a real ThermoRawFileParser 1.4.x run on an
     # Orbitrap Exploris 480, not guessed. The earlier guesses ("creation date") matched nothing, so
     # acquisition_date would have silently stayed NULL for all ~7,100 Orbitrap raws.
@@ -180,11 +266,20 @@ def read_thermo(path):
         "mobility_max": None,
         "n_ms1_frames": _int(flat.get("Number of MS1 spectra")),
         "n_ms2_frames": _int(flat.get("Number of MS2 spectra")),
+        # DELIBERATELY None, unlike the Bruker path. The only estimate available from `-m 0` is
+        # (MS max RT x 60 / n_MS1), which was MEASURED against Spectronaut's reported cycle time on
+        # 3,379 Orbitrap runs at 11.2% mean error -- "MS max RT" spans the whole run including wash,
+        # and the first MS1 is not at t=0. Exact scan times would need a heavier parse than -m 0.
+        # An 11%-wrong denominator silently becomes an 11%-wrong points-per-peak, so store nothing.
+        "cycle_time_sec": None,
         # Orbitrap runs have no IM, so max RT is the honest gradient estimate. Note corpus_ingest
         # already fills gradient_minutes for 98.7% of rows from the EvoSep SPD map or the observed RT
         # span, and the backfill COALESCEs, so this only fills genuine gaps.
         "gradient_minutes": _flt(flat.get("MS max RT"), 3),
-        "ms2_resolution": _flt(flat.get("mass resolution")),
+        # ms1_resolution / ms2_resolution are filled below from the scan trailers, NOT from
+        # flat["mass resolution"] -- that key is a constant 0.5 placeholder, not resolving power.
+        "ms1_resolution": _ms1_res,
+        "ms2_resolution": _ms2_res,
         "instrument_metadata_json": json.dumps(flat),
     }
 

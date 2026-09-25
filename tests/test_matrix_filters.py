@@ -5,8 +5,11 @@ carry a phospho site, so filtering the 50 rows the ranking already selected leav
 while every other check here, including "changes which genes are returned", still passes. A
 client-side filter looks like it works. That check is the only one that catches it.
 """
-import os, sys, time
-os.environ.setdefault("DELIMP_PG_TOKEN_FILE", "/Users/brettphinney/.pgfarm_token")
+import os
+import sys, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _live_db import require_live_db  # noqa: E402
+require_live_db("the search-matrix filters")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app import queries                                # noqa: E402
 

@@ -1,5 +1,8 @@
-import os, sys
-os.environ.setdefault("DELIMP_PG_TOKEN_FILE", "/Users/brettphinney/.pgfarm_token")
+import os
+import sys, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _live_db import require_live_db  # noqa: E402
+require_live_db("the per-search PTM rollup")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app.db import query                               # noqa: E402
 

@@ -11,7 +11,9 @@ import os
 import subprocess
 import sys
 
-os.environ.setdefault("DELIMP_PG_TOKEN_FILE", "/Users/brettphinney/.pgfarm_token")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _live_db import require_live_db  # noqa: E402
+require_live_db("the ingest staleness gate (it WRITES to delimp_ingest_manifest inside rolled-back savepoints)")
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.join(HERE, "..")
 INGEST = os.path.join(REPO, "ingest")

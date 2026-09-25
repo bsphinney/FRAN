@@ -3541,10 +3541,22 @@ def peptide_xic(stripped_seq: str, top_n: int = 6) -> dict[str, Any]:
     import json as _json
 
     seq = (stripped_seq or "").strip().upper()
+    # `trace_rt_basis IS DISTINCT FROM 'absolute'` IS LOAD-BEARING -- DO NOT RELAX IT.
+    # It is not a leftover from the per-run lane's RT convention. The per-run writer,
+    # ingest/ingest_perrun_xic.py line 106, sets `rel_intensity = apex / max(apex)` -- derived
+    # from the trace ITSELF, not from any library. The mirror plot below treats rel_intensity as
+    # an INDEPENDENT predicted value and plots it against the same traces' apexes. Feed it an
+    # 'absolute' row and the "predicted" half becomes a rescaled copy of the acquired half:
+    # a plot of a thing against itself, which renders as near-perfect agreement and means nothing.
+    # Same class as the self-referential engine-reported XIC scoring that was deliberately not
+    # promoted. Note the column comment in ingest/fix_xic_schema.py ("rel_intensity is computed
+    # from the averaged trace") describes the per-run writer, NOT this lane -- here the value is
+    # the library Relative.Intensity (xic_ingest.py:187) or Spectronaut frg_rel
+    # (sne_xic_ingest.py:127). One column, two incompatible meanings; this filter is the seam.
     try:
         meas = query(
-            """SELECT precursor_id, charge, raw_path, rt_apex, ms1_apex, ms1, fragments,
-                      engine, engine_version
+            """SELECT precursor_id, charge, precursor_mz, raw_path, rt_apex, ms1_apex, ms1,
+                      fragments, engine, engine_version
                FROM delimp_precursor_xic
                WHERE stripped_seq = %s AND trace_rt_basis IS DISTINCT FROM 'absolute'
                ORDER BY charge""",
@@ -3597,17 +3609,25 @@ def peptide_xic(stripped_seq: str, top_n: int = 6) -> dict[str, Any]:
         frags = _j(m["fragments"]) or []
         rep_frags = {f["label"]: f for f in frags}
         rel = {lab: (f.get("rel_intensity") or 0) for lab, f in rep_frags.items()}
+        # A row ingested without a report-lib carries rel_intensity None on EVERY fragment
+        # (xic_ingest.py's _records_xiconly path, which hard-sets it). With rel all-zero the
+        # intensity tiebreak below is DEAD and the top-N collapses to alphabetical-by-label, so
+        # the panel shows a near-arbitrary six instead of the six strongest. Fall back to the
+        # measured trace apex -- exactly what _records_xiconly itself ranks by at write time.
+        has_lib_rel = any(f.get("rel_intensity") is not None for f in rep_frags.values())
+        rank = rel if has_lib_rel else {lab: (f.get("apex") or 0) for lab, f in rep_frags.items()}
         u = usage_by_pid.get(pid, {})
         ns = max(len(searches_by_pid.get(pid, set())), 1)
         usage_list = sorted(
             ({"label": lab, "n_searches": len(sids), "pct": round(100 * len(sids) / ns),
               "rel_intensity": round(rel.get(lab, 0), 4)} for lab, sids in u.items()),
-            key=lambda x: (-x["n_searches"], -x["rel_intensity"], x["label"]),
+            key=lambda x: (-x["n_searches"], -rank.get(x["label"], 0), x["label"]),
         )
-        if not usage_list:  # no quant overlay -> rank by library intensity
+        if not usage_list:  # no quant overlay -> rank by library intensity, else by trace apex
             usage_list = sorted(
-                ({"label": lab, "n_searches": 0, "pct": 0, "rel_intensity": round(ri, 4)}
-                 for lab, ri in rel.items()), key=lambda x: -x["rel_intensity"])
+                ({"label": lab, "n_searches": 0, "pct": 0,
+                  "rel_intensity": round(rel.get(lab, 0), 4)} for lab in rep_frags),
+                key=lambda x: -rank.get(x["label"], 0))
         top = [x["label"] for x in usage_list[:top_n]]
         bottom = [{"label": lab, "ion": rep_frags[lab].get("type", "") + str(rep_frags[lab].get("series", "")),
                    "mz": rep_frags[lab].get("mz"), "charge": rep_frags[lab].get("charge"),
@@ -3625,7 +3645,16 @@ def peptide_xic(stripped_seq: str, top_n: int = 6) -> dict[str, Any]:
             "representative_run": m["raw_path"], "n_searches": len(searches_by_pid.get(pid, set())),
             "ms1": _j(m["ms1"]) or [], "fragments": bottom, "fragment_usage": usage_list,
             "engine": eng_label, "engine_version": m.get("engine_version"),
-            "has_real_trace": has_real})
+            "has_real_trace": has_real,
+            # Does this row actually carry library fragment intensities? The mirror plot's
+            # "predicted" half has NO source without them and must not be drawn -- gating it on
+            # has_real_trace (the ACQUIRED half) drew an all-zero series labelled as a library.
+            "has_library_intensities": has_lib_rel,
+            # _records_xiconly yields precursor_mz None and computes every fragment m/z from the
+            # sequence (theoretical b/y, Cys carbamidomethyl assumed) -- so that combination is
+            # its signature. Surface it: a reader taking m/z off this axis must know they are
+            # calculated, not measured.
+            "fragment_mz_theoretical": (not has_lib_rel) and m.get("precursor_mz") is None})
     precursors.sort(key=lambda p: -(p.get("rt_apex") is not None), )  # stable; keep charge order from SQL
     return {"available": True, "stripped_seq": seq,
             "rt_axis": "RT − apex (min)",  # traces are apex-aligned averages
@@ -4297,9 +4326,17 @@ def engine_run_xic(raw_basename: str, per_class: int = 8) -> dict[str, Any]:
                GROUP BY 1, 2)
             SELECT x.stripped_seq, x.modified_seq, x.charge, x.engine, x.precursor_mz,
                    x.rt_apex, x.ms1_apex, x.n_fragments_total, x.ms1, x.fragments,
+                   x.trace_rt_basis,
                    COALESCE(f.n_eng, 0) AS n_eng, f.engines
               FROM delimp_precursor_xic x
               LEFT JOIN found f ON f.stripped_seq = x.stripped_seq AND f.charge = x.charge
+             -- NOTE: no trace_rt_basis guard here, unlike peptide_xic(). `run` is populated only
+             -- on per-run rows, and ALL 18,634 'absolute' rows have it -- so this endpoint reads
+             -- the per-run lane, whose fragments[].rel_intensity is apex/max(apex) derived from
+             -- the trace itself (ingest/ingest_perrun_xic.py:106), NOT a library value. _trim()
+             -- below passes the fragment dicts through whole, so that self-referential number is
+             -- shipped to clients. Nothing renders it today; do NOT start plotting it against
+             -- these same traces without reading the comment in peptide_xic() first.
              WHERE x.run = %s AND x.ms1 IS NOT NULL
              ORDER BY x.ms1_apex DESC NULLS LAST
              LIMIT 400
@@ -4324,6 +4361,20 @@ def engine_run_xic(raw_basename: str, per_class: int = 8) -> dict[str, Any]:
                     "rt_apex": r["rt_apex"], "ms1_apex": r["ms1_apex"],
                     "n_fragments_total": r["n_fragments_total"],
                     "n_engines": r["n_eng"], "engines": (r["engines"] or "").split(",") if r["engines"] else [],
+                    # Published so a consumer can tell WHICH meaning fragments[].rel_intensity has,
+                    # because this one column carries two incompatible ones:
+                    #   'absolute'          -> apex / max(apex), derived from THESE SAME traces
+                    #                          (ingest/ingest_perrun_xic.py:106). Self-referential:
+                    #                          mirror-plotting it against these traces compares a
+                    #                          thing with itself and always looks like a match.
+                    #   anything else/NULL  -> the library Relative.Intensity (xic_ingest.py:187)
+                    #                          or Spectronaut frg_rel (sne_xic_ingest.py:127),
+                    #                          an INDEPENDENT value that may honestly be compared.
+                    # Chosen over stripping rel_intensity outright: this endpoint is consumed by
+                    # clients we cannot enumerate (MCP, exports, federation), so removing a field
+                    # breaks unknown callers while labelling it breaks none. Stripping can follow
+                    # once the consumer set is known.
+                    "trace_rt_basis": r["trace_rt_basis"],
                     "ms1": r["ms1"] or [], "fragments": frs}
 
         shared, uniq = [], []

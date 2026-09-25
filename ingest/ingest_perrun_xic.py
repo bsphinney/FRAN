@@ -100,7 +100,16 @@ def build_rows(ds_path, limit=0, keys=None, runs=None):
             frags.append({"label": str(lab), "apex": apex, "trace": pts})
         if not frags and not ms1_trace:
             continue
-        # rel_intensity against the strongest fragment, matching the consensus lane's convention
+        # rel_intensity as apex/max(apex) -- derived from THIS trace, i.e. SELF-REFERENTIAL.
+        # This does NOT match the consensus lane, despite what this comment used to claim: there
+        # rel_intensity is the library value (DIA-NN Relative.Intensity, xic_ingest.py:187, or
+        # Spectronaut frg_rel, sne_xic_ingest.py:127), which is independent of the measurement.
+        # Consequence: these rows must never reach a predicted-vs-acquired comparison, because
+        # the "predicted" half would just be a rescaled copy of the acquired half and would
+        # render as near-perfect agreement while proving nothing. Two things keep them out --
+        # the `trace_rt_basis IS DISTINCT FROM 'absolute'` filter in app/queries.py
+        # peptide_xic(), and the basis guard on the upsert in xic_engine_display_set.py.
+        # Both are load-bearing. If you change the meaning of this value, fix them together.
         top = max((f["apex"] for f in frags), default=0.0) or 1.0
         for f in frags:
             f["rel_intensity"] = round(f["apex"] / top, 6)

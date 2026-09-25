@@ -35,6 +35,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from coreomics_import import _conn as _base_conn                                  # noqa: E402
 
 TABLE = "delimp_precursors"
+# delimp_proteins is measured too, from 2026-09-23. The DIA-NN widening put ten columns there
+# (PG.MaxLFQ and the protein/gene FDR family) because they are constant within (run, protein
+# group) and so are not per-precursor facts. A writer regression in those ten would be invisible
+# to a precursors-only audit -- which is the exact shape of the bug this file exists to catch.
+# TABLE stays the primary one so the existing report, baseline key and --check keep their meaning.
+TABLES = (TABLE, "delimp_proteins")
 SAMPLE_ROWS = 50_000          # per search; bounds the scan on a multi-million-row search
 REGRESSION_DROP = 0.20        # a column losing >20 points of coverage vs baseline is a regression
 
@@ -50,9 +56,29 @@ REGRESSION_DROP = 0.20        # a column losing >20 points of coverage vs baseli
 #   normalized_intensity -- NULL for Spectronaut by adapter design (refuses per-fragment areas)
 #   irt       -- depends on whether the library carries iRT
 #   site_localization_probability -- only when the search enabled PTM localization
+#
+# The 2026-09-23 DIA-NN widening adds a second reason a column can legitimately empty out: the
+# ENGINE VERSION that produced the report. DIA-NN grew these columns over time, and FRAN's corpus
+# spans 1.7.10 to 2.7.0, so "is this column populated?" depends on which release ran the search.
+# Measured over every reachable DIA-NN report in the corpus:
+#     2.6.1 / 2.7.0 (8.5M rows)   all 36 mapped columns present
+#     2.3.0 / 2.5.1 (23.5M rows)  35/36 -- Averagine arrived in 2.6
+#     1.9           (0.2M rows)   30/36
+#     1.8.2         (0.3M rows)   26/36
+# The gate compares the baseline's search against whatever is NEWEST for that engine, so ingesting
+# one 2.3.0 search after a 2.7.0 one would report `diann.averagine: 100% -> 0%` and exit 1 on
+# entirely correct behaviour. Listed here for the same reason `im` is: a gate that cries wolf
+# gets ignored, and then it catches nothing.
+_VERSION_DEPENDENT = frozenset({
+    "averagine",                                          # DIA-NN 2.6+
+    "best_fr_mz", "best_fr_mz_delta", "channel_evidence",  # absent in 1.8.2 and 1.9
+    "ms1_apex_mz_delta",                                  # absent in 1.8.2 and 1.9
+    "ms1_apex_area", "peptidoform_q_value", "global_peptidoform_q_value",  # absent in 1.8.2
+})
+
 CONFIG_DEPENDENT = frozenset({
     "im", "iim", "mods", "normalized_intensity", "irt", "site_localization_probability",
-})
+}) | _VERSION_DEPENDENT
 
 
 def _conn(timeout_ms: int = 300_000):
@@ -63,9 +89,9 @@ def _conn(timeout_ms: int = 300_000):
     return con
 
 
-def columns(cur) -> list[str]:
+def columns(cur, table: str = TABLE) -> list[str]:
     cur.execute("""select column_name from information_schema.columns
-                    where table_name=%s order by ordinal_position""", (TABLE,))
+                    where table_name=%s order by ordinal_position""", (table,))
     return [r[0] for r in cur.fetchall()]
 
 
@@ -79,21 +105,21 @@ def newest_per_engine(cur) -> list[tuple]:
     return cur.fetchall()
 
 
-def scoped_coverage(cur, search_id: str, cols: list[str]) -> dict:
+def scoped_coverage(cur, search_id: str, cols: list[str], table: str = TABLE) -> dict:
     """Non-null fraction of every column within one search, bounded to SAMPLE_ROWS."""
     sel = ", ".join(f'count("{c}")' for c in cols)
     cur.execute(f"""select count(*), {sel} from (
-                      select * from {TABLE} where search_id = %s limit {SAMPLE_ROWS}) t""",
+                      select * from {table} where search_id = %s limit {SAMPLE_ROWS}) t""",
                 (search_id,))
     row = cur.fetchone()
     total = row[0] or 0
     return {c: (row[i + 1] / total if total else None) for i, c in enumerate(cols)}, total
 
 
-def corpus_null_frac(cur) -> dict:
+def corpus_null_frac(cur, table: str = TABLE) -> dict:
     """pg_stats view. Free, possibly stale — reported alongside its own staleness."""
     cur.execute("""select attname, null_frac from pg_stats
-                    where schemaname='public' and tablename=%s""", (TABLE,))
+                    where schemaname='public' and tablename=%s""", (table,))
     return {r[0]: 1.0 - float(r[1]) for r in cur.fetchall()}
 
 
@@ -110,6 +136,18 @@ def build(cur) -> dict:
         "corpus_non_null_frac": corpus_null_frac(cur),
         "per_engine": {},
     }
+    # Secondary tables get their own block, keyed by table name. A NEW top-level key rather than a
+    # reshape of `per_engine`: check() reads `per_engine` and an older baseline that predates this
+    # simply has no `per_table` to compare, which degrades to "not tracked yet" instead of a crash.
+    out["per_table"] = {}
+    for tbl in TABLES[1:]:
+        tcols = columns(cur, tbl)
+        blk = {}
+        for engine, sid, name, ing in newest_per_engine(cur):
+            frac, n = scoped_coverage(cur, sid, tcols, tbl)
+            blk[engine] = {"search_id": str(sid), "search_name": name, "ingested": str(ing),
+                           "rows_sampled": n, "non_null_frac": frac}
+        out["per_table"][tbl] = blk
     for engine, sid, name, ing in newest_per_engine(cur):
         frac, n = scoped_coverage(cur, sid, cols)
         out["per_engine"][engine] = {
@@ -133,6 +171,18 @@ def render(rep: dict) -> str:
               f"- **partial ({len(part)})**: " +
               (", ".join(f"{c} {f:.1%}" for c, f in part) or "—"),
               f"- **EMPTY ({len(empty)})**: {', '.join(empty) or '—'}", ""]
+    for tbl, tblk in sorted(rep.get("per_table", {}).items()):
+        L += [f"# {tbl} column coverage", ""]
+        for engine, blk in sorted(tblk.items()):
+            empty = sorted(c for c, f in blk["non_null_frac"].items() if f is not None and f == 0.0)
+            part = sorted((c, f) for c, f in blk["non_null_frac"].items() if f and 0 < f < 1.0)
+            full = sorted(c for c, f in blk["non_null_frac"].items() if f == 1.0)
+            L += [f"## {tbl} / {engine} — `{blk['search_name']}` "
+                  f"({blk['rows_sampled']:,} rows sampled)", "",
+                  f"- **fully populated ({len(full)})**: {', '.join(full) or '—'}",
+                  f"- **partial ({len(part)})**: " +
+                  (", ".join(f"{c} {f:.1%}" for c, f in part) or "—"),
+                  f"- **EMPTY ({len(empty)})**: {', '.join(empty) or '—'}", ""]
     return "\n".join(L)
 
 
@@ -143,25 +193,32 @@ def check(rep: dict, baseline: dict) -> int:
     a gate that fires on a legitimate instrument change is worse than no gate at all.
     """
     bad, informational = [], []
-    for engine, blk in rep["per_engine"].items():
-        base = baseline.get("per_engine", {}).get(engine)
-        if not base:
-            print(f"  note: engine {engine!r} absent from baseline — not a regression, "
-                  f"refresh the baseline to start tracking it")
-            continue
-        same_search = base.get("search_id") == blk.get("search_id")
-        for col, now in blk["non_null_frac"].items():
-            was = base["non_null_frac"].get(col)
-            if was is None or now is None or was - now <= REGRESSION_DROP:
+
+    def compare(now_blocks: dict, base_blocks: dict, label: str) -> None:
+        """One table's per-engine blocks against the baseline's. Appends to bad/informational."""
+        for engine, blk in now_blocks.items():
+            base = base_blocks.get(engine)
+            if not base:
+                print(f"  note: {label}{engine!r} absent from baseline — not a regression, "
+                      f"refresh the baseline to start tracking it")
                 continue
-            line = (f"{engine}.{col}: {was:.1%} -> {now:.1%} "
-                    f"(baseline search {base['search_name']}, now {blk['search_name']})")
-            # A drop within the SAME search is always the writer's doing — no instrument or config
-            # changed underneath it — so it fails even for a config-dependent column.
-            if col in CONFIG_DEPENDENT and not same_search:
-                informational.append(line)
-            else:
-                bad.append(line)
+            same_search = base.get("search_id") == blk.get("search_id")
+            for col, now in blk["non_null_frac"].items():
+                was = base["non_null_frac"].get(col)
+                if was is None or now is None or was - now <= REGRESSION_DROP:
+                    continue
+                line = (f"{label}{engine}.{col}: {was:.1%} -> {now:.1%} "
+                        f"(baseline search {base['search_name']}, now {blk['search_name']})")
+                # A drop within the SAME search is always the writer's doing — no instrument or
+                # config changed underneath it — so it fails even for a config-dependent column.
+                if col in CONFIG_DEPENDENT and not same_search:
+                    informational.append(line)
+                else:
+                    bad.append(line)
+
+    compare(rep["per_engine"], baseline.get("per_engine", {}), "")
+    for tbl, tblk in rep.get("per_table", {}).items():
+        compare(tblk, baseline.get("per_table", {}).get(tbl, {}), f"{tbl}/")
     if informational:
         print("instrument/config-dependent movement (NOT failing — see CONFIG_DEPENDENT):")
         for b in sorted(informational):
