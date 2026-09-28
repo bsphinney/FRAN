@@ -96,8 +96,17 @@ def main():
         (v.get("reason") or "unspecified").split(" -- ")[0][:64]
         for v in st.values() if v.get("status") == "skipped")
     failed = sum(1 for v in st.values() if v.get("status") == "failed")
-    started = len(st)
-    remaining = max(total - started, 0)
+
+    # SETTLED must stay identical to the drip's own done-set (corpus_diann_drip.py, `done = {...}`).
+    # Anything outside it is picked again on a later firing, so it is still work in front of us.
+    # Counting every state entry as started -- which this did -- made `generated` and `failed`
+    # invisible: not done, not in flight, and subtracted from remaining anyway. Seven sets sat in
+    # `generated` through the first day and appeared in no line of the report.
+    SETTLED = ("complete", "submitted", "skipped")
+    settled = sum(1 for v in st.values() if v.get("status") in SETTLED)
+    retry = collections.Counter(v.get("status") or "?"
+                                for v in st.values() if v.get("status") not in SETTLED)
+    remaining = max(total - settled, 0)
     runs_done = sum(int(v.get("n_runs") or 0) for v in st.values()
                     if v.get("status") in ("complete", "submitted")
                     and not any(str(j).split("_")[0] in live for j in (v.get("jobs") or [])))
@@ -130,22 +139,40 @@ def main():
                 eta = f"\n• nothing completed in {hrs:.0f} h ({inflight} still running)"
 
     cpus = cpus_running()
+    # Every RUNNING CPU this user holds, not just the corpus run's -- deliberately, because that is
+    # the number corpus_diann_drip.cpus_in_flight() gates submission on. Read as "the corpus run is
+    # using 650 CPUs" it is wrong; read as "nothing new is submitted until this drops under 100" it
+    # is right, and that is the thing worth knowing when progress looks frozen.
+    if cpus == 0 and remaining:
+        cpu_note = "  ⚠️ *idle with work remaining*"
+    elif cpus >= CEILING and remaining:
+        cpu_note = "  — *submission paused* until it drops"
+    else:
+        cpu_note = ""
     pct = (100.0 * done / total) if total else 0.0
     lines = [
         f"*FRAN corpus-wide DIA-NN 2.7.0* — {done:,}/{total:,} searches ({pct:.1f}%){delta}",
         f"• in flight {inflight} · remaining {remaining:,} · runs searched {runs_done:,}",
-        f"• {cpus} CPUs running / ceiling {CEILING}"
-        + ("  ⚠️ *idle with work remaining*" if cpus == 0 and remaining else ""),
+        f"• {cpus} CPUs running, all jobs / drip ceiling {CEILING}{cpu_note}",
     ]
     if failed:
         lines.append(f"• ⚠️ *{failed} failed*")
     if skipped:
         top = ", ".join(f"{n}× {r}" for r, n in skipped.most_common(3))
         lines.append(f"• skipped {sum(skipped.values())}: {top}")
+    if retry:
+        lines.append("• awaiting a later firing: "
+                     + ", ".join(f"{n}× {s}" for s, n in retry.most_common()))
     lines.append(eta.lstrip("\n") if eta else "")
     text = "\n".join(x for x in lines if x)
 
     print(text)
+    if not a.post:
+        # A dry run is not a report. Writing history here is what produced the first real post's
+        # "(+0 since 0.0 h ago) -- check for a stall": the preview had just stamped an entry, so the
+        # post compared against itself. MIN_TREND_HOURS bounds that damage; this removes the cause.
+        return 0
+
     hist.append({"t": now, "done": done, "inflight": inflight, "remaining": remaining})
     try:
         os.makedirs(OUT_ROOT, exist_ok=True)
@@ -153,9 +180,6 @@ def main():
             json.dump(hist[-200:], fh)
     except OSError as e:
         print(f"(could not write history: {e})")
-
-    if not a.post:
-        return 0
     try:
         hook = open(WEBHOOK_FILE).read().strip()
     except OSError as e:
