@@ -75,11 +75,23 @@ DIANN_VERSION = "2.7.0"
 # the pacing note measured 1,343 idle CPUs there. 100 sustained is a small fraction and leaves
 # the cluster usable by everyone else, which matters over six weeks.
 PARTITION, ACCOUNT, QOS = "low", "publicgrp", "publicgrp-low-qos"
-CPU_CEILING = 100
+# 100 was wrong, and wrong in the way that matters: it was BELOW the footprint of a single
+# search, so the drip could never submit a second one while any search was running. Measured on
+# the live run -- 3 searches submitted, 632 CPUs occupied, 1,325 of 1,337 sets never touched
+# because every firing after the first found itself over the ceiling.
+#
+# The error was in the note below, which claimed a chain "never runs more than 64 at once". That
+# is true of s3_assembly and s5_report, which are single 64-CPU jobs, and false of the steps that
+# dominate: s2_firstpass and s4_finalpass are ARRAYS throttled at %20, each task taking
+# THREADS_PER_FILE, so one search peaks near 20 x 16 = 320 CPUs. A ceiling of 100 against a peak
+# of 320 is not a throttle, it is a stop.
+#
+# 800 clears one search's peak comfortably, lets several small sets (the corpus median is 6 runs,
+# about 96 CPUs at step 2) run together, and still leaves most of a partition the pacing note
+# measured at 1,343 idle CPUs. It is an emergency brake, which is what it should always have been.
+CPU_CEILING = 800
 # Separate from the CPU ceiling and doing a different job: the CPU count bounds what we OCCUPY,
-# this bounds what we QUEUE. One search's chain reserves ~188 CPUs across five dependent steps but
-# never runs more than 64 at once, so occupancy and queue depth need different limits or the drip
-# stalls on its own pending work.
+# this bounds what we QUEUE.
 MAX_SEARCHES_IN_FLIGHT = 12
 THREADS_PER_FILE = 16
 BATCH_MAX = 10            # sets generated per firing; one cohort slice, so they share a library
@@ -273,10 +285,19 @@ def main():
         print("worklist complete")
         return 0
 
-    # One contiguous slice, so the batch sits inside a single cohort and shares a library.
+    # One contiguous slice, so the batch sits inside a single cohort and shares a library. Cohort
+    # ORDER is left alone -- largest-cohort-first still amortises a library build over the most
+    # searches -- but WITHIN the chosen cohort the smallest sets go first.
+    #
+    # Ordering by size costs nothing in library reuse, since every set here shares the cohort's
+    # one library, and it fixes the thing that actually hurt: the first firing drew the three
+    # largest sets in the corpus (125, 224 and 220 runs), saturated the cluster with multi-day
+    # searches, and left nothing finishing for days. Smallest-first means completed searches --
+    # and therefore ingested results, and a progress report that moves -- within hours.
     cohort = todo[0]["cohort"]
-    slice_ = [r for r in todo if r["cohort"] == cohort][: a.batch_max]
-    print(f"cohort {cohort}: taking {len(slice_)} of {sum(1 for r in todo if r['cohort']==cohort)}")
+    in_cohort = [r for r in todo if r["cohort"] == cohort]
+    slice_ = sorted(in_cohort, key=lambda r: int(r["n_runs"] or 0))[: a.batch_max]
+    print(f"cohort {cohort}: taking {len(slice_)} of {len(in_cohort)}")
 
     # map setkey -> its run basenames, needed to pick raw paths out of the probe table
     import collections
