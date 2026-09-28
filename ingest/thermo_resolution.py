@@ -95,9 +95,36 @@ def _cycle_from_scans(ms1_scans):
     return round(float(med), 6) if 0.05 < med < 60 else None
 
 
+def _isolation_window(raw, scan):
+    """(lo, hi) of this MS2 scan's isolation window, from the scan EVENT's reaction.
+
+    Not from the filter string: a Thermo filter shows the isolation CENTRE and the scan range,
+    e.g. `Full ms2 700.5000@hcd30.00 [200.0000-2000.0000]`, so parsing the bracket gives the mass
+    range analysed, not the window isolated. The reaction carries the width, and on instruments
+    that set one, an offset -- both are needed or an asymmetric window is reported centred.
+    """
+    try:
+        r = raw.GetScanEventForScanNumber(scan).GetReaction(0)
+        c, w = float(r.PrecursorMass), float(r.IsolationWidth)
+        io = float(r.IsolationWidthOffset) if hasattr(r, "IsolationWidthOffset") else 0.0
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not (w > 0):
+        return None
+    return (round(c + io - w / 2, 2), round(c + io + w / 2, 2))
+
+
 def read_one(raw_adapter, device, path):
     out = {"path": path, "ms1_resolution": None, "ms2_resolution": None,
-           "cycle_time_sec": None, "model": None, "note": None}
+           "cycle_time_sec": None, "model": None,
+           # The DIA isolation range -- the Thermo counterpart of the Bruker probe's
+           # dia_mz_lo/dia_mz_hi. It is NOT raw_files.mass_range_min/max, which for Bruker is the
+           # instrument's full acquisition range and for Thermo is the MS1 scan range; searching
+           # against either covers a different m/z span than was actually acquired. Keyed into the
+           # speclib cache as --min-pr-mz/--max-pr-mz, so getting it wrong silently reuses a
+           # library that covers less than the acquisition.
+           "dia_mz_lo": None, "dia_mz_hi": None,
+           "dia_n_windows": None, "dia_width_med": None, "note": None}
     try:
         raw = raw_adapter.FileFactory(path)
         raw.SelectInstrument(device, 1)
@@ -116,6 +143,7 @@ def read_one(raw_adapter, device, path):
             scans = sorted({sc for st in starts for sc in range(st, min(st + BLOCK_LEN, last + 1))})
         seen = {"ms1_resolution": set(), "ms2_resolution": set()}
         ms1_scans = []
+        windows = {}
         for scan in scans:
             try:
                 filt = str(raw.GetFilterForScanNumber(scan).ToString())
@@ -134,7 +162,20 @@ def read_one(raw_adapter, device, path):
                     ms1_scans.append((scan, float(raw.RetentionTimeFromScanNumber(scan))))
                 except Exception:      # noqa: BLE001
                     pass
+            else:
+                w = _isolation_window(raw, scan)
+                if w:
+                    windows[w] = windows.get(w, 0) + 1
         out["cycle_time_sec"] = _cycle_from_scans(ms1_scans)
+        if windows:
+            los = [w[0] for w in windows]
+            his = [w[1] for w in windows]
+            wid = sorted(round(w[1] - w[0], 2) for w in windows)
+            out["dia_mz_lo"] = min(los)
+            out["dia_mz_hi"] = max(his)
+            out["dia_n_windows"] = len(windows)
+            n = len(wid)
+            out["dia_width_med"] = wid[n // 2] if n % 2 else round(0.5 * (wid[n // 2 - 1] + wid[n // 2]), 2)
         notes = []
         for key, vals in seen.items():
             if len(vals) == 1:
@@ -185,6 +226,8 @@ def main():
         for p in paths:
             print(json.dumps({"path": p, "ms1_resolution": None, "ms2_resolution": None,
                               "cycle_time_sec": None, "model": None,
+                              "dia_mz_lo": None, "dia_mz_hi": None,
+                              "dia_n_windows": None, "dia_width_med": None,
                               "note": f"pythonnet/coreclr unavailable: {str(e)[:100]}"}))
         return 0
 
