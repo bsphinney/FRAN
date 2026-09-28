@@ -63,6 +63,11 @@ FASTA_ROOT = os.path.join(ROOT, "_fasta")
 
 STACK = "/quobyte/proteomics-grp/fran/pipeline-skill/stack-libcache/scripts"
 TOOLS = "/quobyte/proteomics-grp/fran/engines/pilot_tools/tools.json"
+# The DIA-NN binary itself. plan_speclib_batch forwards --diann straight through to
+# diann_parallel.py, which REQUIRES it -- omitting it fails at batch_submit.sh, after the plan
+# looks fine, which is a confusing place to find out. Taken from tools.json's "diann" key rather
+# than hardcoded from a pilot sbatch, so the pinned version is the one that actually runs.
+DIANN_BIN = "/quobyte/proteomics-grp/fran/engines/pilot_tools/diann/2.7.0/diann-2.7.0/diann-linux"
 PY = "/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python"
 DIANN_VERSION = "2.7.0"
 
@@ -71,6 +76,11 @@ DIANN_VERSION = "2.7.0"
 # the cluster usable by everyone else, which matters over six weeks.
 PARTITION, ACCOUNT, QOS = "low", "publicgrp", "publicgrp-low-qos"
 CPU_CEILING = 100
+# Separate from the CPU ceiling and doing a different job: the CPU count bounds what we OCCUPY,
+# this bounds what we QUEUE. One search's chain reserves ~188 CPUs across five dependent steps but
+# never runs more than 64 at once, so occupancy and queue depth need different limits or the drip
+# stalls on its own pending work.
+MAX_SEARCHES_IN_FLIGHT = 12
 THREADS_PER_FILE = 16
 BATCH_MAX = 10            # sets generated per firing; one cohort slice, so they share a library
 
@@ -109,22 +119,36 @@ def probe_index():
 
 
 def cpus_in_flight():
-    """This user's PENDING + RUNNING CPUs. The backpressure signal.
+    """This user's RUNNING CPUs — the backpressure signal.
 
-    Counts PENDING as well as RUNNING deliberately: a queue full of our own pending work is
-    already committed, and submitting more on top of it is how one user takes a shared
-    partition. squeue needs a login shell for its PATH.
+    RUNNING ONLY, and that is a correction. The first version counted PENDING too, reasoning that
+    our own queued work is already committed. Measured on the first real batch: three searches
+    reported 564 CPUs against a ceiling of 100, which would have wedged the drip permanently after
+    one firing.
+
+    The reasoning was wrong because a 5-step chain is a DEPENDENCY chain. step1 -> 1b -> 2 -> 3 ->
+    4 -> 5, each afterok on the last, so at most one step of a search ever runs at a time. Summing
+    all five counts 188 CPUs for a search whose real peak is 64 (the assembly step). Four fifths of
+    that total is work SLURM is holding back precisely so it does not consume the cluster.
+
+    A pending queue is still a real cost to other users -- it takes scheduling priority -- so it is
+    bounded separately by MAX_SEARCHES_IN_FLIGHT rather than by pretending it is occupancy.
     """
-    r = sh(["bash", "-lc", "squeue -u $USER -h -o '%C %T' 2>/dev/null"])
+    r = sh(["bash", "-lc", "squeue -u $USER -h -t RUNNING -o '%C' 2>/dev/null"])
     n = 0
     for line in (r.stdout or "").splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1] in ("RUNNING", "PENDING", "CONFIGURING"):
-            try:
-                n += int(parts[0])
-            except ValueError:
-                pass
+        try:
+            n += int(line.strip())
+        except ValueError:
+            pass
     return n
+
+
+def searches_in_flight(st):
+    """Searches whose chain has not finished. The bound on how much we queue, as opposed to how
+    much we occupy -- a queue of our own pending chains still takes scheduling priority from
+    everyone else even though it burns no CPU."""
+    return sum(1 for v in st.values() if v.get("status") == "submitted")
 
 
 def still_running(jobs):
@@ -201,6 +225,7 @@ def main():
     ap.add_argument("--submit", action="store_true")
     ap.add_argument("--ceiling", type=int, default=CPU_CEILING)
     ap.add_argument("--batch-max", type=int, default=BATCH_MAX)
+    ap.add_argument("--max-in-flight", type=int, default=MAX_SEARCHES_IN_FLIGHT)
     a = ap.parse_args()
 
     st = load_state()
@@ -228,7 +253,8 @@ def main():
         print(f"worklist   : {len(rows):,} raw sets")
         print(f"state      : {counts or '(nothing started)'}")
         print(f"remaining  : {len(todo):,}")
-        print(f"CPUs in flight: {inflight:,} / ceiling {a.ceiling:,}")
+        print(f"CPUs RUNNING  : {inflight:,} / ceiling {a.ceiling:,}")
+        print(f"searches in flight: {searches_in_flight(st)} / {a.max_in_flight}")
         miss = sorted({r['taxon'] for r in todo if not fasta_for(r.get('taxon'))})
         if miss:
             print(f"taxa with no prepared FASTA ({len(miss)}): {miss[:12]}")
@@ -236,8 +262,13 @@ def main():
 
     inflight = cpus_in_flight()
     if inflight >= a.ceiling:
-        print(f"{inflight:,} CPUs in flight >= ceiling {a.ceiling:,} — nothing submitted")
+        print(f"{inflight:,} CPUs RUNNING >= ceiling {a.ceiling:,} — nothing submitted")
         return 0
+    nflight = searches_in_flight(st)
+    if nflight >= a.max_in_flight:
+        print(f"{nflight} searches already in flight >= {a.max_in_flight} — nothing submitted")
+        return 0
+    a.batch_max = min(a.batch_max, a.max_in_flight - nflight)
     if not todo:
         print("worklist complete")
         return 0
@@ -294,10 +325,10 @@ def main():
         json.dump(batch, fh, indent=1)
     plan_cmd = [PY, os.path.join(STACK, "plan_speclib_batch.py"),
                 "--batch", bjson, "--diann-version", DIANN_VERSION,
+                "--diann", DIANN_BIN,
                 "--out-root", OUT_ROOT,
-                "--threads", str(THREADS_PER_FILE),
-                "--partition", PARTITION, "--account", ACCOUNT, "--qos", QOS,
-                "--tools", TOOLS]
+                "--threads-per-file", str(THREADS_PER_FILE),
+                "--partition", PARTITION, "--account", ACCOUNT, "--qos", QOS]
     print("plan: " + " ".join(shlex.quote(x) for x in plan_cmd))
     if a.dry_run:
         print(f"(dry run — {len(batch)} searches prepared, nothing planned or submitted)")
