@@ -80,6 +80,41 @@ def _head(path: str, nbytes: int = 400_000) -> str:
         return ""
 
 
+def _cmdline_block(path: str, nlines: int = 200, cap: int = 8_000_000) -> str:
+    """The first `nlines` lines of a log, however long any one of them is.
+
+    DIA-NN echoes its entire command line on ONE line a few lines in (line 6 under 2.7.0, after
+    the banner -- so reading "the first line" would not do), and --fasta sits after one --f per
+    raw file. Measured on real logs that is ~150 bytes per raw: --fasta lands ~5 KB in for 23
+    runs, and past a fixed 40 KB window somewhere above ~250. CORPUS_WORKLIST tops out at 239
+    runs with four sets over 150, on Flinders paths longer than the ones measured -- near enough
+    that the FASTA would simply not be found and detect() would fall through in silence, which
+    is the failure mode worth removing rather than re-tuning a byte count for.
+
+    `nlines` is deliberately far past where the command line has ever been seen. Checked on 94
+    logs across DIA-NN 2.6.0, 2.6.1 and 2.7.0: it is line 6 in every one, and "--fasta " occurs
+    on exactly ONE line per log -- so reading well beyond line 6 cannot pick up a second, wrong
+    occurrence, and the margin costs nothing. 1.8.x is not represented in this corpus and its
+    banner length is therefore unverified; the margin is for it.
+
+    `cap` is only a guard against a pathological single-line file, not a window on the content.
+    """
+    out, total = [], 0
+    try:
+        with open(path, errors="replace") as fh:
+            for _ in range(nlines):
+                line = fh.readline()
+                if not line:
+                    break
+                out.append(line)
+                total += len(line)
+                if total >= cap:
+                    break
+    except OSError:
+        return ""
+    return "".join(out)
+
+
 def _first(patterns: list[str], root: str) -> list[str]:
     hits: list[str] = []
     for pat in patterns:
@@ -192,7 +227,7 @@ def detect(engine: str, report_path: str | None, search_dir: str | None = None,
             for root in roots:
                 for p in _first(["report.log.txt", "*.log.txt", "*.log",
                                  os.path.join("dia-quant-output", "report.log.txt")], root):
-                    paths = diann_logged_fastas(_head(p, 40_000))
+                    paths = diann_logged_fastas(_cmdline_block(p))
                     if not paths:
                         continue
                     contam = [x for x in paths if _CONTAM_HINT.search(os.path.basename(x))]
