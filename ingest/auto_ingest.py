@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import glob
 import json
 import os
 import platform
@@ -175,6 +176,64 @@ def pick_one(dirs: list[str], engine: str = "spectronaut") -> str | None:
     if not good:
         return None
     return sorted(good, key=_export_ts, reverse=True)[0]
+
+
+INGESTED_MARKER = "fran_ingested.json"
+
+
+def mark_dropbox_ingested(identity: str, search: str | None = None) -> list[str]:
+    """Write fran_ingested.json into every drop-box entry whose manifest names this output_dir.
+
+    A REVERSE lookup, and that is the entire point of it. On 2026-09-28 nine of the twelve entries
+    in the drop box were already in the corpus: each had been ingested by its real output_dir and
+    never through the box, so nothing ever retired the staging directory -- the two oldest had sat
+    there since 2026-08-26, five weeks after the work was done. A marker written into "the entry we
+    were handed" would not have been written for a single one of them, because auto_ingest was
+    never handed them. It ingested a PATH, and an entry elsewhere happened to point at that path.
+    So this asks the opposite question -- which entries name what was just ingested -- and compares
+    realpaths, because a drop entry is a farm of symlinks into somebody else's directory.
+
+    The marker is for the deposit skill, which watches the drop box and has no database. FRAN needs
+    none of it: find_uningested asks the corpus directly. So the marker is ADVISORY -- its presence
+    is a claim, its absence means nothing, and a reader must not take an unmarked entry for an
+    un-ingested one. It is also never fatal: this runs after a search is already in the corpus, and
+    an ingest that succeeded must not be reported as failed because a marker could not be written
+    (another user owns the entry; the share is read-only that second; the disk is full).
+    """
+    written: list[str] = []
+    try:
+        want = os.path.realpath(identity).rstrip("/")
+        entries = sorted(glob.glob(os.path.join(fu.DROPBOX_ROOT, "*", fu.MANIFEST)))
+    except OSError:
+        return written
+    for mpath in entries:
+        entry = os.path.dirname(mpath)
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                m = json.load(fh)
+            # A manifest is not necessarily a dict. `json.load(fh) or {}` looked like it covered
+            # that and does not: a LIST is truthy, so .get raised AttributeError straight past the
+            # except below. test_auto_ingest_starvation has exactly that fixture, which is how it
+            # was caught. Ask what the object IS rather than whether it is empty.
+            od = m.get("output_dir") if isinstance(m, dict) else None
+            if not isinstance(od, str) or os.path.realpath(od).rstrip("/") != want:
+                continue
+            body = json.dumps({
+                "output_dir": od,
+                "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "search": search,
+                "written_by": "auto_ingest.py mark_dropbox_ingested",
+                "note": "advisory: presence means FRAN holds this output_dir; absence means nothing",
+            }, indent=2) + "\n"
+            # Same directory, then replace: a reader never sees a half-written marker.
+            tmp = os.path.join(entry, f".{INGESTED_MARKER}.{os.getpid()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.replace(tmp, os.path.join(entry, INGESTED_MARKER))
+            written.append(entry)
+        except (OSError, ValueError, TypeError):
+            continue
+    return written
 
 
 def in_dropbox(path: str) -> bool:
@@ -822,6 +881,10 @@ def _run(a, chosen, skipped, qcon=None, store=None, held=()):
             dup += 1
             print(f"      ALREADY IN THE CORPUS as search_id={res['sid']} under this output_dir — "
                   f"not re-ingesting (corpus_ingest would delete and re-insert it)", flush=True)
+            # "already" means the corpus holds this output_dir just as surely as "ok" does, and it
+            # is the branch a re-encountered stale drop entry lands in.
+            for e in mark_dropbox_ingested(c["identity"], c.get("search")):
+                print(f"      drop box: marked {os.path.basename(e)} ingested", flush=True)
             _resolved(c)
         elif out == "duplicate":
             dup += 1
@@ -834,6 +897,8 @@ def _run(a, chosen, skipped, qcon=None, store=None, held=()):
             ok += 1
             progressed.add(c["engine"])
             print(f"      OK in {el:.0f}s", flush=True)
+            for e in mark_dropbox_ingested(c["identity"], c.get("search")):
+                print(f"      drop box: marked {os.path.basename(e)} ingested", flush=True)
             _mark(c, "ok")
             _remember(c, "ok")
             if c["engine"] == "diann":
