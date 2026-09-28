@@ -178,6 +178,48 @@ def _parse_localization_min(loc_str) -> float | None:
     return min(probs) if probs else None
 
 
+def parquet_spec_violation(path: str):
+    """None if a Parquet report is structurally readable, else a line saying why it is not.
+
+    Spectronaut writes its reports with Parquet.Net, which can declare a column in the FILE
+    schema and then omit it from every ROW GROUP. That violates the Parquet spec -- a row group
+    must carry one column chunk per schema column -- and no reader recovers it. Checked on Hive
+    against the same file: polars refuses ("File out of specification: the number of columns in
+    the row group (127) must be equal to the number of columns in the schema (128)"), duckdb
+    refuses ("row group does not have enough columns"), and pyarrow, which resolves a requested
+    name to its file-schema INDEX and reads that index out of the row group, reads every column
+    after the gap one position off the end and dies with
+
+        OSError: Unexpected end of stream
+
+    That message names nothing, points at no column, and looks exactly like a truncated file --
+    which sent three searches through three attempts each and into silent quarantine. It is not
+    truncation: PAR1 is intact at both ends of all of them.
+
+    Nor is it a bad export run. Every export of each of those three searches carries it -- six
+    files spanning 2026-06-19 to 2026-07-02, all Parquet.Net 5.1.1 -- so repeating the export
+    does not help and an older export is no refuge. The report has to be re-exported, and a TSV
+    export is unaffected because the defect is in the Parquet writer alone.
+
+    Cheap to check: row-group metadata lives in the footer beside the schema, so this reads no
+    data page.
+    """
+    import pyarrow.parquet as pq
+    md = pq.ParquetFile(path).metadata
+    if md.num_row_groups == 0:
+        return None
+    schema = [md.schema.column(i).name for i in range(md.num_columns)]
+    for g in range(md.num_row_groups):
+        rg = md.row_group(g)
+        if rg.num_columns == md.num_columns:
+            continue
+        carried = {rg.column(i).path_in_schema for i in range(rg.num_columns)}
+        gone = [c for c in schema if c not in carried]
+        return (f"row group {g} carries {rg.num_columns} of the {md.num_columns} columns its "
+                f"schema declares (written by {md.created_by}); missing: {', '.join(gone) or '?'}")
+    return None
+
+
 def report_columns(path: str) -> list[str]:
     """Header column names of a Spectronaut report — TSV or Parquet."""
     if str(path).lower().endswith(".parquet"):
@@ -207,6 +249,15 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
     means none."""
     _skipped = {"non_numeric_q": 0, "values": set()}
     _unmapped_mods: dict[str, int] = {}
+    if str(report_path).lower().endswith(".parquet"):
+        # Before anything reads a data page: a report that violates the Parquet spec must fail
+        # by NAME here, not as an opaque OSError from deep inside pyarrow six frames down.
+        bad = parquet_spec_violation(report_path)
+        if bad:
+            raise ValueError(
+                f"Spectronaut wrote a Parquet report that no reader can open: {bad}. Re-export "
+                f"the report from Spectronaut -- a TSV export is unaffected, the defect is in "
+                f"the Parquet writer. Re-running the same Parquet export will not fix it.")
     cols = resolve_columns(report_columns(report_path))
     need = ["run", "stripped_seq", "charge"]
     missing = [n for n in need if n not in cols]
