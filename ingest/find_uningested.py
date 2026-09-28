@@ -181,6 +181,30 @@ def excluded(path: str, patterns) -> bool:
 # which the corpus holds. The skill's stage step uses this IDENTICAL regex and writes its verdict
 # into the manifest as "qc" / "qc_rule", so the two repos agree; tests pin the same vectors.
 QC_NAME_RE = re.compile(r"(?i)(?<![a-z0-9])qc(?![a-z])")
+# The Core's HeLa STANDARD -- 50 ng of HeLa digest, named HE50 / HeL50 / Hel-50 / HeLa50(ng) on its
+# runs -- is QC only beside a run-method token: NN-spd (Evosep samples per day; timsTOF HT
+# "07162026_HE50_60-spd-dia-_S1-A1") or an NNm gradient (the Lumos: "FL030926_HeL50_90m_3"; its
+# runs carry no SPD). Measured against STAN's records of the Core's own QC runs, 2026-09-28. Neither
+# token alone is a signal: "HeLa50ng_titration" is an experiment, and "100mM" is not a gradient.
+HELA_STD_RE = re.compile(r"(?i)(?<![a-z0-9])he(?:la?)?[-_]?50(?:ng)?(?!\d)")
+RUN_METHOD_RE = re.compile(r"(?i)(?<![a-z0-9])\d{2,3}[-_]?(?:spd|m|min)(?![a-z0-9])")
+# A Core submission id. A name or path that carries one is a CUSTOMER study, whatever QC word it
+# also carries ("PROT_0812 plasma + pooled QC"): the name rule refers it to a person
+# (needs_agent_check) instead of excluding it as QC. The skill's fran_deposit.py makes the same call
+# before staging, with the skill's ONE definition, core_submission.PROT_TOKEN; FRAN cannot import
+# the skill, so this is a literal copy of it (pattern and flags), pinned by both repos' tests.
+# 3-5 digits: the skill's --prot takes up to 5, so PROT_10234 is one; "Total_prot_10ug" is not.
+PROT_ID_RE = re.compile(r"(?<![A-Za-z0-9])prot[_\-# ]?(\d{3,5})(?![A-Za-z0-9])", re.I)
+
+
+def name_qc_signal(text):
+    """What makes one name look like a QC run, or None: the QC token, or a HeLa standard beside a
+    run-method token. The twin of the skill's fran_deposit.name_qc_signal -- byte for byte."""
+    if QC_NAME_RE.search(text or ""):
+        return "matches QC_NAME_RE"
+    if HELA_STD_RE.search(text or "") and RUN_METHOD_RE.search(text or ""):
+        return "is a HeLa standard (HELA_STD_RE beside a RUN_METHOD_RE token)"
+    return None
 
 
 _SMB_PREFIX, _HIVE_PREFIX = "/Volumes/proteomics-grp", "/quobyte/proteomics-grp"
@@ -213,7 +237,11 @@ def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
                                                     scratch and smoke-test trees.
       3. manifest "qc": false                    -> NOT excluded by name (the producer overrode a
                                                     false positive of the name rule)
-      4. QC_NAME_RE on `name` and on the last three components of `path`.
+      4. name_qc_signal (QC_NAME_RE, or a HeLa standard beside a run-method token) on `name` and
+         on the last three components of `path` -- UNLESS `name` or ANY component of `path`
+         carries a Core submission id (PROT_ID_RE): then the answer is "needs_agent_check: ...",
+         which auto_ingest skips without charging and reports as needing a person. (A PROT id is
+         read on the whole path because it can only refer a call to a person, never exclude.)
     Scope: drop-box candidates only (auto_ingest.select). The FRAN_reports scan is NOT name-filtered.
     A hit is never a failure: nothing is attempted, charged or quarantined."""
     if qc is True:
@@ -226,10 +254,17 @@ def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
             return f"output_dir is under {pat} (DEFAULT_EXCLUDES)"
     if qc is False:
         return None
-    parts = [p for p in str(path or "").replace("\\", "/").split("/") if p][-3:]
-    for field, text in [("search_name", name or "")] + [("output_dir", p) for p in parts]:
-        if QC_NAME_RE.search(text):
-            return f"{field} {text!r} matches QC_NAME_RE"
+    every = [p for p in str(path or "").replace("\\", "/").split("/") if p]
+    labelled = [("search_name", name or "")] + [("output_dir", p) for p in every[-3:]]
+    for field, text in labelled:
+        sig = name_qc_signal(text)
+        if not sig:
+            continue
+        prot = next((t for t in [name or ""] + every if PROT_ID_RE.search(t)), None)
+        if prot:
+            return (f"needs_agent_check: {field} {text!r} {sig}, but {prot!r} carries a Core "
+                    f"submission id -- a person decides (the manifest's qc flag)")
+        return f"{field} {text!r} {sig}"
     return None
 
 

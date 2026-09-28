@@ -22,7 +22,7 @@ never reached. This pins the fix:
 
 Run:  python tests/test_auto_ingest_starvation.py     (no pytest, no database, no network)
 """
-import contextlib, io, json, os, shutil, subprocess, sys, tempfile, textwrap, time, types
+import contextlib, io, json, os, re, shutil, subprocess, sys, tempfile, textwrap, time, types
 import urllib.error, urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 INGEST = os.path.join(HERE, "..", "ingest")
@@ -31,6 +31,7 @@ import auto_ingest as ai                                    # noqa: E402
 import auto_ingest_alert as aia                             # noqa: E402
 import auto_ingest_state as ais                             # noqa: E402
 import find_uningested as fu                                # noqa: E402
+import engine_fasta as ef                                   # noqa: E402
 
 FAILS = []
 def check(name, cond, detail=""):
@@ -410,6 +411,42 @@ with tempfile.TemporaryDirectory() as tmp:
             check(f"QC_NAME_RE keeps {n!r}", fu.qc_reason("/a/b/c", n) is None)
         check("the regex is the one the skill mirrors",
               fu.QC_NAME_RE.pattern == r"(?i)(?<![a-z0-9])qc(?![a-z])")
+        # The Core's HeLa standard (HE50 / HeL50 / HeLa50 beside NN-spd or an NNm gradient), and a
+        # PROT_#### customer study that names its pooled QC -- the skill's QcRuleTests pin the same.
+        for n in ("07162026_HE50_60-spd-dia-_S1-A1_1_23036", "FL030926_HeL50_90m_3",
+                  "12May2026_DIA_60spd_HeLa50_S1-A5", "30apr26_HeL50Flextr-tf9d0_100spd_S4-A1",
+                  "FL050525_HeL50-Dda-newDualIT-HCDIT_60m_1", "Hel-50_100spd"):
+            check(f"a HeLa standard is QC: {n!r}", "HeLa standard" in (fu.qc_reason("/a/b/c", n) or ""),
+                  str(fu.qc_reason("/a/b/c", n)))
+        for n in ("HeLa50ng_titration", "buffer 100mM HeLa50", "HeLa_digest_timecourse"):
+            check(f"HeLa without a run-method token is kept: {n!r}", fu.qc_reason("/a/b/c", n) is None)
+        agent = "PROT_0812 plasma + pooled QC"
+        check("a PROT_#### study naming its QC goes to a person, not the QC exclusion",
+              (fu.qc_reason("/a/b/c", agent) or "").startswith("needs_agent_check: ")
+              and "PROT_0812" in fu.qc_reason("/a/b/c", agent), str(fu.qc_reason("/a/b/c", agent)))
+        check("  ...the id counts in the output_dir too",
+              (fu.qc_reason("/x/PROT_0812_plasma/search_out", "Lumos QC") or "").startswith(
+                  "needs_agent_check: "), str(fu.qc_reason("/x/PROT_0812_plasma/search_out", "Lumos QC")))
+        check("  ...a person's qc: false keeps it; qc: true excludes it",
+              fu.qc_reason("/a/b/c", agent, False) is None and
+              fu.qc_reason("/a/b/c", agent, True) == "manifest says qc: true")
+        check("  ...a PROT id alone is no signal", fu.qc_reason("/a/b/c", "PROT_0812 plasma") is None)
+        check("  ...a 5-digit id counts (the skill's --prot takes up to 5)",
+              (fu.qc_reason("/a/b/c", "PROT_10234 plasma + pooled QC") or "").startswith(
+                  "needs_agent_check: "), str(fu.qc_reason("/a/b/c", "PROT_10234 plasma + pooled QC")))
+        deep = "/q/SERVICE/Lab/PROT_0812/diann/2.7.0/search_out"
+        check("  ...an id ANYWHERE up the path counts (here 4th from the end); none there is QC",
+              (fu.qc_reason(deep, "Lumos QC") or "").startswith("needs_agent_check: ") and
+              fu.qc_reason(deep.replace("PROT_0812", "x"), "Lumos QC") == "search_name 'Lumos QC' "
+              "matches QC_NAME_RE", str(fu.qc_reason(deep, "Lumos QC")))
+        check("  ...protein amounts and names are not ids",
+              all(fu.qc_reason("/a/b/c", n) == f"search_name {n!r} matches QC_NAME_RE"
+                  for n in ("Total_prot_10ug QC", "WT_prot1 QC")))
+        check("the HeLa / run-method / PROT patterns are the ones the skill mirrors",
+              fu.HELA_STD_RE.pattern == r"(?i)(?<![a-z0-9])he(?:la?)?[-_]?50(?:ng)?(?!\d)" and
+              fu.RUN_METHOD_RE.pattern == r"(?i)(?<![a-z0-9])\d{2,3}[-_]?(?:spd|m|min)(?![a-z0-9])" and
+              fu.PROT_ID_RE.pattern == r"(?<![A-Za-z0-9])prot[_\-# ]?(\d{3,5})(?![A-Za-z0-9])"
+              and fu.PROT_ID_RE.flags & re.I)
         qc_entry, _ = drop("search__9ff203cf", "chkLUppm_HeLa50_2026 Lumos QC", T0 - 24 * H)
         hela, _ = drop("hela_study__11", "Smith HeLa phospho knockdown", T0 - 24 * H)
         flagged, _ = drop("flagged__12", "plain name", T0 - 24 * H, qc=True)
@@ -452,6 +489,27 @@ with tempfile.TemporaryDirectory() as tmp:
               "SKIP search__9ff203cf  skipped (qc: " in outs_q[0], outs_q[0][-400:])
         check("QC: the entry stays in incoming/", os.path.isfile(os.path.join(qc_entry["dir"],
                                                                               fu.MANIFEST)))
+        prot_qc, _ = drop("prot_qc__25", "PROT_0812 plasma + pooled QC", T0 - 24 * H)
+        hela_std, _ = drop("hela_std__26", "07162026_HE50_60-spd-dia-_S1-A1_1_23036", T0 - 24 * H)
+        chosen_a, skipped_a = ai.select([prot_qc, hela_std])
+        why_a = dict(skipped_a)
+        check("QC: a PROT_#### study naming its QC is skipped as needs_agent_check (not 'qc: ')",
+              not chosen_a and why_a.get("prot_qc__25", "").startswith("needs_agent_check: "),
+              str(why_a))
+        check("QC: the Core's HeLa standard run is skipped as QC",
+              why_a.get("hela_std__26", "").startswith("qc: ") and "HeLa standard" in why_a["hela_std__26"],
+              str(why_a))
+        ajson = os.path.join(tmp, "agent.json")
+        json.dump([prot_qc], open(ajson, "w"))
+        astate = os.path.join(tmp, "s4", "agent.json")
+        fake_a = FakeIngest({})
+        rc, oa = run_main(["--apply", "--candidates", ajson, "--state-file", astate, "--no-alert"],
+                          fake_a)
+        check("needs_agent_check: logged as 'skipped (needs_agent_check: ...)', never attempted or "
+              "charged", "SKIP prot_qc__25  skipped (needs_agent_check: " in oa and fake_a.calls == []
+              and json.load(open(astate))["candidates"] == {}, oa[-500:])
+        check("  ...and is due as an alert that needs a person", "ALERT DUE (human:prot_qc__25)" in oa,
+              oa[-300:])
 
         # --- manifest vs the search's own FASTA record ---
         diann_cmd = ("diann-linux --f a.d --lib x --fasta {} --fasta-search --threads 32\n"
@@ -467,7 +525,12 @@ with tempfile.TemporaryDirectory() as tmp:
                      prov={"engine": "diann", "fasta": "/nfs/x/input/search.fasta"})
         og, _ = drop("org_mismatch__24", "org", T0 - 24 * H, organism="Homo sapiens",
                      prov={"engine": "diann", "organism": "Mus musculus"})
-        chosen_f, skipped_f = ai.select([mm, mt, ab, pv, og])
+        # DIA-NN logs a path with spaces UNQUOTED; it was cut at the space ("Universal"), so a
+        # correct manifest was called a mismatch and held for a person.
+        sp, _ = drop("spaced_match__27", "spaced", T0 - 24 * H,
+                     fasta_path="/Users/b/fasta/Universal Protein Contaminants.fasta",
+                     log=diann_cmd.format("/quobyte/SERVICE/fasta/Universal Protein Contaminants.fasta"))
+        chosen_f, skipped_f = ai.select([mm, mt, ab, pv, og, sp])
         why, names_f = dict(skipped_f), [c["search"] for c in chosen_f]
         check("FASTA mismatch (the real PROT_0793 case) is skipped as manifest_fasta_mismatch",
               why.get("mouse_mismatch__20") == "manifest_fasta_mismatch: manifest=human_UP000005640.fasta"
@@ -480,6 +543,32 @@ with tempfile.TemporaryDirectory() as tmp:
               "--fasta-search" not in why.get("mouse_mismatch__20", ""))
         check("a recorded organism that disagrees is skipped",
               why.get("org_mismatch__24", "").startswith("manifest_organism_mismatch"), str(why))
+        check("a --fasta path with spaces matches its manifest (not cut at the first space)",
+              "spaced" in names_f and "spaced_match__27" not in why, str(why.get("spaced_match__27")))
+        # The one reading of a logged --fasta (engine_fasta.diann_logged_fastas), as DIA-NN reads
+        # its own arguments -- the skill's fran_deposit.logged_fastas pins the same vectors.
+        pxd = (r"C:\DIA-NN\1.8.1\DiaNN.exe --f D:\raw\a.raw  --lib  --threads 12 --fasta "
+               r"C:\SpectralLib\human - 2021-02-16-reviewed-contam-UP000005640.fasta --met-excision")
+        check("a verbatim DIA-NN 1.8.1 Windows log (PXD022216): the spaced path whole",
+              ef.diann_logged_fastas(pxd) ==
+              [r"C:\SpectralLib\human - 2021-02-16-reviewed-contam-UP000005640.fasta"],
+              str(ef.diann_logged_fastas(pxd)))
+        log2 = ("/opt/diann-linux --f a.d --fasta /x/y/Universal Protein Contaminants.fasta "
+                "--fasta-search --fasta /x/human.fasta --fasta-filter f.txt --threads 8\r\n"
+                "diann.exe --fasta \"/q/with space.fasta\" --out r.parquet\n--fasta /x/last.fasta\n")
+        check("values end at the next option; --fasta-search / --fasta-filter are not --fasta",
+              ef.diann_logged_fastas(log2) == ["/x/y/Universal Protein Contaminants.fasta",
+                                               "/x/human.fasta", "/q/with space.fasta", "/x/last.fasta"],
+              str(ef.diann_logged_fastas(log2)))
+        sd = os.path.join(tmp, "ef_search")
+        os.makedirs(sd, exist_ok=True)
+        with open(os.path.join(sd, "report.log.txt"), "w") as fh:
+            fh.write("DIA-NN 2.7.0\n/opt/diann-linux --f a.d --fasta /nfs/fasta/human.fasta "
+                     "--fasta /nfs/fasta/Universal Protein Contaminants.fasta --fasta-search\n")
+        det = ef.detect("diann", None, sd) or {}
+        check("ingest's detect(): the spaced contaminant library is recognised, the database kept",
+              det.get("fasta_path") == "/nfs/fasta/human.fasta" and
+              det.get("contaminant_lib") == "Universal Protein Contaminants.fasta", str(det))
         mjson = os.path.join(tmp, "mm.json")
         json.dump([mm], open(mjson, "w"))
         rc, om = run_main(["--apply", "--candidates", mjson, "--state-file",
