@@ -188,10 +188,13 @@ QC_NAME_RE = re.compile(r"(?i)(?<![a-z0-9])qc(?![a-z])")
 # token alone is a signal: "HeLa50ng_titration" is an experiment, and "100mM" is not a gradient.
 HELA_STD_RE = re.compile(r"(?i)(?<![a-z0-9])he(?:la?)?[-_]?50(?:ng)?(?!\d)")
 RUN_METHOD_RE = re.compile(r"(?i)(?<![a-z0-9])\d{2,3}[-_]?(?:spd|m|min)(?![a-z0-9])")
-# A Core submission id. A name that carries one is a CUSTOMER study, whatever QC word it also
-# carries ("PROT_0812 plasma + pooled QC"): the name rule refers it to a person (needs_agent_check)
-# instead of excluding it as QC. The skill's fran_deposit.py makes the same call before staging.
-PROT_ID_RE = re.compile(r"(?i)(?<![a-z0-9])prot[-_]?\d{4}(?!\d)")
+# A Core submission id. A name or path that carries one is a CUSTOMER study, whatever QC word it
+# also carries ("PROT_0812 plasma + pooled QC"): the name rule refers it to a person
+# (needs_agent_check) instead of excluding it as QC. The skill's fran_deposit.py makes the same call
+# before staging, with the skill's ONE definition, core_submission.PROT_TOKEN; FRAN cannot import
+# the skill, so this is a literal copy of it (pattern and flags), pinned by both repos' tests.
+# 3-5 digits: the skill's --prot takes up to 5, so PROT_10234 is one; "Total_prot_10ug" is not.
+PROT_ID_RE = re.compile(r"(?<![A-Za-z0-9])prot[_\-# ]?(\d{3,5})(?![A-Za-z0-9])", re.I)
 
 
 def name_qc_signal(text):
@@ -235,9 +238,10 @@ def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
       3. manifest "qc": false                    -> NOT excluded by name (the producer overrode a
                                                     false positive of the name rule)
       4. name_qc_signal (QC_NAME_RE, or a HeLa standard beside a run-method token) on `name` and
-         on the last three components of `path` -- UNLESS one of those carries a Core submission id
-         (PROT_ID_RE): then the answer is "needs_agent_check: ...", which auto_ingest skips without
-         charging and reports as needing a person.
+         on the last three components of `path` -- UNLESS `name` or ANY component of `path`
+         carries a Core submission id (PROT_ID_RE): then the answer is "needs_agent_check: ...",
+         which auto_ingest skips without charging and reports as needing a person. (A PROT id is
+         read on the whole path because it can only refer a call to a person, never exclude.)
     Scope: drop-box candidates only (auto_ingest.select). The FRAN_reports scan is NOT name-filtered.
     A hit is never a failure: nothing is attempted, charged or quarantined."""
     if qc is True:
@@ -250,13 +254,13 @@ def qc_reason(path: str, name: str | None = None, qc: bool | None = None,
             return f"output_dir is under {pat} (DEFAULT_EXCLUDES)"
     if qc is False:
         return None
-    parts = [p for p in str(path or "").replace("\\", "/").split("/") if p][-3:]
-    labelled = [("search_name", name or "")] + [("output_dir", p) for p in parts]
+    every = [p for p in str(path or "").replace("\\", "/").split("/") if p]
+    labelled = [("search_name", name or "")] + [("output_dir", p) for p in every[-3:]]
     for field, text in labelled:
         sig = name_qc_signal(text)
         if not sig:
             continue
-        prot = next((t for _, t in labelled if PROT_ID_RE.search(t)), None)
+        prot = next((t for t in [name or ""] + every if PROT_ID_RE.search(t)), None)
         if prot:
             return (f"needs_agent_check: {field} {text!r} {sig}, but {prot!r} carries a Core "
                     f"submission id -- a person decides (the manifest's qc flag)")

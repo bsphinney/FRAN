@@ -48,8 +48,24 @@ import hashlib
 import os
 import re
 
-# `--fasta path` / `--fasta=path`, quoted or bare, repeatable.
-_DIANN_FASTA = re.compile(r"--fasta[=\s]+(\"[^\"]+\"|'[^']+'|\S+)")
+# A --fasta value on the command line DIA-NN echoes into its log, read the way DIA-NN reads its own
+# arguments (diann.cpp 1.8, arguments()): argv is joined with single spaces, UNQUOTED -- the shell or
+# Windows already removed any quotes -- and each option's value runs to the next "--", trimmed. So a
+# path with spaces is logged as is, and only this reading gets it back: the DIA-NN 1.8.1 log of
+# PXD022216 has `--fasta C:\SpectralLib\human - 2021-02-16-reviewed-contam-UP000005640.fasta
+# --met-excision`, which \S+ cut to `C:\SpectralLib\human` (and "Universal Protein
+# Contaminants.fasta" to "Universal", which then did not even look like a contaminant library).
+# "fasta " needs its space, as in DIA-NN: --fasta-search / --fasta-filter are never read as one,
+# and DIA-NN has no `--fasta=path` form. The twin of the skill's fran_deposit.logged_fastas.
+_DIANN_FASTA = re.compile(r"--fasta (.*?)(?=--|$)", re.M)
+
+
+def diann_logged_fastas(text: str) -> list[str]:
+    """Every --fasta value in DIA-NN log text (see _DIANN_FASTA), trimmed, repeatable; surrounding
+    quotes, which only a hand-written command line would carry, are dropped. The ONE reading of a
+    logged --fasta in FRAN: detect() and auto_ingest's manifest cross-check both use it."""
+    vals = (m.strip().strip("\"'").strip() for m in _DIANN_FASTA.findall(text.replace("\r", "")))
+    return [v for v in vals if v]
 # "├─ Original File: gg_HoSa_rUP5640.fasta"  (box-drawing prefix varies; anchor on the label)
 _SN_ORIGINAL = re.compile(r"Original File:\s*(.+?\.fasta)\s*$", re.I | re.M)
 _SN_DB_BLOCK = re.compile(r"Protein Databases Used(.*?)(?:\n\s*[├└]─ \w|\Z)", re.I | re.S)
@@ -176,10 +192,9 @@ def detect(engine: str, report_path: str | None, search_dir: str | None = None,
             for root in roots:
                 for p in _first(["report.log.txt", "*.log.txt", "*.log",
                                  os.path.join("dia-quant-output", "report.log.txt")], root):
-                    hits = _DIANN_FASTA.findall(_head(p, 40_000))
-                    if not hits:
+                    paths = diann_logged_fastas(_head(p, 40_000))
+                    if not paths:
                         continue
-                    paths = [h.strip("\"'") for h in hits]
                     contam = [x for x in paths if _CONTAM_HINT.search(os.path.basename(x))]
                     main = [x for x in paths if x not in contam]
                     if not main:  # as in the Spectronaut branch: a single "..._contaminants.fasta"

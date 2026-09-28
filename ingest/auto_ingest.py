@@ -71,6 +71,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # closure, so it reads NOT SAFE TO INGEST before anything runs (ingest/DEPLOY_auto_ingest.md).
 import auto_ingest_alert as aia  # noqa: E402
 import auto_ingest_state as ais  # noqa: E402
+from engine_fasta import diann_logged_fastas  # noqa: E402  -- the ONE reading of a logged --fasta
 import find_uningested as fu  # noqa: E402  -- the drop-box contract: DROPBOX_ROOT, read_manifest
 # fran_queue too (stdlib-only at module level; psycopg2 is imported lazily inside it), so a deploy
 # missing fran_queue.py fails here. The functions below still `import fran_queue` locally: that
@@ -232,7 +233,6 @@ def _apply_manifest(c: dict, m: dict) -> None:
             c[dst] = m[src]
 
 
-_FASTA_ARG = re.compile(r"--fasta[ =]+(\S+)")
 NEEDS_HUMAN = ("manifest_fasta_mismatch", "manifest_organism_mismatch", "needs_agent_check")
 
 
@@ -242,7 +242,8 @@ def _search_record(d: str):
     Two independent sources, both written when the search RAN, not when it was staged:
       * search_provenance.json -- "fasta" (a path or a list) and, if present, "organism";
       * report.log.txt -- DIA-NN writes its command line at the top, one `--fasta <path>` per
-        database (`--fasta-search` is a different flag and does not match).
+        database, unquoted even when the path has spaces (engine_fasta.diann_logged_fastas reads
+        it as DIA-NN does; `--fasta-search` is a different flag and does not match).
     fran_deposit.json is deliberately NOT a source: the stage step writes it from the same inputs as
     the manifest, so agreeing with it proves nothing."""
     names, org = set(), None
@@ -261,7 +262,7 @@ def _search_record(d: str):
     try:
         with open(os.path.join(d, "report.log.txt"), "rb") as fh:
             head = fh.read(256 * 1024).decode("utf-8", "replace")
-        names |= {os.path.basename(p) for p in _FASTA_ARG.findall(head)}
+        names |= {os.path.basename(p) for p in diann_logged_fastas(head)}
     except OSError:
         pass
     return (names or None), org
