@@ -410,6 +410,30 @@ with tempfile.TemporaryDirectory() as tmp:
             check(f"QC_NAME_RE keeps {n!r}", fu.qc_reason("/a/b/c", n) is None)
         check("the regex is the one the skill mirrors",
               fu.QC_NAME_RE.pattern == r"(?i)(?<![a-z0-9])qc(?![a-z])")
+        # The Core's HeLa standard (HE50 / HeL50 / HeLa50 beside NN-spd or an NNm gradient), and a
+        # PROT_#### customer study that names its pooled QC -- the skill's QcRuleTests pin the same.
+        for n in ("07162026_HE50_60-spd-dia-_S1-A1_1_23036", "FL030926_HeL50_90m_3",
+                  "12May2026_DIA_60spd_HeLa50_S1-A5", "30apr26_HeL50Flextr-tf9d0_100spd_S4-A1",
+                  "FL050525_HeL50-Dda-newDualIT-HCDIT_60m_1", "Hel-50_100spd"):
+            check(f"a HeLa standard is QC: {n!r}", "HeLa standard" in (fu.qc_reason("/a/b/c", n) or ""),
+                  str(fu.qc_reason("/a/b/c", n)))
+        for n in ("HeLa50ng_titration", "buffer 100mM HeLa50", "HeLa_digest_timecourse"):
+            check(f"HeLa without a run-method token is kept: {n!r}", fu.qc_reason("/a/b/c", n) is None)
+        agent = "PROT_0812 plasma + pooled QC"
+        check("a PROT_#### study naming its QC goes to a person, not the QC exclusion",
+              (fu.qc_reason("/a/b/c", agent) or "").startswith("needs_agent_check: ")
+              and "PROT_0812" in fu.qc_reason("/a/b/c", agent), str(fu.qc_reason("/a/b/c", agent)))
+        check("  ...the id counts in the output_dir too",
+              (fu.qc_reason("/x/PROT_0812_plasma/search_out", "Lumos QC") or "").startswith(
+                  "needs_agent_check: "), str(fu.qc_reason("/x/PROT_0812_plasma/search_out", "Lumos QC")))
+        check("  ...a person's qc: false keeps it; qc: true excludes it",
+              fu.qc_reason("/a/b/c", agent, False) is None and
+              fu.qc_reason("/a/b/c", agent, True) == "manifest says qc: true")
+        check("  ...a PROT id alone is no signal", fu.qc_reason("/a/b/c", "PROT_0812 plasma") is None)
+        check("the HeLa / run-method / PROT patterns are the ones the skill mirrors",
+              fu.HELA_STD_RE.pattern == r"(?i)(?<![a-z0-9])he(?:la?)?[-_]?50(?:ng)?(?!\d)" and
+              fu.RUN_METHOD_RE.pattern == r"(?i)(?<![a-z0-9])\d{2,3}[-_]?(?:spd|m|min)(?![a-z0-9])" and
+              fu.PROT_ID_RE.pattern == r"(?i)(?<![a-z0-9])prot[-_]?\d{4}(?!\d)")
         qc_entry, _ = drop("search__9ff203cf", "chkLUppm_HeLa50_2026 Lumos QC", T0 - 24 * H)
         hela, _ = drop("hela_study__11", "Smith HeLa phospho knockdown", T0 - 24 * H)
         flagged, _ = drop("flagged__12", "plain name", T0 - 24 * H, qc=True)
@@ -452,6 +476,27 @@ with tempfile.TemporaryDirectory() as tmp:
               "SKIP search__9ff203cf  skipped (qc: " in outs_q[0], outs_q[0][-400:])
         check("QC: the entry stays in incoming/", os.path.isfile(os.path.join(qc_entry["dir"],
                                                                               fu.MANIFEST)))
+        prot_qc, _ = drop("prot_qc__25", "PROT_0812 plasma + pooled QC", T0 - 24 * H)
+        hela_std, _ = drop("hela_std__26", "07162026_HE50_60-spd-dia-_S1-A1_1_23036", T0 - 24 * H)
+        chosen_a, skipped_a = ai.select([prot_qc, hela_std])
+        why_a = dict(skipped_a)
+        check("QC: a PROT_#### study naming its QC is skipped as needs_agent_check (not 'qc: ')",
+              not chosen_a and why_a.get("prot_qc__25", "").startswith("needs_agent_check: "),
+              str(why_a))
+        check("QC: the Core's HeLa standard run is skipped as QC",
+              why_a.get("hela_std__26", "").startswith("qc: ") and "HeLa standard" in why_a["hela_std__26"],
+              str(why_a))
+        ajson = os.path.join(tmp, "agent.json")
+        json.dump([prot_qc], open(ajson, "w"))
+        astate = os.path.join(tmp, "s4", "agent.json")
+        fake_a = FakeIngest({})
+        rc, oa = run_main(["--apply", "--candidates", ajson, "--state-file", astate, "--no-alert"],
+                          fake_a)
+        check("needs_agent_check: logged as 'skipped (needs_agent_check: ...)', never attempted or "
+              "charged", "SKIP prot_qc__25  skipped (needs_agent_check: " in oa and fake_a.calls == []
+              and json.load(open(astate))["candidates"] == {}, oa[-500:])
+        check("  ...and is due as an alert that needs a person", "ALERT DUE (human:prot_qc__25)" in oa,
+              oa[-300:])
 
         # --- manifest vs the search's own FASTA record ---
         diann_cmd = ("diann-linux --f a.d --lib x --fasta {} --fasta-search --threads 32\n"

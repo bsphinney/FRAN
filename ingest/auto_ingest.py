@@ -32,9 +32,11 @@ nothing, while drop-box searches sorted behind "2022..." names were never reache
   * drop-box entries (incoming/) go before the FRAN_reports backlog, oldest-staged first within
     each group; registered queue rows still go before both. A drop-box entry takes its identity
     from a VALID fran_manifest.json (a legacy bare-symlink entry from its target) and is skipped --
-    never charged -- when the manifest is malformed, when FRAN policy excludes it as QC, or when it
-    contradicts its own search's FASTA record (find_uningested.read_manifest / qc_reason: the one
-    definition of the contract and of the QC rule);
+    never charged -- when the manifest is malformed, when FRAN policy excludes it as QC, when its
+    name looks like QC but carries a PROT_#### submission id (needs_agent_check: a person sets the
+    manifest's qc flag), or when it contradicts its own search's FASTA record
+    (find_uningested.read_manifest / qc_reason: the one definition of the contract and of the QC
+    rule);
   * every scan outcome is remembered (auto_ingest_state.py): ok/duplicate never again, a failure
     backs off 4 h -> 1 d and is quarantined after 3; a systemic failure (stale code, database
     down, CLI skew) is not charged -- it stops the run, or, for an import failure, holds back that
@@ -42,8 +44,8 @@ nothing, while drop-box searches sorted behind "2022..." names were never reache
   * every ingest is re-checked against the corpus immediately before it runs, under a lease on its
     output_dir, because corpus_ingest deletes and re-inserts an existing one;
   * whatever needs a person -- N runs with work and no progress (a crash or a killed run counts),
-    an engine blocked N runs running, a manifest that contradicts its search -- posts ONE Slack
-    message (auto_ingest_alert.py).
+    an engine blocked N runs running, a manifest that contradicts its search, a needs_agent_check
+    entry -- posts ONE Slack message (auto_ingest_alert.py).
 
     python auto_ingest.py --list-quarantine
     python auto_ingest.py --clear <key or unique part of it>
@@ -231,7 +233,7 @@ def _apply_manifest(c: dict, m: dict) -> None:
 
 
 _FASTA_ARG = re.compile(r"--fasta[ =]+(\S+)")
-NEEDS_HUMAN = ("manifest_fasta_mismatch", "manifest_organism_mismatch")
+NEEDS_HUMAN = ("manifest_fasta_mismatch", "manifest_organism_mismatch", "needs_agent_check")
 
 
 def _search_record(d: str):
@@ -326,7 +328,9 @@ def select(candidates, skip_failed=True):
                                m.get("search_name") if m else name,
                                m.get("qc") if m else None, m.get("exclude") if m else None)
             if why:
-                skipped.append((name, f"qc: {why}"))
+                # "needs_agent_check: ..." (a QC-looking name on a PROT_#### customer study) is not
+                # a QC exclusion: it is held for a person, and alerted as one (NEEDS_HUMAN).
+                skipped.append((name, why if why.startswith("needs_agent_check") else f"qc: {why}"))
                 continue
             if m:
                 _apply_manifest(c, m)
