@@ -324,6 +324,22 @@ def main():
 
     batch, skipped = [], []
     for r in slice_:
+        # A one-run set cannot go through this pipeline at all: plan_speclib_batch/batch_submit
+        # refuse it outright -- "Parallel search needs >= 2 raw files ... use the single-shot
+        # run_search.py for 1" -- because the 5-step chain exists to split runs across an array
+        # and there is nothing to split. 181 of the 1,337 sets (13.5%) are single-run.
+        #
+        # Recorded as a skip WITH ITS REASON rather than quietly passed over, so the progress
+        # report counts them and names why. They are real work that still needs doing, by the
+        # single-shot path, and a silent omission here is exactly how a worklist shrinks without
+        # anyone noticing. Found within one firing of ordering smallest-first, which put ten of
+        # them in the first batch -- the old ordering would have hidden it for weeks.
+        if int(r["n_runs"] or 0) < 2:
+            why = "single-run set -- needs the single-shot run_search.py, not the parallel chain"
+            skipped.append((r["setkey"], why))
+            st[r["setkey"]] = {"status": "skipped", "reason": why, "cohort": r["cohort"],
+                               "n_runs": int(r["n_runs"] or 0)}
+            continue
         r["_runs"] = runs_of.get(r["setkey"], set())
         entry, why = prepare(r, probes)
         if entry:
