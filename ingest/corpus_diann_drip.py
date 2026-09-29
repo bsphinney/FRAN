@@ -285,6 +285,29 @@ def main():
         print("worklist complete")
         return 0
 
+    # Record EVERY single-run set now, in one pass, and take them out of contention.
+    #
+    # Skipping them one batch at a time was not enough. The batch is the ten smallest sets in the
+    # cohort, and the ten smallest are all single-run, so a firing skipped ten and generated
+    # nothing -- and the next firing would have done the same, for the eighteen firings it takes
+    # to walk past 181 of them at ten a time. Six hours of doing nothing, correctly.
+    #
+    # They are still recorded individually, with the reason, so the progress report can count
+    # them; what changes is that the drip stops rediscovering them and gets on with the 1,156
+    # sets it can actually run.
+    singles = [r for r in todo if int(r["n_runs"] or 0) < 2]
+    if singles:
+        why = "single-run set -- needs the single-shot run_search.py, not the parallel chain"
+        for r in singles:
+            st[r["setkey"]] = {"status": "skipped", "reason": why, "cohort": r["cohort"],
+                               "n_runs": int(r["n_runs"] or 0)}
+        save_state(st)
+        print(f"recorded {len(singles)} single-run set(s) as skipped — they need run_search.py")
+        todo = [r for r in todo if int(r["n_runs"] or 0) >= 2]
+        if not todo:
+            print("nothing left that the parallel chain can run")
+            return 0
+
     # One contiguous slice, so the batch sits inside a single cohort and shares a library. Cohort
     # ORDER is left alone -- largest-cohort-first still amortises a library build over the most
     # searches -- but WITHIN the chosen cohort the smallest sets go first.
