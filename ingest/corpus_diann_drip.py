@@ -92,7 +92,21 @@ PARTITION, ACCOUNT, QOS = "low", "publicgrp", "publicgrp-low-qos"
 CPU_CEILING = 800
 # Separate from the CPU ceiling and doing a different job: the CPU count bounds what we OCCUPY,
 # this bounds what we QUEUE.
-MAX_SEARCHES_IN_FLIGHT = 12
+# Raised from 12 after measuring what 12 actually occupies: 176 CPUs against a ceiling of 800,
+# with 4,157 CPUs idle in the partition and every one of our pending jobs waiting on its OWN chain
+# (squeue reason "Dependency"), not on the cluster. A search is five SEQUENTIAL steps, so it idles
+# between them -- twelve in flight averaged ~15 active CPUs each. The queue-depth cap was sized as
+# if searches occupy CPUs continuously; they do not. 50 is what it takes to approach the 800-CPU
+# ceiling, and the ceiling is then the thing that actually throttles, which is what it is for.
+MAX_SEARCHES_IN_FLIGHT = 50
+# diann_parallel.py defaults --time-per-file to 2 hours, and plan_speclib_batch.py does not expose
+# it, so every step-2/step-4 array task got a 2 h wall. That killed five chains on the first two
+# days: one run of a 2-file set needed 2:00:10 while its partner finished in 0:29:56, the task hit
+# the wall, and afterok then never released s3_assembly -- losing the whole search, including the
+# hundreds of first-pass tasks that had already succeeded beside it. Run length varies by more
+# than an order of magnitude across this corpus, so a wall sized for the median is a wall that
+# silently destroys the tail.
+TIME_PER_FILE_H = 8
 THREADS_PER_FILE = 16
 BATCH_MAX = 10            # sets generated per firing; one cohort slice, so they share a library
 
@@ -403,6 +417,30 @@ def main():
     if not os.path.exists(submit):
         print("no batch_submit.sh produced")
         return 1
+    # Raise the per-file wall in the generated batch_submit.sh before running it.
+    #
+    # It has to happen HERE and not earlier: plan_speclib_batch.py writes batch_submit.sh, which
+    # invokes diann_parallel.py, which is what generates the step sbatch files -- so the sbatch
+    # files do not exist until this script runs, and there is nothing to edit before it. Adding
+    # the flag to the diann_parallel.py invocations is the only point where the wall is still
+    # changeable from FRAN's side. plan_speclib_batch.py lives in the pipeline skill's stack, not
+    # this repo; if it ever forwards --time-per-file, delete this and pass it in plan_cmd instead.
+    try:
+        txt = open(submit).read()
+        lines = txt.splitlines(True)
+        n = 0
+        for i, ln in enumerate(lines):
+            if "diann_parallel.py" in ln and "--time-per-file" not in ln:
+                lines[i] = ln.rstrip("\n") + f" --time-per-file {TIME_PER_FILE_H}\n"
+                n += 1
+        if n:
+            with open(submit, "w") as fh:
+                fh.writelines(lines)
+            print(f"raised --time-per-file to {TIME_PER_FILE_H} h on {n} chain(s)")
+    except OSError as e:
+        # Not fatal: a 2 h wall still searches most sets. Losing the batch would be worse.
+        print(f"could not raise the wall ({e}); chains keep the 2 h default")
+
     r = sh(["bash", submit])
     print((r.stdout or "")[-2000:])
     if r.returncode != 0:
