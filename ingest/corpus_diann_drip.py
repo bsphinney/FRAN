@@ -47,6 +47,7 @@ import csv
 import functools
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -244,8 +245,161 @@ def prepare(row, probes):
             "out": os.path.join(dest, "output", "search")}, None
 
 
+TOOLS_JSON = "/quobyte/proteomics-grp/fran/engines/pilot_tools/tools.json"
+SINGLES_BATCH_MAX = 20
+
+
+def _bundle_for(entry, row, dest_wf):
+    """run_search.py requires a --bundle; diann_parallel.py does not, so the drip never wrote one.
+
+    Mirrors what the pilot runs carry. Only the fields run_search reads are filled: the engine and
+    its version, the FASTA, the acquisition, and the instrument, which decides the DIA-NN defaults
+    for a Bruker .d versus a Thermo .raw.
+    """
+    inst = (row.get("instrument") or "").strip()
+    klass = "timstof" if "timstof" in inst.lower() else "orbitrap"
+    b = {"id": "diann_%s_dia" % klass, "name": "diann — %s (DIA)" % (inst or klass),
+         "path": None, "acquisition": "DIA",
+         "instruments": [inst] if inst else [], "instrument_class": klass,
+         "instrument_label": inst or klass, "organism": None,
+         "organism_taxid": int(row["taxon"]) if str(row.get("taxon") or "").isdigit() else None,
+         "engine": {"name": "diann", "version": DIANN_VERSION},
+         "fasta": {"path": entry["fasta"], "add_contaminants": True}}
+    path = os.path.join(dest_wf, "workflow.manifest.json")
+    with open(path, "w") as fh:
+        json.dump(b, fh, indent=1)
+    return path
+
+
+def submit_singles(st, rows, probes, a):
+    """Search the one-run sets, which the 5-step chain cannot take.
+
+    diann_parallel refuses a single file -- "Parallel search needs >= 2 raw files ... use the
+    single-shot run_search.py for 1" -- because the chain exists to split runs across an array and
+    one run has nothing to split. That is a plumbing limit, not a reason to leave the data
+    unsearched: 176 of the 1,337 sets are one-run, the DIA-NN search itself is entirely ordinary,
+    and the Spectronaut result we are comparing against was also produced from that one run, so
+    the comparison stays like-for-like. The only real difference is that there is no
+    match-between-runs, which is a property of having one run, not a defect of searching it.
+
+    LIBRARY REUSE IS THE POINT OF DOING IT THIS WAY. The expensive step is predicting the spectral
+    library, and the cache is keyed on (FASTA contents, DIA-NN version, the 14 flags) -- not on the
+    runs. So a one-run set in a cohort whose library was already built for its multi-run siblings
+    hits the SAME key, and --cached-lib skips step 1 outright. Predicting a library per one-run
+    search would cost more than searching them.
+    """
+    done = {k for k, v in st.items()
+            if v.get("status") in ("complete", "submitted")
+            or (v.get("status") == "skipped" and "single-run" not in (v.get("reason") or ""))}
+    todo = [r for r in rows if int(r["n_runs"] or 0) == 1 and r["setkey"] not in done]
+    if not todo:
+        print("no one-run sets left to submit")
+        return 0
+    print(f"{len(todo):,} one-run set(s) outstanding; taking {min(len(todo), a.batch_max)}")
+
+    runs_of = runs_by_setkey()
+    n_sub = 0
+    for row in todo[: a.batch_max]:
+        row["_runs"] = runs_of.get(row["setkey"], set())
+        entry, why = prepare(row, probes)
+        if not entry:
+            st[row["setkey"]] = {"status": "skipped", "reason": why, "cohort": row["cohort"],
+                                 "n_runs": 1}
+            print(f"  SKIP {row['setkey'][:10]} — {why}")
+            continue
+        wf = os.path.dirname(entry["cfg"])
+        bundle = _bundle_for(entry, row, wf)
+        raws = [ln.strip() for ln in open(entry["raw_list"]) if ln.strip()]
+
+        os.makedirs(entry["out"], exist_ok=True)
+        # NO --cached-lib, and that is measured, not an oversight. run_search ignores it on the
+        # single-shot route whatever we do -- "--cached-lib is ignored on the single-shot route
+        # (1 file(s), at or below the threshold of 5); this search predicts its own library" --
+        # and putting --lib in the cfg does not help either; it still plans two_job_libfree.
+        #
+        # So each one-run search predicts its own library. Measured cost: s1_libpred averages 13
+        # minutes on 16 CPUs over 74 completed builds, i.e. 3.5 CPU-h, so 176 of them is ~616
+        # CPU-h against a corpus estimate near 140,000 -- about 0.4%. Worth paying rather than
+        # hand-rolling a bare DIA-NN call, because run_search runs bruker_tdf.tdf_integrity() on
+        # every .d first, and DIA-NN has truncated .d files in this corpus before.
+        prefix = os.path.join(entry["out"], "single.sbatch")
+        r = sh([PY, os.path.join(STACK, "run_search.py"),
+                "--tools", TOOLS_JSON, "--bundle", bundle, "--params", entry["cfg"],
+                "--fasta", entry["fasta"], "--out", entry["out"],
+                "--files", *raws, "--threads", str(THREADS_PER_FILE),
+                "--engine", "diann", "--sbatch", prefix,
+                "--partition", PARTITION, "--account", ACCOUNT, "--qos", QOS])
+        # --sbatch names a PREFIX, not a file: run_search writes <prefix>_1_lib.sh and
+        # <prefix>_2_search.sh and chains them from submit.sh in the output dir. Checking for the
+        # prefix path itself finds nothing and reads as a failure on a run that worked.
+        submit = os.path.join(entry["out"], "submit.sh")
+        if r.returncode != 0 or not os.path.exists(submit):
+            why = "run_search --sbatch failed rc=%s %s" % (r.returncode, (r.stderr or "")[:140])
+            st[row["setkey"]] = {"status": "failed", "reason": why, "cohort": row["cohort"],
+                                 "n_runs": 1}
+            print(f"  FAIL {entry['name'][:44]} — {why}")
+            continue
+        sub = sh(["bash", submit])
+        jids = re.findall(r"=(\d{5,})", (sub.stdout or ""))
+        if sub.returncode != 0 or not jids:
+            why = "submit.sh failed rc=%s %s" % (sub.returncode, (sub.stderr or "")[:140])
+            st[row["setkey"]] = {"status": "failed", "reason": why, "cohort": row["cohort"],
+                                 "n_runs": 1}
+            print(f"  FAIL {entry['name'][:44]} — {why}")
+            continue
+        # run_search's submit.sh echoes the ids and writes no jobs.txt; the parallel route writes
+        # one, and everything downstream -- the progress report, the completeness check before
+        # ingest -- reads it to decide whether a chain is still running. Write it here so a
+        # one-run search is indistinguishable to those readers from any other.
+        try:
+            with open(os.path.join(entry["out"], "jobs.txt"), "w") as fh:
+                fh.write("\n".join(jids) + "\n")
+        except OSError as e:
+            print(f"    (could not write jobs.txt: {e})")
+        st[row["setkey"]] = {"status": "submitted", "name": entry["name"], "jobs": jids,
+                             "cohort": row["cohort"], "n_runs": 1, "route": "single-shot"}
+        n_sub += 1
+        print("  %-46s libpred+search %s" % (entry["name"][:46], ",".join(jids)))
+    save_state(st)
+    print(f"submitted {n_sub} one-run search(es)")
+    return 0
+
+
+def runs_by_setkey():
+    """setkey -> the run basenames it contains, from the Spectronaut side of the corpus.
+
+    Extracted so the parallel path and the one-run path resolve raw files identically. Duplicating
+    it would be the obvious shortcut and exactly the way the two routes drift apart: a set whose
+    raws one route can find and the other cannot is a silent skip, not an error.
+    """
+    import collections
+    runs_of = collections.defaultdict(set)
+    sys.path.insert(0, "/quobyte/proteomics-grp/brett/glendon/fran_ingest")
+    import plan_spectrum_backfill as PB
+    c = PB._conn(); cur = c.cursor()
+    cur.execute("""
+      WITH sn AS (SELECT s.id, md5(string_agg(rf.raw_basename, ',' ORDER BY rf.raw_basename)) AS setkey
+                  FROM delimp_searches s JOIN search_raw_files srf ON srf.search_id=s.id
+                  JOIN raw_files rf ON rf.raw_path=srf.raw_path
+                  WHERE s.search_engine='spectronaut' GROUP BY s.id),
+           pick AS (SELECT DISTINCT ON (setkey) setkey, id FROM sn ORDER BY setkey, id)
+      SELECT p.setkey, rf.raw_basename FROM pick p
+      JOIN search_raw_files srf ON srf.search_id=p.id
+      JOIN raw_files rf ON rf.raw_path=srf.raw_path""")
+    for sk, base in cur.fetchall():
+        b = base.rstrip("/")
+        for e in (".d", ".raw"):
+            if b.lower().endswith(e):
+                b = b[: -len(e)]
+        runs_of[sk].add(os.path.basename(b))
+    c.close()
+    return runs_of
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--singles", action="store_true",
+                    help="submit one-run sets through run_search.py instead of the 5-step chain")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--submit", action="store_true")
@@ -257,6 +411,18 @@ def main():
     st = load_state()
     rows = worklist()
     probes = probe_index()
+
+    if a.singles:
+        if not a.batch_max or a.batch_max == BATCH_MAX:
+            a.batch_max = SINGLES_BATCH_MAX
+        inflight = cpus_in_flight()
+        if inflight >= a.ceiling:
+            print(f"{inflight} CPUs RUNNING >= ceiling {a.ceiling} — nothing submitted")
+            return 0
+        if searches_in_flight(st) >= a.max_in_flight:
+            print(f"{searches_in_flight(st)} searches already in flight — nothing submitted")
+            return 0
+        return submit_singles(st, rows, probes, a)
 
     # refresh what has finished since the last firing
     changed = False
@@ -336,28 +502,7 @@ def main():
     slice_ = sorted(in_cohort, key=lambda r: int(r["n_runs"] or 0))[: a.batch_max]
     print(f"cohort {cohort}: taking {len(slice_)} of {len(in_cohort)}")
 
-    # map setkey -> its run basenames, needed to pick raw paths out of the probe table
-    import collections
-    runs_of = collections.defaultdict(set)
-    sys.path.insert(0, "/quobyte/proteomics-grp/brett/glendon/fran_ingest")
-    import plan_spectrum_backfill as PB
-    c = PB._conn(); cur = c.cursor()
-    cur.execute("""
-      WITH sn AS (SELECT s.id, md5(string_agg(rf.raw_basename, ',' ORDER BY rf.raw_basename)) AS setkey
-                  FROM delimp_searches s JOIN search_raw_files srf ON srf.search_id=s.id
-                  JOIN raw_files rf ON rf.raw_path=srf.raw_path
-                  WHERE s.search_engine='spectronaut' GROUP BY s.id),
-           pick AS (SELECT DISTINCT ON (setkey) setkey, id FROM sn ORDER BY setkey, id)
-      SELECT p.setkey, rf.raw_basename FROM pick p
-      JOIN search_raw_files srf ON srf.search_id=p.id
-      JOIN raw_files rf ON rf.raw_path=srf.raw_path""")
-    for sk, base in cur.fetchall():
-        b = base.rstrip("/")
-        for e in (".d", ".raw"):
-            if b.lower().endswith(e):
-                b = b[: -len(e)]
-        runs_of[sk].add(os.path.basename(b))
-    c.close()
+    runs_of = runs_by_setkey()
 
     batch, skipped = [], []
     for r in slice_:
