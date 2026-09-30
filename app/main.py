@@ -913,10 +913,37 @@ def api_species(name: str):
 # comparison is easy to get wrong -- see the traps documented above queries.multi_engine_runs().
 
 
+@app.get("/api/engines/list")
+def api_engine_list():
+    """Every engine in the corpus and its versions — what the filter offers.
+
+    Read from the corpus rather than hardcoded: the DIA-NN re-search adds versions as it runs, and
+    a fixed list would stop offering the newest one exactly when it became the interesting one.
+    """
+    return ok(_safe(queries.engine_inventory, {"engines": []}))
+
+
 @app.get("/api/engines/runs")
-def api_engine_runs(limit: int = Query(200, ge=1, le=500)):
-    """Acquisitions searched by 2+ engines — the list the comparison page opens on."""
-    return ok({"rows": _safe(lambda: queries.multi_engine_runs(limit), [])})
+def api_engine_runs(limit: int = Query(200, ge=1, le=500),
+                    engines: str = Query("", description="comma-separated; ALL must be present"),
+                    min_versions: int = Query(0, ge=0, le=20),
+                    version_engine: str = Query("")):
+    """Acquisitions worth comparing.
+
+    With no `engines`, every run searched by 2+ engines (the list the page opens on). With
+    `engines=spectronaut,diann`, only runs BOTH searched — all of them must be present, because a
+    run only one engine touched has nothing to compare. With `min_versions=2`, runs where one
+    engine was used at two or more versions, which is not a multi-engine question at all and was
+    unaskable before: "DIA-NN 2.6 vs 2.7 over the same raw file".
+    """
+    sel = [e.strip() for e in engines.split(",") if e.strip()]
+    return ok({
+        "rows": _safe(lambda: queries.multi_engine_runs(
+            limit, engines=sel, min_versions=min_versions,
+            version_engine=version_engine or None), []),
+        "filter": {"engines": sel, "min_versions": min_versions,
+                   "version_engine": version_engine or (sel[0] if len(sel) == 1 else None)},
+    })
 
 
 @app.get("/api/engines/species")

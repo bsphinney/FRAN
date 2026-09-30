@@ -3260,8 +3260,9 @@ function eSplit(onlyA, both, onlyB, la, lb){
 async function renderEngines(){
   view.innerHTML=`<div class="skeleton h-64 rounded-xl"></div>`;
   try{
-    const [runs, species] = await Promise.all([api('/api/engines/runs?limit=300'), api('/api/engines/species')]);
-    const R = runs.rows||[], S = species.rows||[];
+    const [runs, species, inv] = await Promise.all([api('/api/engines/runs?limit=300'), api('/api/engines/species'), api('/api/engines/list')]);
+    const R = runs.rows||[], S = species.rows||[], INV = (inv.engines)||[];
+    window.__eInv = INV;
     if(!R.length){ view.innerHTML = crumb([['Dashboard','dashboard'],['Engine comparison',null]]) + empty('No acquisition has been searched by more than one engine yet.'); return; }
     const badge = e => `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-white/10 text-slate-200">${esc(e)}</span>`;
     view.innerHTML = `
@@ -3293,8 +3294,21 @@ async function renderEngines(){
     <div class="glass card p-5">
       <div class="flex items-center gap-3 mb-3 flex-wrap">
         <h2 class="font-bold text-white">Acquisitions</h2>
+        <span id="eCount" class="text-slate-400 text-sm">${fmt(R.length)}</span>
         <input id="eFilter" oninput="eFilterRuns()" placeholder="filter by run or organism…"
           class="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm flex-1 min-w-[220px]">
+      </div>
+      <div id="eEngines" class="flex flex-wrap items-center gap-2 mb-4 text-sm">
+        <span class="text-slate-400">Searched by</span>
+        ${INV.map(e=>`<label class="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 cursor-pointer select-none">
+          <input type="checkbox" value="${esc(e.engine)}" onchange="eApplyEngines()" class="align-middle mr-1.5">
+          <span class="text-white">${esc(e.engine)}</span>
+          <span class="text-slate-500 ml-1">${fmt(e.n_searches)}</span>
+          <span class="text-slate-600 ml-1">· ${fmt(e.versions.length)}v</span></label>`).join('')}
+        <label id="eVerWrap" class="hidden px-2.5 py-1 rounded-lg bg-indigo-500/10 border border-indigo-400/20 cursor-pointer select-none">
+          <input type="checkbox" id="eMultiVer" checked onchange="eApplyEngines()" class="align-middle mr-1.5">
+          <span class="text-indigo-200">searched at 2+ versions</span></label>
+        <span id="eHint" class="text-slate-500 text-xs"></span>
       </div>
       <div id="eRuns">${table(['Run','Engines','Organism','Instrument','Precursors'],
         R.map(r=>[`<span class="font-mono text-xs">${esc(r.raw_basename)}</span>`,
@@ -3307,12 +3321,46 @@ async function renderEngines(){
   }catch(e){ view.innerHTML = crumb([['Dashboard','dashboard'],['Engine comparison',null]]) + empty('Could not load: '+e.message); }
 }
 
+async function eApplyEngines(){
+  // EVERY checked engine must be present, not any of them: "compare Spectronaut and DIA-NN" means
+  // runs that have both. A run only one of them touched has nothing to compare and would pad the
+  // list -- selecting diann alone matches 2,526 runs, against 1,503 for the pair.
+  const sel = [...document.querySelectorAll('#eEngines input[type=checkbox][value]')]
+                .filter(c=>c.checked).map(c=>c.value);
+  // One engine is not a comparison unless you compare its VERSIONS, so that toggle appears only
+  // then, and defaults on -- otherwise a single tick silently lists everything that engine ever
+  // searched, which looks like a broken filter rather than an answered question.
+  const wrap=$('#eVerWrap'), ver=$('#eMultiVer'), hint=$('#eHint');
+  if(wrap) wrap.classList.toggle('hidden', sel.length!==1);
+  const mv = (sel.length===1 && ver && ver.checked) ? 2 : 0;
+  if(hint) hint.textContent = !sel.length ? 'any 2+ engines'
+      : sel.length===1 ? (mv? `${sel[0]} at 2+ versions, same raw file` : `every run ${sel[0]} searched`)
+      : `runs searched by all ${sel.length}`;
+  const qs = new URLSearchParams({limit:'300'});
+  if(sel.length) qs.set('engines', sel.join(','));
+  if(mv) qs.set('min_versions', String(mv));
+  $('#eRuns').innerHTML = `<div class="skeleton h-40 rounded-xl"></div>`;
+  try{
+    const res = await api('/api/engines/runs?'+qs.toString());
+    window.__eRows = res.rows||[];
+    window.__eShowVersions = mv>0;
+    const c=$('#eCount'); if(c) c.textContent = fmt(window.__eRows.length);
+    eFilterRuns();
+  }catch(e){ $('#eRuns').innerHTML = empty('Could not load: '+e.message); }
+}
+
 function eFilterRuns(){
   const q=($('#eFilter').value||'').toLowerCase(), R=window.__eRows||[];
   const f=R.filter(r=>!q || r.raw_basename.toLowerCase().includes(q) || (r.organism||'').toLowerCase().includes(q));
   const badge = e => `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-white/10 text-slate-200">${esc(e)}</span>`;
-  $('#eRuns').innerHTML = f.length? table(['Run','Engines','Organism','Instrument','Precursors'],
-    f.map(r=>[`<span class="font-mono text-xs">${esc(r.raw_basename)}</span>`, r.engines.map(badge).join(' '),
+  // With a version filter on, every row carries the same engine badge, so the badge answers
+  // nothing -- show the versions that made the run match instead.
+  const showV = window.__eShowVersions && f.some(r=>r.engine_versions);
+  const cols = showV ? ['Run','Versions','Organism','Instrument','Precursors']
+                     : ['Run','Engines','Organism','Instrument','Precursors'];
+  $('#eRuns').innerHTML = f.length? table(cols,
+    f.map(r=>[`<span class="font-mono text-xs">${esc(r.raw_basename)}</span>`,
+              (showV ? (r.engine_versions||[]) : (r.engines||[])).map(badge).join(' '),
               `<span class="italic">${esc(r.organism||'—')}</span>`, esc(r.instrument||r.platform||'—'), fmt(r.sum_precursors)]),
     f.map(r=>`go('enginerun','${encodeURIComponent(r.raw_basename)}')`)) : empty('No run matches that filter.');
 }
