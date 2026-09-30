@@ -179,6 +179,58 @@ def searches_in_flight(st):
     return sum(1 for v in st.values() if v.get("status") == "submitted")
 
 
+# Anything that is not a clean finish. CANCELLED is in here deliberately: a chain we cancelled
+# because it had stranded is not a completed search, and must come back round for a retry.
+BAD_STATES = ("FAILED", "TIMEOUT", "OUT_OF_MEMORY", "CANCELLED", "NODE_FAIL", "PREEMPTED",
+              "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT")
+
+
+def chain_outcome(jobs, out_dir=None):
+    """("running", None) | ("complete", None) | ("failed", why) for one search's chain.
+
+    WHY THIS ASKS sacct RATHER THAN ONLY squeue. The old test was "is any job still queued", and
+    absence-from-queue was read as success. It is not: a chain that DIED also has nothing queued.
+    That recorded five OUT_OF_MEMORY single-shot searches as `complete` -- searches with no
+    report.parquet at all -- and they would never have been retried, because `complete` is in the
+    drip's done-set. Nothing caught it except the ingest drip refusing to ingest a report that did
+    not exist. The queue answers "is it over"; only sacct answers "did it work".
+
+    THE THIRD CASE, which is why this is not a two-line change. sacct records age out of SLURM's
+    database, so an old chain returns NO rows at all -- indistinguishable, from sacct alone, from a
+    chain that never ran. Treating "no records" as failure would resurrect every long-finished
+    search on the next firing; treating it as success is the bug this function exists to fix. So
+    when sacct is silent we fall back to the artefact: a search with a report.parquet finished, one
+    without it did not.
+    """
+    if still_running(jobs):
+        return "running", None
+    if not jobs:
+        return "failed", "no job ids recorded for this chain"
+
+    r = sh(["bash", "-lc", "sacct -X -n -P -o JobID,State -j %s 2>/dev/null"
+            % ",".join(str(j) for j in jobs)])
+    states = {}
+    for line in (r.stdout or "").splitlines():
+        if "|" not in line:
+            continue
+        jid, st = line.split("|", 1)
+        states[jid.strip()] = st.strip().split()[0]      # "CANCELLED by 1234" -> "CANCELLED"
+
+    if not states:
+        rp = os.path.join(out_dir or "", "report.parquet")
+        if out_dir and os.path.exists(rp):
+            return "complete", None
+        return "failed", "no sacct records and no report.parquet (chain died, records aged out)"
+
+    bad = sorted({v for v in states.values() if v in BAD_STATES})
+    if bad:
+        n = sum(1 for v in states.values() if v in BAD_STATES)
+        return "failed", "%d of %d chain job(s) ended %s" % (n, len(states), "/".join(bad))
+    if any(v not in ("COMPLETED",) for v in states.values()):
+        return "running", None                            # PENDING/RUNNING that squeue just missed
+    return "complete", None
+
+
 def still_running(jobs):
     """True while ANY job id from this set's chain is in the queue.
 
@@ -451,13 +503,22 @@ def main():
             return 0
         return submit_singles(st, rows, probes, a)
 
-    # refresh what has finished since the last firing
+    # Refresh what has ENDED since the last firing -- and whether it ended well. A search that
+    # died goes to `failed`, which is not in the done-set below, so the drip picks it up again.
     changed = False
     for sk, s in st.items():
-        if s.get("status") == "submitted" and not still_running(s.get("jobs") or []):
-            s["status"] = "complete"
-            s["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            changed = True
+        if s.get("status") != "submitted":
+            continue
+        out_dir = os.path.join(OUT_ROOT, s.get("name", ""), "output", "search") if s.get("name") else None
+        state, why = chain_outcome(s.get("jobs") or [], out_dir)
+        if state == "running":
+            continue
+        s["status"] = state
+        s["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        if why:
+            s["reason"] = why
+            print(f"  FAILED {(s.get('name') or sk)[:52]} — {why}")
+        changed = True
     if changed:
         save_state(st)
 
