@@ -45,6 +45,7 @@ existing: it exists while step 5 is still writing it, which nearly caused a part
 import argparse
 import csv
 import functools
+import glob
 import json
 import os
 import re
@@ -246,6 +247,7 @@ def prepare(row, probes):
 
 
 TOOLS_JSON = "/quobyte/proteomics-grp/fran/engines/pilot_tools/tools.json"
+SEARCH_MEM = "192G"           # see the rewrite in submit_singles for why 64G is not enough
 SINGLES_BATCH_MAX = 20
 
 
@@ -339,6 +341,31 @@ def submit_singles(st, rows, probes, a):
                                  "n_runs": 1}
             print(f"  FAIL {entry['name'][:44]} — {why}")
             continue
+        # Raise the search job's memory before submitting. run_search hardcodes mem="64G" in
+        # _write_sbatch and exposes no flag for it (--assembly-mem is the parallel path only), so
+        # rewriting the generated script is the only lever from here -- the same place and reason
+        # the parallel route rewrites --time-per-file.
+        #
+        # 64G is not enough for a NON-TRYPTIC one-run search. Five died this way before anyone
+        # noticed, every one of them a chymotryptic, elastase or non-specific digest:
+        # MT2-Chymo, mt3-elastase, MT3_non_specific_search, chymo11. Measured on 24190791 --
+        # ReqMem 64G, MaxRSS 67,103,912K, killed at exactly the limit after 2 h 09 m of work. An
+        # alternative protease multiplies the peptide search space, and the memory follows.
+        #
+        # 192G because every one of the 168 nodes on this partition has 256,000+ MB, so asking for
+        # it costs nothing in scheduling. SLURM reserves rather than allocates, so a tryptic search
+        # that needs 20G is not penalised for the ceiling.
+        for sb in sorted(glob.glob(prefix + "*_search.sh")):
+            try:
+                t = open(sb).read()
+                if "#SBATCH --mem=" in t and SEARCH_MEM not in t:
+                    t = re.sub(r"#SBATCH --mem=\S+", f"#SBATCH --mem={SEARCH_MEM}", t, count=1)
+                    with open(sb, "w") as fh:
+                        fh.write(t)
+            except OSError as e:
+                # Not fatal: 64G still searches a tryptic set. Losing the batch would be worse.
+                print(f"    (could not raise memory on {os.path.basename(sb)}: {e})")
+
         sub = sh(["bash", submit])
         jids = re.findall(r"=(\d{5,})", (sub.stdout or ""))
         if sub.returncode != 0 or not jids:
