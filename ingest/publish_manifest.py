@@ -23,10 +23,34 @@ REFUSE_FILES = {"corpus_ingest.py", "spectronaut_to_corpus.py", "diann_to_corpus
 
 
 def file_md5(path: str) -> str:
+    """md5 of a file's CONTENTS, refusing to hash a short read.
+
+    WHY THE LENGTH CHECK EXISTS. On 2026-09-29 this published d41d8cd98f00b204e9800998ecf8427e --
+    the md5 of ZERO BYTES -- for corpus_ingest.py, a file 87,309 bytes long. `~/Documents` is
+    iCloud-backed; macOS had evicted the file to a dataless placeholder, and the read returned
+    nothing at all without raising. corpus_ingest.py is refuse-gated, so that one row stopped EVERY
+    ingest on HIVE -- the corpus-wide drip and the 4-hourly auto-ingest cron both -- and two cron
+    firings reported "0 ingested, 25 failed" before anyone looked at a log.
+
+    The gate itself behaved correctly the whole time: it failed closed and wrote nothing bad. The
+    fault was here, publishing the hash of content this process never actually read. Comparing what
+    we hashed against what the filesystem says is on disk costs one stat call, and turns a silent
+    pipeline outage into a refusal at the one moment it is still cheap to fix.
+    """
     h = hashlib.md5()
+    n = 0
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
+            n += len(chunk)
+    size = os.path.getsize(path)
+    if n != size:
+        raise SystemExit(
+            f"REFUSING TO PUBLISH: read {n} bytes from {path}, which is {size} bytes on disk.\n"
+            f"  On an iCloud-backed checkout that means the file is a dataless placeholder and its\n"
+            f"  contents are not on this Mac. Publishing now would record the hash of content that\n"
+            f"  was never read, and a refuse-gated file would halt ingest everywhere.\n"
+            f"  Materialise it first -- read it through, or restore it from git -- then re-run.")
     return h.hexdigest()
 
 
