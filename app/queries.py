@@ -3854,18 +3854,90 @@ def corpus_facts() -> dict:
 # rows; an unscoped cross-engine join is not a web request, it is a batch job.
 
 
-def multi_engine_runs(limit: int = 200) -> list[dict[str, Any]]:
-    """Acquisitions searched by two or more ENGINES -- the input list for the comparison page.
+ENGINE_TABLES = ["search_raw_files", "raw_files", "delimp_searches", "delimp_sample_metadata"]
+
+
+def engine_inventory() -> dict[str, Any]:
+    """Which engines exist in the corpus, and which versions of each -- what the filter offers.
+
+    Built from the corpus rather than hardcoded, because the list is not static: the DIA-NN
+    re-search adds versions as it runs, and a hardcoded list would quietly stop offering the newest
+    one exactly when it became the interesting one to compare against.
+
+    A NULL search_engine_version is reported as its own bucket rather than dropped. 762 Spectronaut
+    searches have no recorded version, and a filter that silently hid two thirds of the Spectronaut
+    corpus would be worse than one that shows an honest "(unrecorded)".
+    """
+    def _p() -> dict[str, Any]:
+        rows = query(
+            """SELECT search_engine                       AS engine,
+                      search_engine_version               AS version,
+                      COUNT(*)                            AS n_searches
+                 FROM delimp_searches
+                WHERE search_engine IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 3 DESC""",
+            (), tables=["delimp_searches"])
+        by: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            e = by.setdefault(r["engine"], {"engine": r["engine"], "n_searches": 0, "versions": []})
+            e["n_searches"] += int(r["n_searches"] or 0)
+            e["versions"].append({"version": r["version"], "n_searches": int(r["n_searches"] or 0)})
+        return {"engines": sorted(by.values(), key=lambda x: -x["n_searches"])}
+    return SLOW_CACHE.get_or_set("engine_inventory", _p)
+
+
+def multi_engine_runs(limit: int = 200, engines: list[str] | None = None,
+                      min_versions: int = 0, version_engine: str | None = None
+                      ) -> list[dict[str, Any]]:
+    """Acquisitions worth comparing -- the input list for the comparison page.
 
     Keyed off search_raw_files (17 MB) and delimp_searches (1.6 MB), never delimp_precursors, so it
     stays a cheap lookup no matter how large the corpus gets.
+
+    THREE QUESTIONS, one query, because they are the same shape:
+
+      engines=None                       every run searched by 2+ engines          (1,516 runs)
+      engines=[spectronaut, diann]       runs both of them searched                (the usual ask)
+      engines=[diann], min_versions=2    runs DIA-NN searched with 2+ versions        (92 runs)
+
+    The engine filter requires EVERY selected engine to be present, not any of them. "Compare
+    Spectronaut and DIA-NN" means runs that have both; a run only one of them touched has nothing
+    to compare and would just pad the list.
+
+    The version filter is a separate axis on purpose. "DIA-NN 2.6 vs 2.7 over the same raw" is not
+    a multi-ENGINE question and the n_engines > 1 test excludes it outright -- which is why it was
+    unaskable before. COUNT(DISTINCT version) ignores NULLs, so a search with no recorded version
+    cannot be mistaken for a distinct one.
     """
+    limit = min(int(limit), 500)
+    engines = [e for e in (engines or []) if e]
+    min_versions = max(int(min_versions or 0), 0)
+    version_engine = version_engine or (engines[0] if len(engines) == 1 else None)
+
+    having, params = [], []
+    if engines:
+        having.append("COUNT(DISTINCT s.search_engine) "
+                      "FILTER (WHERE s.search_engine = ANY(%s)) = %s")
+        params += [engines, len(engines)]
+    if min_versions >= 2 and version_engine:
+        having.append("COUNT(DISTINCT s.search_engine_version) "
+                      "FILTER (WHERE s.search_engine = %s) >= %s")
+        params += [version_engine, min_versions]
+    if not having:
+        having.append("COUNT(DISTINCT s.search_engine) > 1")
+
+    key = f"multi_engine_runs:{limit}:{','.join(sorted(engines))}:{min_versions}:{version_engine}"
+
     def _p() -> list[dict[str, Any]]:
         rows = query(
-            """SELECT rf.raw_basename,
+            f"""SELECT rf.raw_basename,
                       COUNT(DISTINCT s.search_engine)                       AS n_engines,
                       COUNT(DISTINCT s.id)                                  AS n_searches,
                       ARRAY_AGG(DISTINCT s.search_engine)                   AS engines,
+                      ARRAY_AGG(DISTINCT s.search_engine || ' '
+                                || COALESCE(s.search_engine_version, '(unrecorded)'))
+                                                                            AS engine_versions,
                       MAX(m.organism_name)                                  AS organism,
                       MAX(rf.platform)                                      AS platform,
                       MAX(rf.instrument_model)                              AS instrument,
@@ -3875,13 +3947,12 @@ def multi_engine_runs(limit: int = 200) -> list[dict[str, Any]]:
                  JOIN delimp_searches s ON s.id = f.search_id
                  LEFT JOIN delimp_sample_metadata m ON m.raw_path = f.raw_path
                 GROUP BY rf.raw_basename
-               HAVING COUNT(DISTINCT s.search_engine) > 1
+               HAVING {' AND '.join(having)}
                 ORDER BY COUNT(DISTINCT s.search_engine) DESC, SUM(f.n_precursors) DESC
                 LIMIT %s""",
-            (min(int(limit), 500),),
-            tables=["search_raw_files", "raw_files", "delimp_searches", "delimp_sample_metadata"])
+            tuple(params + [limit]), tables=ENGINE_TABLES)
         return [dict(r) for r in rows]
-    return SLOW_CACHE.get_or_set(f"multi_engine_runs:{limit}", _p)
+    return SLOW_CACHE.get_or_set(key, _p)
 
 
 def resolve_run_key(key: str) -> str:
