@@ -613,6 +613,38 @@ def main():
         r["_runs"] = runs_of.get(r["setkey"], set())
         entry, why = prepare(r, probes)
         if entry:
+            # A set is only searchable if EVERY one of its runs has a probed raw path. prepare()
+            # resolves raws from the probe table, so an under-probed set quietly yields a shorter
+            # file list and searches a subset of itself.
+            #
+            # Two things go wrong, and the second is worse than the first. A set that resolves to
+            # ONE file makes diann_parallel refuse outright ("Parallel search needs >= 2 raw
+            # files"), and because batch_submit.sh runs under `set -euo pipefail` that one refusal
+            # ABORTS THE WHOLE BATCH -- every search queued behind it in the same firing never
+            # submits. One bad entry stalled the corpus run repeatedly, firing after firing, while
+            # the drip reported itself healthy.
+            #
+            # A set that resolves to 2+ but still fewer than it has is quieter and costs more: it
+            # searches a subset, produces a report covering fewer runs than the set, and the
+            # ingest drip's run-count gate then refuses it -- after the CPU has been spent. On
+            # CORPUS_WORKLIST that is 26 sets, 4 of them resolving under 2.
+            #
+            # Neither is fixable here: the answer is to probe the missing runs (probe_acquisition),
+            # not to search what happens to be probed. So they are skipped with the numbers in the
+            # reason, which is what makes them findable later.
+            try:
+                n_raw = sum(1 for ln in open(entry["raw_list"]) if ln.strip())
+            except OSError:
+                n_raw = 0
+            want = int(r["n_runs"] or 0)
+            if n_raw < want:
+                why = ("under-probed: %d of %d runs have a probed raw path, so this would search a "
+                       "subset and the report could not be ingested. Probe the missing runs first."
+                       % (n_raw, want))
+                skipped.append((r["setkey"], why))
+                st[r["setkey"]] = {"status": "skipped", "reason": why, "cohort": r["cohort"],
+                                   "n_runs": want, "n_probed": n_raw}
+                continue
             batch.append(entry)
             st[r["setkey"]] = {"status": "generated", "name": entry["name"],
                                "cohort": r["cohort"], "n_runs": int(r["n_runs"])}
