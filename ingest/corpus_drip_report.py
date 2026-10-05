@@ -24,6 +24,7 @@ must not be able to stop the run it is reporting on.
 import argparse
 import collections
 import functools
+import glob
 import json
 import os
 import subprocess
@@ -40,7 +41,17 @@ STATE = os.path.join(OUT_ROOT, "state.json")
 HISTORY = os.path.join(OUT_ROOT, "report_history.json")
 WORKLIST = os.path.join(ROOT, "CORPUS_WORKLIST.tsv")
 WEBHOOK_FILE = "/quobyte/proteomics-grp/.config/skill_slack_webhook"
-CEILING = 100
+DRIP_LOGS = "/quobyte/proteomics-grp/brett/scratch/corpus_drip_logs"
+
+# Read the ceiling from the drip rather than keeping a second copy. The copy here said 100 for
+# days after the drip was raised to 800, so every Slack post carried a number that had not been
+# true since 2026-09-29 -- the quiet kind of drift that makes a dashboard untrustworthy without
+# ever being wrong enough to notice.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from corpus_diann_drip import CPU_CEILING as CEILING
+except Exception:                                                  # noqa: BLE001
+    CEILING = 800                                                  # last known; never silently 100
 
 
 def sh(cmd):
@@ -61,6 +72,43 @@ def cpus_running():
         except ValueError:
             pass
     return n
+
+
+def last_firing_error():
+    """Why the most recent drip firing failed, or None if it did not.
+
+    THE REPORTER KNEW THE DRIP HAD STALLED AND NOT WHY. On 2026-10-05 it posted "nothing completed
+    and nothing running -- the drip has stalled" every six hours for most of a day while the real
+    cause was a PG Farm connection timeout: the drip could not resolve raw paths, so it failed
+    closed and submitted nothing. "Stalled" is indistinguishable from any other stall and tells a
+    reader nothing to act on; "last firing failed: psycopg2 OperationalError ... timeout expired"
+    tells them where to look. The reporter reads state.json and squeue, neither of which can see a
+    firing that died before writing anything -- so it has to read the drip's own log.
+    """
+    try:
+        logs = sorted(glob.glob(os.path.join(DRIP_LOGS, "drip_*.log")))
+        if not logs:
+            return None
+        tail = open(logs[-1], errors="replace").read()[-6000:]
+    except OSError:
+        return None
+    # The last firing is whatever follows the final start marker; anything earlier is history.
+    for marker in ("one-run set(s) outstanding", "cohort ", "worklist complete"):
+        if marker in tail:
+            tail = tail[tail.rfind(marker):]
+            break
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        # A Python exception's last line is the one that names the fault.
+        if line.startswith(("psycopg2.", "OSError", "ValueError", "RuntimeError", "KeyError",
+                            "FileNotFoundError", "subprocess.", "TypeError", "AttributeError")):
+            return line[:200]
+        if line.startswith(("batch_submit FAILED", "plan_speclib_batch FAILED",
+                            "sbatch failed", "ABORT:")):
+            return line[:200]
+    return None
 
 
 def load(path, default):
@@ -134,7 +182,10 @@ def main():
             elif dd == 0 and inflight == 0 and remaining > 0:
                 # Nothing finished AND nothing is running: that is a stall. Nothing finished
                 # while chains are still running is just a long search.
-                eta = "\n• ⚠️ *nothing completed and nothing running* — the drip has stalled"
+                why = last_firing_error()
+                eta = ("\n• ⚠️ *nothing completed and nothing running* — the drip has stalled"
+                       + (f"\n• last firing failed: `{why}`" if why else
+                          "\n• the last firing reported no error — look at SLURM, not the drip"))
             elif dd == 0:
                 eta = f"\n• nothing completed in {hrs:.0f} h ({inflight} still running)"
 
