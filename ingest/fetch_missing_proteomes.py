@@ -92,28 +92,51 @@ def resolve_proteome(taxon):
         return None, "no proteome candidate for taxid %s" % taxon
     # Reference proteomes first, then the largest. UniProt often returns several strains; the
     # reference one is what a search should use unless somebody deliberately chose otherwise.
-    best = sorted(cands, key=lambda c: (not c.get("is_reference"),
-                                        -int(c.get("protein_count") or 0)))[0]
-    return best.get("proteome_id"), "%s %s (%s proteins%s)" % (
-        best.get("proteome_id"), (best.get("organism") or "?")[:40],
-        best.get("protein_count"), ", reference" if best.get("is_reference") else "")
+    # Returns the whole ORDER, not just the winner: a non-reference proteome is frequently not
+    # downloadable at all ("non-Reference proteome' proteomes are often not downloadable"), which
+    # failed two taxa whose candidate list had no reference entry. Trying the next one costs a
+    # request and turns a hard failure into a second choice that is at least recorded.
+    ranked = sorted(cands, key=lambda c: (not c.get("is_reference"),
+                                          -int(c.get("protein_count") or 0)))
+    return ranked, "%d candidate(s)" % len(ranked)
 
 
 def fetch_one(taxon, organism, stamp):
     """One prepared proteome, via fetch_fasta.py. Returns (ok, note)."""
-    up, note = resolve_proteome(taxon)
-    if not up:
+    ranked, note = resolve_proteome(taxon)
+    if not ranked:
         return False, note
-    stage = os.path.join(FASTA_ROOT, ".staging_%s_%s" % (taxon, os.getpid()))
-    os.makedirs(stage, exist_ok=True)
-    out = os.path.join(stage, "search.fasta")
-    r = subprocess.run(
-        [PY, os.path.join(STACK, "fetch_fasta.py"), "fetch", "--proteome", up,
-         "--content", "one_per_gene", "--contaminants", "universal", "--add-contaminants",
-         "--out", out],
-        capture_output=True, text=True, timeout=900)
-    if r.returncode != 0 or not os.path.exists(out):
-        return False, "%s | %s" % (note, (r.stderr or r.stdout or "")[-160:].replace("\n", " "))
+    last = note
+    for cand in ranked[:4]:                 # the reference, then the next few by size
+        up = cand.get("proteome_id")
+        if not up:
+            continue
+        # A proteome already prepared for ANOTHER taxon of the same organism is not a failure:
+        # several worklist taxa resolve to one UniProt proteome, and the second arrival used to
+        # abort on "destination already exists" having done the work correctly. Link the taxon to
+        # what is already there instead.
+        existing = os.path.join(FASTA_ROOT, "%s_%s" % (up, taxon), stamp)
+        if os.path.exists(os.path.join(existing, "search.fasta")):
+            return True, "already prepared: %s" % existing
+        stage = os.path.join(FASTA_ROOT, ".staging_%s_%s" % (taxon, os.getpid()))
+        subprocess.run(["rm", "-rf", stage], check=False)
+        os.makedirs(stage, exist_ok=True)
+        out = os.path.join(stage, "search.fasta")
+        r = subprocess.run(
+            [PY, os.path.join(STACK, "fetch_fasta.py"), "fetch", "--proteome", up,
+             "--content", "one_per_gene", "--contaminants", "universal", "--add-contaminants",
+             "--out", out],
+            capture_output=True, text=True, timeout=900)
+        if r.returncode == 0 and os.path.exists(out):
+            note = "%s %s (%s proteins%s)" % (up, (cand.get("organism") or "?")[:36],
+                                              cand.get("protein_count"),
+                                              ", reference" if cand.get("is_reference") else
+                                              ", NOT reference")
+            break
+        last = "%s: %s" % (up, (r.stderr or r.stdout or "")[-120:].replace("\n", " "))
+        subprocess.run(["rm", "-rf", stage], check=False)
+    else:
+        return False, "no candidate downloaded; last: %s" % last
     # NAME THE DIRECTORY BY THE WORKLIST'S TAXON, not the proteome's own. They differ whenever
     # UniProt's reference is a strain: taxid 4932 (S. cerevisiae) resolves to UP000002311, whose
     # taxid is 559292 (strain S288c). The drip's fasta_for() scans for a directory ending
