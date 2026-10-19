@@ -77,13 +77,21 @@ def sh(cmd):
     return subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True)
 
 
+# $(id -un), never $USER. Cron does not set USER, so under cron `squeue -u $USER -h` became
+# `squeue -u -h`, which fails "Invalid user: -h" into the 2>/dev/null. Every scheduled report from
+# 2026-09-28 to 2026-10-19 (61 of them) therefore saw an empty queue: 0 CPUs, 0 in flight, and
+# every still-running search counted as complete. corpus_drip.sh exports USER for exactly this
+# reason; corpus_report.sh never did, and only a cron-shaped run shows the difference.
+ME = "$(id -un)"
+
+
 def running_jobs():
-    r = sh("squeue -u $USER -h -o '%i' 2>/dev/null")
+    r = sh(f"squeue -u {ME} -h -o '%i' 2>/dev/null")
     return {ln.strip().split("_")[0] for ln in (r.stdout or "").splitlines() if ln.strip()}
 
 
 def cpus_running():
-    r = sh("squeue -u $USER -h -t RUNNING -o '%C' 2>/dev/null")
+    r = sh(f"squeue -u {ME} -h -t RUNNING -o '%C' 2>/dev/null")
     n = 0
     for ln in (r.stdout or "").splitlines():
         try:
