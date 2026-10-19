@@ -53,6 +53,25 @@ try:
 except Exception:                                                  # noqa: BLE001
     CEILING = 800                                                  # last known; never silently 100
 
+# PG FARM'S DISK. The delimp database filled its disk on 2026-10-05 and the site went down; ingest
+# has been paused since. Justin Merz (PG Farm admin) gave us the query below to watch it and said to
+# add ~5 GB for the OS and docker images. Postgres cannot see the disk's size, so the size is his
+# number: "you are currently at 400GB", plus the 5 GB he added to bring it back.
+# CHANGE PG_DISK_GB TO 1600 WHEN HE CONFIRMS THE RESIZE (agreed 2026-10-15, waiting on the
+# recharge). Until then this warns on every report, which is correct: ~2.5 GB is ~15 searches.
+# GB here are GiB, as pg_size_pretty and the cloud disk both count them.
+PG_DISK_GB = 405
+PG_OVERHEAD_GB = 5
+PG_WARN_FREE_GB = 10
+PG_USED_SQL = """
+SELECT SUM(pg_total_relation_size(c.oid))
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p', 'm')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+"""
+
 
 def sh(cmd):
     return subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True)
@@ -109,6 +128,44 @@ def last_firing_error():
                             "sbatch failed", "ABORT:")):
             return line[:200]
     return None
+
+
+def pg_used_gb():
+    """(GB on PG Farm's disk by Justin's query, None) or (None, why it could not be measured).
+
+    Through the drip's own connection helper, so this measures with exactly the credential path
+    that is known to work from this directory. Never raises: the report must still go out when the
+    database is the thing that is broken -- that is when it matters most.
+    """
+    try:
+        from plan_spectrum_backfill import _conn
+        con = _conn()
+        try:
+            cur = con.cursor()
+            cur.execute(PG_USED_SQL)
+            return float(cur.fetchone()[0]) / 1024 ** 3, None
+        finally:
+            con.close()
+    except Exception as e:                                         # noqa: BLE001
+        msg = (str(e).strip().splitlines() or [""])[0]
+        return None, f"{type(e).__name__}: {msg}"[:160]
+
+
+def disk_line(used, why, prev_used=None):
+    """The report's PG Farm disk line. Pure, so it is tested without a database.
+
+    Free space leads when it is low, because that is the number someone has to act on. An
+    unmeasured disk is a warning too: on 2026-10-05 a full disk looked, from outside, exactly like
+    a connection that never finished.
+    """
+    if used is None:
+        return f"• ⚠️ *PG Farm disk not measured* — {why}"
+    free = PG_DISK_GB - PG_OVERHEAD_GB - used
+    trend = f", {used - prev_used:+.1f} GB since last report" if prev_used is not None else ""
+    if free < PG_WARN_FREE_GB:
+        return (f"• ⚠️ *PG Farm disk: ~{free:.1f} GB free* ({used:.1f} of {PG_DISK_GB} GB used"
+                f"{trend}) — under {PG_WARN_FREE_GB} GB, keep ingest off")
+    return f"• PG Farm disk: ~{free:.1f} GB free ({used:.1f} of {PG_DISK_GB} GB used{trend})"
 
 
 def load(path, default):
@@ -190,6 +247,7 @@ def main():
                 eta = f"\n• nothing completed in {hrs:.0f} h ({inflight} still running)"
 
     cpus = cpus_running()
+    pg_used, pg_why = pg_used_gb()
     # Every RUNNING CPU this user holds, not just the corpus run's -- deliberately, because that is
     # the number corpus_diann_drip.cpus_in_flight() gates submission on. Read as "the corpus run is
     # using 650 CPUs" it is wrong; read as "nothing new is submitted until this drops under 100" it
@@ -205,6 +263,7 @@ def main():
         f"*FRAN corpus-wide DIA-NN 2.7.0* — {done:,}/{total:,} searches ({pct:.1f}%){delta}",
         f"• in flight {inflight} · remaining {remaining:,} · runs searched {runs_done:,}",
         f"• {cpus} CPUs running, all jobs / drip ceiling {CEILING}{cpu_note}",
+        disk_line(pg_used, pg_why, prev.get("pg_used") if prev else None),
     ]
     if failed:
         lines.append(f"• ⚠️ *{failed} failed*")
@@ -224,7 +283,8 @@ def main():
         # post compared against itself. MIN_TREND_HOURS bounds that damage; this removes the cause.
         return 0
 
-    hist.append({"t": now, "done": done, "inflight": inflight, "remaining": remaining})
+    hist.append({"t": now, "done": done, "inflight": inflight, "remaining": remaining,
+                 "pg_used": pg_used})
     try:
         os.makedirs(OUT_ROOT, exist_ok=True)
         with open(HISTORY, "w") as fh:
