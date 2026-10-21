@@ -20,9 +20,12 @@ WHAT IT WRITES TO delimp_searches -- the summary names main_database(): the larg
 is neither a contaminant list nor an iRT file.
   fill      fasta_path is NULL: set the summary.
   same      fasta_path already names that database: fill only its NULL md5 / count / contam lib.
-  correct   fasta_path names ANOTHER database of the same search -- a cRAP list (54 searches),
-            iRT.fasta (5), a 10-entry virus file. The old detector took whichever database was
-            listed first. Overwritten, and every one is listed in the plan file first.
+  correct   fasta_path names a contaminant list, iRT file or sub-1,000-entry add-on of the same
+            search -- cRAP lists, iRT.fasta, 1-13 entry bait constructs. The old detector took
+            whichever database was listed first. Overwritten; every one is in the plan file.
+  keep      fasta_path names another REAL proteome of the same search (barley beside wheat, a
+            pathogen beside its host). Not overwritten -- "largest" is a convention, not a
+            correction -- but its own NULL md5 / count are filled from its row.
   conflict  fasta_path names something this search's databases do not include. Left alone and
             reported: two sources disagree and neither is proof.
 
@@ -42,7 +45,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from engine_fasta import _sne_stream, detect_all, main_database, summarize  # noqa: E402
+from engine_fasta import _IRT_NAME, _sne_stream, detect_all, main_database, summarize  # noqa: E402
 
 MIGRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations",
                          "2026-10-21_search_fastas.sql")
@@ -153,8 +156,26 @@ def _base(p: str | None) -> str:
     return os.path.basename((p or "").replace("\\", "/")).lower()
 
 
+# Below this, a non-contaminant database is an add-on (a bait construct, a tag, a virus), never a
+# defensible choice for "the" search database: the dry run's stored values of this kind were 1-13
+# entries (KimTurboID.fasta, Human RB1-vojo.fasta, uniprotkb_2024_01_17.fasta).
+ADDON_MAX_ENTRIES = 1000
+
+
+def _is_wrong_choice(d: dict) -> bool:
+    n = d.get("n_entries")
+    return bool(d.get("is_contaminant") or _IRT_NAME.search(d.get("file_name") or "")
+                or (n is not None and n < ADDON_MAX_ENTRIES))
+
+
 def summary_action(row: dict, dbs: list[dict]) -> tuple[str, dict | None]:
-    """(action, values) for delimp_searches; see the module docstring for the four actions."""
+    """(action, values) for delimp_searches; see the module docstring for the actions.
+
+    `correct` is deliberately narrow: only a stored contaminant list, iRT file or sub-1,000-entry
+    add-on is replaced. A stored REAL proteome that is not the largest -- barley beside wheat,
+    C. fulvum beside tomato, C. posadasii beside human -- is `keep`: for a host-pathogen study the
+    smaller one may be the point, "largest" is only a convention, and every database is in
+    delimp_search_fastas regardless. `keep` fills that stored database's own NULL md5 / count."""
     summ = summarize(dbs)
     if not summ:
         return "none", None
@@ -162,12 +183,17 @@ def summary_action(row: dict, dbs: list[dict]) -> tuple[str, dict | None]:
     cur = row.get("fasta_path")
     if not cur:
         return "fill", summ
-    names = {_base(d.get("file_name")) for d in dbs} | {_base(d.get("file_path")) for d in dbs}
     if _base(cur) in (_base(main.get("file_name")), _base(main.get("file_path"))):
         return "same", summ
-    if _base(cur) in names:
+    named = next((d for d in dbs if _base(cur) in (_base(d.get("file_name")),
+                                                   _base(d.get("file_path")))), None)
+    if named is None:
+        return "conflict", summ
+    if _is_wrong_choice(named):
         return "correct", summ
-    return "conflict", summ
+    return "keep", {"fasta_path": cur, "fasta_md5": named.get("file_md5"),
+                    "fasta_n_proteins": named.get("n_entries"),
+                    "contaminant_lib": summ["contaminant_lib"]}
 
 
 def main() -> int:
@@ -220,7 +246,7 @@ def main() -> int:
     with open(a.plan, "w", newline="") as fh:
         plan = csv.writer(fh, delimiter="\t")
         plan.writerow(["search_id", "engine", "kind", "how", "source_path", "ordinal", "file_name",
-                       "is_contaminant", "n_entries", "n_genes", "content_sha256", "file_path",
+                       "is_contaminant", "n_entries", "n_genes", "n_gene_entries", "content_sha256", "file_path",
                        "file_md5", "current_fasta_path", "action", "new_fasta_path",
                        "new_n_proteins"])
         for k, row in enumerate(rows, 1):
@@ -248,8 +274,8 @@ def main() -> int:
             dbs = (found or {}).get("databases") or []
             if not dbs:
                 tally[f"{eng}: no source reachable"] += 1
-                plan.writerow([sid, eng, "unresolved", "", "", "", "", "", "", "", "", "", "",
-                               row["fasta_path"] or "", "none", "", ""])
+                plan.writerow([sid, eng, "unresolved"] + [""] * 11
+                              + [row["fasta_path"] or "", "none", "", ""])
                 continue
             action, summ = summary_action(row, dbs)
             tally[f"{eng}: {found['source']} via {how}"] += 1
@@ -260,6 +286,7 @@ def main() -> int:
                 plan.writerow([sid, eng, found["source"], how, found["source_path"], i,
                                d.get("file_name") or "", int(bool(d.get("is_contaminant"))),
                                d.get("n_entries") or "", d.get("n_genes") or "",
+                               d.get("n_gene_entries") or "",
                                d.get("content_sha256") or "", d.get("file_path") or "",
                                d.get("file_md5") or "", row["fasta_path"] or "", action,
                                (summ or {}).get("fasta_path") or "",
@@ -275,7 +302,7 @@ def main() -> int:
                                 {"p": summ["fasta_path"], "m": summ["fasta_md5"],
                                  "n": summ["fasta_n_proteins"], "c": summ["contaminant_lib"],
                                  "id": sid})
-                elif action == "same":
+                elif action in ("same", "keep"):
                     cur.execute("""UPDATE delimp_searches SET fasta_md5=COALESCE(fasta_md5,%(m)s),
                                    fasta_n_proteins=COALESCE(fasta_n_proteins,%(n)s),
                                    contaminant_lib=COALESCE(contaminant_lib,%(c)s)

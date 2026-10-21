@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS delimp_search_fastas (
     is_contaminant boolean  NOT NULL,   -- by name (contaminant / cRAP) or by >=50% Cont_/CON__ entries
     n_entries      integer,             -- FASTA entries ('>' headers)
     n_genes        integer,             -- distinct GN=; NULL when fewer than half the entries carry one
+    n_gene_entries integer,             -- entries carrying GN=. ENTRIES PER GENE = n_gene_entries /
+                                        -- n_genes, NOT n_entries / n_genes: unnamed entries have no
+                                        -- gene to share, and dividing them in read a one-protein-per-
+                                        -- gene dog proteome as 1.63 (20,992 / 12,859)
     content_sha256 text,                -- sha256 over the sorted per-entry sha256("header\nSEQUENCE"):
                                         -- equal for the same entries whatever the wrapping or order
     file_path      text,                -- a file on disk verified to hold this database

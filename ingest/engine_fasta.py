@@ -190,10 +190,14 @@ class _Digest:
         self.digests.append(hashlib.sha256((header + "\n" + seq.upper()).encode()).digest())
 
     def result(self) -> dict:
+        genes_ok = bool(self.n) and self.n_gn >= GENE_MIN_SHARE * self.n
         return {
             "n_entries": self.n,
-            "n_genes": (len(self.genes)
-                        if self.n and self.n_gn >= GENE_MIN_SHARE * self.n else None),
+            "n_genes": len(self.genes) if genes_ok else None,
+            # entries carrying GN=: the numerator for entries-per-gene. n_entries is the wrong one
+            # -- unnamed entries have no gene to share, so dividing by n_genes inflates the
+            # ratio: a one-protein-per-gene dog proteome read 1.63 (20,992 / 12,859).
+            "n_gene_entries": self.n_gn if genes_ok else None,
             "content_sha256": hashlib.sha256(b"".join(sorted(self.digests))).hexdigest(),
             "contaminant_entry_share": round(self.n_cont / self.n, 3) if self.n else None,
         }
@@ -528,11 +532,11 @@ def _db_from_file(name: str, path: str | None, roots: list[str]) -> dict:
     dg = fasta_digest(resolved) if resolved else None
     base = os.path.basename((path or name).replace("\\", "/"))
     row = {"file_name": base, "file_path": path or resolved, "file_md5": None,
-           "n_entries": None, "n_genes": None, "content_sha256": None,
+           "n_entries": None, "n_genes": None, "n_gene_entries": None, "content_sha256": None,
            "contaminant_entry_share": None}
     if dg:
-        row.update({k: dg[k] for k in ("n_entries", "n_genes", "content_sha256",
-                                       "contaminant_entry_share")},
+        row.update({k: dg[k] for k in ("n_entries", "n_genes", "n_gene_entries",
+                                       "content_sha256", "contaminant_entry_share")},
                    file_path=resolved, file_md5=dg["md5"])
     row["is_contaminant"] = is_contaminant_db(base, row["contaminant_entry_share"],
                                               row["n_entries"])

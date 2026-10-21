@@ -175,13 +175,16 @@ def write_search_fastas(cur, search_id: str, found: dict | None) -> int:
         cur.execute("DELETE FROM delimp_search_fastas WHERE search_id=%s", (search_id,))
         for i, d in enumerate(dbs):
             cur.execute("""INSERT INTO delimp_search_fastas (search_id, ordinal, file_name,
-                           is_contaminant, n_entries, n_genes, content_sha256, file_path, file_md5,
-                           source, source_path)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (search_id, i, d.get("file_name"), bool(d.get("is_contaminant")),
-                         d.get("n_entries"), d.get("n_genes"), d.get("content_sha256"),
-                         d.get("file_path"), d.get("file_md5"), found.get("source"),
-                         found.get("source_path")))
+                           is_contaminant, n_entries, n_genes, n_gene_entries, content_sha256,
+                           file_path, file_md5, source, source_path)
+                           VALUES (%(sid)s,%(i)s,%(name)s,%(contam)s,%(n)s,%(genes)s,%(gene_entries)s,
+                                   %(sha)s,%(path)s,%(md5)s,%(source)s,%(source_path)s)""",
+                        {"sid": search_id, "i": i, "name": d.get("file_name"),
+                         "contam": bool(d.get("is_contaminant")), "n": d.get("n_entries"),
+                         "genes": d.get("n_genes"), "gene_entries": d.get("n_gene_entries"),
+                         "sha": d.get("content_sha256"), "path": d.get("file_path"),
+                         "md5": d.get("file_md5"), "source": found.get("source"),
+                         "source_path": found.get("source_path")})
         cur.execute("RELEASE SAVEPOINT search_fastas")
         return len(dbs)
     except Exception as e:  # noqa: BLE001 - provenance is never worth failing an ingest over

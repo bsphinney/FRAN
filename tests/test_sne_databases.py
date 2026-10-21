@@ -94,7 +94,9 @@ def _check_three(dbs):
     assert [d["is_contaminant"] for d in dbs] == [True, False, False]
     assert all(d["parse_ok"] for d in dbs)
     assert dbs[2]["n_genes"] == 2          # two isoforms of G1 count once
+    assert dbs[2]["n_gene_entries"] == 3   # entries-per-gene = 3 / 2
     assert dbs[1]["n_genes"] is None       # no GN= at all: not reported as 0 genes
+    assert dbs[1]["n_gene_entries"] is None
 
 
 def test_plain_layout_reads_every_database_in_order(tmp_path):

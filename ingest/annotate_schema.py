@@ -169,6 +169,11 @@ COMMENTS = [
      "Distinct GN= values. NULL when fewer than half the entries carry GN= (NCBI / RefSeq / custom "
      "databases), because a count over a few labelled entries reads as a tiny gene set: a barley "
      "database had 273 'genes' over 35,907 entries."),
+    ("delimp_search_fastas", "n_gene_entries",
+     "Entries carrying GN=. ENTRIES PER GENE IS n_gene_entries / n_genes -- not n_entries / "
+     "n_genes: unnamed entries have no gene to share, and counting them read a one-protein-per-gene "
+     "dog proteome as 1.63 entries per gene (20,992 / 12,859). ~1.0 means one entry per gene; a "
+     "full proteome with isoforms runs 2-3.5."),
     ("delimp_search_fastas", "content_sha256",
      "sha256 over the sorted per-entry sha256 of 'header\\nSEQUENCE': identical for the same "
      "entries regardless of line wrapping or entry order, so a database embedded in a .sne and the "

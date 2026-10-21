@@ -44,6 +44,21 @@ def test_summary_fill_same_correct_conflict():
     assert bf.summary_action({"fasta_path": "something_else.fasta"}, dbs)[0] == "conflict"
 
 
+def test_a_tiny_bait_construct_is_corrected():
+    bait = {"file_name": "KimTurboID.fasta", "n_entries": 1, "is_contaminant": False}
+    assert bf.summary_action({"fasta_path": "KimTurboID.fasta"}, [bait, HUMAN])[0] == "correct"
+
+
+def test_a_second_real_proteome_is_kept_not_corrected():
+    # host-pathogen: the stored pathogen database is a real choice, not an error
+    fungus = {"file_name": "C_posadasii_ref-seq-ramona.fasta", "n_entries": 8516,
+              "is_contaminant": False, "file_md5": "abc"}
+    act, vals = bf.summary_action({"fasta_path": "C_posadasii_ref-seq-ramona.fasta"}, [CRAP, fungus, HUMAN])
+    assert act == "keep"
+    assert vals["fasta_path"] == "C_posadasii_ref-seq-ramona.fasta"
+    assert vals["fasta_n_proteins"] == 8516 and vals["fasta_md5"] == "abc"   # its own numbers
+
+
 def test_raw_stems_drop_the_extension():
     assert bf.raw_stems(["30une-2025__60SPD_DIA-MT3_S3-F3_1_14480.d", r"C:\x\DERO_S6-D5_1_9089.htrms"]) == \
         ["30une-2025__60SPD_DIA-MT3_S3-F3_1_14480", "DERO_S6-D5_1_9089"]

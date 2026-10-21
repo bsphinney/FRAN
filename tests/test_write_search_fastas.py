@@ -37,9 +37,10 @@ class FakeCur:
         elif s.startswith("DELETE FROM delimp_search_fastas"):
             self.rows.pop(params[0], None)
         elif s.startswith("INSERT INTO delimp_search_fastas"):
-            self.rows.setdefault(params[0], []).append(
-                {"ordinal": params[1], "file_name": params[2], "is_contaminant": params[3],
-                 "n_entries": params[4], "source": params[9]})
+            self.rows.setdefault(params["sid"], []).append(
+                {"ordinal": params["i"], "file_name": params["name"], "is_contaminant": params["contam"],
+                 "n_entries": params["n"], "n_gene_entries": params["gene_entries"],
+                 "source": params["source"]})
 
     def fetchone(self):
         return self._result
