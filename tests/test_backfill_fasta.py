@@ -89,3 +89,13 @@ def test_a_fran_reports_export_looks_for_its_original_sne():
     idx = {"spn_x_apr24.sne": [(5, "/nfs/lssc0/flinders/proteomics/Data/lab/service/q/SpN_x_apr24.sne")]}
     got = bf.sne_candidates(bf.FRAN_REPORTS + "SpN_x_apr24/20260627_174949_SpN_x_apr24", idx)
     assert got == [("/nfs/lssc0/flinders/proteomics/Data/lab/service/q/SpN_x_apr24.sne", "name")]
+
+
+def test_a_recorded_path_that_exists_here_is_used_as_is(tmp_path):
+    # on the Windows node, B:\Automatic_SNE_storage\x.sne is local and has no Hive mapping
+    p = tmp_path / "local.sne"
+    p.write_bytes(b"")
+    assert bf.hive_path(r"B:\Automatic_SNE_storage\x.sne") is None
+    assert bf.local_path(str(p)) == str(p)
+    assert bf.sne_candidates(str(p), {}) == [(str(p), "path")]
+    assert bf.local_path(r"R:\Data\lab\a.sne") == "/nfs/lssc0/flinders/proteomics/Data/lab/a.sne"

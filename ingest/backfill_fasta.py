@@ -13,7 +13,8 @@ WHERE A SEARCH'S DATABASES COME FROM
                 the rest are found by name in --sne-index (a `find` of every .sne on Hive) and
                 ACCEPTED ONLY IF the .sne names one of the search's own raw files -- a same-named
                 .sne is otherwise a guess. About 150 live only on a Windows node's local disk
-                (B:\\Automatic_SNE_storage) and need this script run there.
+                (B:\\Automatic_SNE_storage) and need this script run there; it runs unchanged,
+                because a recorded path that exists locally is used as is.
   DIA-NN        every --fasta on the logged command line, counted when the file is readable.
 
 WHAT IT WRITES TO delimp_searches -- the summary names main_database(): the largest database that
@@ -74,6 +75,14 @@ def hive_path(p: str | None) -> str | None:
     return w
 
 
+def local_path(p: str | None) -> str | None:
+    """The recorded path itself when it exists here -- on the Windows node that wrote it,
+    B:\\Automatic_SNE_storage is a local disk Hive cannot see -- else its Hive mapping."""
+    if p and os.path.exists(p):
+        return p
+    return hive_path(p)
+
+
 def load_index(path: str | None) -> dict[str, list[tuple[int, str]]]:
     """basename.lower() -> [(size, path)] from `find ... -printf '%s\\t%T@\\t%p\\n'`."""
     idx: dict[str, list[tuple[int, str]]] = collections.defaultdict(list)
@@ -101,7 +110,7 @@ def sne_candidates(output_dir: str, idx: dict) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     w = output_dir.replace("\\", "/")
     if w.lower().endswith(".sne"):
-        direct = hive_path(output_dir)
+        direct = local_path(output_dir)
         if direct and os.path.isfile(direct):
             out.append((direct, "path"))
         names = [os.path.basename(w)]
@@ -262,11 +271,11 @@ def main() -> int:
                         how = how_
                         break
                 if not found:
-                    hp = hive_path(row["output_dir"])
+                    hp = local_path(row["output_dir"])
                     if hp and os.path.isdir(hp):
                         found, how = detect_all(eng, None, hp, a.fasta_root), "dir"
             else:
-                hp = hive_path(row["output_dir"])
+                hp = local_path(row["output_dir"])
                 if hp and os.path.isfile(hp):
                     hp = os.path.dirname(hp)
                 if hp and os.path.isdir(hp):
