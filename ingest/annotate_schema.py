@@ -135,7 +135,9 @@ COMMENTS = [
      "RunSummaries/*_RunOverview.tsv does NOT carry the database (verified 2026-08-25), so "
      "archived Spectronaut exports that kept only RunSummaries stay NULL. Before 2026-08-25 only "
      "~157 of 2,014 rows were populated, all from a one-off load ingested 2026-06-13..06-30; "
-     "corpus_ingest.py recorded no FASTA at all."),
+     "corpus_ingest.py recorded no FASTA at all. SINCE 2026-10-21 this names the LARGEST database "
+     "that is not a contaminant or iRT list (engine_fasta.main_database), read from the .sne when "
+     "there is one; before, it was the first one listed. All of them: delimp_search_fastas."),
     ("delimp_searches", "fasta_n_proteins",
      "Entry count of the search database, from the same detector as fasta_path, and only when the "
      "file is reachable from the ingest host -- Spectronaut records a bare filename, so it fills "
@@ -143,7 +145,40 @@ COMMENTS = [
      "COUNTS ACROSS SEARCHES: divided by the distinct gene count it gives entries-per-gene, which "
      "is what decides whether a protein-count difference is real depth or database redundancy. "
      "A one-protein-per-gene proteome sits at ~1.00; a full proteome with unreviewed isoforms can "
-     "exceed 2, and that alone can move a cross-engine protein-group gap from +5% to +42%."),
+     "exceed 2, and that alone can move a cross-engine protein-group gap from +5% to +42%. "
+     "SINGLE-VALUED SUMMARY ONLY: most searches used two or three databases -- every one, with its "
+     "own entry and gene counts, is in delimp_search_fastas."),
+
+    # ---- delimp_search_fastas: every database a search used ------------------------------------
+    ("delimp_search_fastas", None,
+     "One row per protein database a search used, contaminant lists included (2026-10-21). "
+     "delimp_searches.fasta_* holds ONE of them; before 2026-10-21 it was whichever was listed "
+     "first, which recorded cRAP lists (54 searches) and iRT.fasta (5) as the search database. Use "
+     "this table for entries-per-gene (n_entries / n_genes) and for 'did these searches use the same "
+     "database' (content_sha256). Source 'sne' rows are read from the Spectronaut .sne itself, "
+     "which embeds every database entry for entry, so their counts are exact even where the FASTA "
+     "is gone. Join on search_id = delimp_searches.id; no FK, by design (re-ingest deletes and "
+     "re-inserts the search row)."),
+    ("delimp_search_fastas", "is_contaminant",
+     "TRUE for a contaminant LIST: most entries carry Cont_/CON__ accessions, or the name says "
+     "contaminant/cRAP AND it is list-sized (<= 2,000 entries). A proteome with contaminants "
+     "appended ('Human_HIV_crap_nonredun.fasta', 74,792 entries) is FALSE: it is the search "
+     "database. iRT files are FALSE too -- they are calibrants, not contaminants; filter them by "
+     "name if needed."),
+    ("delimp_search_fastas", "n_genes",
+     "Distinct GN= values. NULL when fewer than half the entries carry GN= (NCBI / RefSeq / custom "
+     "databases), because a count over a few labelled entries reads as a tiny gene set: a barley "
+     "database had 273 'genes' over 35,907 entries."),
+    ("delimp_search_fastas", "content_sha256",
+     "sha256 over the sorted per-entry sha256 of 'header\\nSEQUENCE': identical for the same "
+     "entries regardless of line wrapping or entry order, so a database embedded in a .sne and the "
+     "FASTA file on disk compare equal (verified on a 60,832-entry bat proteome). Not the file md5 "
+     "-- that is file_md5."),
+    ("delimp_search_fastas", "file_md5",
+     "md5 of a FASTA file actually read. For source='sne' it is set only when that file's "
+     "content_sha256 equals the embedded database's -- a same-named FASTA beside the .sne is not "
+     "proof, proteomes are re-downloaded under the same name. NULL means 'no verified file', not "
+     "'unknown database'."),
 
     # ---- sample metadata: the empty annotation block -------------------------------------------
     ("delimp_sample_metadata", None,

@@ -1,31 +1,173 @@
 #!/usr/bin/env python3
-"""backfill_fasta.py — fill delimp_searches.fasta_* for searches already in the corpus.
+"""backfill_fasta.py — record EVERY database each corpus search used, from the .sne where possible.
 
-Companion to the ingest-side fix in corpus_ingest.py. Every search row carries `output_dir`,
-so the same detector that runs at ingest can be replayed over the archive.
+Fills delimp_search_fastas (one row per database, contaminant lists included; see
+migrations/2026-10-21_search_fastas.sql) and the delimp_searches.fasta_* summary, for searches
+already in the corpus. The same detector the ingest runs (engine_fasta.detect_all), replayed over
+the archive -- on Hive, because that is where the .sne files are.
 
-Coverage will be PARTIAL and that is expected, not a failure:
-  * Spectronaut records the database only in *ExperimentSetupOverview*.txt / setup.txt.
-    RunSummaries/*_RunOverview.tsv -- the file that rescued version detection for archived
-    CLI exports -- does NOT contain it (verified 2026-08-25). Archived dirs that kept only
-    RunSummaries will stay NULL until their originating export dir is pulled.
-  * Spectronaut stores a BARE FILENAME, so md5 / n_proteins fill only when that name resolves
-    under --fasta-root.
-  * DIA-NN logs carry an absolute path, so those resolve whenever the path is mounted here.
+WHERE A SEARCH'S DATABASES COME FROM
+  Spectronaut   its .sne, which embeds every database it searched, entry for entry. 2,010 rows
+                record the .sne itself as output_dir, mostly as a Windows path. R:\\Data and
+                K:\\Data are /nfs/lssc0/flinders/proteomics/Data here (1,674 resolve that way);
+                the rest are found by name in --sne-index (a `find` of every .sne on Hive) and
+                ACCEPTED ONLY IF the .sne names one of the search's own raw files -- a same-named
+                .sne is otherwise a guess. About 150 live only on a Windows node's local disk
+                (B:\\Automatic_SNE_storage) and need this script run there.
+  DIA-NN        every --fasta on the logged command line, counted when the file is readable.
 
-Dry by default. Nothing is written without --commit.
+WHAT IT WRITES TO delimp_searches -- the summary names main_database(): the largest database that
+is neither a contaminant list nor an iRT file.
+  fill      fasta_path is NULL: set the summary.
+  same      fasta_path already names that database: fill only its NULL md5 / count / contam lib.
+  correct   fasta_path names ANOTHER database of the same search -- a cRAP list (54 searches),
+            iRT.fasta (5), a 10-entry virus file. The old detector took whichever database was
+            listed first. Overwritten, and every one is listed in the plan file first.
+  conflict  fasta_path names something this search's databases do not include. Left alone and
+            reported: two sources disagree and neither is proof.
 
-  python3 backfill_fasta.py --limit 200
-  python3 backfill_fasta.py --fasta-root /quobyte/proteomics-grp/MRS --commit
+Dry by default: writes the plan (one line per database, plus the summary action per search) and
+changes nothing. --commit applies the migration if needed and writes.
+
+  python3 backfill_fasta.py --sne-index sne_index.tsv --plan plan.tsv
+  python3 backfill_fasta.py --sne-index sne_index.tsv --plan plan.tsv --commit
 """
 from __future__ import annotations
 
 import argparse
+import collections
+import csv
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from engine_fasta import detect  # noqa: E402
+from engine_fasta import _sne_stream, detect_all, main_database, summarize  # noqa: E402
+
+MIGRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations",
+                         "2026-10-21_search_fastas.sql")
+
+# Windows drive / Mac mount -> Hive. Verified on real .sne paths 2026-10-21 (R: 1,073, K: 601).
+DRIVE_ROOTS = {"R:": "/nfs/lssc0/flinders/proteomics", "K:": "/nfs/lssc0/flinders/proteomics"}
+MOUNTS = (("/Volumes/proteomics-grp/", "/quobyte/proteomics-grp/"),
+          ("/Volumes/proteomics/", "/nfs/lssc0/flinders/proteomics/"))
+FRAN_REPORTS = "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports/"
+RAW_EXT = (".d", ".raw", ".htrms", ".wiff", ".wiff2", ".mzml", ".dia")
+
+
+def hive_path(p: str | None) -> str | None:
+    """Where a recorded output_dir lives on Hive, by mapping alone (no filesystem access)."""
+    if not p:
+        return None
+    w = p.replace("\\", "/")
+    while "//" in w:
+        w = w.replace("//", "/")
+    if len(w) > 1 and w[1] == ":":
+        root = DRIVE_ROOTS.get(w[:2].upper())
+        return root + "/" + w[2:].lstrip("/") if root else None
+    for mac, hive in MOUNTS:
+        if w.startswith(mac):
+            return hive + w[len(mac):]
+    return w
+
+
+def load_index(path: str | None) -> dict[str, list[tuple[int, str]]]:
+    """basename.lower() -> [(size, path)] from `find ... -printf '%s\\t%T@\\t%p\\n'`."""
+    idx: dict[str, list[tuple[int, str]]] = collections.defaultdict(list)
+    if path:
+        with open(path) as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 3:
+                    idx[os.path.basename(parts[2]).lower()].append((int(parts[0]), parts[2]))
+    return idx
+
+
+def _suffix_score(a: str, b: str) -> int:
+    pa, pb = a.lower().split("/"), b.lower().split("/")
+    n = 0
+    while n < min(len(pa), len(pb)) and pa[-1 - n] == pb[-1 - n]:
+        n += 1
+    return n
+
+
+def sne_candidates(output_dir: str, idx: dict) -> list[tuple[str, str]]:
+    """[(path, how)] to try for a Spectronaut search, best first. `how` is 'path' when the
+    recorded path maps straight onto Hive, 'name' when only the file name matched -- the caller
+    must then check the .sne against the search's raw files."""
+    out: list[tuple[str, str]] = []
+    w = output_dir.replace("\\", "/")
+    if w.lower().endswith(".sne"):
+        direct = hive_path(output_dir)
+        if direct and os.path.isfile(direct):
+            out.append((direct, "path"))
+        names = [os.path.basename(w)]
+    elif w.startswith(FRAN_REPORTS):
+        # a re-export: FRAN_reports/<name>/<ts>_<name>/ -- the .sne was <name>.sne
+        names = [w[len(FRAN_REPORTS):].split("/", 1)[0] + ".sne"]
+    else:
+        names = []
+    seen = {p for p, _ in out}
+    for nm in names:
+        cands = sorted(idx.get(nm.lower(), []), key=lambda t: -_suffix_score(t[1], w))
+        for _, p in cands:
+            if p not in seen:
+                out.append((p, "name"))
+                seen.add(p)
+    return out
+
+
+def raw_stems(raws) -> list[str]:
+    out = []
+    for r in raws or []:
+        b = os.path.basename((r or "").replace("\\", "/"))
+        for ext in RAW_EXT:
+            if b.lower().endswith(ext):
+                b = b[:-len(ext)]
+                break
+        if b:
+            out.append(b)
+    return out
+
+
+def sne_mentions_raws(path: str, stems: list[str], nbytes: int = 32 << 20) -> bool:
+    """True when the .sne's own stream names at least one of these raw files. A .sne found only
+    by its file name is accepted on this and nothing less."""
+    if not stems:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            buf, have = [], 0
+            for chunk in _sne_stream(fh):
+                buf.append(chunk)
+                have += len(chunk)
+                if have >= nbytes:
+                    break
+        blob = b"".join(buf)
+    except OSError:
+        return False
+    return any(s.encode("utf-16le") in blob for s in stems[:50])
+
+
+def _base(p: str | None) -> str:
+    return os.path.basename((p or "").replace("\\", "/")).lower()
+
+
+def summary_action(row: dict, dbs: list[dict]) -> tuple[str, dict | None]:
+    """(action, values) for delimp_searches; see the module docstring for the four actions."""
+    summ = summarize(dbs)
+    if not summ:
+        return "none", None
+    main = main_database(dbs)
+    cur = row.get("fasta_path")
+    if not cur:
+        return "fill", summ
+    names = {_base(d.get("file_name")) for d in dbs} | {_base(d.get("file_path")) for d in dbs}
+    if _base(cur) in (_base(main.get("file_name")), _base(main.get("file_path"))):
+        return "same", summ
+    if _base(cur) in names:
+        return "correct", summ
+    return "conflict", summ
 
 
 def main() -> int:
@@ -33,71 +175,132 @@ def main() -> int:
     ap.add_argument("--commit", action="store_true", help="write; otherwise dry-run")
     ap.add_argument("--limit", type=int, default=0, help="0 = all")
     ap.add_argument("--engine", default=None, help="restrict to one engine")
+    ap.add_argument("--sne-index", default=None, help="find-output TSV of every .sne on Hive")
     ap.add_argument("--fasta-root", action="append", default=[],
-                    help="directory to resolve bare FASTA filenames against; repeatable")
+                    help="directory to look for FASTA files in (one level deep); repeatable")
+    ap.add_argument("--plan", default="fasta_backfill_plan.tsv", help="where to write the plan")
     ap.add_argument("--redo", action="store_true",
-                    help="also revisit rows that already have a fasta_path")
+                    help="also revisit searches that already have delimp_search_fastas rows")
     a = ap.parse_args()
 
-    from corpus_ingest import _conn  # reuse the ingester's own credential handling
+    from corpus_ingest import _conn, write_search_fastas  # the ingester's own credential + writer
     cn = _conn()
     cur = cn.cursor()
-    where = ["output_dir IS NOT NULL"]
-    if not a.redo:
-        where.append("(fasta_path IS NULL OR fasta_md5 IS NULL OR fasta_n_proteins IS NULL)")
-    if a.engine:
-        where.append("search_engine = %(eng)s")
-    sql = ("SELECT id, search_engine, output_dir FROM delimp_searches WHERE "
-           + " AND ".join(where) + " ORDER BY ingested_at DESC")
-    if a.limit:
-        sql += f" LIMIT {int(a.limit)}"
-    cur.execute(sql, {"eng": a.engine})
-    rows = cur.fetchall()
-    print(f"{len(rows)} candidate searches")
+    cur.execute("SELECT to_regclass('public.delimp_search_fastas')")
+    have_table = cur.fetchone()[0] is not None
+    if a.commit and not have_table:
+        cur.execute(open(MIGRATION).read())
+        cn.commit()
+        have_table = True
+        print("created delimp_search_fastas")
 
-    found = md5s = counts = 0
-    for sid, engine, outdir in rows:
-        got = detect(engine, None, outdir, search_roots=a.fasta_root) or {}
-        if not got.get("fasta_path"):
-            continue
-        found += 1
-        md5s += bool(got.get("fasta_md5"))
-        counts += bool(got.get("fasta_n_proteins"))
-        # basename() alone leaves Windows paths whole on POSIX, and most output_dir values in
-        # this corpus are Windows paths -- normalise first or the dry run is unreadable.
-        shown = os.path.basename(str(got["fasta_path"]).replace("\\", "/"))
-        print(f"  {engine:12s} {shown[:52]:52s} n={got.get('fasta_n_proteins') or '-'}")
-        if a.commit:
-            # COALESCE so a detection that resolved the path but not the md5 cannot blank an
-            # md5 already on the row (the spectrum_lance.register() lesson) -- but only while
-            # the row still names the SAME database. Once --redo resolves a DIFFERENT file the
-            # stored md5 and entry count describe the old one, and keeping them would pair a
-            # fresh path with a stale fingerprint, which reads as verified provenance and is
-            # worse than a NULL. Every SET expression sees the pre-UPDATE fasta_path, so the
-            # single CASE is evaluated against the stored value even though fasta_path is
-            # assigned in the same statement. Named placeholders: this file's INSERTs have
-            # twice been broken by positional drift.
-            cur.execute(
-                """UPDATE delimp_searches
-                      SET fasta_md5        = CASE WHEN fasta_path IS DISTINCT FROM %(path)s
-                                                  THEN %(md5)s
-                                                  ELSE COALESCE(%(md5)s, fasta_md5) END,
-                          fasta_n_proteins = CASE WHEN fasta_path IS DISTINCT FROM %(path)s
-                                                  THEN %(n)s
-                                                  ELSE COALESCE(%(n)s, fasta_n_proteins) END,
-                          contaminant_lib  = CASE WHEN fasta_path IS DISTINCT FROM %(path)s
-                                                  THEN %(contam)s
-                                                  ELSE COALESCE(%(contam)s, contaminant_lib) END,
-                          fasta_path       = %(path)s
-                    WHERE id = %(id)s""",
-                {"path": got.get("fasta_path"), "md5": got.get("fasta_md5"),
-                 "n": got.get("fasta_n_proteins"), "contam": got.get("contaminant_lib"),
-                 "id": sid})
+    done: set[str] = set()
+    if have_table and not a.redo:
+        cur.execute("SELECT DISTINCT search_id::text FROM delimp_search_fastas")
+        done = {r[0] for r in cur.fetchall()}
+    sql = ("SELECT id::text, search_engine, output_dir, fasta_path, fasta_md5, fasta_n_proteins, "
+           "contaminant_lib FROM delimp_searches WHERE output_dir IS NOT NULL"
+           + (" AND search_engine = %(eng)s" if a.engine else "") + " ORDER BY ingested_at DESC")
+    cur.execute(sql, {"eng": a.engine})
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall() if r[0] not in done]
+    if a.limit:
+        rows = rows[:a.limit]
+    cur.execute("""SELECT srf.search_id::text, rf.raw_basename FROM search_raw_files srf
+                   JOIN raw_files rf USING (raw_path)""")
+    raws: dict[str, list[str]] = collections.defaultdict(list)
+    for sid, rb in cur.fetchall():
+        raws[sid].append(rb)
+    idx = load_index(a.sne_index)
+    print(f"{len(rows)} searches to visit ({len(done)} already recorded); "
+          f"{sum(len(v) for v in idx.values())} .sne in the index")
+
+    tally: collections.Counter = collections.Counter()
+    t0 = time.time()
+    with open(a.plan, "w", newline="") as fh:
+        plan = csv.writer(fh, delimiter="\t")
+        plan.writerow(["search_id", "engine", "kind", "how", "source_path", "ordinal", "file_name",
+                       "is_contaminant", "n_entries", "n_genes", "content_sha256", "file_path",
+                       "file_md5", "current_fasta_path", "action", "new_fasta_path",
+                       "new_n_proteins"])
+        for k, row in enumerate(rows, 1):
+            sid, eng = row["id"], (row["search_engine"] or "").lower()
+            found, how = None, None
+            if eng.startswith("spectronaut"):
+                for path, how_ in sne_candidates(row["output_dir"], idx):
+                    if how_ == "name" and not sne_mentions_raws(path, raw_stems(raws.get(sid))):
+                        tally["sne name match rejected (no shared raw file)"] += 1
+                        continue
+                    found = detect_all("spectronaut", None, path, a.fasta_root)
+                    if found:
+                        how = how_
+                        break
+                if not found:
+                    hp = hive_path(row["output_dir"])
+                    if hp and os.path.isdir(hp):
+                        found, how = detect_all(eng, None, hp, a.fasta_root), "dir"
+            else:
+                hp = hive_path(row["output_dir"])
+                if hp and os.path.isfile(hp):
+                    hp = os.path.dirname(hp)
+                if hp and os.path.isdir(hp):
+                    found, how = detect_all(eng, None, hp, a.fasta_root), "dir"
+            dbs = (found or {}).get("databases") or []
+            if not dbs:
+                tally[f"{eng}: no source reachable"] += 1
+                plan.writerow([sid, eng, "unresolved", "", "", "", "", "", "", "", "", "", "",
+                               row["fasta_path"] or "", "none", "", ""])
+                continue
+            action, summ = summary_action(row, dbs)
+            tally[f"{eng}: {found['source']} via {how}"] += 1
+            tally[f"summary {action}"] += 1
+            if sum(1 for d in dbs if not d.get("is_contaminant")) > 1:
+                tally["searches with more than one non-contaminant database"] += 1
+            for i, d in enumerate(dbs):
+                plan.writerow([sid, eng, found["source"], how, found["source_path"], i,
+                               d.get("file_name") or "", int(bool(d.get("is_contaminant"))),
+                               d.get("n_entries") or "", d.get("n_genes") or "",
+                               d.get("content_sha256") or "", d.get("file_path") or "",
+                               d.get("file_md5") or "", row["fasta_path"] or "", action,
+                               (summ or {}).get("fasta_path") or "",
+                               (summ or {}).get("fasta_n_proteins") or ""])
+            if a.commit:
+                write_search_fastas(cur, sid, found)
+                if action == "fill":
+                    cur.execute("""UPDATE delimp_searches SET fasta_path=%(p)s,
+                                   fasta_md5=COALESCE(fasta_md5,%(m)s),
+                                   fasta_n_proteins=COALESCE(fasta_n_proteins,%(n)s),
+                                   contaminant_lib=COALESCE(contaminant_lib,%(c)s)
+                                   WHERE id=%(id)s AND fasta_path IS NULL""",
+                                {"p": summ["fasta_path"], "m": summ["fasta_md5"],
+                                 "n": summ["fasta_n_proteins"], "c": summ["contaminant_lib"],
+                                 "id": sid})
+                elif action == "same":
+                    cur.execute("""UPDATE delimp_searches SET fasta_md5=COALESCE(fasta_md5,%(m)s),
+                                   fasta_n_proteins=COALESCE(fasta_n_proteins,%(n)s),
+                                   contaminant_lib=COALESCE(contaminant_lib,%(c)s)
+                                   WHERE id=%(id)s""",
+                                {"m": summ["fasta_md5"], "n": summ["fasta_n_proteins"],
+                                 "c": summ["contaminant_lib"], "id": sid})
+                elif action == "correct":
+                    # the stored md5 / count described the WRONG database: replace, never keep
+                    cur.execute("""UPDATE delimp_searches SET fasta_path=%(p)s, fasta_md5=%(m)s,
+                                   fasta_n_proteins=%(n)s,
+                                   contaminant_lib=COALESCE(%(c)s, contaminant_lib)
+                                   WHERE id=%(id)s AND fasta_path=%(old)s""",
+                                {"p": summ["fasta_path"], "m": summ["fasta_md5"],
+                                 "n": summ["fasta_n_proteins"], "c": summ["contaminant_lib"],
+                                 "id": sid, "old": row["fasta_path"]})
+                if k % 50 == 0:
+                    cn.commit()
+            if k % 100 == 0:
+                print(f"  {k}/{len(rows)}  {time.time() - t0:.0f}s", flush=True)
     if a.commit:
         cn.commit()
-    print(f"\nresolved a database for {found}/{len(rows)} "
-          f"({100*found/max(1,len(rows)):.1f}%); md5 for {md5s}; entry count for {counts}")
-    print("DRY RUN — re-run with --commit to write" if not a.commit else "committed")
+    print(f"\nvisited {len(rows)} searches in {time.time() - t0:.0f}s; plan: {a.plan}")
+    for key, n in sorted(tally.items()):
+        print(f"  {n:6d}  {key}")
+    print("DRY RUN — nothing written; re-run with --commit" if not a.commit else "committed")
     cn.close()
     return 0
 
