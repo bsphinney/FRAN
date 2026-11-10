@@ -38,6 +38,7 @@ RUNNING MORE THAN ONE BATCH AT ONCE needs two things the single-batch design got
 import argparse
 import csv
 import functools
+import glob
 import os
 import subprocess
 import sys
@@ -134,6 +135,21 @@ def report_run_count(path):
         return -1
 
 
+def refused_dirs():
+    """Searches corpus_ingest.py refused (exit 3, the synthetic-sequence guard), per batch file.
+
+    A refused search never enters delimp_searches, so without this it would be re-selected and
+    re-refused every firing, forever. To retry one, delete its line from the file."""
+    got = set()
+    for f in glob.glob(os.path.join(SCRATCH, "corpus_ingest_refused_*.txt")):
+        try:
+            with open(f) as fh:
+                got.update(ln.strip().rstrip("/") for ln in fh if ln.strip())
+        except OSError as e:
+            print(f"cannot read {f} ({e})")
+    return got
+
+
 def candidates(a, claimed=frozenset()):
     """(ready, short, running). Gate 1 is free; gate 2 is not, so it is applied LAZILY.
 
@@ -146,12 +162,16 @@ def candidates(a, claimed=frozenset()):
     want = expected_runs()
     live = queued_jobs()
     have = already_in_corpus()
-    ready, short, running, waiting = [], [], 0, 0
+    refused = refused_dirs()
+    ready, short, running, waiting, n_refused = [], [], 0, 0, 0
     for d in sorted(os.listdir(OUT_ROOT)):
         sd = os.path.join(OUT_ROOT, d, "output", "search")
         rp = os.path.join(sd, "report.parquet")
         if not os.path.exists(rp) or sd.rstrip("/") in have or sd.rstrip("/") in claimed:
             continue                                   # in the corpus, or in a live batch
+        if sd.rstrip("/") in refused:
+            n_refused += 1
+            continue                                   # refused before; no parquet read
         jf = os.path.join(sd, "jobs.txt")
         jobs = []
         if os.path.exists(jf):
@@ -168,6 +188,8 @@ def candidates(a, claimed=frozenset()):
             ready.append(sd)                           # gate 2: it covers every run
         else:
             short.append((d, got, exp))
+    if n_refused:
+        print(f"refused before, skipped   : {n_refused} (see {SCRATCH}/corpus_ingest_refused_*.txt)")
     if waiting:
         print(f"(+{waiting} more past gate 1, not read this firing — batch is full)")
     return ready, short, running
@@ -201,22 +223,30 @@ cd {HERE}
 DONE={tasks}.done
 touch "$DONE"
 echo "##### start $(date '+%F %T') on $(hostname) restart=${{SLURM_RESTART_COUNT:-0}}"
-ok=0; fail=0
+ok=0; fail=0; refused=0
 while read -r d; do
   [ -n "$d" ] || continue
   if grep -qxF "$d" "$DONE"; then
-    echo "--- skip (committed before a requeue): $(basename $(dirname $(dirname "$d")))"
+    echo "--- skip (finished before a requeue): $(basename $(dirname $(dirname "$d")))"
     continue
   fi
   echo "=== $(basename $(dirname $(dirname "$d")))"
-  if {PY} corpus_ingest.py "$d" --engine diann --output-dir "$d" --bulk-copy --no-fragments 2>&1 \\
-       | grep -vE "collation version|^DETAIL:|^HINT:" | sed 's/^/    /'; then
+  {PY} corpus_ingest.py "$d" --engine diann --output-dir "$d" --bulk-copy --no-fragments 2>&1 \\
+    | grep -vE "collation version|^DETAIL:|^HINT:" | sed 's/^/    /'
+  rc=${{PIPESTATUS[0]}}          # corpus_ingest's own code, not grep's (grep exits 1 on no output)
+  if [ "$rc" -eq 0 ]; then
     ok=$((ok+1)); echo "$d" >> "$DONE"
+  elif [ "$rc" -eq 3 ]; then
+    # The synthetic-sequence guard refused it. Retrying cannot change that, so remember it: the
+    # drip skips every dir in corpus_ingest_refused_*.txt. One file per job (one writer per file).
+    refused=$((refused+1)); echo "$d" >> "$DONE"
+    echo "$d" >> {SCRATCH}/corpus_ingest_refused_${{SLURM_JOB_ID:-nojob}}.txt
+    echo "    *** REFUSED (rc=3) -- recorded; delete its line in corpus_ingest_refused_*.txt to retry"
   else
-    fail=$((fail+1)); echo "    *** FAILED"
+    fail=$((fail+1)); echo "    *** FAILED (rc=$rc)"
   fi
 done < {tasks}
-echo; echo "=== done: $ok ingested, $fail failed ==="; date
+echo; echo "=== done: $ok ingested, $refused refused, $fail failed ==="; date
 """
     with open(SBATCH, "w") as fh:
         fh.write(body)
