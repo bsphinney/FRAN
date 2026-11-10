@@ -60,7 +60,7 @@ except Exception:                                                  # noqa: BLE00
 # CHANGE PG_DISK_GB TO 1600 WHEN HE CONFIRMS THE RESIZE (agreed 2026-10-15, waiting on the
 # recharge). Until then this warns on every report, which is correct: ~2.5 GB is ~15 searches.
 # GB here are GiB, as pg_size_pretty and the cloud disk both count them.
-PG_DISK_GB = 405
+PG_DISK_GB = 1600  # resized 2026-11-06 (Justin Merz); was 405
 PG_OVERHEAD_GB = 5
 PG_WARN_FREE_GB = 10
 PG_USED_SQL = """
