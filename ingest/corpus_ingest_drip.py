@@ -18,12 +18,22 @@ should not:
      passes all three of them, because a cancelled chain has no queued jobs either.
 
 Nothing here writes to the corpus itself: it selects, writes a task list, and submits ONE sbatch
-that does the ingesting on a compute node. It refuses to submit while its own previous job is
-still running, so a slow batch cannot stack.
+per firing that does the ingesting on a compute node. It refuses to submit while --max-concurrent
+of its own batches are still running (default 1), so slow batches cannot stack beyond that.
+
+RUNNING MORE THAN ONE BATCH AT ONCE needs two things the single-batch design got for free:
+  * Each batch gets ITS OWN task file, named in the job's --comment. The batch reads its list
+    with `while read ... < file` as it goes, so rewriting one shared file while a batch runs would
+    change what that batch ingests next.
+  * Selection skips every search listed in a live batch's task file. A search is not in
+    delimp_searches until its batch commits it, so without this the second batch would pick the
+    same searches the first is still ingesting. A batch submitted before this change has no
+    comment; its list is the old shared corpus_ingest_tasks.txt, which is therefore never rewritten.
 
     python ingest/corpus_ingest_drip.py                 # report what is ready, submit nothing
     python ingest/corpus_ingest_drip.py --submit
     python ingest/corpus_ingest_drip.py --submit --batch-max 40
+    python ingest/corpus_ingest_drip.py --submit --max-concurrent 2
 """
 import argparse
 import csv
@@ -31,6 +41,7 @@ import functools
 import os
 import subprocess
 import sys
+import time
 
 print = functools.partial(print, flush=True)                      # noqa: A001
 
@@ -38,7 +49,7 @@ ROOT = "/nfs/lssc0/flinders/proteomics/Data/FRAN_diann"
 OUT_ROOT = os.path.join(ROOT, "corpus_2026")
 WORKLIST = os.path.join(ROOT, "CORPUS_WORKLIST.tsv")
 SCRATCH = "/quobyte/proteomics-grp/brett/scratch"
-TASKS = os.path.join(SCRATCH, "corpus_ingest_tasks.txt")
+LEGACY_TASKS = os.path.join(SCRATCH, "corpus_ingest_tasks.txt")   # pre-concurrency; read only
 SBATCH = os.path.join(SCRATCH, "corpus_ingest_drip.sbatch")
 HERE = "/quobyte/proteomics-grp/brett/glendon/fran_ingest"
 PY = "/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python"
@@ -71,10 +82,29 @@ def queued_jobs():
     return {ln.strip().split("_")[0] for ln in (r.stdout or "").splitlines() if ln.strip()}
 
 
-def ours_running():
-    """True if a previous corpus_ingest batch is still going -- do not stack another."""
-    r = sh(["bash", "-lc", f"squeue -u $USER -h -n {JOB_NAME} -o '%i' 2>/dev/null"])
-    return bool((r.stdout or "").strip())
+def live_batches():
+    """{job_id: task_file} for every corpus_ingest batch still queued or running."""
+    r = sh(["bash", "-lc", f"squeue -u $USER -h -n {JOB_NAME} -o '%i|%k' 2>/dev/null"])
+    out = {}
+    for ln in (r.stdout or "").splitlines():
+        if "|" not in ln:
+            continue
+        jid, comment = (x.strip() for x in ln.split("|", 1))
+        out[jid] = comment if comment.startswith(SCRATCH + "/") else LEGACY_TASKS
+    return out
+
+
+def claimed_by(batches):
+    """Searches a live batch is ingesting or will ingest -- not yet in delimp_searches."""
+    got = set()
+    for tf in set(batches.values()):
+        try:
+            with open(tf) as fh:
+                got.update(ln.strip().rstrip("/") for ln in fh if ln.strip())
+        except OSError as e:
+            # Cannot tell what that batch holds; picking blind could ingest a search twice at once.
+            raise SystemExit(f"cannot read a live batch's task list {tf} ({e}) — nothing submitted")
+    return got
 
 
 def already_in_corpus():
@@ -104,7 +134,7 @@ def report_run_count(path):
         return -1
 
 
-def candidates(a):
+def candidates(a, claimed=frozenset()):
     """(ready, short, running). Gate 1 is free; gate 2 is not, so it is applied LAZILY.
 
     Gate 2 opens a parquet and walks one column, and this runs on a login node where heavy IO is
@@ -120,8 +150,8 @@ def candidates(a):
     for d in sorted(os.listdir(OUT_ROOT)):
         sd = os.path.join(OUT_ROOT, d, "output", "search")
         rp = os.path.join(sd, "report.parquet")
-        if not os.path.exists(rp) or sd.rstrip("/") in have:
-            continue
+        if not os.path.exists(rp) or sd.rstrip("/") in have or sd.rstrip("/") in claimed:
+            continue                                   # in the corpus, or in a live batch
         jf = os.path.join(sd, "jobs.txt")
         jobs = []
         if os.path.exists(jf):
@@ -143,9 +173,10 @@ def candidates(a):
     return ready, short, running
 
 
-def write_sbatch(n):
+def write_sbatch(n, tasks):
     body = f"""#!/bin/bash -l
 #SBATCH --job-name={JOB_NAME}
+#SBATCH --comment={tasks}
 #SBATCH --cpus-per-task=4
 #SBATCH --mem={MEM}
 #SBATCH --time=12:00:00
@@ -170,7 +201,7 @@ while read -r d; do
   else
     fail=$((fail+1)); echo "    *** FAILED"
   fi
-done < {TASKS}
+done < {tasks}
 echo; echo "=== done: $ok ingested, $fail failed ==="; date
 """
     with open(SBATCH, "w") as fh:
@@ -182,13 +213,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--submit", action="store_true", help="submit the batch (otherwise just report)")
     ap.add_argument("--batch-max", type=int, default=BATCH_MAX)
+    ap.add_argument("--max-concurrent", type=int, default=1,
+                    help="how many corpus_ingest batches may run at once (default 1)")
     a = ap.parse_args()
 
-    if a.submit and ours_running():
-        print(f"a {JOB_NAME} batch is still running — nothing submitted")
+    batches = live_batches()
+    if a.submit and len(batches) >= a.max_concurrent:
+        if a.max_concurrent == 1:
+            print(f"a {JOB_NAME} batch is still running — nothing submitted")
+        else:
+            print(f"{len(batches)} {JOB_NAME} batches still running (max {a.max_concurrent}) "
+                  f"— nothing submitted")
         return 0
+    claimed = claimed_by(batches)
+    if batches:
+        print(f"batches running        : {len(batches)} ({', '.join(sorted(batches))}), "
+              f"{len(claimed)} search(es) claimed")
 
-    ready, short, running = candidates(a)
+    ready, short, running = candidates(a, claimed)
     print(f"chains still in flight : {running}")
     print(f"ready to ingest        : {len(ready)}")
     if short:
@@ -204,9 +246,11 @@ def main():
         print(f"(dry run — {len(batch)} would be submitted, nothing written)")
         return 0
 
-    with open(TASKS, "w") as fh:
+    # A new file per batch: a live batch is still reading its own list line by line.
+    tasks = os.path.join(SCRATCH, f"corpus_ingest_tasks_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.txt")
+    with open(tasks, "w") as fh:
         fh.write("\n".join(batch) + "\n")
-    write_sbatch(len(batch))
+    write_sbatch(len(batch), tasks)
     r = sh(["bash", "-lc", f"sbatch --parsable {SBATCH}"])
     jid = (r.stdout or "").strip().split(";")[0]
     if r.returncode != 0 or not jid.isdigit():
