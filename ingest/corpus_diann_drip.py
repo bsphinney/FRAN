@@ -59,6 +59,11 @@ print = functools.partial(print, flush=True)                      # noqa: A001
 ROOT = "/nfs/lssc0/flinders/proteomics/Data/FRAN_diann"
 WORKLIST = os.path.join(ROOT, "CORPUS_WORKLIST.tsv")
 PROBE = os.path.join(ROOT, "CORPUS_PROBE.tsv")
+# MS1/MS2 resolving power per Orbitrap run, read from the .raw scan trailers by
+# engines/bin/thermo_acq_probe.py (array job scratch/orbi_res_probe.sbatch, 2026-11-12). See
+# orbitrap_resolution() for why the chain cannot run an Orbitrap set without it.
+RESOLUTION = os.path.join(ROOT, "CORPUS_RESOLUTION.tsv")
+ORBITRAP_WORDS = ("orbitrap", "exploris", "exactive", "fusion", "lumos", "eclipse")
 OUT_ROOT = os.path.join(ROOT, "corpus_2026")
 STATE = os.path.join(OUT_ROOT, "state.json")
 FASTA_ROOT = os.path.join(ROOT, "_fasta")
@@ -144,6 +149,55 @@ def probe_index():
         for r in csv.DictReader(fh, delimiter="\t"):
             idx[r["run"]] = r
     return idx
+
+
+@functools.lru_cache(maxsize=1)
+def resolution_index():
+    """{run: (ms1_res, ms2_res)} for the Orbitrap runs probed so far; {} if the table is absent."""
+    idx = {}
+    try:
+        with open(RESOLUTION) as fh:
+            for r in csv.DictReader(fh, delimiter="\t"):
+                try:
+                    idx[r["run"]] = (int(float(r["ms1_resolution"])), int(float(r["ms2_resolution"])))
+                except (TypeError, ValueError):
+                    pass                                 # probe error: left out, i.e. unknown
+    except OSError:
+        pass
+    return idx
+
+
+def orbitrap_resolution(row):
+    """((ms1, ms2), None) for an Orbitrap set, (None, None) for anything else, (None, why) to skip.
+
+    WHY THIS EXISTS. estimate_params.py can only fix (or plan to measure) an Orbitrap's mass
+    accuracy if it is told the resolving power; CORPUS_PROBE.tsv never recorded it, so every
+    Orbitrap cfg came out with mass accuracy on AUTO. The 5-step chain refuses AUTO -- DIA-NN
+    would calibrate each file separately in each pass and the passes get stitched together -- and
+    batch_submit.sh runs under `set -e`, so ONE such set aborted the whole 10-set batch, every
+    firing: 2026-11-10..12, 146 failed firings, nothing submitted, 388 of the 521 remaining sets
+    were Orbitrap. (The 34 Orbitrap sets already complete ran single-shot, where AUTO is valid.)
+
+    The resolution comes from the .raw itself (scan trailer "FT Resolution:"), one value per run.
+    Every run of the set must be probed and agree: the chain applies ONE mass accuracy to every
+    file, so a set that mixes methods cannot be searched this way, and searching the probed subset
+    would be the under-probed failure described in the batch loop.
+    """
+    inst = (row.get("instrument") or "").lower()
+    if "astral" in inst or not any(w in inst for w in ORBITRAP_WORDS):
+        return None, None                          # timsTOF etc.; Astral has a documented value
+    res = resolution_index()
+    runs = sorted(row.get("_runs") or ())
+    got = {r: res[r] for r in runs if r in res}
+    if len(got) < len(runs):
+        return None, ("Orbitrap resolution not probed for %d of %d runs (%s); re-run "
+                      "scratch/orbi_res_probe.sbatch, then delete this skip"
+                      % (len(runs) - len(got), len(runs), os.path.basename(RESOLUTION)))
+    pairs = sorted(set(got.values()))
+    if len(pairs) != 1:
+        return None, ("mixed Orbitrap resolutions within the set %s; the chain applies one mass "
+                      "accuracy to every file -- split the set or search it single-shot" % pairs)
+    return pairs[0], None
 
 
 def cpus_in_flight():
@@ -262,8 +316,11 @@ def fasta_for(taxon):
     return None
 
 
-def prepare(row, probes):
-    """Generate one search's params.cfg and raw list. Returns a batch entry, or (None, reason)."""
+def prepare(row, probes, chain=True):
+    """Generate one search's params.cfg and raw list. Returns a batch entry, or (None, reason).
+
+    chain=False is the single-shot path (one-run sets), where mass accuracy on AUTO is valid: an
+    Orbitrap resolution is passed when known, but its absence is not a reason to skip."""
     name = "%s__%s" % (row["search_name"][:60].replace("/", "_").replace(" ", "_"),
                        row["setkey"][:8])
     dest = os.path.join(OUT_ROOT, name)
@@ -281,6 +338,11 @@ def prepare(row, probes):
     with open(rl, "w") as fh:
         fh.write("\n".join(raws) + "\n")
 
+    res, why = orbitrap_resolution(row)
+    if why and chain:
+        return None, why
+    res_args = (["--ms1-resolution", str(res[0]), "--ms2-resolution", str(res[1])] if res else [])
+
     cfg = os.path.join(wf, "params.cfg")
     r = sh([PY, os.path.join(STACK, "estimate_params.py"),
             "--engine", "diann", "--acquisition", "DIA",
@@ -291,9 +353,20 @@ def prepare(row, probes):
             "--overrides", json.dumps({"--missed-cleavages": 2}),
             "--precursor-mz-range", row["dia_mz_lo"], row["dia_mz_hi"],
             "--fasta-meta", fasta + ".meta.json",
+            *res_args,
             "--out", cfg])
     if r.returncode != 0 or not os.path.exists(cfg):
         return None, "estimate_params failed rc=%s %s" % (r.returncode, (r.stderr or "")[:120])
+    # The chain refuses a cfg whose mass accuracy is left on AUTO, and that refusal aborts the
+    # whole batch_submit.sh. Catch it here, per set, so it costs one skip instead of the batch.
+    try:
+        with open(cfg + ".rationale.json") as fh:
+            plan = json.load(fh).get("mass_accuracy_plan")
+    except (OSError, ValueError):
+        plan = None
+    if chain and plan == "auto":
+        return None, ("mass accuracy left on auto (%s, resolution %s): the 5-step chain refuses it "
+                      "and would abort the whole batch" % (row["instrument"], res or "unknown"))
     return {"name": name, "fasta": fasta, "cfg": cfg, "raw_list": rl,
             "out": os.path.join(dest, "output", "search")}, None
 
@@ -355,7 +428,7 @@ def submit_singles(st, rows, probes, a):
     n_sub = 0
     for row in todo[: a.batch_max]:
         row["_runs"] = runs_of.get(row["setkey"], set())
-        entry, why = prepare(row, probes)
+        entry, why = prepare(row, probes, chain=False)
         if not entry:
             st[row["setkey"]] = {"status": "skipped", "reason": why, "cohort": row["cohort"],
                                  "n_runs": 1}
