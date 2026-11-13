@@ -15,6 +15,11 @@ WHAT IT CHECKS (each finding is RED / AMBER / ok):
   slurm     jobs held by a launch failure, and which nodes caused them this week
   cron      the expected crontab lines are present on login2 (from a snapshot the cron wrapper writes)
   ingest    when the last search was ingested
+  training  is the data a model like Cascadia trains on still complete and still honest?
+            window scheme per located raw (and no reader-failure rows), every run has a split
+            flag under the current rule, no group straddles splits, no standard in test/val,
+            held-out share sane, raw md5 coverage, a random sample of located raws still on
+            disk, and spectrum/XIC lane counts that agree with the corpus (lanes fail silently)
 
 --heal does the safe, mechanical fixes: release held jobs off their bad node (slurm_heal.py) and
 resubmit the filler if it has not run. Everything else is reported, because it needs a decision.
@@ -218,6 +223,151 @@ def check_db(c):
     add("RED" if pct_free < 0.05 else "AMBER" if pct_free < 0.15 else "ok", "database", msg)
 
 
+RAW_SAMPLE = 300          # located raws stat-ed per scan to prove the raws are still there
+
+
+def check_training(c):
+    """Readiness of the training data (design doc section 4): what silently going wrong looks like.
+    Each sub-check is its own try, so one broken query cannot hide the rest."""
+    t = metrics.setdefault("training", {})
+
+    def sub(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            add("AMBER", "training", f"{name} check errored: {repr(e)[:180]}")
+
+    def windows():
+        # Window scheme (DIA isolation windows + CE) per located raw. Reader-failure rows mean the
+        # .NET runtime / tdf reader was missing when the row was written (2026-11-13: 5,269 .raw).
+        c.execute("""SELECT count(DISTINCT r.hive_path),
+                            count(DISTINCT r.hive_path) FILTER (WHERE w.hive_path IS NOT NULL),
+                            count(DISTINCT r.hive_path) FILTER (WHERE w.windows IS NOT NULL),
+                            count(DISTINCT r.hive_path) FILTER (WHERE w.note ILIKE '%unavailable%'
+                                                                   OR w.note ILIKE '%reader failed%')
+                       FROM raw_files r LEFT JOIN delimp_run_windows w ON w.hive_path = r.hive_path
+                      WHERE nullif(btrim(r.hive_path), '') IS NOT NULL
+                        AND (r.hive_path ILIKE '%.d' OR r.hive_path ILIKE '%.raw')""")
+        n, probed, dia, broken = c.fetchone()
+        t["windows"] = {"located": n, "probed": probed, "with_dia_windows": dia, "reader_failed": broken}
+        msg = (f"window schemes: {probed:,}/{n:,} located raws probed ({probed / max(n, 1):.0%}), "
+               f"{dia:,} with DIA windows")
+        if broken:
+            add("RED", "training", msg + f"; {broken:,} recorded as reader-unavailable/failed -- the "
+                "Thermo/.NET or tdf reader was missing; rerun load_run_windows --recheck in a job "
+                "that loads dotnet-core-sdk + DOTNET_ROOT")
+        else:
+            add("AMBER" if probed < 0.9 * n else "ok", "training", msg)
+
+    def split():
+        import build_run_flags as B
+        c.execute("""SELECT count(DISTINCT lower(r.raw_basename))
+                       FROM raw_files r
+                       LEFT JOIN delimp_run_flags f ON f.run_key = lower(r.raw_basename)
+                      WHERE nullif(btrim(r.raw_basename), '') IS NOT NULL AND f.run_key IS NULL
+                        AND r.first_seen_at < now() - interval '2 days'""")
+        unflagged = c.fetchone()[0]
+        c.execute("""SELECT count(*), count(*) FILTER (WHERE split <> 'train'),
+                            count(*) FILTER (WHERE split_rule NOT LIKE %s),
+                            count(*) FILTER (WHERE shareable = 'unknown')
+                       FROM delimp_run_flags""", (B.RULE_VERSION + ":%",))
+        n, held, old_rule, unknown = c.fetchone()
+        c.execute("""SELECT group_key, count(DISTINCT split) FROM delimp_run_flags
+                      GROUP BY 1 HAVING count(DISTINCT split) > 1 LIMIT 20""")
+        straddle = c.fetchall()
+        c.execute("""SELECT max(k) FROM (SELECT count(*) k FROM delimp_run_flags GROUP BY group_key) g""")
+        biggest = c.fetchone()[0] or 0
+        c.execute("SELECT run_key, split FROM delimp_run_flags WHERE split <> 'train'")
+        std_held = [k for k, _ in c.fetchall() if B.standard_of(k)]
+        t["split"] = {"runs": n, "held_out": held, "unflagged_2d": unflagged, "old_rule": old_rule,
+                      "straddling_groups": len(straddle), "largest_group": biggest,
+                      "standards_held_out": len(std_held), "shareable_unknown": unknown}
+        frac = held / max(n, 1)
+        msg = (f"train/val/test split: {n:,} runs, {held:,} held out ({frac:.1%}), largest group "
+               f"{biggest:,}; shareable unknown {unknown:,} ({unknown / max(n, 1):.0%})")
+        problems = []
+        if straddle:
+            problems.append(f"{len(straddle)} group(s) straddle splits (leakage), e.g. "
+                            + ", ".join(g for g, _ in straddle[:3]))
+        if std_held:
+            problems.append(f"{len(std_held)} standard run(s) in val/test, e.g. {std_held[:3]}")
+        if old_rule:
+            problems.append(f"{old_rule:,} row(s) not on rule {B.RULE_VERSION}")
+        if problems:
+            add("RED", "training", msg + "; " + "; ".join(problems))
+        elif unflagged or not 0.04 <= frac <= 0.15 or biggest > 0.05 * n:
+            add("AMBER", "training", msg + (f"; {unflagged:,} run(s) >2 d old have no split flag "
+                                            f"(build_run_flags in fran_fill)" if unflagged else "")
+                + ("" if 0.04 <= frac <= 0.15 else "; held-out share outside 4-15%")
+                + ("" if biggest <= 0.05 * n else "; one group holds >5% of runs"))
+        else:
+            add("ok", "training", msg)
+
+    def md5():
+        c.execute("""SELECT count(DISTINCT hive_path),
+                            count(DISTINCT hive_path) FILTER (WHERE nullif(btrim(md5), '') IS NOT NULL)
+                       FROM raw_files WHERE nullif(btrim(hive_path), '') IS NOT NULL""")
+        n, have = c.fetchone()
+        t["md5"] = {"located": n, "hashed": have}
+        add("AMBER" if have < 0.9 * n else "ok", "training",
+            f"raw md5 (run identity / proof the raw is the one searched): {have:,}/{n:,} located raws "
+            f"({have / max(n, 1):.0%}); raw_md5 runs nightly, <=2 TB a night")
+
+    def on_disk():
+        c.execute("""SELECT hive_path FROM (SELECT DISTINCT hive_path FROM raw_files
+                                             WHERE nullif(btrim(hive_path), '') IS NOT NULL) h
+                      ORDER BY random() LIMIT %s""", (RAW_SAMPLE,))
+        paths = [r[0] for r in c.fetchall()]
+        gone = [p for p in paths if not os.path.exists(
+            os.path.join(p, "analysis.tdf_bin") if p.lower().rstrip("/").endswith(".d") else p)]
+        t["on_disk"] = {"sampled": len(paths), "missing": len(gone)}
+        msg = (f"raws still on disk: {len(paths) - len(gone)}/{len(paths)} of a random sample of "
+               f"located raws")
+        frac = len(gone) / max(len(paths), 1)
+        add("RED" if frac >= 0.02 else "AMBER" if gone else "ok", "training",
+            msg + (f"; missing e.g. {gone[:3]} -- moved or deleted raws can't feed scan-level "
+                   f"training; the weekly census + nightly fill re-locate moved ones" if gone else ""))
+
+    def lanes():
+        # Lanes are best-effort and fail silently (memory fran-lance-lane-traps). Spectronaut
+        # spectrum lanes normally EQUAL the corpus count; DIA-NN XIC lanes count differently, so
+        # only a gross ratio is flagged (runs x library size is the known per-run-index bug).
+        rows = {}
+        for lane in ("delimp_spectrum_lane", "delimp_xic_lane"):
+            c.execute(f"""SELECT count(*) FILTER (WHERE l.search_id IS NULL),
+                                 count(*) FILTER (WHERE s.search_engine = 'spectronaut'),
+                                 count(*) FILTER (WHERE s.search_engine = 'spectronaut'
+                                                  AND l.n_precursors = s.n_precursors_total),
+                                 count(*) FILTER (WHERE s.n_precursors_total > 0
+                                                  AND (l.n_precursors > 1.5 * s.n_precursors_total
+                                                       OR l.n_precursors < 0.5 * s.n_precursors_total)),
+                                 (array_agg(s.search_name ORDER BY l.ingested_at DESC)
+                                     FILTER (WHERE s.n_precursors_total > 0
+                                             AND (l.n_precursors > 1.5 * s.n_precursors_total
+                                                  OR l.n_precursors < 0.5 * s.n_precursors_total)))[1:3],
+                                 count(*)
+                            FROM {lane} l LEFT JOIN delimp_searches s ON s.id = l.search_id
+                           WHERE l.ingested_at > now() - interval '{RECENT} days'""")
+            rows[lane] = c.fetchone()
+        t["lanes"] = {k: {"unlinked": v[0], "sn": v[1], "sn_equal": v[2], "gross_mismatch": v[3],
+                          "n": v[5]} for k, v in rows.items()}
+        for lane, (unlinked, sn, sn_eq, gross, ex, n) in rows.items():
+            name = lane.replace("delimp_", "").replace("_", " ")
+            msg = f"{name} (last {RECENT} d): {n:,} lane(s)"
+            bad = []
+            if sn >= 10 and sn_eq < 0.8 * sn:
+                bad.append(f"only {sn_eq}/{sn} Spectronaut lanes match the corpus precursor count")
+            if gross:
+                bad.append(f"{gross} with a lane/corpus precursor ratio outside 0.5-1.5x, e.g. {ex}")
+            if unlinked:
+                bad.append(f"{unlinked} not linked to a search (python ingest/link_spectrum_lane.py)")
+            add("AMBER" if bad else "ok", "training", msg + ("; " + "; ".join(bad) if bad else ""))
+
+    for name, fn in (("windows", windows), ("split", split), ("md5", md5), ("on-disk", on_disk),
+                     ("lanes", lanes)):
+        sub(name, fn)
+
+
 def check_filler():
     runs = sorted(glob.glob(os.path.join(FILL_DIR, "fill_*.json")), key=os.path.getmtime)
     if not runs:
@@ -256,7 +406,7 @@ def check_drip():
                        "parked": [{"name": (v.get("name") or k)[:80], "reason": (v.get("reason") or "")[:240]}
                                   for k, v in st.items() if v.get("status") == "parked"][:100]}
     add("AMBER" if parked else "ok", "drip", f"state {counts}" +
-        (f"; parked sets need a human:\n    " + "\n    ".join(parked[:15]) if parked else ""))
+        ("; parked sets need a human:\n    " + "\n    ".join(parked[:15]) if parked else ""))
     r = sh("squeue -u $(id -un) -h -t PD -o '%r'")
     reasons = r.stdout.splitlines()
     dns = sum(1 for x in reasons if x.strip() == "DependencyNeverSatisfied")
@@ -406,7 +556,7 @@ def main():
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '15min'")
-        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest):
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
