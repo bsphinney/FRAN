@@ -10,8 +10,12 @@
 #SBATCH --output=/quobyte/proteomics-grp/brett/scratch/fran_health/logs/fran_fill_%j.out
 # Runs FRAN's metadata fillers in order (fran_fill.py docstring). Nightly from fran_fill_cron.sh;
 # pass --weekly through to add the whole-corpus tissue/blood rescoring:  sbatch fran_fill.sbatch --weekly
-set -uo pipefail
+# modules.sh dereferences unset variables, and under set -u that kills the job with no message
+# (exit 1 at 0 s, found by test 2026-11-13) -- the same trap corpus_drip.sh documents.
+set +u
 source /etc/profile.d/modules.sh 2>/dev/null || true
+set -uo pipefail
+export PATH=/cvmfs/hpc.ucdavis.edu/sw/spack/environments/core/view/generic/slurm/bin:$PATH
 export DELIMP_PG_TOKEN_FILE=/quobyte/proteomics-grp/brett/.pgfarm_token
 ING=/quobyte/proteomics-grp/brett/glendon/fran_ingest
 export PYTHONPATH=$ING
