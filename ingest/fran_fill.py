@@ -36,7 +36,7 @@ A step that fails is recorded and the next one still runs: a broken Thermo reade
 the PTM rollup. The status JSON (one file per run -- one writer per file on Quobyte) is what
 fran_health_scan.py reads to tell whether the fillers are actually running.
 
-    python fran_fill.py [--weekly] [--dry-run] [--only STEP,...] [--status-dir DIR]
+    python fran_fill.py [--weekly] [--dry-run] [--only STEP,...] [--skip STEP,...] [--status-dir DIR]
 """
 import argparse
 import json
@@ -131,9 +131,11 @@ def main():
     ap.add_argument("--weekly", action="store_true", help="also run the whole-corpus rescoring")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--only", default="", help="comma-separated step names")
+    ap.add_argument("--skip", default="", help="comma-separated step names to leave out")
     ap.add_argument("--status-dir", default=STATUS_DIR)
     a = ap.parse_args()
     only = {x.strip() for x in a.only.split(",") if x.strip()}
+    skip = {x.strip() for x in a.skip.split(",") if x.strip()}
 
     run = {"started": time.strftime("%FT%T"), "host": os.uname().nodename,
            "job": os.environ.get("SLURM_JOB_ID"), "weekly": a.weekly, "dry_run": a.dry_run,
@@ -142,6 +144,9 @@ def main():
         if only and name not in only and name.split(":")[0] not in only:
             continue
         if weekly_only and not a.weekly:
+            continue
+        if name in skip or name.split(":")[0] in skip:
+            run["steps"][name] = {"rc": None, "skipped": "--skip"}
             continue
         print(f"\n===== {time.strftime('%F %T')} step {name} =====", flush=True)
         res = engines_confirming(a.dry_run) if args is None else run_script(name, args, timeout, a.dry_run)

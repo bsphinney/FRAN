@@ -46,6 +46,15 @@ FILL_SBATCH = os.path.join(HERE, "fran_fill.sbatch")
 
 RECENT, BASE_FROM, BASE_TO = 30, 30, 120     # days: recent window, baseline window
 MIN_ROWS = 20                                 # don't judge a window with fewer rows than this
+# FIXED floors, not only a rolling baseline. The first test run proved why: the 90-day baseline was
+# itself half-decayed (hive_path 49%, PTM rollup 21%), so a slow decay only ever looked like a
+# modest drop against its own recent past. Below its floor a column is RED whatever came before.
+# Floors are what the corpus reached when the fillers were run (June-August 2026).
+FLOORS = {"raw_files.hive_path": 0.90, "raw_files.instrument_model": 0.90,
+          "raw_files.acquisition_date": 0.90, "raw_files.n_ms2_frames": 0.85,
+          "raw_files.cycle_time_sec": 0.85, "sample_metadata.organism_taxon_id": 0.90,
+          "searches with PTM rollup": 0.90, "searches with provenance row": 0.90,
+          "searches with FASTA record": 0.90, "searches with raw-file links": 0.95}
 
 # (label, FROM clause, date expression, [(column label, filled-expression)])
 FILL_CHECKS = [
@@ -95,10 +104,17 @@ def sh(cmd):
 
 
 def judge(area, what, recent, base, n_recent, n_base):
-    if n_recent < MIN_ROWS or n_base < MIN_ROWS:
+    if n_recent < MIN_ROWS:
+        return
+    floor = FLOORS.get(what.split(" (")[0])
+    txt = (f"{what}: {recent:.0%} of the last {RECENT} d vs {base:.0%} before "
+           f"(n={n_recent:,}/{n_base:,})" + (f"; floor {floor:.0%}" if floor else ""))
+    if floor and recent < floor:
+        add("RED", area, txt)
+        return
+    if n_base < MIN_ROWS:
         return
     drop = base - recent
-    txt = f"{what}: {recent:.0%} of the last {RECENT} d vs {base:.0%} before (n={n_recent:,}/{n_base:,})"
     if base >= 0.5 and drop >= 0.30:
         add("RED", area, txt)
     elif drop >= 0.15:
@@ -129,8 +145,9 @@ def check_fill(c):
         n_r, n_b = row[0], row[1]
         for i, (name, _) in enumerate(cols):
             r, b = row[2 + 2 * i], row[3 + 2 * i]
-            if r is None or b is None:
+            if r is None:
                 continue
+            b = r if b is None else b
             judge("fill", f"{label}.{name}", float(r), float(b), n_r, n_b)
 
 
@@ -144,7 +161,8 @@ def check_coverage(c):
                         FROM delimp_searches s
                        WHERE s.ingested_at > now() - interval '{BASE_TO} days' {eng}""")
         n_r, r, n_b, b = c.fetchone()
-        if r is not None and b is not None:
+        if r is not None:
+            b = r if b is None else b
             judge("coverage", f"searches with {label}" + (f" ({engine})" if engine else ""),
                   float(r), float(b), n_r, n_b)
 
