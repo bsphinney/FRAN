@@ -25,6 +25,7 @@ STEPS (order is load-bearing -- see each script's docstring):
                                   (its docstring says corpus_ingest calls it; nothing does)
   9 refresh_search_ptm            per-search PTM rollup for searches that have none
     build_run_flags               train/val/test split (set once) + shareable class per raw run
+    raw_md5                       md5 of every newly located raw (capped at 2 TB a night)
  --weekly adds:
  10 predict_tissue, 11 predict_blood_fraction   whole-corpus rescoring (scores depend on the
                                   corpus-wide universe, so per-batch runs would be wasted)
@@ -72,6 +73,7 @@ STEPS = [
     ("engines_confirming", None, 3600, False),            # in-process, see engines_confirming()
     ("refresh_search_ptm", ["--batch", "50"], 4 * 3600, False),
     ("build_run_flags", ["--apply"], 3600, False),         # split + shareable per raw run
+    ("raw_md5", ["--apply", "--max-bytes", "2e12"], 20 * 3600, False),  # newly located raws, <=2 TB/night
     ("predict_tissue", ["--apply"], 2 * 3600, True),
     ("predict_blood_fraction", ["--apply"], 2 * 3600, True),
 ]
