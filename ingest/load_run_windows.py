@@ -78,10 +78,16 @@ def main():
         print(f"  thermo {min(i + THERMO_BATCH, len(thermo)):,}/{len(thermo):,} "
               f"{time.time() - t0:.0f}s")
 
-    rows = []
+    rows, n_env = [], 0
     for d in results:
         p = d.get("path")
         if p not in base:
+            continue
+        # A reader that could not start says nothing about the FILE. Recording it would stop the
+        # next night from probing it (2026-11-13: 5,269 .raw rows written this way because the
+        # job had no DOTNET_ROOT). Skip it and fail the step so the status JSON shows the gap.
+        if any(s in (d.get("note") or "") for s in ("coreclr unavailable", "reader unavailable")):
+            n_env += 1
             continue
         w = d.get("windows")
         rows.append((p, base[p], d.get("kind"), d.get("instrument"), d.get("dia_mz_lo"),
@@ -92,11 +98,16 @@ def main():
     n_dia = sum(1 for r in rows if r[8])
     print(f"probed {len(rows):,} in {time.time() - t0:.0f}s: {n_dia:,} with a DIA window scheme, "
           f"{len(rows) - n_dia:,} without (see note)")
+    rc = 0
+    if n_env:
+        rc = 2
+        print(f"ERROR: the Thermo reader could not start for {n_env:,} file(s) (DOTNET_ROOT / "
+              f"pythonnet). They were NOT recorded; fix the environment and rerun.", file=sys.stderr)
     if not a.apply:
         for r in rows[:5]:
             print("  sample:", r[0], r[2], r[4], r[5], r[6], (r[11] or "")[:80])
         print("dry run: nothing written (--apply to write)")
-        return 0
+        return rc
     from psycopg2.extras import execute_values
     with conn.cursor() as c:
         c.execute("SET lock_timeout = '5s'")
@@ -117,7 +128,7 @@ def main():
     conn.commit()
     conn.close()
     print(f"upserted {len(rows):,} row(s)")
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
