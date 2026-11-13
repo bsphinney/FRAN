@@ -82,6 +82,17 @@ def probe_bruker(path):
         except sqlite3.Error:
             out["note"] = "no DiaFrameMsMsWindows (not a dia-PASEF acquisition)"
             return out
+        # The full scheme: each window group's m/z window AND its mobility slice (TIMS scan-number
+        # range) and collision energy. diaPASEF windows are 2-D; the m/z union alone loses that.
+        try:
+            full = con.execute(
+                "SELECT WindowGroup, ScanNumBegin, ScanNumEnd, IsolationMz, IsolationWidth, "
+                "CollisionEnergy FROM DiaFrameMsMsWindows ORDER BY WindowGroup, ScanNumBegin").fetchall()
+            out["windows"] = [{"group": g, "scan_begin": b, "scan_end": e,
+                               "mz_lo": round(mz - w / 2, 3), "mz_hi": round(mz + w / 2, 3),
+                               "ce": ce} for g, b, e, mz, w, ce in full if mz is not None and w]
+        except sqlite3.Error:
+            pass
         wins = {(round(mz - w / 2, 2), round(mz + w / 2, 2))
                 for mz, w in rows if mz is not None and w}
         if not wins:
@@ -120,7 +131,8 @@ def probe_thermo_batch(paths):
             o = _blank(d.get("path"), "raw", d.get("note"))
             o["instrument"] = d.get("model")
             for k in ("dia_mz_lo", "dia_mz_hi", "dia_n_windows", "dia_width_med",
-                      "ms1_resolution", "ms2_resolution", "cycle_time_sec"):
+                      "ms1_resolution", "ms2_resolution", "cycle_time_sec", "windows",
+                      "collision_energies"):
                 o[k] = d.get(k)
             got[o["path"]] = o
         pr.wait()

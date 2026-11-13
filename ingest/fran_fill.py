@@ -17,12 +17,14 @@ STEPS (order is load-bearing -- see each script's docstring):
   2 record_raw_metadata --bruker  instrument / acquisition facts from each .d   (needs 1)
   3 record_raw_metadata --thermo  the same from each .raw                       (needs 1)
   4 backfill_thermo_resolution    ms1/ms2 resolution + cycle time for .raw      (needs 1)
+    load_run_windows              isolation-window scheme + collision energies   (needs 1)
   5 backfill_raw_metadata_from_siblings  copy from a same-basename row -- MUST be after 2-4, or it
                                   fills the NULL with a cousin's value and blocks the real read
   6 backfill_organism_taxon, 7 backfill_organism_taxid   sample_metadata.organism_taxon_id
   8 engines_confirming            refresh_for() on the raw basenames of recently ingested searches
                                   (its docstring says corpus_ingest calls it; nothing does)
   9 refresh_search_ptm            per-search PTM rollup for searches that have none
+    build_run_flags               train/val/test split (set once) + shareable class per raw run
  --weekly adds:
  10 predict_tissue, 11 predict_blood_fraction   whole-corpus rescoring (scores depend on the
                                   corpus-wide universe, so per-batch runs would be wasted)
@@ -63,11 +65,13 @@ STEPS = [
     ("record_raw_metadata:bruker", ["--bruker", "--only-missing", "--apply"], 10 * 3600, False),
     ("record_raw_metadata:thermo", ["--thermo", "--only-missing", "--apply"], 10 * 3600, False),
     ("backfill_thermo_resolution", ["--apply"], 6 * 3600, False),
+    ("load_run_windows", ["--apply"], 10 * 3600, False),   # window scheme per raw (needs 1)
     ("backfill_raw_metadata_from_siblings", ["--apply"], 3600, False),
     ("backfill_organism_taxon", ["--apply"], 1800, False),
     ("backfill_organism_taxid", ["--apply"], 1800, False),
     ("engines_confirming", None, 3600, False),            # in-process, see engines_confirming()
     ("refresh_search_ptm", ["--batch", "50"], 4 * 3600, False),
+    ("build_run_flags", ["--apply"], 3600, False),         # split + shareable per raw run
     ("predict_tissue", ["--apply"], 2 * 3600, True),
     ("predict_blood_fraction", ["--apply"], 2 * 3600, True),
 ]

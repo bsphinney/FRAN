@@ -30,6 +30,20 @@ from collections import Counter
 HELD_REASON = "launch failed requeued held"
 LOG = os.environ.get("FRAN_HEAL_LOG",
                      "/quobyte/proteomics-grp/brett/scratch/corpus_drip_logs/slurm_heal_nodes.tsv")
+# One JSON line per firing that DID something; fran_health_scan.py imports these into
+# delimp_qc_event for the FRAN-QC page. Single writer: only the drip's cron firing runs this.
+EVENTS = os.environ.get("FRAN_HEAL_EVENTS",
+                        "/quobyte/proteomics-grp/brett/scratch/corpus_drip_logs/slurm_heal_events.jsonl")
+
+
+def log_event(kind, summary, **detail):
+    try:
+        import json
+        with open(EVENTS, "a") as fh:
+            fh.write(json.dumps({"at": time.strftime("%FT%T%z"), "kind": kind,
+                                 "summary": summary, "detail": detail}) + "\n")
+    except OSError as e:
+        print(f"heal: could not append {EVENTS}: {e}")
 
 
 def sh(cmd):
@@ -106,6 +120,9 @@ def steer_pending(user, bad, dry):
     if n:
         print(f"{time.strftime('%F %T')} heal: {'would steer' if dry else 'steered'} {n} pending "
               f"job(s) off {','.join(sorted(bad))}")
+        if not dry:
+            log_event("steered", f"steered {n} pending job(s) off {', '.join(sorted(bad))}",
+                      n=n, nodes=sorted(bad))
     return n
 
 
@@ -143,6 +160,10 @@ def main():
                     fh.write(f"{time.strftime('%FT%T')}\t{node}\t{n}\n")
         except OSError as e:
             print(f"heal: could not append {LOG}: {e}")
+    if not a.dry_run and released:
+        log_event("released", f"released {released} held job(s); failing node(s): "
+                              f"{', '.join(f'{k} ({v})' for k, v in seen.items()) or 'unknown'}",
+                  n=released, jobs=[j for j, _ in held][:200], nodes=dict(seen))
     print(f"{time.strftime('%F %T')} heal: {released}/{len(held)} held job(s) released; failing "
           f"node(s): {dict(seen) or 'unknown'}")
     steer_pending(user, recent_bad_nodes() | set(seen), a.dry_run)

@@ -144,6 +144,7 @@ def read_one(raw_adapter, device, path):
         seen = {"ms1_resolution": set(), "ms2_resolution": set()}
         ms1_scans = []
         windows = {}
+        energies = {}      # collision energy per MS2 scan event (NCE for HCD), counted
         for scan in scans:
             try:
                 filt = str(raw.GetFilterForScanNumber(scan).ToString())
@@ -166,6 +167,11 @@ def read_one(raw_adapter, device, path):
                 w = _isolation_window(raw, scan)
                 if w:
                     windows[w] = windows.get(w, 0) + 1
+                try:
+                    ce = round(float(raw.GetScanEventForScanNumber(scan).GetReaction(0).CollisionEnergy), 2)
+                    energies[ce] = energies.get(ce, 0) + 1
+                except Exception:                    # noqa: BLE001
+                    pass
         out["cycle_time_sec"] = _cycle_from_scans(ms1_scans)
         if windows:
             los = [w[0] for w in windows]
@@ -176,6 +182,12 @@ def read_one(raw_adapter, device, path):
             out["dia_n_windows"] = len(windows)
             n = len(wid)
             out["dia_width_med"] = wid[n // 2] if n % 2 else round(0.5 * (wid[n // 2 - 1] + wid[n // 2]), 2)
+            # The full scheme, not just its summary: DIA de novo / rescoring models (Cascadia,
+            # DIANovo) need every window. [lo, hi, n_scans_seen] from the SAMPLED blocks, each block
+            # longer than a DIA cycle, so every window of the cycle is seen.
+            out["windows"] = [[lo, hi, c] for (lo, hi), c in sorted(windows.items())]
+        if energies:
+            out["collision_energies"] = [[e, c] for e, c in sorted(energies.items())]
         notes = []
         for key, vals in seen.items():
             if len(vals) == 1:

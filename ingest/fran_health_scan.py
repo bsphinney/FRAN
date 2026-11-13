@@ -92,6 +92,9 @@ EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh
                  "fran_fill_cron.sh", "fran_health_cron.sh"]
 
 findings = []   # (severity, area, message)
+metrics = {"fill": {}, "coverage": {}}   # structured numbers for delimp_qc_scan / the FRAN-QC page
+HEAL_EVENTS = "/quobyte/proteomics-grp/brett/scratch/corpus_drip_logs/slurm_heal_events.jsonl"
+PG_DISK_GB = float(os.environ.get("FRAN_PG_DISK_GB", "1600"))   # PG Farm volume since 2026-11-06
 
 
 def add(sev, area, msg):
@@ -107,6 +110,9 @@ def judge(area, what, recent, base, n_recent, n_base):
     if n_recent < MIN_ROWS:
         return
     floor = FLOORS.get(what.split(" (")[0])
+    if area in metrics:
+        metrics[area][what] = {"recent": round(recent, 4), "base": round(base, 4), "floor": floor,
+                               "n_recent": n_recent, "n_base": n_base}
     txt = (f"{what}: {recent:.0%} of the last {RECENT} d vs {base:.0%} before "
            f"(n={n_recent:,}/{n_base:,})" + (f"; floor {floor:.0%}" if floor else ""))
     if floor and recent < floor:
@@ -178,6 +184,8 @@ def check_backlog(c):
                     AND EXISTS (SELECT 1 FROM delimp_precursors p WHERE p.search_id = s.id
                                 AND p.protein_group IS NOT NULL LIMIT 1)""")
     no_ptm = c.fetchone()[0]
+    metrics["backlog"] = {"raw_rows": n, "distinct_runs": n_base, "no_hive_path": no_path,
+                          "no_instrument": no_inst, "no_ptm": no_ptm}
     msg = (f"raw_files {n:,} rows / {n_base:,} distinct runs: no hive_path {no_path:,}, "
            f"no instrument {no_inst:,}; searches >2 d old with no PTM rollup {no_ptm:,}")
     add("AMBER" if (no_ptm > 50 or no_path > 0.1 * n) else "ok", "backlog", msg)
@@ -191,8 +199,23 @@ def check_ingest(c):
         add("RED", "ingest", "no ingested searches at all?")
         return
     age_h = (time.time() - last.timestamp()) / 3600
+    metrics["ingest"] = {"last_age_h": round(age_h, 1), "n_7d": n7}
     add("AMBER" if age_h > 48 else "ok", "ingest",
         f"last search ingested {age_h:.0f} h ago; {n7:,} in the last 7 days")
+
+
+def check_db(c):
+    """Database size against the PG Farm volume. The service account cannot see the disk itself,
+    so free space is estimated the way the PG Farm admin does (relation sizes + ~5 GB for the OS).
+    The disk filling on 2026-10-05 took FRAN down for a month; this is the early warning."""
+    c.execute("SELECT pg_database_size(current_database())")
+    size = c.fetchone()[0]
+    free = PG_DISK_GB * 1024 ** 3 - size - 5 * 1024 ** 3
+    pct_free = free / (PG_DISK_GB * 1024 ** 3)
+    metrics["db"] = {"size_bytes": size, "disk_gb": PG_DISK_GB, "est_free_bytes": int(free)}
+    msg = (f"database {size / 1024 ** 3:,.0f} GiB of a {PG_DISK_GB:,.0f} GB volume; "
+           f"~{free / 1024 ** 3:,.0f} GiB free ({pct_free:.0%})")
+    add("RED" if pct_free < 0.05 else "AMBER" if pct_free < 0.15 else "ok", "database", msg)
 
 
 def check_filler():
@@ -229,12 +252,16 @@ def check_drip():
         counts[v.get("status", "?")] = counts.get(v.get("status", "?"), 0) + 1
     parked = [(v.get("name") or k)[:60] + " -- " + (v.get("reason") or "")[:120]
               for k, v in st.items() if v.get("status") == "parked"]
+    metrics["drip"] = {"status_counts": counts,
+                       "parked": [{"name": (v.get("name") or k)[:80], "reason": (v.get("reason") or "")[:240]}
+                                  for k, v in st.items() if v.get("status") == "parked"][:100]}
     add("AMBER" if parked else "ok", "drip", f"state {counts}" +
         (f"; parked sets need a human:\n    " + "\n    ".join(parked[:15]) if parked else ""))
     r = sh("squeue -u $(id -un) -h -t PD -o '%r'")
     reasons = r.stdout.splitlines()
     dns = sum(1 for x in reasons if x.strip() == "DependencyNeverSatisfied")
     held = sum(1 for x in reasons if "launch failed" in x)
+    metrics.setdefault("slurm", {}).update({"held": held, "stranded": dns})
     if dns:
         add("AMBER", "slurm", f"{dns} job(s) stranded on DependencyNeverSatisfied (the drip cancels "
                               f"its own each firing; any left belong to something else)")
@@ -251,6 +278,7 @@ def check_bad_nodes():
         p = line.rstrip("\n").split("\t")
         if len(p) == 3 and p[0] >= cutoff and p[1] != "node":
             per[p[1]] = per.get(p[1], 0) + int(p[2] or 0)
+    metrics.setdefault("slurm", {})["bad_nodes"] = per
     if per:
         add("AMBER", "slurm", "nodes that failed job launches this week (report to "
                               f"hpc-help@ucdavis.edu if they persist): {per}")
@@ -282,6 +310,76 @@ def heal(filler_state):
             add("RED", "heal", f"could not resubmit the filler: {r.stderr.strip()[:200]}")
 
 
+def import_events(conn):
+    """Copy what the self-healing layer did into delimp_qc_event (dedupe_key makes it idempotent)."""
+    ev = []
+    try:
+        for i, line in enumerate(open(HEAL_EVENTS)):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            ev.append((d["at"], "heal", d.get("kind", "?"), d.get("summary", ""),
+                       json.dumps(d.get("detail", {})), f"heal:{d['at']}:{d.get('kind')}:{i}"))
+    except OSError:
+        pass
+    for path in glob.glob(os.path.join(FILL_DIR, "fill_*.json")):
+        try:
+            st = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        tag = os.path.basename(path)
+        steps = st.get("steps", {})
+        bad = {k: v for k, v in steps.items() if v.get("rc") not in (0, None)}
+        ev.append((st.get("finished") or st.get("started"), "fill", "fill_run",
+                   f"fill run{' (weekly)' if st.get('weekly') else ''}{' DRY' if st.get('dry_run') else ''}: "
+                   f"{len(steps)} step(s), {len(bad)} failed",
+                   json.dumps({k: {"rc": v.get("rc"), "seconds": v.get("seconds"),
+                                   "skipped": v.get("skipped")} for k, v in steps.items()}),
+                   f"fill:{tag}"))
+        for k, v in bad.items():
+            ev.append((st.get("finished") or st.get("started"), "fill", "fill_step_failed",
+                       f"{k} rc={v.get('rc')}: {(v.get('err_tail') or v.get('tail') or '')[-160:]}",
+                       json.dumps({"step": k, "rc": v.get("rc")}), f"fill:{tag}:{k}"))
+    try:
+        st = json.load(open(DRIP_STATE))
+        for k, v in st.items():
+            if v.get("status") == "parked" and v.get("parked_at"):
+                ev.append((v["parked_at"], "drip", "parked", f"parked {(v.get('name') or k)[:60]}: "
+                           f"{(v.get('reason') or '')[:200]}", json.dumps({"setkey": k}),
+                           f"drip:parked:{k}:{v['parked_at']}"))
+            elif v.get("status") == "failed" and v.get("completed_at") and "stranded" in (v.get("reason") or ""):
+                ev.append((v["completed_at"], "drip", "stranded", f"cancelled stranded chain "
+                           f"{(v.get('name') or k)[:60]}", json.dumps({"setkey": k}),
+                           f"drip:stranded:{k}:{v['completed_at']}"))
+    except (OSError, ValueError):
+        pass
+    if not ev:
+        return 0
+    from psycopg2.extras import execute_values
+    with conn.cursor() as c:
+        execute_values(c, """INSERT INTO delimp_qc_event (at, source, kind, summary, detail, dedupe_key)
+                             VALUES %s ON CONFLICT (dedupe_key) DO NOTHING""", ev,
+                       template="(%s::timestamptz,%s,%s,%s,%s::jsonb,%s)", page_size=500)
+        n = c.rowcount
+    conn.commit()
+    return n
+
+
+def record_scan(conn, kind):
+    with conn.cursor() as c:
+        c.execute("""INSERT INTO delimp_qc_scan (kind, n_red, n_amber, findings, metrics, job_id, host)
+                     VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) RETURNING id""",
+                  (kind, sum(1 for f in findings if f[0] == "RED"),
+                   sum(1 for f in findings if f[0] == "AMBER"),
+                   json.dumps([{"sev": s_, "area": a_, "msg": m} for s_, a_, m in findings]),
+                   json.dumps(metrics, default=str), os.environ.get("SLURM_JOB_ID"),
+                   os.uname().nodename))
+        sid = c.fetchone()[0]
+    conn.commit()
+    return sid
+
+
 def post(text):
     try:
         hook = open(WEBHOOK_FILE).read().strip()
@@ -298,14 +396,17 @@ def main():
     ap.add_argument("--heal", action="store_true")
     ap.add_argument("--post", action="store_true")
     ap.add_argument("--out", default=OUT_DIR)
+    ap.add_argument("--kind", default="manual", choices=["daily", "weekly", "manual"])
+    ap.add_argument("--no-db", action="store_true", help="don't write delimp_qc_scan / delimp_qc_event")
     a = ap.parse_args()
 
+    global _conn
     from coreomics_import import _conn
     conn = _conn()
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '15min'")
-        for fn in (check_fill, check_coverage, check_backlog, check_ingest):
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
@@ -331,6 +432,15 @@ def main():
     with open(path, "w") as fh:
         fh.write(f"# {head}\n\n{body}\n")
     print(f"\n{head}\nreport: {path}")
+    if not a.no_db:
+        try:
+            w = _conn()
+            n_ev = import_events(w)
+            sid = record_scan(w, a.kind)
+            w.close()
+            print(f"recorded scan {sid} and {n_ev} new event(s) for FRAN-QC")
+        except Exception as e:  # noqa: BLE001 - the report file and Slack post still happen
+            print(f"could not record to the QC tables: {repr(e)[:300]}")
     if a.post:
         short = "\n".join(f"- *{s}* {a_}: {m.splitlines()[0][:220]}" for s, a_, m in findings if s != "ok")
         post(f"{head}\n{short or 'everything filling normally'}\nfull report: {path}")
