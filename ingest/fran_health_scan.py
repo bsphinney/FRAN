@@ -19,7 +19,8 @@ WHAT IT CHECKS (each finding is RED / AMBER / ok):
             window scheme per located raw (and no reader-failure rows), every run has a split
             flag under the current rule, no group straddles splits, no standard in test/val,
             held-out share sane, raw md5 coverage, a random sample of located raws still on
-            disk, and spectrum/XIC lane counts that agree with the corpus (lanes fail silently)
+            disk, lane counts against the corpus, and the 3 newest DIA-NN XIC lanes opened to
+            prove q<=0.01 rows == corpus with no decoys (lanes fail silently)
 
 --heal does the safe, mechanical fixes: release held jobs off their bad node (slurm_heal.py) and
 resubmit the filler if it has not run. Everything else is reported, because it needs a decision.
@@ -329,42 +330,92 @@ def check_training(c):
                    f"training; the weekly census + nightly fill re-locate moved ones" if gone else ""))
 
     def lanes():
-        # Lanes are best-effort and fail silently (memory fran-lance-lane-traps). Spectronaut
-        # spectrum lanes normally EQUAL the corpus count; DIA-NN XIC lanes count differently, so
-        # only a gross ratio is flagged (runs x library size is the known per-run-index bug).
-        rows = {}
-        for lane in ("delimp_spectrum_lane", "delimp_xic_lane"):
-            c.execute(f"""SELECT count(*) FILTER (WHERE l.search_id IS NULL),
-                                 count(*) FILTER (WHERE s.search_engine = 'spectronaut'),
-                                 count(*) FILTER (WHERE s.search_engine = 'spectronaut'
-                                                  AND l.n_precursors = s.n_precursors_total),
-                                 count(*) FILTER (WHERE s.n_precursors_total > 0
-                                                  AND (l.n_precursors > 1.5 * s.n_precursors_total
-                                                       OR l.n_precursors < 0.5 * s.n_precursors_total)),
-                                 (array_agg(s.search_name ORDER BY l.ingested_at DESC)
-                                     FILTER (WHERE s.n_precursors_total > 0
-                                             AND (l.n_precursors > 1.5 * s.n_precursors_total
-                                                  OR l.n_precursors < 0.5 * s.n_precursors_total)))[1:3],
-                                 count(*)
-                            FROM {lane} l LEFT JOIN delimp_searches s ON s.id = l.search_id
-                           WHERE l.ingested_at > now() - interval '{RECENT} days'""")
-            rows[lane] = c.fetchone()
-        t["lanes"] = {k: {"unlinked": v[0], "sn": v[1], "sn_equal": v[2], "gross_mismatch": v[3],
-                          "n": v[5]} for k, v in rows.items()}
-        for lane, (unlinked, sn, sn_eq, gross, ex, n) in rows.items():
-            name = lane.replace("delimp_", "").replace("_", " ")
-            msg = f"{name} (last {RECENT} d): {n:,} lane(s)"
-            bad = []
-            if sn >= 10 and sn_eq < 0.8 * sn:
-                bad.append(f"only {sn_eq}/{sn} Spectronaut lanes match the corpus precursor count")
-            if gross:
-                bad.append(f"{gross} with a lane/corpus precursor ratio outside 0.5-1.5x, e.g. {ex}")
+        # Lanes are best-effort and fail silently (memory fran-lance-lane-traps).
+        #  - Spectronaut spectrum lane: normally EQUALS the corpus precursor count.
+        #  - DIA-NN XIC lane: a SUPERSET by design -- it also keeps traces DIA-NN wrote for precursors
+        #    it reported only in another run (q_value NULL). Verified 2026-11-13 on 12 lanes (8 that
+        #    an equality rule flagged): rows with q <= 0.01 == corpus rows exactly, 0 decoys. So the
+        #    registry can only show two failures: lane BELOW corpus (traces missing), and lane ~=
+        #    corpus x runs (the per-run index bug: every run given every precursor).
+        c.execute(f"""SELECT s.search_engine, l.search_id IS NULL, l.n_precursors, s.n_precursors_total,
+                             s.n_raw_files, s.search_name
+                        FROM delimp_spectrum_lane l LEFT JOIN delimp_searches s ON s.id = l.search_id
+                       WHERE l.ingested_at > now() - interval '{RECENT} days'""")
+        spec = c.fetchall()
+        c.execute(f"""SELECT s.search_engine, l.search_id IS NULL, l.n_precursors, s.n_precursors_total,
+                             s.n_raw_files, s.search_name, l.search_id
+                        FROM delimp_xic_lane l LEFT JOIN delimp_searches s ON s.id = l.search_id
+                       WHERE l.ingested_at > now() - interval '{RECENT} days'""")
+        xic = c.fetchall()
+        t["lanes"] = {"spectrum_n": len(spec), "xic_n": len(xic)}
+        for label, rows_ in (("spectrum lane", spec), ("xic lane", xic)):
+            unlinked = [r for r in rows_ if r[1]]
+            linked = [r for r in rows_ if not r[1] and r[3]]
+            sn = [r for r in linked if r[0] == "spectronaut"]
+            sn_eq = sum(1 for r in sn if r[2] == r[3])
+            below = [r for r in linked if r[0] == "diann" and r[2] < 0.98 * r[3]]
+            # Labelled designs (SILAC / plexDIA) store one corpus row per CHANNEL but one trace per
+            # (run, precursor): PROT_0749 SILAC had 220,007 rows = 75,143 pairs x ~3 channels, and
+            # its lane held exactly 75,143 at q<=0.01. Recount those as distinct pairs first.
+            channel = []
+            for r in list(below):
+                c.execute("""SELECT count(DISTINCT (raw_path, precursor_id_diann)) FROM delimp_precursors
+                              WHERE search_id = %s""", (r[6],))
+                pairs = c.fetchone()[0]
+                if pairs and r[2] >= 0.98 * pairs:
+                    below.remove(r)
+                    channel.append(r)
+            perrun = [r for r in linked if (r[4] or 0) > 2 and r[2] >= 0.75 * r[3] * r[4]]
+            t["lanes"][label] = {"unlinked": len(unlinked), "sn": len(sn), "sn_equal": sn_eq,
+                                 "diann_below_corpus": len(below), "per_run_bug": len(perrun),
+                                 "channel_designs": len(channel)}
+            msg = f"{label} (last {RECENT} d): {len(rows_):,} lane(s)" + (
+                f" ({len(channel)} multi-channel, counted per run+precursor)" if channel else "")
+            red, amber = [], []
+            if perrun:
+                red.append(f"{len(perrun)} look like the per-run index bug (lane ~= corpus x runs), "
+                           f"e.g. {[r[5] for r in perrun[:3]]}")
+            if len(sn) >= 10 and sn_eq < 0.8 * len(sn):
+                amber.append(f"only {sn_eq}/{len(sn)} Spectronaut lanes match the corpus precursor count")
+            if below:
+                amber.append(f"{len(below)} DIA-NN lane(s) hold fewer precursors than the corpus "
+                             f"(traces missing), e.g. {[r[5] for r in below[:3]]}")
             if unlinked:
-                bad.append(f"{unlinked} not linked to a search (python ingest/link_spectrum_lane.py)")
-            add("AMBER" if bad else "ok", "training", msg + ("; " + "; ".join(bad) if bad else ""))
+                amber.append(f"{len(unlinked)} not linked to a search (python ingest/link_spectrum_lane.py)")
+            add("RED" if red else "AMBER" if amber else "ok", "training",
+                msg + ("; " + "; ".join(red + amber) if red or amber else ""))
+
+    def lane_deep():
+        # Open the 3 newest DIA-NN XIC lanes and prove the identity the registry can't show:
+        # q <= 0.01 rows == the corpus's distinct (run, precursor) pairs (== its row count unless the
+        # search is multi-channel), and no decoys (a decoy in a public lane is a leak).
+        import lance
+        import pyarrow.compute as pc
+        c.execute("""SELECT l.search_id, s.search_name, l.lance_path,
+                            (SELECT count(DISTINCT (p.raw_path, p.precursor_id_diann))
+                               FROM delimp_precursors p WHERE p.search_id = l.search_id)
+                       FROM delimp_xic_lane l JOIN delimp_searches s ON s.id = l.search_id
+                      WHERE s.search_engine = 'diann' AND s.n_precursors_total > 0
+                        AND l.n_precursors < 3000000
+                      ORDER BY l.ingested_at DESC LIMIT 3""")
+        res = []
+        for sid, name, path, n_corpus in c.fetchall():
+            tb = lance.dataset(path).to_table(columns=["search_id", "q_value", "is_decoy"])
+            if pc.any(pc.not_equal(tb["search_id"], str(sid))).as_py():
+                tb = tb.filter(pc.equal(tb["search_id"], str(sid)))
+            le = pc.sum(pc.less_equal(tb["q_value"], 0.01)).as_py() or 0
+            dec = pc.sum(tb["is_decoy"]).as_py() or 0
+            res.append((name, le, n_corpus, dec))
+        bad = [r for r in res if r[1] != r[2] or r[3]]
+        t["lane_deep"] = [{"search": r[0], "q01": r[1], "corpus": r[2], "decoys": r[3]} for r in res]
+        add("RED" if bad else "ok", "training",
+            f"XIC lane deep check ({len(res)} newest DIA-NN lanes opened): "
+            + ("q<=0.01 rows == corpus and 0 decoys in each" if not bad else
+               "MISMATCH " + "; ".join(f"{n}: q<=.01 {a:,} vs corpus {b:,}, decoys {d:,}"
+                                       for n, a, b, d in bad)))
 
     for name, fn in (("windows", windows), ("split", split), ("md5", md5), ("on-disk", on_disk),
-                     ("lanes", lanes)):
+                     ("lanes", lanes), ("lane deep", lane_deep)):
         sub(name, fn)
 
 

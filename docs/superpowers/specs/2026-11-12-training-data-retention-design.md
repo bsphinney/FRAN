@@ -99,6 +99,19 @@ of 649 searches also have the older `report_xic/` layout, which is why the gap l
 Next: array job over the 613 corpus searches (+ the 217 non-corpus DIA-NN searches where XICs exist),
 `--apply` registers in `delimp_xic_lane`. Then add it to `corpus_ingest_drip.py` so it never lags.
 
+**Training label rule for the DIA-NN XIC lane (verified 2026-11-13).** A DIA-NN XIC lane is a
+SUPERSET of the corpus: it also keeps traces DIA-NN wrote in run X for precursors it reported only
+in ANOTHER run of the search, with `q_value` NULL ("signal extracted, not identified here"). On 12
+lanes checked by opening them, rows with `q_value <= 0.01` equalled the corpus rows exactly, there
+were 0 decoys, and the NULL-q rows were 12-40% of each lane (206,769 of 562,687 in one). So:
+- **positive labels = `q_value IS NOT NULL AND q_value <= 0.01` only.** A NULL-q trace is never a
+  positive; using one teaches the model a label nothing confirmed in that run.
+- NULL-q traces are usable only as explicitly UNLABELLED / candidate examples, marked as such.
+- Labelled designs (SILAC / plexDIA): the corpus has one row per channel, the lane one trace per
+  precursor (channels share the trace), so lane < corpus there is expected; join on
+  (run, precursor) and carry the channel from the corpus.
+The daily health scan opens the 3 newest DIA-NN lanes and checks q<=0.01 rows == corpus, 0 decoys.
+
 ### 4.2 Lane gap: Spectronaut spectrum lane — 165 now, 610 via Windows
 Of the 775 lane-less SN searches (all arrived via the Windows `spectronaut-uploader`, which never
 writes the lane):

@@ -5,7 +5,7 @@
 #SBATCH --qos=genome-center-grp-high-qos
 #SBATCH --time=02:00:00                      # read-only SQL; the coverage queries take minutes
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=2G
+#SBATCH --mem=4G                         # the lane deep check reads 3 Lance columns
 #SBATCH --exclude=hive-as-11-2-41
 #SBATCH --output=/quobyte/proteomics-grp/brett/scratch/fran_health/logs/fran_health_%j.out
 # Weekly FRAN health scan (fran_health_scan.py docstring). Submitted by fran_health_cron.sh on login2,

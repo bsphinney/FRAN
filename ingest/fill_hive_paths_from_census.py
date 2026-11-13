@@ -18,6 +18,16 @@ ORDER OF EVIDENCE (only for rows with no hive_path; a non-empty hive_path is nev
                then the shortest path (deterministic, so reruns agree).
 Rows found nowhere are listed, not guessed.
 
+RELOCATION. A located raw can MOVE afterwards (folders reorganised, a project renamed, runs moved
+into a raw/ subfolder: 213 located paths, all set 2026-07-22, were gone by 2026-11-13 though every
+run still had copies). A non-empty hive_path is otherwise never touched, so without this pass a
+moved raw stays stale for ever and every filler that reads the raw skips it. When a located path
+fails the on-disk check, it is re-pointed to a census copy ONLY if every complete copy has the same
+size and the same extension (and the recorded size, if any), and the new path passes the on-disk
+check now. delimp_run_windows rows follow the path (same data, same windows). md5 is kept: it is
+the data's hash. If more than RELOCATE_MAX_FRAC of located paths look gone, NOTHING is relocated:
+that is a mount that is down, not files that moved.
+
 Also fills file_size_bytes (.raw = file size, .d = analysis.tdf + analysis.tdf_bin) for every row
 with a hive_path, from the census or, failing that, a direct stat.
 
@@ -44,6 +54,7 @@ csv.field_size_limit(10 ** 8)
 CENSUS_ROOT = "/quobyte/proteomics-grp/brett/raw_census"
 ARCHIVE = "/nfs/lssc0/flinders/proteomics/Data/"
 CENSUS_STALE_DAYS = 10
+RELOCATE_MAX_FRAC, RELOCATE_MAX_MIN = 0.03, 500   # refuse when more than max(3%, 500) look gone
 
 
 CENSUS_PARTS = ("flinders", "quobyte")
@@ -118,6 +129,75 @@ def pick_copy(copies, preferred=None):
                                          len(c["path"]), c["path"]))[0]["path"]
 
 
+def ext_of(p):
+    p = (p or "").lower().rstrip("/")
+    return ".d" if p.endswith(".d") else ".raw" if p.endswith(".raw") else ""
+
+
+def relocate_stale(conn, by_base, out, apply):
+    """Re-point located raws whose file is gone (see RELOCATION in the module docstring)."""
+    with conn.cursor() as c:
+        c.execute("""SELECT hive_path, min(raw_basename), max(file_size_bytes) FROM raw_files
+                      WHERE nullif(btrim(hive_path), '') IS NOT NULL GROUP BY 1""")
+        located = c.fetchall()
+    moves, stuck = [], []
+    for hp, base, size in located:
+        if disk_size(hp)[0]:
+            continue
+        copies = [r for r in by_base.get((base or "").lower(), [])
+                  if r["complete"] and r["path"] != hp and r["ext"] == ext_of(hp)]
+        sizes = {r["size"] for r in copies}
+        if not copies:
+            stuck.append((hp, base, "", "no complete copy of the same type in the census"))
+        elif len(sizes) > 1:
+            stuck.append((hp, base, "", f"{len(copies)} copies in {len(sizes)} sizes"))
+        elif size and size not in sizes:
+            stuck.append((hp, base, "", "copies differ from the recorded size"))
+        else:
+            new = pick_copy(copies)
+            ok, sz = disk_size(new)
+            if ok:
+                moves.append((hp, new, sz))
+            else:
+                stuck.append((hp, base, new, "census copy is not on disk now"))
+    gone = len(moves) + len(stuck)
+    limit = max(RELOCATE_MAX_MIN, RELOCATE_MAX_FRAC * len(located))
+    with open(os.path.join(out, "relocate.tsv"), "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(["hive_path_before", "hive_path_new", "size", "status"])
+        w.writerows((o, n, sz, "relocate") for o, n, sz in moves)
+        w.writerows((o, n, "", "stuck: " + why) for o, _, n, why in stuck)
+    print(f"located paths: {len(located):,}; gone from disk: {gone:,} -> relocatable {len(moves):,}, "
+          f"stuck {len(stuck):,} (relocate.tsv)")
+    if gone > limit:
+        print(f"REFUSED relocation: {gone:,} located raws look gone (> {limit:,.0f}); a mount is "
+              f"probably down. Nothing re-pointed.", file=sys.stderr)
+        return 0, gone
+    if not apply or not moves:
+        return 0, gone
+    from psycopg2.extras import execute_values
+    with conn.cursor() as c:
+        c.execute("SET lock_timeout = '5s'")
+        c.execute("SET statement_timeout = '20min'")
+        execute_values(c, """UPDATE raw_files r
+                                SET hive_path = v.new, hive_verified_at = now(),
+                                    file_size_bytes = COALESCE(r.file_size_bytes, v.size)
+                               FROM (VALUES %s) AS v(old, new, size)
+                              WHERE r.hive_path = v.old""",
+                       moves, template="(%s, %s, %s::bigint)", page_size=500)
+        n = c.rowcount
+        execute_values(c, """UPDATE delimp_run_windows w SET hive_path = v.new
+                               FROM (VALUES %s) AS v(old, new)
+                              WHERE w.hive_path = v.old
+                                AND NOT EXISTS (SELECT 1 FROM delimp_run_windows x
+                                                 WHERE x.hive_path = v.new)""",
+                       [(o, nw) for o, nw, _ in moves], page_size=500)
+        nw_ = c.rowcount
+    conn.commit()
+    print(f"relocated {len(moves):,} path(s) ({n:,} raw_files rows, {nw_:,} window rows)")
+    return len(moves), gone
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--census", default=None)
@@ -159,6 +239,8 @@ def main():
 
     from coreomics_import import _conn
     conn = _conn()
+    if by_base:
+        relocate_stale(conn, by_base, out, a.apply)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '10min'")
         c.execute("""SELECT raw_path, raw_basename, nullif(btrim(hive_path), ''), file_size_bytes
