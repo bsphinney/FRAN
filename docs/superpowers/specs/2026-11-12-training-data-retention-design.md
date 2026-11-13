@@ -234,6 +234,14 @@ flags answer its requests (raw path, acquisition mode/window scheme, engine per 
 marker, shareable flag).
 
 ## 6. Results log
+- 2026-11-13: scan-lane pilot (§4.5) finished; `scratch/training_pilot_20261112/scan_lane/RESULTS.md`.
+  Recommendation (b): Thermo runs get a scan lane (0.12x raw with zstd on the list child + f32 m/z,
+  removes the ~5 min TRFP per access; MS2 centres text-identical to cascadia.augment); Bruker stays
+  index-only against the raws (a lane is 1.2-1.4x raw and reads no faster than decoding tdf_bin),
+  with a Bruker lane only for a curated subset. T3 index ~20-38 GB corpus-wide. Corpus is 69% .d /
+  31% .raw by run. Loaders must read whole runs (random per-precursor reads cost 1-2 s on Quobyte).
+  It also found that Radiant's Bruker generator compares timsrust frame RT (seconds) with DIA-NN RT
+  (minutes): every training spectrum came from the void volume (memory radiant-generator-rt-units).
 - 2026-11-13: split rule v1 -> v2 (group by submission / PROT / PXD / single-submission folder) ->
   v3 (standards always train), all before any training; v1 rows backed up in
   `scratch/fran_health/run_flags_v1_backup_20261113_132746.tsv`.
