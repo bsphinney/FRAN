@@ -294,18 +294,22 @@ def chain_outcome(jobs, out_dir=None):
     So a chain whose ONLY queued jobs are DependencyNeverSatisfied is dead: cancel the orphans and
     report it failed, which also lets the attempt cap below see it.
     """
+    #
+    # ONE such job is enough. The first live test (2026-11-13 11:40) caught 1 of 10: only the step
+    # right after the failure says DependencyNeverSatisfied; the steps after IT wait on a job that
+    # is itself pending, so squeue says plain "Dependency". A chain is a straight line, so a step
+    # that can never start means nothing after it can either -- cancel everything still queued.
     q = queued(jobs)
     if q:
-        orphans = [jid for jid, state, reason in q
-                   if state == "PENDING" and reason == "DependencyNeverSatisfied"]
-        if len(orphans) < len(q):
+        if not any(state == "PENDING" and reason == "DependencyNeverSatisfied"
+                   for _, state, reason in q):
             return "running", None
         # A pending array prints as "25703003_[0-8%20]"; scancel wants the base id, and every task
         # of it is stranded alike.
-        ids = sorted({jid.split("_[")[0] for jid in orphans})
+        ids = sorted({jid.split("_[")[0] for jid, _, _ in q})
         sh(["bash", "-lc", "scancel %s 2>/dev/null" % " ".join(ids)])
-        return "failed", ("stranded: an upstream step failed and %d dependent job(s) could never "
-                          "start (DependencyNeverSatisfied); cancelled them" % len(orphans))
+        return "failed", ("stranded: an upstream step failed, so %d queued job(s) could never "
+                          "start (DependencyNeverSatisfied); cancelled them" % len(q))
     if not jobs:
         return "failed", "no job ids recorded for this chain"
 

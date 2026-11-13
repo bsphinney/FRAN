@@ -8,7 +8,8 @@ way by mid-morning; the search drip counted their sets as in flight and stopped 
 
 WHAT. For each of this user's jobs held for a launch failure: read from sacct which node(s) it
 failed on, add them to the job's ExcNodeList (keeping any exclusions already there), and release
-it. Idempotent; a job that is not held is never touched. It also prints which nodes failed
+it. Then add every node that failed a launch in the last 24 h to the ExcNodeList of all other
+PENDING jobs, so they never land there. Idempotent; a job that is not held is never touched. It also prints which nodes failed
 launches, so a node that keeps doing it can be reported to hpc-help@ucdavis.edu.
 
 It acts on ALL of this user's held jobs, not only FRAN's: the hold is never something a job wants,
@@ -65,6 +66,49 @@ def current_exclusions(jid):
     return set()
 
 
+def recent_bad_nodes(hours=24):
+    """Nodes this healer has seen fail a launch in the last `hours` (from its own log)."""
+    cutoff = time.strftime("%FT%T", time.localtime(time.time() - hours * 3600))
+    bad = set()
+    try:
+        for line in open(LOG):
+            p = line.rstrip("\n").split("\t")
+            if len(p) == 3 and p[0] != "time" and p[0] >= cutoff:
+                bad.add(p[1])
+    except OSError:
+        pass
+    return bad
+
+
+def steer_pending(user, bad, dry):
+    """Add recently-bad nodes to every PENDING job's ExcNodeList BEFORE it can land there.
+
+    Releasing alone is not enough (2026-11-13): new jobs kept being scheduled onto the broken node
+    every 20 minutes -- 8 more held between two firings -- because Slurm never drained it. A pending
+    job's exclusion list can be changed freely; one that already excludes the node is not touched.
+    """
+    if not bad:
+        return 0
+    r = sh(["squeue", "-u", user, "-h", "-t", "PD", "-o", "%i|%r"])
+    n = 0
+    for line in r.stdout.splitlines():
+        jid, _, reason = line.partition("|")
+        jid = jid.strip()
+        if reason.strip() == HELD_REASON:
+            continue                      # handled by the release pass
+        base = jid.split("_[")[0]         # a pending array prints as 123_[0-8%20]
+        exc = current_exclusions(base)
+        if bad <= exc:
+            continue
+        if not dry:
+            sh(["scontrol", "update", "JobId=%s" % base, "ExcNodeList=%s" % ",".join(sorted(exc | bad))])
+        n += 1
+    if n:
+        print(f"{time.strftime('%F %T')} heal: {'would steer' if dry else 'steered'} {n} pending "
+              f"job(s) off {','.join(sorted(bad))}")
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -72,6 +116,7 @@ def main():
     user = os.environ.get("USER") or sh(["id", "-un"]).stdout.strip()   # cron sets no USER
     held = held_jobs(user)
     if not held:
+        steer_pending(user, recent_bad_nodes(), a.dry_run)
         return 0
     seen = Counter()
     released = 0
@@ -100,6 +145,7 @@ def main():
             print(f"heal: could not append {LOG}: {e}")
     print(f"{time.strftime('%F %T')} heal: {released}/{len(held)} held job(s) released; failing "
           f"node(s): {dict(seen) or 'unknown'}")
+    steer_pending(user, recent_bad_nodes() | set(seen), a.dry_run)
     return 0
 
 
