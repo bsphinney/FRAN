@@ -233,6 +233,35 @@ def searches_in_flight(st):
     return sum(1 for v in st.values() if v.get("status") == "submitted")
 
 
+# A set that fails the same way every time used to be resubmitted on every firing, for ever:
+# `failed` is not in the done-set, and nothing counted. mt3-elastase ran ~80 times (trypsin rules on
+# an elastase digest, 0 IDs at 1% FDR); one Orbitrap set failed batch_submit 105 times in two days
+# and blocked every set batched with it. After MAX_ATTEMPTS tries a set is `parked` -- out of the
+# worklist, with its last reason kept -- and the weekly health scan lists parked sets for a human.
+# To retry one after fixing its cause, set its status back to "failed" and attempts to 0 (under
+# the drip flock).
+MAX_ATTEMPTS = 3
+DONE_STATUSES = ("complete", "submitted", "skipped", "parked")
+
+
+def attempts_of(st, sk):
+    return int((st.get(sk) or {}).get("attempts") or 0)
+
+
+def park_exhausted(st):
+    """Park every set that has used up its attempts and is not running or done. Returns how many."""
+    n = 0
+    for sk, v in st.items():
+        if v.get("status") in ("failed", "generated") and int(v.get("attempts") or 0) >= MAX_ATTEMPTS:
+            v["reason"] = "parked after %d attempts; last: %s" % (v["attempts"], v.get("reason") or
+                                                                "(batch never submitted)")
+            v["status"] = "parked"
+            v["parked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            print(f"  PARKED {(v.get('name') or sk)[:52]} — {v['reason'][:160]}")
+            n += 1
+    return n
+
+
 # Anything that is not a clean finish. CANCELLED is in here deliberately: a chain we cancelled
 # because it had stranded is not a completed search, and must come back round for a retry.
 BAD_STATES = ("FAILED", "TIMEOUT", "OUT_OF_MEMORY", "CANCELLED", "NODE_FAIL", "PREEMPTED",
@@ -255,9 +284,28 @@ def chain_outcome(jobs, out_dir=None):
     search on the next firing; treating it as success is the bug this function exists to fix. So
     when sacct is silent we fall back to the artefact: a search with a report.parquet finished, one
     without it did not.
+
+    THE STRANDED CASE (2026-11-13). "Anything still queued" is not the same as "still running".
+    When a step fails, every later step stays in the queue for ever as PENDING with reason
+    DependencyNeverSatisfied: afterok can never be met, and Hive does not purge such jobs. The old
+    test read those orphans as a live chain, so a dead search held an in-flight slot permanently.
+    On 2026-11-13, 31 orphaned jobs from 10 dead chains (s1b_window probe failures) sat in the
+    queue, and the drip logged "50 searches already in flight -- nothing submitted" all morning.
+    So a chain whose ONLY queued jobs are DependencyNeverSatisfied is dead: cancel the orphans and
+    report it failed, which also lets the attempt cap below see it.
     """
-    if still_running(jobs):
-        return "running", None
+    q = queued(jobs)
+    if q:
+        orphans = [jid for jid, state, reason in q
+                   if state == "PENDING" and reason == "DependencyNeverSatisfied"]
+        if len(orphans) < len(q):
+            return "running", None
+        # A pending array prints as "25703003_[0-8%20]"; scancel wants the base id, and every task
+        # of it is stranded alike.
+        ids = sorted({jid.split("_[")[0] for jid in orphans})
+        sh(["bash", "-lc", "scancel %s 2>/dev/null" % " ".join(ids)])
+        return "failed", ("stranded: an upstream step failed and %d dependent job(s) could never "
+                          "start (DependencyNeverSatisfied); cancelled them" % len(orphans))
     if not jobs:
         return "failed", "no job ids recorded for this chain"
 
@@ -291,10 +339,21 @@ def still_running(jobs):
     The completion test, and it is deliberately not "report.parquet exists": that file exists
     while step 5 is still writing it.
     """
+    return bool(queued(jobs))
+
+
+def queued(jobs):
+    """[(job id, state, reason)] for every job of this chain still in the queue."""
     if not jobs:
-        return False
-    r = sh(["bash", "-lc", "squeue -h -j %s -o %%i 2>/dev/null" % ",".join(str(j) for j in jobs)])
-    return bool((r.stdout or "").strip())
+        return []
+    r = sh(["bash", "-lc", "squeue -h -j %s -o '%%i|%%T|%%r' 2>/dev/null"
+            % ",".join(str(j) for j in jobs)])
+    out = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) == 3:
+            out.append(tuple(parts))
+    return out
 
 
 def fasta_for(taxon):
@@ -416,7 +475,7 @@ def submit_singles(st, rows, probes, a):
     search would cost more than searching them.
     """
     done = {k for k, v in st.items()
-            if v.get("status") in ("complete", "submitted")
+            if v.get("status") in ("complete", "submitted", "parked")
             or (v.get("status") == "skipped" and "single-run" not in (v.get("reason") or ""))}
     todo = [r for r in rows if int(r["n_runs"] or 0) == 1 and r["setkey"] not in done]
     if not todo:
@@ -434,6 +493,7 @@ def submit_singles(st, rows, probes, a):
                                  "n_runs": 1}
             print(f"  SKIP {row['setkey'][:10]} — {why}")
             continue
+        tries = attempts_of(st, row["setkey"]) + 1
         wf = os.path.dirname(entry["cfg"])
         bundle = _bundle_for(entry, row, wf)
         raws = [ln.strip() for ln in open(entry["raw_list"]) if ln.strip()]
@@ -463,7 +523,7 @@ def submit_singles(st, rows, probes, a):
         if r.returncode != 0 or not os.path.exists(submit):
             why = "run_search --sbatch failed rc=%s %s" % (r.returncode, (r.stderr or "")[:140])
             st[row["setkey"]] = {"status": "failed", "reason": why, "cohort": row["cohort"],
-                                 "n_runs": 1}
+                                 "n_runs": 1, "attempts": tries}
             print(f"  FAIL {entry['name'][:44]} — {why}")
             continue
         # Raise the search job's memory before submitting. run_search hardcodes mem="64G" in
@@ -496,7 +556,7 @@ def submit_singles(st, rows, probes, a):
         if sub.returncode != 0 or not jids:
             why = "submit.sh failed rc=%s %s" % (sub.returncode, (sub.stderr or "")[:140])
             st[row["setkey"]] = {"status": "failed", "reason": why, "cohort": row["cohort"],
-                                 "n_runs": 1}
+                                 "n_runs": 1, "attempts": tries}
             print(f"  FAIL {entry['name'][:44]} — {why}")
             continue
         # run_search's submit.sh echoes the ids and writes no jobs.txt; the parallel route writes
@@ -509,7 +569,8 @@ def submit_singles(st, rows, probes, a):
         except OSError as e:
             print(f"    (could not write jobs.txt: {e})")
         st[row["setkey"]] = {"status": "submitted", "name": entry["name"], "jobs": jids,
-                             "cohort": row["cohort"], "n_runs": 1, "route": "single-shot"}
+                             "cohort": row["cohort"], "n_runs": 1, "route": "single-shot",
+                             "attempts": tries}
         n_sub += 1
         print("  %-46s libpred+search %s" % (entry["name"][:46], ",".join(jids)))
     save_state(st)
@@ -592,10 +653,12 @@ def main():
             s["reason"] = why
             print(f"  FAILED {(s.get('name') or sk)[:52]} — {why}")
         changed = True
+    if park_exhausted(st):
+        changed = True
     if changed:
         save_state(st)
 
-    done = {k for k, v in st.items() if v.get("status") in ("complete", "submitted", "skipped")}
+    done = {k for k, v in st.items() if v.get("status") in DONE_STATUSES}
     todo = [r for r in rows if r["setkey"] not in done]
     counts = {}
     for v in st.values():
@@ -720,7 +783,8 @@ def main():
                 continue
             batch.append(entry)
             st[r["setkey"]] = {"status": "generated", "name": entry["name"],
-                               "cohort": r["cohort"], "n_runs": int(r["n_runs"])}
+                               "cohort": r["cohort"], "n_runs": int(r["n_runs"]),
+                               "attempts": attempts_of(st, r["setkey"]) + (0 if a.dry_run else 1)}
         else:
             skipped.append((r["setkey"], why))
             st[r["setkey"]] = {"status": "skipped", "reason": why, "cohort": r["cohort"]}
