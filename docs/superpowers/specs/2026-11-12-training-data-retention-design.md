@@ -192,6 +192,17 @@ runs, scan lane for a curated subset, or index-only against the raws.
   2026-11-12 backfill added, 27 hold only runs already stored, 18 some, 112 none. These are
   distinct searches (other FASTA / library / settings), so their labels are kept; only the split
   must group by run.
+  **Grouping by run is necessary but not enough (2026-11-13, split rule v3).** v1 hashed each run
+  alone, which scattered the replicates of one sample across train and test, so test scores would
+  include peptides and near-identical spectra the model trained on. `delimp_run_flags` now assigns
+  the split per leakage GROUP (`group_key`, `build_run_flags.py`): runs are linked by CoreOmics
+  submission, PROT_ number in the name, PXD accession, and by folder only when the folder holds a
+  single submission (linking through the monthly `raw_data/<instrument>/<month>` dumps chained 23.5%
+  of runs into one group). Standards (HeLa, NIST, blanks, K562, PRTC/iRT) are `std:*` groups and
+  always train, because the same standards recur every month in different folders. Result: 1,079
+  groups, the largest 2.6%; 90.5% train / 3.1% val / 6.4% test runs; test holds no named standards.
+  Residual leakage a model must still handle: unnamed standards, and the same organism's peptides
+  across projects. A peptide-disjoint evaluation is a training-time filter, not a run split.
 - Canonical ProForma per precursor alongside the engine string.
 - Multi-engine agreement per precursor (the `n_engines_confirming` column is a stub — memory
   `fran-engines-confirming-stub`).
@@ -210,6 +221,9 @@ flags answer its requests (raw path, acquisition mode/window scheme, engine per 
 marker, shareable flag).
 
 ## 6. Results log
+- 2026-11-13: split rule v1 -> v2 (group by submission / PROT / PXD / single-submission folder) ->
+  v3 (standards always train), all before any training; v1 rows backed up in
+  `scratch/fran_health/run_flags_v1_backup_20261113_132746.tsv`.
 - 2026-11-12: survey; gap table; XIC dry run OK; SN 775 split; worklist bug fixed; DIA-NN flags found.
 - 2026-11-12: DIA-NN training-report pilot 25684183 — works, see §4.3.
 - 2026-11-12: `--worklist` test, 3 reports incl. the colliding `Ab_geli` (1,553,402 precursors /

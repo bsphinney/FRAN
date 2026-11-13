@@ -13,7 +13,9 @@ idempotent (COALESCE, or only-NULL updates). So a scheduled pass over everything
 post-ingest hook, without editing the refuse-gated corpus_ingest.py.
 
 STEPS (order is load-bearing -- see each script's docstring):
-  1 resolve_raw_hive_paths        hive_path for rows that have none (filesystem walk)
+  1 fill_hive_paths_from_census   hive_path for rows that have none: the search's file_list.txt
+                                  (checked on disk), else the weekly raw census when every copy
+                                  is the same size. Replaced resolve_raw_hive_paths 2026-11-13.
   2 record_raw_metadata --bruker  instrument / acquisition facts from each .d   (needs 1)
   3 record_raw_metadata --thermo  the same from each .raw                       (needs 1)
   4 backfill_thermo_resolution    ms1/ms2 resolution + cycle time for .raw      (needs 1)
@@ -53,16 +55,10 @@ STATUS_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/fill"
 RECENT_DAYS = 10      # engines_confirming: basenames of searches ingested in this window
 
 # (name, argv after the script path, timeout seconds, weekly_only). Script = name before any ":".
-# Where raws live on Hive. resolve_raw_hive_paths' own default is only the first and a to-hive
-# drop box, which is part of why hive_path stopped filling: the drip's runs live under SERVICE/Data.
-RAW_ROOTS = ["/nfs/lssc0/flinders/proteomics/Data", "/quobyte/proteomics-grp/to-hive",
-             "/quobyte/proteomics-grp/SERVICE", "/quobyte/proteomics-grp/Data",
-             "/quobyte/proteomics-grp/MRS", "/quobyte/proteomics-grp/hela_qcs",
-             "/quobyte/proteomics-grp/training_DDA_data",
-             "/quobyte/proteomics-grp/2026_shortcourse_data"]
-
 STEPS = [
-    ("resolve_raw_hive_paths", [x for r in RAW_ROOTS for x in ("--root", r)], 6 * 3600, False),
+    # Not resolve_raw_hive_paths: basename-only, it picked the wrong copy 264 times in the
+    # 2026-11-13 dry run. This uses the search's own file list, then the weekly raw census.
+    ("fill_hive_paths_from_census", ["--apply"], 2 * 3600, False),
     ("record_raw_metadata:bruker", ["--bruker", "--only-missing", "--apply"], 10 * 3600, False),
     ("record_raw_metadata:thermo", ["--thermo", "--only-missing", "--apply"], 10 * 3600, False),
     ("backfill_thermo_resolution", ["--apply"], 6 * 3600, False),
@@ -79,7 +75,7 @@ STEPS = [
 ]
 # The dry-run form of each step: the flag that turns writing off. Scripts that write by default
 # take --dry-run; scripts that are dry by default simply lose --apply.
-DRY_FLAG = {"resolve_raw_hive_paths": ["--dry-run"]}
+DRY_FLAG = {}
 NO_DRY_RUN = {"refresh_search_ptm"}   # writes unconditionally; skipped under --dry-run
 
 

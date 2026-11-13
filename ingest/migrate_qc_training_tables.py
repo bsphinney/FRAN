@@ -81,13 +81,22 @@ DDL = [
         set_at            timestamptz NOT NULL DEFAULT now(),
         updated_at        timestamptz NOT NULL DEFAULT now())""",
     "CREATE INDEX IF NOT EXISTS delimp_run_flags_split ON delimp_run_flags (split)",
+    "ALTER TABLE delimp_run_flags ADD COLUMN IF NOT EXISTS group_key text",
+    "CREATE INDEX IF NOT EXISTS delimp_run_flags_group ON delimp_run_flags (group_key)",
     """COMMENT ON TABLE delimp_run_flags IS
        'Per raw RUN (run_key = lower(raw_basename), extension stripped): a STABLE train/val/test '
-       'split and whether models trained on the run may be published. Split by run, never by '
-       'search or dataset: 30% of runs sit in 2+ lane datasets, so a dataset split leaks. split '
-       'is assigned once and never rewritten (see build_run_flags.py). shareable: public = a '
-       'public (PXD) dataset; internal = the core''s own QC / training runs; client = customer '
-       'data; unknown = no evidence either way (treat as client).'""",
+       'split and whether models trained on the run may be published. The split is assigned per '
+       'GROUP (group_key), not per run, so replicates of one sample never straddle train and test: '
+       'runs are linked by CoreOmics submission, PROT_ number in the name, PXD accession, and by '
+       'folder when the folder holds one submission; standards (HeLa, NIST, blanks, K562, PRTC/iRT) '
+       'form std:* groups that are always train (split_rule v3, build_run_flags.py). A run '
+       'joining an existing group inherits its split; split is never rewritten under a rule. '
+       'shareable: public = a public (PXD) dataset; internal = the core''s own QC / training runs; '
+       'client = customer data; unknown = no evidence either way (treat as client).'""",
+    """COMMENT ON COLUMN delimp_run_flags.group_key IS
+       'Leakage group: runs sharing it are always on the same side of the split. One of '
+       'std:<standard>, sub:<CoreOmics submission id>, prot:<PROT_ number>, pxd:<accession>, dir:<raw folder>, '
+       'run:<run_key> -- the smallest sub/prot/pxd label in the linked component, else its folder.'"""
 ]
 
 
