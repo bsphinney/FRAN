@@ -296,6 +296,22 @@ def _no_store(resp):
     return resp
 
 
+@app.get("/qc", response_class=HTMLResponse)
+def qc_page(request: Request):
+    """FRAN-QC: staff-only health page (scan findings, live DB health, self-healing log). Same
+    login-or-403 behaviour as /mcp-key; data comes from /api/internal/qc (also full-tier only)."""
+    from . import auth
+    if not db.is_full():
+        msg = ('Please <a href="/login?post=/qc">log in with your UC Davis account</a> to view FRAN-QC.'
+               ) if not auth._decode_principal(request) else \
+              "Your account is not authorized for FRAN-QC. Contact the Proteomics Core for access."
+        return _no_store(HTMLResponse(_MCP_KEY_DENIED.format(message=msg).replace(
+            "<title>FRAN — MCP Key</title>", "<title>FRAN-QC</title>"), status_code=403))
+    html = (BASE / "templates" / "qc.html").read_text()
+    return HTMLResponse(html, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                       "Pragma": "no-cache", "Expires": "0"})
+
+
 _MCP_KEY_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FRAN — Your Confidential MCP Key</title>
@@ -580,6 +596,17 @@ def api_species_showcase():
 
 # FULL (core staff) ONLY — the cross-lab directory. Lab users are NOT admitted here (they'd see other
 # labs' people); their own data is served, scoped, by /api/my. Hence is_full(), not is_internal().
+@app.get("/api/internal/qc")
+def api_internal_qc():
+    """FULL only: FRAN-QC scan history + events + live DB health."""
+    if not db.is_full():
+        raise HTTPException(404, "Not found.")
+    from . import qc
+    return ok({"overview": _safe(qc.qc_overview, {"latest": None, "history": [], "events": [],
+                                                  "growth": {}, "note": "unavailable"}),
+               "db_health": _safe(qc.db_health, {"unavailable": {"db_health": "failed"}})})
+
+
 @app.get("/api/internal/collaborators")
 def api_internal_collaborators():
     """FULL only: the collaborator directory from provenance."""
