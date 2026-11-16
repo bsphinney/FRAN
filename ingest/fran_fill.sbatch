@@ -32,6 +32,13 @@ export DELIMP_PG_TOKEN_FILE=/quobyte/proteomics-grp/brett/.pgfarm_token
 ING=/quobyte/proteomics-grp/brett/glendon/fran_ingest
 export PYTHONPATH=$ING
 cd "$ING"
+# Never two fillers at once. On 2026-11-14 the health scan resubmitted one while the nightly run was
+# still going; both updated delimp_precursors in engines_confirming and PG killed one as a deadlock.
+OTHER=$(squeue -u "$(id -un)" -h -n fran_fill -t RUNNING -o %i 2>/dev/null | grep -vx "${SLURM_JOB_ID:-x}" || true)
+if [ -n "$OTHER" ]; then
+    echo "===== fran_fill $(date -Is): another fran_fill is running ($OTHER); exiting without work ====="
+    exit 0
+fi
 echo "===== fran_fill $(date -Is) on $(hostname) args: $* ====="
 /quobyte/proteomics-grp/brett/envs/alphadia2/bin/python -u fran_fill.py "$@"
 echo "===== fran_fill done rc=$? $(date -Is) ====="

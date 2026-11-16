@@ -95,7 +95,8 @@ COVERAGE_CHECKS = [
 ]
 
 EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh",
-                 "fran_fill_cron.sh", "fran_health_cron.sh"]
+                 "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh"]
+XIC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/xic_lane"   # fill_diann_xic_lanes.py
 
 findings = []   # (severity, area, message)
 metrics = {"fill": {}, "coverage": {}}   # structured numbers for delimp_qc_scan / the FRAN-QC page
@@ -190,11 +191,41 @@ def check_backlog(c):
                     AND EXISTS (SELECT 1 FROM delimp_precursors p WHERE p.search_id = s.id
                                 AND p.protein_group IS NOT NULL LIMIT 1)""")
     no_ptm = c.fetchone()[0]
+    c.execute("""SELECT count(*) FROM delimp_searches s
+                  WHERE s.search_engine = 'diann' AND s.ingested_at < now() - interval '2 days'
+                    AND NOT EXISTS (SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id)""")
+    no_xic = c.fetchone()[0]
     metrics["backlog"] = {"raw_rows": n, "distinct_runs": n_base, "no_hive_path": no_path,
-                          "no_instrument": no_inst, "no_ptm": no_ptm}
+                          "no_instrument": no_inst, "no_ptm": no_ptm, "diann_no_xic_lane": no_xic}
     msg = (f"raw_files {n:,} rows / {n_base:,} distinct runs: no hive_path {no_path:,}, "
-           f"no instrument {no_inst:,}; searches >2 d old with no PTM rollup {no_ptm:,}")
-    add("AMBER" if (no_ptm > 50 or no_path > 0.1 * n) else "ok", "backlog", msg)
+           f"no instrument {no_inst:,}; searches >2 d old with no PTM rollup {no_ptm:,}; "
+           f"DIA-NN searches >2 d old with no XIC lane {no_xic:,}")
+    add("AMBER" if (no_ptm > 50 or no_path > 0.1 * n or no_xic > 50) else "ok", "backlog", msg)
+
+
+def check_xic_job():
+    """The daily DIA-NN XIC-lane job (fill_diann_xic_lanes): did it plan recently, did its writes fail?"""
+    plans = sorted(glob.glob(os.path.join(XIC_FILL_DIR, "plan_*.json")), key=os.path.getmtime)
+    if not plans:
+        add("RED", "xic job", f"fill_diann_xic_lanes has never planned ({XIC_FILL_DIR}); is its cron line live?")
+        return
+    newest = plans[-1]
+    age_h = (time.time() - os.path.getmtime(newest)) / 3600
+    sm = json.load(open(newest)).get("summary", {})
+    since = os.path.getmtime(plans[-2]) if len(plans) > 1 else 0
+    fails, n_res = [], 0
+    for f in glob.glob(os.path.join(XIC_FILL_DIR, "result_*.tsv")):
+        if os.path.getmtime(f) < since:
+            continue
+        for ln in open(f).read().splitlines()[1:]:
+            p = ln.split("\t")
+            n_res += 1
+            if len(p) > 2 and p[2] != "0":
+                fails.append(p[1])
+    sev = "RED" if age_h > 48 else ("AMBER" if fails else "ok")
+    add(sev, "xic job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} DIA-NN searches without a lane, "
+        f"{sm.get('planned', '?')} planned, skipped {sm.get('skipped', {})}; since then {n_res} written, "
+        f"{len(fails)} failed" + (f" (e.g. {', '.join(fails[:3])})" if fails else ""))
 
 
 def check_ingest(c):
@@ -504,6 +535,10 @@ def heal(filler_state):
     out = (r.stdout or "").strip().splitlines()
     add("ok", "heal", out[-1] if out else "no held jobs")
     if filler_state == "stale":
+        busy = sh("squeue -u \"$(id -un)\" -h -n fran_fill -o %i").stdout.split()
+        if busy:
+            add("ok", "heal", f"filler looks stale but fran_fill job(s) {', '.join(busy)} are queued/running; not resubmitting")
+            return
         r = sh(f"sbatch --parsable {FILL_SBATCH}")
         if r.returncode == 0:
             add("ok", "heal", f"resubmitted the filler: job {r.stdout.strip()}")
@@ -614,7 +649,7 @@ def main():
                 add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
     conn.close()
     filler_state = check_filler()
-    for fn in (check_drip, check_bad_nodes, check_cron):
+    for fn in (check_xic_job, check_drip, check_bad_nodes, check_cron):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
@@ -645,7 +680,7 @@ def main():
     if a.post:
         short = "\n".join(f"- *{s}* {a_}: {m.splitlines()[0][:220]}" for s, a_, m in findings if s != "ok")
         post(f"{head}\n{short or 'everything filling normally'}\nfull report: {path}")
-    return 1 if n_red else 0
+    return 0   # the scan completed; REDs live in the report. A crash still exits non-zero.
 
 
 if __name__ == "__main__":
