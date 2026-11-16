@@ -52,7 +52,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATUS_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/fill"
-RECENT_DAYS = 10      # engines_confirming: basenames of searches ingested in this window
+RECENT_DAYS = 10      # engines_confirming: first-run window, before a high-water mark exists
+ENGINES_BUDGET_S = 4 * 3600   # engines_confirming stops here; the rest waits for the next night
 
 # (name, argv after the script path, timeout seconds, weekly_only). Script = name before any ":".
 STEPS = [
@@ -67,7 +68,7 @@ STEPS = [
     ("backfill_organism_taxon", ["--apply"], 1800, False),
     ("backfill_organism_taxid", ["--apply"], 1800, False),
     ("engines_confirming", None, 3600, False),            # in-process, see engines_confirming()
-    ("refresh_search_ptm", ["--batch", "50"], 4 * 3600, False),
+    ("refresh_search_ptm", ["--batch", "10"], 4 * 3600, False),   # 50 timed out on 1M+-precursor searches
     ("build_run_flags", ["--apply"], 3600, False),         # split + shareable per raw run
     ("raw_md5", ["--apply", "--max-bytes", "2e12"], 20 * 3600, False),  # newly located raws, <=2 TB/night
     ("predict_tissue", ["--apply"], 2 * 3600, True),
@@ -99,28 +100,71 @@ def run_script(name, args, timeout, dry):
 
 
 def engines_confirming(dry):
-    """refresh_for() over the raw basenames of recently ingested searches."""
+    """refresh_for() over the raw basenames of searches ingested since the last run (high-water mark).
+
+    It used to redo every basename from the last 10 days each night, in-process and so with no step
+    timeout. Once the DIA-NN corpus run made nearly every acquisition multi-engine that meant ~10x
+    repeated reads of 434M-row delimp_precursors: 13,523 s on 2026-11-14 (then a deadlock against a
+    second filler), and >23 h on 2026-11-14/15 (killed at the job time limit). Now: whole searches
+    in ingest order after the saved mark, the mark advanced after each search, stopping at a time
+    budget; what is left is reported and picked up the next night. A deadlock is retried once.
+    """
     sys.path.insert(0, HERE)
     import backfill_engines_confirming as B
     from coreomics_import import _conn
+    import psycopg2
     t0 = time.time()
+    mark_f = os.path.join(STATUS_DIR, "engines_confirming.watermark")
+    try:
+        mark = open(mark_f).read().strip()
+    except OSError:
+        mark = None
     conn = _conn()
     try:
         with conn.cursor() as c:
-            c.execute("""SELECT DISTINCT r.raw_basename
+            c.execute("""SELECT s.ingested_at, array_agg(DISTINCT r.raw_basename)
                            FROM delimp_searches s
                            JOIN search_raw_files sr ON sr.search_id = s.id
                            JOIN raw_files r ON r.raw_path = sr.raw_path
-                          WHERE s.ingested_at > now() - %s::interval
-                            AND r.raw_basename IS NOT NULL""", ("%d days" % RECENT_DAYS,))
-            names = [x[0] for x in c.fetchall()]
+                          WHERE s.ingested_at > COALESCE(%s::timestamptz, now() - %s::interval)
+                            AND r.raw_basename IS NOT NULL
+                          GROUP BY s.id, s.ingested_at ORDER BY s.ingested_at""",
+                      (mark, "%d days" % RECENT_DAYS))
+            todo = c.fetchall()
         if dry:
             return {"rc": 0, "seconds": round(time.time() - t0),
-                    "tail": "dry run: would refresh %d basenames" % len(names)}
-        res = B.refresh_for(conn, names)
-        conn.commit()
-        return {"rc": 0, "seconds": round(time.time() - t0),
-                "tail": "refreshed %d basenames: %s" % (len(names), str(res)[:300])}
+                    "tail": "dry run: %d searches after mark %s" % (len(todo), mark)}
+        done_s = changed = 0
+        seen = set()
+        for ts, names in todo:
+            if time.time() - t0 > ENGINES_BUDGET_S:
+                break
+            # no de-dup across searches: a later search from another engine changes the count again
+            for attempt in (1, 2):
+                try:
+                    changed += B.refresh_for(conn, names, verbose=False)
+                    break
+                except psycopg2.errors.DeadlockDetected:
+                    conn.rollback()
+                    if attempt == 2:
+                        raise
+                    time.sleep(30)
+            seen.update(names)
+            done_s += 1
+            with open(mark_f + ".tmp", "w") as fh:
+                fh.write(ts.isoformat())
+            os.replace(mark_f + ".tmp", mark_f)
+        left = len(todo) - done_s
+        # left / lag are machine-readable so the health scan can flag a backlog that grows while
+        # every run "succeeds" (fran_health_scan.check_filler).
+        try:
+            cur_mark = open(mark_f).read().strip()
+        except OSError:
+            cur_mark = None
+        return {"rc": 0, "seconds": round(time.time() - t0), "left": left, "mark": cur_mark,
+                "tail": "%d of %d searches after mark %s refreshed (%d basenames, %d rows changed)%s"
+                        % (done_s, len(todo), mark, len(seen), changed,
+                           "; %d left for the next run (budget %d s)" % (left, ENGINES_BUDGET_S) if left else "")}
     except Exception as e:  # noqa: BLE001 - recorded, never stops the remaining steps
         conn.rollback()
         return {"rc": 1, "seconds": round(time.time() - t0), "err_tail": repr(e)[:600]}

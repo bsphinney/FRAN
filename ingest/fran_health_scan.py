@@ -463,6 +463,20 @@ def check_filler():
         add("AMBER", "filler", f"unreadable status {newest}: {e}")
         return "stale" if age_h > 48 else "ok"
     bad = [k for k, v in st.get("steps", {}).items() if v.get("rc") not in (0, None)]
+    # A step that stops at a time budget and resumes next night (engines_confirming) reports rc 0
+    # with work left over; flag it, or a backlog that outgrows the budget stays green forever.
+    for k, v in st.get("steps", {}).items():
+        if v.get("left"):
+            lag_d = None
+            if v.get("mark"):
+                try:
+                    from datetime import datetime, timezone
+                    lag_d = (datetime.now(timezone.utc) - datetime.fromisoformat(v["mark"])).total_seconds() / 86400
+                except ValueError:
+                    pass
+            sev = "RED" if lag_d is not None and lag_d > 3 else "AMBER"
+            add(sev, "filler", f"{k}: {v['left']} search(es) left after its time budget"
+                + (f"; caught up to {lag_d:.1f} d ago" if lag_d is not None else ""))
     if age_h > 48:
         add("RED", "filler", f"last fill run {age_h:.0f} h ago ({os.path.basename(newest)})")
         return "stale"

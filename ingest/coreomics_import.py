@@ -74,7 +74,16 @@ def _pg_token() -> str:
     req = urllib.request.Request(
         "https://pgfarm.library.ucdavis.edu/auth/service-account/login",
         data=body, headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=30).read())["access_token"]
+    # Retry a slow or unreachable auth endpoint: on 2026-11-15 one 30-s read timeout here killed
+    # that night's fran_fill at its first step and the morning health scan, a whole day lost.
+    for attempt, wait in enumerate((20, 60, 0), 1):
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=30).read())["access_token"]
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if not wait:
+                raise
+            print(f"  PG Farm token exchange failed ({e!r}); retry {attempt} in {wait}s", file=sys.stderr, flush=True)
+            time.sleep(wait)
 
 
 def _conn():
