@@ -2910,19 +2910,36 @@ def protein_coverage_peptides(protein_group: str, limit: int = 4000,
     if hit is not None:
         return hit
     result = _protein_coverage_peptides(pg, limit, search_id)
-    if result and not result.get("scope_unavailable") and not result.get("sites_unavailable"):
+    if (result and not result.get("scope_unavailable") and not result.get("sites_unavailable")
+            and not result.get("corpus_unavailable")):
         CACHE.put(key, result)
-    return result or {"gene": None, "peptides": [], "sites": []}
+    # A FAILED scan (result is None) is distinguishable from a genuinely empty one: scan_failed.
+    # Without it the route rendered a timeout as "0 peptides, 0% coverage".
+    return result or {"gene": None, "peptides": [], "sites": [], "scan_failed": True}
 
 
 def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None) -> dict[str, Any] | None:
-    try:  # live table under ingestion load -> tight timeout, degrade to no gene rather than 503
-        gene = query(
-            "SELECT MAX(gene) AS gene FROM delimp_proteins WHERE protein_group = %s",
-            (pg,), tables=["delimp_proteins"], fetch="val", timeout_ms=6000,
-        )
-    except Exception:  # noqa: BLE001
-        gene = None
+    gene = None
+    if search_id:
+        # SEARCH-SCOPED FIRST (0.2 s on the heaviest histone). The unscoped lookup below is a
+        # corpus-wide scan of delimp_proteins by protein_group that measured 8.2 s for P62805
+        # (H4C1) -- over its own 6 s timeout, so the gene silently came back None for exactly the
+        # abundant proteins a search page's heatmap ranks first.
+        try:
+            gene = query(
+                "SELECT MAX(gene) AS gene FROM delimp_proteins WHERE protein_group = %s AND search_id = %s",
+                (pg, search_id), tables=["delimp_proteins"], fetch="val", timeout_ms=6000,
+            )
+        except Exception:  # noqa: BLE001
+            gene = None
+    if not gene:
+        try:  # live table under ingestion load -> tight timeout, degrade to no gene rather than 503
+            gene = query(
+                "SELECT MAX(gene) AS gene FROM delimp_proteins WHERE protein_group = %s",
+                (pg,), tables=["delimp_proteins"], fetch="val", timeout_ms=6000,
+            )
+        except Exception:  # noqa: BLE001
+            gene = None
     # EXACT: delimp_precursors.protein_group, indexed by idx_prec_protein_group (2026-07-30).
     #
     # This replaced a co-observation HEURISTIC that was biased by abundance. That version took 8
@@ -2969,10 +2986,38 @@ def _protein_coverage_peptides(pg: str, limit: int, search_id: str | None = None
     # not cached. The exact filter changes that: a protein group with no precursors assigned to it is
     # now a correct, cacheable answer, and treating it as failure would re-run the query on every
     # page load forever. So gate on whether the query SUCCEEDED, not on whether it returned rows.
+    corpus_unavailable = False
+    if not ok and search_id:
+        # THE CORPUS SCAN TIMED OUT; THE SEARCH-SCOPED ONE DOES NOT. Measured 2026-11-16 on P62805
+        # (histone H4, 248,655 corpus precursors): the corpus-wide GROUP BY needs ~26 s of heap
+        # reads against the 25 s cap above, while the same predicate plus search_id takes 0.3 s.
+        # The old code returned None here and the route rendered "0 peptides, 0%" for the #1 most
+        # abundant protein of the very search being viewed -- a failure presented as a measurement.
+        # Fall back to this search's own peptides (every one is "here"), and flag the result so the
+        # UI says the corpus comparison is missing and the wrapper does not cache it.
+        try:
+            here_only = query(
+                """SELECT stripped_seq,
+                          COUNT(*)                 AS here_n_precursors,
+                          COUNT(DISTINCT raw_path) AS here_n_runs,
+                          COUNT(DISTINCT charge)   AS here_n_charges,
+                          MIN(q_value)             AS here_best_q_value
+                     FROM delimp_precursors
+                    WHERE protein_group=%s AND search_id=%s
+                    GROUP BY stripped_seq
+                    ORDER BY here_n_precursors DESC""",
+                (pg, search_id), tables=["delimp_precursors"], timeout_ms=15000)
+            peps = [dict(r, here=True) for r in here_only]
+            ok = True
+            corpus_unavailable = True
+        except Exception:  # noqa: BLE001
+            pass
     if not ok:
         return None            # falsy -> not cached by get_or_set -> retried next request
     result = {"gene": gene, "peptides": peps}
-    if search_id and peps:
+    if corpus_unavailable:
+        result["corpus_unavailable"] = True
+    if search_id and peps and not corpus_unavailable:
         try:
             # One extra indexed lookup, not a re-derivation: idx_prec_protein_group covers this too.
             # GROUP BY (not SELECT DISTINCT) so the UI can show a real this-experiment vs corpus
@@ -4759,6 +4804,24 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
     never reach this function."""
     order = _MATRIX_MODES[mode]
 
+    # WHICH QUANTITY. `intensity` is the SUM of a protein's precursor intensities in a run
+    # (corpus_ingest.py), i.e. it scales with how many precursors the run identified. On
+    # search-5ea3d3 three runs of the same sample hold 63,896 / 34,981 / 7,944 precursors, and the
+    # summed intensity falls 61e9 / 13e9 / 1.5e9 -- a 40x loading/depth gradient that z-scoring per
+    # gene then paints as three flat columns (sample 1 > 2 > 3 for EVERY row). DIA-NN's PG.MaxLFQ
+    # (delimp_proteins.pg_maxlfq, populated since 2026-09-23) is the protein-level quantity made
+    # for between-run comparison: same search sums 7.3e9 / 6.3e9 / 4.4e9. So use it whenever the
+    # search carries it for at least half the rows that have an intensity, else fall back to
+    # `intensity` (Spectronaut / pre-2026-09 DIA-NN). `normalized_intensity` stays unused: it is
+    # NULL for most rows and, measured here, is not flatter (32e9 / 18.7e9 / 5.2e9). The column name
+    # below comes from this fixed pair, never from the request.
+    _cov = query(
+        """SELECT count(*) FILTER (WHERE pg_maxlfq > 0) AS n_lfq,
+                  count(*) FILTER (WHERE intensity > 0) AS n_int
+             FROM delimp_proteins WHERE search_id = %(sid)s""",
+        {"sid": search_id}, tables=["delimp_proteins"], fetch="one", timeout_ms=8000) or {}
+    qcol = "pg_maxlfq" if (_cov.get("n_lfq") or 0) >= 0.5 * (_cov.get("n_int") or 0) and (_cov.get("n_lfq") or 0) > 0 else "intensity"
+
     # n_samples_total used to come from its own `count(DISTINCT raw_path)` (2.69s on the
     # largest search). Fix round 2: this SELECT DISTINCT below yields the identical number
     # (222) for the identical predicate at 0.23s — a twelve-fold difference for the same
@@ -4862,7 +4925,7 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
         f"""
         WITH per_sample AS (
           SELECT gene, raw_path,
-                 avg(intensity)             AS v,
+                 avg({qcol})                AS v,
                  max(protein_group)         AS protein_group,
                  bool_or(is_contaminant)    AS is_contaminant,
                  -- max(), NEVER sum(). n_unique_peptides is PER RUN, and summing it across runs
@@ -4871,7 +4934,7 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
                  -- anywhere it surfaces. Free: the same scan already runs.
                  max(n_unique_peptides)     AS max_pep
             FROM delimp_proteins
-           WHERE search_id = %(sid)s AND intensity > 0 AND NULLIF(gene,'') IS NOT NULL
+           WHERE search_id = %(sid)s AND {qcol} > 0 AND NULLIF(gene,'') IS NOT NULL
            GROUP BY gene, raw_path),
         agg AS (
           SELECT gene,
@@ -4957,9 +5020,9 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
 
     genes = [r["gene"] for r in rows]
     cells = query(
-        """SELECT gene, raw_path, avg(intensity) AS v
+        f"""SELECT gene, raw_path, avg({qcol}) AS v
              FROM delimp_proteins
-            WHERE search_id=%(sid)s AND gene = ANY(%(genes)s) AND intensity > 0
+            WHERE search_id=%(sid)s AND gene = ANY(%(genes)s) AND {qcol} > 0
             GROUP BY gene, raw_path""",
         {"sid": search_id, "genes": genes}, tables=["delimp_proteins"]) if genes else []
 
@@ -5018,6 +5081,7 @@ def _search_protein_matrix(search_id: str, mode: str, limit: int,
               "filters": applied,
               "n_rankable": rows[0]["n_rankable"] if rows else 0,
               "n_samples_total": n_samples_total, "n_samples_dated": n_samples_dated,
+              "quantity": "maxlfq" if qcol == "pg_maxlfq" else "intensity",
               "floor_pct": int(_MATRIX_FLOOR * 100), "reach_computed_at": as_of}
 
     if rows:
