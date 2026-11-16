@@ -95,7 +95,8 @@ COVERAGE_CHECKS = [
 ]
 
 EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh",
-                 "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh"]
+                 "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh",
+                 "upload_lanes_to_blob.sbatch"]
 XIC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/xic_lane"   # fill_diann_xic_lanes.py
 
 findings = []   # (severity, area, message)
@@ -226,6 +227,38 @@ def check_xic_job():
     add(sev, "xic job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} DIA-NN searches without a lane, "
         f"{sm.get('planned', '?')} planned, skipped {sm.get('skipped', {})}; since then {n_res} written, "
         f"{len(fails)} failed" + (f" (e.g. {', '.join(fails[:3])})" if fails else ""))
+
+
+def check_blob_upload():
+    """Do the lanes the website reads actually reach Azure? Hive's upload SAS expired 2026-07-23 and
+    spectrum uploads stopped for four months with nothing saying so. Reads the newest
+    fran_blob_upload log's 'UPLOAD <container> rc=' lines, and each SAS file's expiry if it has one."""
+    import re
+    from urllib.parse import unquote
+    from datetime import datetime, timezone
+    for cont in ("xic", "spectra"):
+        f = f"/quobyte/proteomics-grp/brett/.fran_blob_sas_{cont}"
+        try:
+            se = next((kv[3:] for kv in open(f).read().strip().split("&") if kv.startswith("se=")), None)
+        except OSError:
+            add("RED", "blob upload", f"no upload credential for container '{cont}' ({f}); lanes can't reach the site")
+            continue
+        if se:   # a policy-bound SAS carries no se=; its expiry lives on the container policy
+            days = (datetime.fromisoformat(unquote(se).replace("Z", "+00:00")) - datetime.now(timezone.utc)).days
+            if days < 30:
+                add("RED" if days < 7 else "AMBER", "blob upload", f"SAS for '{cont}' expires in {days} d")
+    logs = sorted(glob.glob("/quobyte/proteomics-grp/brett/scratch/fran_health/logs/fran_blob_upload_*.out"),
+                  key=os.path.getmtime)
+    if not logs:
+        add("RED", "blob upload", "fran_blob_upload has never run; new XIC/spectrum lanes are not on the site")
+        return
+    age_h = (time.time() - os.path.getmtime(logs[-1])) / 3600
+    res = re.findall(r"^UPLOAD (\S+) rc=(\d+)", open(logs[-1]).read(), re.M)
+    bad = [f"{c} rc={r}" for c, r in res if r != "0"]
+    running = age_h < 48 and not re.search(r"^=== done", open(logs[-1]).read(), re.M)
+    sev = "ok" if running else ("RED" if bad or age_h > 72 or not res else "ok")
+    add(sev, "blob upload", f"last upload log {age_h:.0f} h old"
+        + (" (still running)" if running else ": " + (", ".join(f"{c} rc={r}" for c, r in res) or "no result lines")))
 
 
 def check_ingest(c):
@@ -663,7 +696,7 @@ def main():
                 add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
     conn.close()
     filler_state = check_filler()
-    for fn in (check_xic_job, check_drip, check_bad_nodes, check_cron):
+    for fn in (check_xic_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
