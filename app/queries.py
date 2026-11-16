@@ -887,8 +887,8 @@ def _search_peptides_exact(seqs: list[str], lim: int, off: int) -> dict[str, Any
 
 
 # --- substring peptide search over the distinct-peptide trigram relation -----------------------
-# delimp_peptide_index(stripped_seq PK, seq_il = replace(stripped_seq,'I','L'), n_precursors) with a
-# pg_trgm GIN on seq_il. pg_trgm only indexes patterns with >= 3 characters; shorter ones would
+# delimp_peptide_index(stripped_seq PK, seq_il = replace(stripped_seq,'I','L'), + the list-row
+# aggregates) with a pg_trgm GIN on seq_il. pg_trgm only indexes patterns with >= 3 characters; shorter ones would
 # be a scan of ~4M rows returning an unreadable (~400k-peptide) list, so they are refused up front.
 _PEPTIDE_INDEX = "delimp_peptide_index"
 _SUBSTR_MIN_LEN = 3
@@ -934,21 +934,19 @@ def _search_peptides_trgm(seq: str, lim: int, off: int) -> dict[str, Any]:
                       tables=[_PEPTIDE_INDEX], fetch="val", timeout_ms=tmo) or 0
         if not total:
             return {"rows": [], "total": 0, "limit": lim, "offset": off}
-        page = query(
-            f"SELECT stripped_seq FROM {_PEPTIDE_INDEX} WHERE seq_il LIKE %s "
-            "ORDER BY n_precursors DESC, stripped_seq LIMIT %s OFFSET %s",
-            (pat, lim, off), tables=[_PEPTIDE_INDEX], timeout_ms=tmo)
-        seqs = [r["stripped_seq"] for r in page]
+        # The list columns are precomputed IN the index relation: joining back to delimp_precursors
+        # to aggregate them was measured at >120 s for the 10 most-observed peptides (millions of
+        # precursors each) and 16 s even for a cold 36-peptide NEEDS page. Never touch the big table.
         rows = query(
             f"""
-            SELECT {_PEPTIDE_SEARCH_COLS}
-            FROM delimp_precursors
-            WHERE stripped_seq = ANY(%s)
-            GROUP BY stripped_seq
+            SELECT stripped_seq, n_precursors, n_modforms, n_charges, n_runs, n_searches,
+                   best_q_value, has_im, 1 AS max_engines
+            FROM {_PEPTIDE_INDEX}
+            WHERE seq_il LIKE %s
             ORDER BY n_precursors DESC, stripped_seq
+            LIMIT %s OFFSET %s
             """,
-            (seqs,), tables=["delimp_precursors"], timeout_ms=tmo * 4,
-        ) if seqs else []
+            (pat, lim, off), tables=[_PEPTIDE_INDEX], timeout_ms=tmo)
     except Exception:  # noqa: BLE001 -- bounded; never a bare 503
         return {"rows": [], "total": 0, "limit": lim, "offset": off, "degraded": True,
                 "hint": "The peptide search timed out, so this is NOT a statement that no peptide "

@@ -23,8 +23,8 @@ def fake_query(sql, params=None, *, tables, fetch="all", timeout_ms=None, work_m
     if "FROM delimp_peptide_index" in sql and "COUNT(*)" in sql:
         return 2
     if "FROM delimp_peptide_index" in sql:
-        return [{"stripped_seq": "AANEEDSK"}, {"stripped_seq": "LNEEDSR"}]
-    return [{"stripped_seq": "AANEEDSK", "n_precursors": 9}, {"stripped_seq": "LNEEDSR", "n_precursors": 3}]
+        return [{"stripped_seq": "AANEEDSK", "n_precursors": 9}, {"stripped_seq": "LNEEDSR", "n_precursors": 3}]
+    raise AssertionError("substring search must not touch delimp_precursors: " + sql[:60])
 
 queries.query = fake_query
 queries._peptide_index_state.update(ok=True, checked=0.0)
