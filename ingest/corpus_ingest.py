@@ -148,6 +148,51 @@ def _conn():
         password=_token(), sslmode="require", connect_timeout=30)
 
 
+def write_search_fastas(cur, search_id: str, found: dict | None) -> int:
+    """Record every database engine_fasta.detect_all() found for one search in
+    delimp_search_fastas (ingest/migrations/2026-10-21_search_fastas.sql), contaminant lists
+    included. Returns the number of rows written.
+
+    The same clobber rule as the fasta_* columns: a re-ingest that finds NOTHING keeps what is
+    stored, and a poorer source never replaces a .sne's -- a setup file names the databases, the
+    .sne also counts them, and the backfill fills these rows from .sne files the ingest host
+    usually cannot see. Never fails the ingest: a savepoint contains any error, and the table
+    not existing yet is a no-op."""
+    dbs = (found or {}).get("databases") or []
+    if not dbs:
+        return 0
+    try:
+        cur.execute("SAVEPOINT search_fastas")
+        cur.execute("SELECT to_regclass('public.delimp_search_fastas')")
+        if cur.fetchone()[0] is None:
+            cur.execute("RELEASE SAVEPOINT search_fastas")
+            return 0
+        cur.execute("SELECT source FROM delimp_search_fastas WHERE search_id=%s LIMIT 1", (search_id,))
+        have = cur.fetchone()
+        if have and have[0] == "sne" and found.get("source") != "sne":
+            cur.execute("RELEASE SAVEPOINT search_fastas")
+            return 0
+        cur.execute("DELETE FROM delimp_search_fastas WHERE search_id=%s", (search_id,))
+        for i, d in enumerate(dbs):
+            cur.execute("""INSERT INTO delimp_search_fastas (search_id, ordinal, file_name,
+                           is_contaminant, n_entries, n_genes, n_gene_entries, content_sha256,
+                           file_path, file_md5, source, source_path)
+                           VALUES (%(sid)s,%(i)s,%(name)s,%(contam)s,%(n)s,%(genes)s,%(gene_entries)s,
+                                   %(sha)s,%(path)s,%(md5)s,%(source)s,%(source_path)s)""",
+                        {"sid": search_id, "i": i, "name": d.get("file_name"),
+                         "contam": bool(d.get("is_contaminant")), "n": d.get("n_entries"),
+                         "genes": d.get("n_genes"), "gene_entries": d.get("n_gene_entries"),
+                         "sha": d.get("content_sha256"), "path": d.get("file_path"),
+                         "md5": d.get("file_md5"), "source": found.get("source"),
+                         "source_path": found.get("source_path")})
+        cur.execute("RELEASE SAVEPOINT search_fastas")
+        return len(dbs)
+    except Exception as e:  # noqa: BLE001 - provenance is never worth failing an ingest over
+        cur.execute("ROLLBACK TO SAVEPOINT search_fastas")
+        print(f"  [skip] delimp_search_fastas not written ({type(e).__name__}: {e})")
+        return 0
+
+
 def sanitize(name: str) -> str:
     base = (name or "").replace("\\", "/").split("/")[-1]
     return f"run-{hashlib.sha1((name or '').encode()).hexdigest()[:6]}"
@@ -787,11 +832,15 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # never fatal. Without it the corpus cannot tell a user whether two searches are even
         # comparable -- entries-per-gene is what decides whether a protein-count gap is a real
         # depth difference or an artefact of database redundancy.
+        # EVERY database, not just one: a .sne output_dir is read for its embedded databases, and
+        # the summary below names the largest real one rather than whichever was listed first
+        # (that recorded cRAP lists and iRT.fasta as "the" database for 59 searches).
         try:
-            from engine_fasta import detect as _detect_fasta
-            fa = _detect_fasta(engine, report, output_dir) or {}
+            from engine_fasta import detect_all as _detect_all, summarize as _summarize_fasta
+            fa_all = _detect_all(engine, report, output_dir) or {}
+            fa = _summarize_fasta(fa_all.get("databases") or []) or {}
         except Exception:  # noqa: BLE001 - never fail an ingest over provenance
-            fa = {}
+            fa_all, fa = {}, {}
         # Only carry the stored values forward when this run did not identify a DIFFERENT
         # database. md5 and entry count describe one specific file; a freshly resolved path
         # with the previous row's md5 beside it is worse than a NULL, because it reads as
@@ -824,6 +873,13 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                          len(runs), len(recs), n_protein_groups, SCHEMA_VERSION,
                          fa.get("fasta_path"), fa.get("fasta_md5"), fa.get("fasta_n_proteins"),
                          fa.get("contaminant_lib")))
+        n_fa_rows = write_search_fastas(cur, search_id, fa_all)
+        if n_fa_rows:
+            print(f"  fasta: {n_fa_rows} database(s) recorded from {fa_all.get('source')}: "
+                  + "; ".join(f"{d.get('file_name') or '?'}"
+                              + (f" n={d['n_entries']}" if d.get("n_entries") else "")
+                              + (" [contaminants]" if d.get("is_contaminant") else "")
+                              for d in fa_all.get("databases") or []))
         # per-run max RT (≈ gradient length) for gradient_minutes
         run_max_rt = {}
         for x in recs:
