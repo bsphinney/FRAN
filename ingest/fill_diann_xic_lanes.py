@@ -96,10 +96,21 @@ def run(a):
         out.write("search_id\tsearch_name\trc\tseconds\ttail\n")
         for j in jobs:
             t0 = time.time()
-            r = subprocess.run([sys.executable, "-u", WRITER, "--dir", j["dir"], "--xic-dir", j["xic"],
-                                "--report", j["report"], "--out", j["out"], "--search-id", j["sid"],
-                                "--search-name", j["name"], "--apply"], capture_output=True, text=True)
-            tail = " / ".join((r.stdout + r.stderr).strip().splitlines()[-3:])[:600]
+            cmd = [sys.executable, "-u", WRITER, "--dir", j["dir"], "--xic-dir", j["xic"],
+                   "--report", j["report"], "--out", j["out"], "--search-id", j["sid"],
+                   "--search-name", j["name"], "--apply"]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            txt = r.stdout + r.stderr
+            # The writer refuses when the XIC dir holds a run the report doesn't (a run with no IDs,
+            # e.g. a failed injection). If EVERY report run has its XIC file, restricting to the
+            # report's runs is exact, not a guess: retry with --runs. Any other mismatch stays a failure.
+            if (r.returncode != 0 and "XIC files with no report run" in txt
+                    and "report/--runs runs with no XIC file (0)" in txt):
+                import pyarrow.parquet as pq
+                runs = sorted(set(pq.read_table(j["report"], columns=["Run"]).column("Run").to_pylist()))
+                r = subprocess.run(cmd + ["--runs", ",".join(runs)], capture_output=True, text=True)
+                txt = "[retried with the report's %d runs] " % len(runs) + r.stdout + r.stderr
+            tail = " / ".join(txt.strip().splitlines()[-3:])[:600]
             out.write(f"{j['sid']}\t{j['name']}\t{r.returncode}\t{time.time()-t0:.0f}\t{tail}\n")
             out.flush()
             print(f"--- {j['name']} ({j['n_xic']} xic) rc={r.returncode} {time.time()-t0:.0f}s\n    {tail}", flush=True)
