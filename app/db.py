@@ -124,7 +124,10 @@ _INTERNAL_TABLES = frozenset({"delimp_search_provenance",
                               "coreomics_submissions_cache", "coreomics_samples_cache",
                               "delimp_submission_service_dir", "delimp_service_dir_inventory",
                               "delimp_pi_profile", "delimp_lab_institute_override",
-                              "delimp_ingest_manifest"})
+                              "delimp_ingest_manifest",
+                              # FRAN-QC health scan + self-healing event log (written by the Hive scan;
+                              # paths/job ids/hostnames) — staff-only /qc page, so internal-only.
+                              "delimp_qc_scan", "delimp_qc_event"})
 
 # Per-request ACCESS SCOPE — the tiered portal. The auth middleware sets this once per request from
 # the SSO principal. Tiers:

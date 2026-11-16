@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FRAN-QC</title>
+  <meta name="robots" content="noindex" />
+<script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: {
+        fontFamily: { sans: ['Inter','ui-sans-serif','system-ui','sans-serif'], mono: ['"JetBrains Mono"','ui-monospace','monospace'] },
+        colors: {
+          // UC Davis brand: Aggie Blue #022851 (primary) + Aggie Gold #FFBF00 (accent)
+          ink: { 950:'#01122b', 900:'#022851', 850:'#053063', 800:'#0a3a70', 700:'#14497f', 600:'#1f5a93' },
+          accent: { DEFAULT:'#FFBF00', 400:'#FFCF40', 500:'#FFBF00', 600:'#D99E00' },
+          teal: { DEFAULT:'#00B5E2' },   /* UCD secondary "Tahoe" */
+          plum: { DEFAULT:'#6FCFEB' },   /* UCD secondary "Rec Pool" */
+        },
+        boxShadow: { glow:'0 0 0 1px rgba(255,191,0,.18), 0 8px 40px -8px rgba(255,191,0,.35)' }
+      }}
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+    :root { color-scheme: dark; }
+    html, body { overflow-x: hidden; }
+    body { background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(255,191,0,.09), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(0,181,226,.08), transparent 55%),
+      #01142e; color:#e2e8f0; }
+    .glass { background: rgba(3,32,63,.6); backdrop-filter: blur(14px); border:1px solid rgba(255,255,255,.06); }
+    .tscroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    table.t { border-collapse:collapse; width:100%; font-size:.8rem; }
+    table.t th { text-align:left; color:#94a3b8; font-weight:600; padding:.35rem .6rem; white-space:nowrap; border-bottom:1px solid rgba(255,255,255,.1); }
+    table.t td { padding:.3rem .6rem; border-bottom:1px solid rgba(255,255,255,.05); vertical-align:top; }
+    table.t td.n { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+    .pill { display:inline-block; padding:.05rem .5rem; border-radius:999px; font-size:.7rem; font-weight:700; }
+    .RED{background:#7f1d1d;color:#fecaca} .AMBER{background:#78350f;color:#fde68a} .ok{background:#064e3b;color:#a7f3d0}
+    .card-warn{border-color:rgba(251,191,36,.6)!important} .card-red{border-color:rgba(248,113,113,.8)!important}
+    .chartbox{position:relative;height:220px}
+  </style>
+</head>
+<body class="font-sans min-h-screen">
+<main class="max-w-6xl mx-auto px-4 py-5 space-y-6">
+
+  <header class="flex flex-wrap items-center gap-3">
+    <a href="/" class="text-accent-400 hover:text-white text-sm font-semibold">&larr; FRAN home</a>
+    <h1 class="text-xl font-extrabold">🩺 FRAN-QC</h1>
+    <span id="overall" class="pill ok hidden"></span>
+    <span id="scanned" class="text-sm text-slate-400"></span>
+    <button id="refresh" class="ml-auto glass px-3 py-1.5 rounded-lg text-sm font-semibold text-accent-400 hover:text-white">Refresh</button>
+  </header>
+  <div id="errbox" class="hidden glass rounded-xl p-3 text-sm text-red-300"></div>
+  <div id="emptybox" class="hidden glass rounded-xl p-4 text-sm text-slate-300">No scans yet. The health scan has not written to <code>delimp_qc_scan</code> (or the table does not exist yet). Live database health is shown below.</div>
+
+  <section>
+    <h2 class="font-bold mb-2">Database health</h2>
+    <div id="cards" class="grid grid-cols-2 md:grid-cols-4 gap-3"></div>
+    <div id="unavail" class="text-xs text-slate-500 mt-2"></div>
+    <div class="grid gap-4 mt-4">
+      <div><h3 class="text-sm font-semibold text-slate-300 mb-1">Largest relations</h3><div class="glass rounded-xl tscroll" id="t_rel"></div></div>
+      <div><h3 class="text-sm font-semibold text-slate-300 mb-1">Dead tuples and vacuum recency</h3><div class="glass rounded-xl tscroll" id="t_vac"></div></div>
+      <div><h3 class="text-sm font-semibold text-slate-300 mb-1">Transaction-ID wraparound (oldest tables)</h3><div class="glass rounded-xl tscroll" id="t_wrap"></div></div>
+      <div><h3 class="text-sm font-semibold text-slate-300 mb-1">Large indexes with zero scans</h3><div id="idxnote" class="text-xs text-slate-400 mb-1"></div><div class="glass rounded-xl tscroll" id="t_idx"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="font-bold mb-2">Latest scan findings</h2>
+    <div id="findings" class="space-y-2"></div>
+  </section>
+
+  <section>
+    <h2 class="font-bold mb-2">Trends</h2>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="glass rounded-xl p-3"><div class="text-xs text-slate-400 mb-1">Findings per scan</div><div class="chartbox"><canvas id="c_find"></canvas></div></div>
+      <div class="glass rounded-xl p-3"><div class="text-xs text-slate-400 mb-1">Database size (GB)</div><div class="chartbox"><canvas id="c_size"></canvas></div></div>
+      <div class="glass rounded-xl p-3 md:col-span-2"><div class="text-xs text-slate-400 mb-1">Fill and coverage rates (recent)</div><div class="chartbox" style="height:280px"><canvas id="c_fill"></canvas></div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="flex flex-wrap items-center gap-2 mb-2">
+      <h2 class="font-bold">Self-healing log</h2>
+      <select id="srcfilter" class="glass rounded-lg px-2 py-1 text-sm bg-transparent"><option value="">all sources</option></select>
+    </div>
+    <div class="glass rounded-xl tscroll" style="max-height:28rem;overflow-y:auto" id="t_ev"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = x => (x === null || x === undefined || x === '' || isNaN(Number(x))) ? null : Number(x);
+const fmtBytes = b => { b = num(b); if (b === null) return '—'; const u=['B','KB','MB','GB','TB']; let i=0, neg=b<0; b=Math.abs(b); while (b>=1024 && i<4){b/=1024;i++;} return (neg?'-':'')+b.toFixed(i>=3?1:0)+' '+u[i]; };
+const fmtInt = x => { x = num(x); return x === null ? '—' : Math.round(x).toLocaleString(); };
+const fmtDur = s => { s = num(s); if (s === null) return '—'; if (s < 90) return s.toFixed(0)+' s'; if (s < 5400) return (s/60).toFixed(0)+' min'; if (s < 172800) return (s/3600).toFixed(1)+' h'; return (s/86400).toFixed(1)+' d'; };
+const ago = t => { if (!t) return '—'; const s = (Date.now() - new Date(t).getTime())/1000; return isNaN(s) ? '—' : fmtDur(s)+' ago'; };
+const when = t => { if (!t) return '—'; const d = new Date(t); return isNaN(d) ? esc(t) : d.toLocaleString(); };
+let charts = {}, EVENTS = [];
+
+function card(label, value, sub, cls) {
+  return `<div class="glass rounded-xl p-3 ${cls||''}"><div class="text-xs text-slate-400">${esc(label)}</div>
+    <div class="text-lg font-bold break-words">${esc(value)}</div><div class="text-xs text-slate-500">${esc(sub||'')}</div></div>`;
+}
+function table(cols, rows, empty) {
+  if (!rows || !rows.length) return `<div class="p-3 text-sm text-slate-500">${esc(empty || 'unavailable')}</div>`;
+  return `<table class="t"><thead><tr>${cols.map(c=>`<th>${esc(c.h)}</th>`).join('')}</tr></thead><tbody>` +
+    rows.map(r => `<tr>${cols.map(c=>`<td class="${c.n?'n':''}">${c.html ? c.f(r) : esc(c.f(r))}</td>`).join('')}</tr>`).join('') + '</tbody></table>';
+}
+function barSplit(r) {
+  const t = num(r.total_bytes) || 1;
+  const p = k => Math.max(0, 100 * (num(r[k]) || 0) / t).toFixed(1);
+  return `<div style="display:flex;height:8px;width:120px;border-radius:4px;overflow:hidden;background:#0b2a50">` +
+    `<div title="heap" style="width:${p('heap_bytes')}%;background:#00B5E2"></div>` +
+    `<div title="index" style="width:${p('index_bytes')}%;background:#FFBF00"></div>` +
+    `<div title="toast" style="width:${p('toast_bytes')}%;background:#6FCFEB"></div></div>`;
+}
+
+function renderHealth(h, growth) {
+  h = h || {}; const u = h.unavailable || {};
+  const cards = [];
+  const disk = h.disk, size = h.size;
+  cards.push(card('Database size', size ? fmtBytes(size.size_bytes) : '—', size ? 'of ~'+fmtInt(disk && disk.disk_gb)+' GB disk (configured)' : (u.size||'unavailable')));
+  if (disk) {
+    const freeFrac = num(disk.est_free_bytes) / (disk.disk_gb * 1024**3);
+    const cls = freeFrac < .05 ? 'card-red' : freeFrac < .15 ? 'card-warn' : '';
+    cards.push(card('Estimated free', fmtBytes(disk.est_free_bytes), (disk.pct_used)+'% used (incl. 5 GiB OS)', cls));
+  } else cards.push(card('Estimated free', '—', 'unavailable'));
+  const g = growth || {}; const d = num(g.days_to_full);
+  cards.push(card('Days to full', d === null ? '—' : d.toFixed(0)+' d',
+    num(g.gb_per_day) === null ? 'not enough scan history' : num(g.gb_per_day).toFixed(1)+' GB/day over '+(g.window_days||14)+' d',
+    d !== null && d < 14 ? 'card-red' : d !== null && d < 45 ? 'card-warn' : ''));
+  const ds = h.dbstat;
+  cards.push(card('Cache hit', ds && ds.cache_hit_pct != null ? ds.cache_hit_pct+' %' : '—', ds ? 'rollbacks '+fmtInt(ds.xact_rollback)+', deadlocks '+fmtInt(ds.deadlocks)+', temp files '+fmtInt(ds.temp_files)+' ('+fmtBytes(ds.temp_bytes)+')' : (u.dbstat||'unavailable'),
+    ds && ds.cache_hit_pct != null && ds.cache_hit_pct < 95 ? 'card-warn' : ''));
+  const w = h.wraparound;
+  cards.push(card('XID wraparound age', w && w.db_pct != null ? w.db_pct+' %' : '—', w ? fmtInt(w.db_age)+' of 2^31; freeze_max_age '+(w.freeze_max_age!=null?fmtInt(w.freeze_max_age):'unreadable') : (u.wraparound_db||'unavailable'),
+    w && w.db_pct > 50 ? 'card-red' : w && w.db_pct > 30 ? 'card-warn' : ''));
+  const c = h.connections;
+  const total = c && c.by_state ? c.by_state.reduce((a,r)=>a+Number(r.n),0) : null;
+  cards.push(card('Connections', total === null ? '—' : fmtInt(total), c ? (c.by_state||[]).map(r=>r.state+' '+r.n).join(', ')+' | idle in txn '+fmtInt(c.idle_in_txn) : (u.connection_states||'unavailable'),
+    c && num(c.idle_in_txn) > 0 ? 'card-warn' : ''));
+  cards.push(card('Longest active query', c ? fmtDur(c.longest_active_s) : '—', c ? 'oldest transaction '+fmtDur(c.oldest_xact_s) : (u.connection_ages||'unavailable'),
+    c && num(c.longest_active_s) > 3600 ? 'card-warn' : ''));
+  cards.push(card('Waiting locks', h.waiting_locks == null ? '—' : fmtInt(h.waiting_locks), u.locks || '', num(h.waiting_locks) > 0 ? 'card-warn' : ''));
+  const s = h.server;
+  cards.push(card('Uptime', s ? fmtDur(s.uptime_s) : '—', s ? String(s.version||'').split(' on ')[0] + ' | started ' + when(s.started_at) : (u.server||'unavailable')));
+  const cp = h.checkpoints;
+  if (cp) {
+    const req = cp.checkpoints_req ?? cp.num_requested, tim = cp.checkpoints_timed ?? cp.num_timed;
+    cards.push(card('Checkpoints', req == null ? '—' : fmtInt(req)+' requested', 'timed '+fmtInt(tim)));
+  }
+  $('cards').innerHTML = cards.join('');
+  const un = Object.entries(u);
+  $('unavail').textContent = un.length ? 'Unavailable: ' + un.map(([k,v]) => k + ' (' + v + ')').join('; ') : '';
+
+  $('t_rel').innerHTML = table([
+    {h:'Relation', f:r=>r.name}, {h:'Total', f:r=>fmtBytes(r.total_bytes), n:1}, {h:'Heap', f:r=>fmtBytes(r.heap_bytes), n:1},
+    {h:'Index', f:r=>fmtBytes(r.index_bytes), n:1}, {h:'Toast', f:r=>fmtBytes(r.toast_bytes), n:1},
+    {h:'Rows (est)', f:r=>fmtInt(r.row_estimate), n:1}, {h:'Split', f:barSplit, html:1}], h.relations, u.relations || 'no data');
+  $('t_vac').innerHTML = table([
+    {h:'Table', f:r=>r.name}, {h:'Live', f:r=>fmtInt(r.n_live_tup), n:1}, {h:'Dead', f:r=>fmtInt(r.n_dead_tup), n:1},
+    {h:'Dead %', f:r=>r.dead_pct==null?'—':r.dead_pct, n:1}, {h:'Vacuum', f:r=>ago(r.last_vacuum), n:1},
+    {h:'Autovacuum', f:r=>ago(r.last_autovacuum), n:1}, {h:'Analyze', f:r=>ago(r.last_analyze), n:1},
+    {h:'Autoanalyze', f:r=>ago(r.last_autoanalyze), n:1}], h.vacuum, u.vacuum || 'no data');
+  const lim = (w && w.freeze_max_age) || 2**31;
+  $('t_wrap').innerHTML = table([
+    {h:'Table', f:r=>r.name}, {h:'XID age', f:r=>fmtInt(r.xid_age), n:1},
+    {h:'% of 2^31', f:r=>(100*r.xid_age/2**31).toFixed(2), n:1},
+    {h:'% of freeze_max_age', f:r=>w && w.freeze_max_age ? (100*r.xid_age/lim).toFixed(1) : '—', n:1}], w && w.tables, u.wraparound_tables || 'no data');
+  const iu = h.unused_indexes;
+  $('idxnote').textContent = iu ? 'Counters since stats reset: ' + when(iu.stats_reset) + '. Zero scans since a recent reset does not mean unused.' : '';
+  $('t_idx').innerHTML = table([
+    {h:'Table', f:r=>r.table_name}, {h:'Index', f:r=>r.index_name}, {h:'Size', f:r=>fmtBytes(r.index_bytes), n:1}],
+    iu && iu.indexes, u.unused_indexes || 'none');
+}
+
+function renderFindings(latest) {
+  const box = $('findings');
+  const f = (latest && Array.isArray(latest.findings)) ? latest.findings : [];
+  if (!latest) { box.innerHTML = '<div class="text-sm text-slate-500">No scan yet.</div>'; return; }
+  const row = x => `<div class="glass rounded-lg px-3 py-2 text-sm flex gap-2 items-start"><span class="pill ${esc(x.sev)}">${esc(x.sev)}</span><span class="text-slate-400 shrink-0">${esc(x.area)}</span><span class="break-words min-w-0">${esc(x.msg)}</span></div>`;
+  const by = s => f.filter(x => x.sev === s);
+  const okc = by('ok');
+  box.innerHTML = by('RED').map(row).join('') + by('AMBER').map(row).join('') +
+    (okc.length ? `<details class="glass rounded-lg"><summary class="px-3 py-2 text-sm cursor-pointer">${okc.length} ok checks</summary><div class="p-2 space-y-2">${okc.map(row).join('')}</div></details>` : '') +
+    (!f.length ? '<div class="text-sm text-slate-500">Latest scan has no findings.</div>' : '');
+}
+
+function mkChart(id, cfg) {
+  if (charts[id]) charts[id].destroy();
+  if (typeof Chart === 'undefined') return;
+  charts[id] = new Chart($(id), cfg);
+}
+const PAL = ['#00B5E2','#FFBF00','#6FCFEB','#f87171','#34d399','#c084fc','#fb923c','#a3e635','#f472b6','#94a3b8'];
+function renderTrends(hist) {
+  hist = hist || [];
+  const labels = hist.map(h => new Date(h.scanned_at).toLocaleDateString(undefined,{month:'short',day:'numeric'}));
+  const opt = (extra) => Object.assign({responsive:true, maintainAspectRatio:false, animation:false,
+    plugins:{legend:{labels:{color:'#cbd5e1',boxWidth:10,font:{size:10}}}},
+    scales:{x:{ticks:{color:'#94a3b8',maxTicksLimit:8},grid:{color:'rgba(255,255,255,.05)'}},
+            y:{ticks:{color:'#94a3b8'},grid:{color:'rgba(255,255,255,.05)'}}}}, extra||{});
+  mkChart('c_find', {type:'line', data:{labels, datasets:[
+    {label:'RED', data:hist.map(h=>h.n_red), borderColor:'#f87171', backgroundColor:'#f87171', pointRadius:1, tension:.2},
+    {label:'AMBER', data:hist.map(h=>h.n_amber), borderColor:'#fbbf24', backgroundColor:'#fbbf24', pointRadius:1, tension:.2}]}, options:opt()});
+  mkChart('c_size', {type:'line', data:{labels, datasets:[
+    {label:'size GB', data:hist.map(h=>h.size_bytes==null?null:h.size_bytes/1024**3), borderColor:'#00B5E2', pointRadius:1, spanGaps:true, tension:.2}]}, options:opt()});
+  const keys = []; hist.forEach(h => ['fill','coverage'].forEach(g => Object.keys(h[g]||{}).forEach(k => { const n = g+': '+k; if (!keys.includes(n)) keys.push(n); })));
+  mkChart('c_fill', {type:'line', data:{labels, datasets: keys.map((n,i) => { const [g,k] = [n.split(': ')[0], n.slice(n.indexOf(': ')+2)];
+    return {label:n, data:hist.map(h => (h[g]||{})[k] ?? null), borderColor:PAL[i%PAL.length], pointRadius:1, spanGaps:true, tension:.2}; })},
+    options:opt({scales:{x:{ticks:{color:'#94a3b8',maxTicksLimit:8},grid:{color:'rgba(255,255,255,.05)'}},y:{min:0,max:1,ticks:{color:'#94a3b8'},grid:{color:'rgba(255,255,255,.05)'}}}})});
+}
+
+function renderEvents() {
+  const f = $('srcfilter').value;
+  const rows = EVENTS.filter(e => !f || e.source === f);
+  $('t_ev').innerHTML = table([
+    {h:'Time', f:e=>when(e.at)}, {h:'Source', f:e=>e.source}, {h:'Kind', f:e=>e.kind}, {h:'Summary', f:e=>e.summary}], rows, 'No events.');
+}
+
+function render(d) {
+  const ov = d.overview || {}, latest = ov.latest;
+  $('emptybox').classList.toggle('hidden', !!latest);
+  const o = $('overall');
+  if (latest) {
+    const sev = latest.n_red > 0 ? 'RED' : latest.n_amber > 0 ? 'AMBER' : 'ok';
+    o.className = 'pill ' + sev; o.textContent = sev === 'ok' ? 'OK' : sev + ' (' + latest.n_red + ' red, ' + latest.n_amber + ' amber)';
+    $('scanned').textContent = 'scanned ' + ago(latest.scanned_at) + ' (' + (latest.kind||'') + ')';
+  } else { o.classList.add('hidden'); $('scanned').textContent = ''; }
+  renderHealth(d.db_health, ov.growth);
+  renderFindings(latest);
+  renderTrends(ov.history);
+  EVENTS = ov.events || [];
+  const sel = $('srcfilter'), cur = sel.value;
+  sel.innerHTML = '<option value="">all sources</option>' + [...new Set(EVENTS.map(e=>e.source))].sort().map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  sel.value = cur;
+  renderEvents();
+}
+
+async function load() {
+  $('errbox').classList.add('hidden');
+  $('refresh').disabled = true;
+  try {
+    const r = await fetch('/api/internal/qc', {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 404 ? ' (staff access required)' : ''));
+    render(await r.json());
+  } catch (e) { $('errbox').textContent = 'Could not load FRAN-QC data: ' + e.message; $('errbox').classList.remove('hidden'); }
+  $('refresh').disabled = false;
+}
+$('refresh').onclick = load;
+$('srcfilter').onchange = renderEvents;
+load();
+</script>
+</body>
+</html>

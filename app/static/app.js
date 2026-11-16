@@ -2703,7 +2703,7 @@ function applyAuth(st){
   const tog=(id,hide)=>{const e=document.getElementById(id); if(e) e.classList.toggle('hidden', hide);};
   tog('nav_collab', !isFull); tog('nav_collab_m', !isFull);     // Collaborators dir = full only
   tog('nav_subs', !isFull); tog('nav_subs_m', !isFull);         // Submissions dir = full only
-  tog('nav_labs', !isFull); tog('nav_labs_m', !isFull);         // Labs by institution = full only
+  tog('nav_labs', !isFull); tog('nav_labs_m', !isFull); tog('nav_qc', !isFull); tog('nav_qc_m', !isFull);         // Labs by institution = full only
   tog('nav_mydata', tier!=='lab'); tog('nav_mydata_m', tier!=='lab'); // My Submissions = lab users
   // tier badge in the navbar
   let badge=document.getElementById('tierBadge');
