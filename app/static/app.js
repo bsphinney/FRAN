@@ -1056,7 +1056,8 @@ async function renderPeptide(seq){
     <div id="protbox" class="glass card p-5 fade-in mb-5"><div class="skeleton h-24 rounded-xl"></div></div>
     <div class="glass card p-5 fade-in mb-5"><h3 class="font-bold text-white mb-3">Modified forms × charge</h3>
     ${table(['ProForma','Charge','Obs','Avg m/z','Avg RT','Avg 1/K₀','Best q','Avg log₂ int','Engines'],
-      d.forms.map(f=>[`<span class="font-mono text-xs text-white break-all">${esc(f.modified_seq_proforma||'—')}</span>`,f.charge+'+',fmt(f.n_obs),fmtF(f.avg_mz,4),fmtF(f.avg_rt),fmtF(f.avg_im,3),sci(f.best_q_value),fmtF(f.avg_log2_int),f.max_engines>1?`${f.max_engines}×`:'1']))}</div>
+      d.forms.map(f=>[`<span class="font-mono text-xs text-white break-all">${modForm(f)}</span>${f.n_notations>1?`<span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-plum/20 text-plum cursor-help whitespace-nowrap" title="${esc('Merged '+f.n_notations+' notations of the same form: '+(f.notations||[]).join('  |  '))}">${f.n_notations} notations merged</span>`:''}`,f.charge+'+',fmt(f.n_obs),fmtF(f.avg_mz,4),fmtF(f.avg_rt),fmtF(f.avg_im,3),sci(f.best_q_value),fmtF(f.avg_log2_int),(f.engines&&f.engines.length)?esc(f.engines.join(', ')):(f.max_engines>1?`${f.max_engines}×`:'1')]))}
+    ${d.forms_truncated?'<p class="text-[10px] text-slate-500 mt-2">Showing the 200 most-observed notations; rarer forms are not merged here.</p>':''}</div>
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Observations across runs (${d.observations.length})</h3>
     ${table(['Search','Engine','Run','Charge','m/z','RT','1/K₀','q-value','Intensity'],
       d.observations.map(o=>[`<span class="text-accent-400 cursor-pointer" onclick="event.stopPropagation();go('run','${o.search_id}')">${esc(o.search_name||'—')}</span>`,esc(o.search_engine||'—'),`<span class="font-mono text-[11px]">${esc((o.raw_path||'').split('/').pop())}</span>`,o.charge+'+',fmtF(o.precursor_mz,4),fmtF(o.rt),fmtF(o.im,3),sci(o.q_value),sci(o.intensity)])) }</div>`;
@@ -2671,6 +2672,19 @@ async function renderSubmissions(){
 
 /* ---------- shared UI bits ---------- */
 function stat(label,val){ return `<div><div class="text-[11px] uppercase tracking-wider text-slate-500">${label}</div><div class="text-xl font-bold text-white kpi-num mt-0.5">${val}</div></div>`; }
+// Readable ProForma: f.segments comes from app/mods.py (mod names for UniMod accessions / Spectronaut
+// names / elemental / delta forms). Each mapped mod carries its accession + original notation in a
+// tooltip; an unrecognised token is shown as written, in amber, never guessed.
+function modForm(f){
+  const segs=f.segments;
+  if(!segs||!segs.length) return esc(f.modified_seq_proforma||'—');
+  return segs.map(g=>{
+    if(!g.bracket) return esc(g.t);
+    if(g.unmapped) return `<span class="text-amber-300" title="${esc('Unrecognised modification notation, shown as recorded: '+g.raw)}">[${esc(g.t)}]</span>`;
+    const tip=`UNIMOD:${g.acc} · ${g.name}${g.mass!=null?` · ${g.mass>=0?'+':''}${Number(g.mass).toFixed(4)} Da`:''}${g.raw!==('UNIMOD:'+g.acc)?` · recorded as "${g.raw}"`:''}`;
+    return `<span class="text-accent-400 cursor-help" title="${esc(tip)}">[${esc(g.t)}]</span>`;
+  }).join('');
+}
 function table(cols, rows, onclicks){
   return `<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-[11px] uppercase tracking-wider text-slate-500 border-b border-white/10">
   ${cols.map(c=>`<th class="py-2 px-3 font-semibold">${c}</th>`).join('')}</tr></thead><tbody>
