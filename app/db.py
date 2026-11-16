@@ -49,6 +49,9 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         # No customer data (just paths/counts/md5); used to locate a peptide's measured spectrum in
         # the franfragments blob for the /api/peptide/{seq}/observed layer.
         "delimp_spectrum_lane",
+        # XIC Lance registry: search_id -> lane dataset path + counts (no customer data). Locates a
+        # peptide's measured chromatogram in franfragments/xic for the /xic fallback (observed_xic).
+        "delimp_xic_lane",
         # precomputed leaderboard snapshots (Highlights) — full GROUP BY over millions of
         # precursor rows times out live on PG Farm, so these are refreshed offline.
         "delimp_mv_top_peptides",

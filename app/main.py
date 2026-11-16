@@ -1016,9 +1016,17 @@ def api_peptide_predicted(stripped_seq: str, charge: int = 2, ce: float = 28.0):
 
 
 @app.get("/api/peptide/{stripped_seq}/xic")
-def api_peptide_xic(stripped_seq: str):
-    """Dual-pane XIC (MS1 + top-6 common quant fragments) with per-fragment usage %."""
-    return ok({"xic": queries.peptide_xic(stripped_seq)})
+def api_peptide_xic(request: Request, stripped_seq: str):
+    """Dual-pane XIC (MS1 + top-6 common quant fragments) with per-fragment usage %.
+    Curated rows (delimp_precursor_xic, apex-aligned averages) first; when the peptide has none,
+    one measured run from its XIC lane in blob storage (observed_xic, labelled single_run).
+    Only the blob fallback is rate-limited -- the curated path is a plain indexed lookup."""
+    x = queries.peptide_xic(stripped_seq)
+    if not (x or {}).get("available"):
+        from . import ratelimit, observed_xic
+        if ratelimit.allow(f"xic:{ratelimit.client_ip(request)}", limit=30, window_s=60):
+            x = _safe(lambda: observed_xic.lane_xic(stripped_seq), x) or x
+    return ok({"xic": x})
 
 
 @app.get("/api/peptide/{stripped_seq}/interference")
