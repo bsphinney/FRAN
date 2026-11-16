@@ -68,6 +68,10 @@ PUBLIC_TABLES: frozenset[str] = frozenset(
         "delimp_proteome_reference",
         # precomputed Koina PFly flyability per peptide (peptide page + Highlights scatter)
         "delimp_peptide_flyability",
+        # one row per DISTINCT peptide (I/L-normalised, pg_trgm GIN) -- serves substring peptide search
+        # in ms instead of a scan of the 763M-row precursors table. Built offline (see
+        # ingest/migrations/2026-11-16_peptide_trgm_index.sql). Sequences + counts only.
+        "delimp_peptide_index",
         # precomputed hidden-words leaderboard over ALL distinct peptides (Highlights word hunt) —
         # scanning ~2M peptides live is too slow, so it's computed offline by scripts/wordhunt_all.py
         "delimp_word_leaderboard",
