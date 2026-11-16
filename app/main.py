@@ -47,7 +47,7 @@ def _build_sha() -> str | None:
 
 BUILD_SHA = _build_sha()
 
-APP_VERSION = "0.25.2"  # 0.25.2: peptide "Avg log₂ int" renders a number instead of an em-dash
+APP_VERSION = "0.26.0"  # 0.26.0: lane-backed DIA-NN XICs from blob; readable merged mod names; substring search via trigram index (once built); search-page coverage + MaxLFQ heatmap; FRAN-QC page
                         #         on every peptide — intensity_log2 has no writer and is entirely
                         #         NULL corpus-wide, so the log is now derived from `intensity`.
                         # 0.18.0: cross-engine comparison page (#engines) — agreement funnel,
