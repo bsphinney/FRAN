@@ -50,15 +50,15 @@ def _storage_options():
 
 
 @functools.lru_cache(maxsize=256)
-def _dataset_cached(basename: str, epoch: int, opts_items: tuple):
+def _dataset_cached(basename: str, epoch: int, opts_items: tuple, container: str = _CONTAINER):
     import lance
-    return lance.dataset(f"az://{_CONTAINER}/{basename}", storage_options=dict(opts_items))
+    return lance.dataset(f"az://{container}/{basename}", storage_options=dict(opts_items))
 
 
-def _dataset(basename: str):
+def _dataset(basename: str, container: str = _CONTAINER):
     opts, epoch = _storage_options()
     # include epoch in the key so a rotated token yields a fresh handle (stale ones fall out of LRU)
-    return _dataset_cached(basename, epoch, tuple(sorted(opts.items())))
+    return _dataset_cached(basename, epoch, tuple(sorted(opts.items())), container)
 
 
 # --- lookup ---------------------------------------------------------------

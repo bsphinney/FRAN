@@ -1353,6 +1353,8 @@ function selectXICPrec(i){
     ? {c:'text-amber-300', t:`⚠ MS1 only — no fragment chromatograms were ingested for this precursor.${hasMs1?' The MS1 trace below is measured.':' No MS1 trace is stored either.'} No fragment identities or intensities are available.`}
     : synthetic
       ? {c:'text-amber-300', t:'⚠ Predicted XIC — fragment identities &amp; relative intensities are real (spectral library), the elution peak shape is modeled (synthetic time axis). Not a measured chromatogram.'}
+      : (p.trace_basis==='single_run')
+        ? {c:'text-slate-500', t:`Real acquired XIC — <b>one</b> measured acquisition (the most confident of ${fmt(p.n_runs_in_search||1)} run${(p.n_runs_in_search||1)===1?'':'s'} in a search ingested with chromatograms), aligned to its apex. Not an average across the corpus.`}
       : {c:'text-slate-500', t:`Real acquired XIC — apex-aligned <b>average</b> of the acquired runs (each run aligned to its apex, then meaned; axis = ${esc(x.rt_axis||'RT − apex, min')}). Observed in ${fmt(p.n_searches)} search${p.n_searches===1?'':'es'}; pools more acquisitions as additional searches are ingested.`};
   // Caveats stacked on top of the banner, for rows ingested without a report-lib.
   const caveats=[];
