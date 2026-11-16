@@ -25,6 +25,7 @@ from .db import (
     query,
 )
 from . import collab
+from .mods import merge_forms
 from .proforma import mod_name, sites_in_protein
 
 
@@ -3233,25 +3234,41 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
     # species_search(), and scripts/predeploy_check.py rule 3c, which now blocks the deploy on it.
     forms = query(
         """
-        SELECT modified_seq_proforma, charge,
+        SELECT p.modified_seq_proforma, p.charge,
                COUNT(*) AS n_obs,
-               AVG(precursor_mz) AS avg_mz,
-               AVG(rt) AS avg_rt,
-               AVG(im) AS avg_im,
-               MIN(q_value) AS best_q_value,
+               AVG(p.precursor_mz) AS avg_mz,
+               AVG(p.rt) AS avg_rt,
+               AVG(p.im) AS avg_im,
+               MIN(p.q_value) AS best_q_value,
                -- Derived, NOT read from intensity_log2 (no writer, all NULL) -- see the note in
                -- Python above this query, which cannot live here because it quotes percentages.
-               AVG(CASE WHEN intensity > 0 THEN ln(intensity) / ln(2) END) AS avg_log2_int,
-               MAX(n_engines_confirming) AS max_engines
-        FROM delimp_precursors
-        WHERE stripped_seq = %s
-        GROUP BY modified_seq_proforma, charge
+               AVG(CASE WHEN p.intensity > 0 THEN ln(p.intensity) / ln(2) END) AS avg_log2_int,
+               MAX(p.n_engines_confirming) AS max_engines,
+               -- engine names, so merge_forms() can report the union when several raw notations
+               -- of one chemical form are merged. delimp_searches is 2k rows; the summary query
+               -- above already joins it over these same rows.
+               array_agg(DISTINCT s.search_engine) AS engines
+        FROM delimp_precursors p
+        JOIN delimp_searches s ON s.id = p.search_id
+        WHERE p.stripped_seq = %s
+        GROUP BY p.modified_seq_proforma, p.charge
         ORDER BY n_obs DESC
         LIMIT %s
         """,
         (seq, MAX_PAGE),
-        tables=["delimp_precursors"],
+        tables=["delimp_precursors", "delimp_searches"],
     )
+    # Engines record the same chemistry in different notations (UNIMOD:35 / "Oxidation (M)" /
+    # +15.99), so the SQL GROUP BY above leaves one chemical form split over several rows. Merge
+    # them by canonical form x charge in Python: the input is already bounded to MAX_PAGE rows, so
+    # this is O(200). If the SQL hit its LIMIT the tail was never fetched and merged counts for
+    # rare forms can be understated -- `forms_truncated` tells the UI.
+    forms_truncated = len(forms) >= MAX_PAGE
+    forms = merge_forms(forms)
+    if summary:
+        summary["n_modforms_raw"] = summary.get("n_modforms")
+        if not forms_truncated:
+            summary["n_modforms"] = len({f["modified_seq_proforma"] for f in forms})
     # Individual observations across runs (bounded).
     observations = query(
         """
@@ -3283,6 +3300,7 @@ def peptide_detail(stripped_seq: str) -> dict[str, Any]:
     return {
         "summary": summary,
         "forms": forms,
+        "forms_truncated": forms_truncated,
         "observations": observations,
         "consensus": consensus,
     }
