@@ -833,6 +833,10 @@ def api_protein_coverage(protein_group: str, search_id: str | None = None):
             "custom_construct": custom,
             "sequence": seq, "sequence_available": bool(seq), **mapped,
             "sites": data.get("sites") or []}
+    if data.get("scan_failed"):
+        resp["scan_failed"] = True          # timeout, NOT "no peptides": the UI must say so
+    if data.get("corpus_unavailable"):
+        resp["corpus_unavailable"] = True   # only this search's peptides; corpus comparison missing
     if data.get("scope_unavailable"):
         # The "here" lookup itself failed (see protein_coverage_peptides): peptides carry no "here"
         # key at all here, so the UI must say "comparison unavailable" rather than infer "not found".

@@ -494,8 +494,10 @@ async function renderSearchDetail(id){
       ${s.doi?`<div class="mt-1 text-xs text-slate-500">DOI: ${esc(s.doi)}</div>`:''}
     </div>
     <div class="glass card p-5 fade-in"><h3 class="font-bold text-white mb-3">Runs (${d.runs.length})</h3>
+    ${(()=>{ const ps=d.runs.map(r=>r.n_precursors||0).sort((a,b)=>a-b); const med=ps.length?ps[Math.floor(ps.length/2)]:0;
+      window.__lowYield=(r)=>d.runs.length>=3&&med>0&&(r.n_precursors||0)<0.25*med; return ''; })()}
     ${d.runs.length?table(['Run','Platform','Acquisition','Instrument','Organism','Precursors','Proteins'],
-      d.runs.map(r=>[`<span class="font-mono text-xs text-white">${esc(r.raw_basename||r.raw_path)}</span>`,esc(r.platform||'—'),esc(r.acquisition_method||'—'),esc(r.instrument_model||'—'),esc(r.organism_name||'—'),fmt(r.n_precursors),fmt(r.n_proteins)])):empty('No run rows.')}</div>
+      d.runs.map(r=>[`<span class="font-mono text-xs text-white">${esc(r.raw_basename||r.raw_path)}</span>${window.__lowYield(r)?' <span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-400" title="Under a quarter of this search\'s median precursor count: likely a failed or low injection. Its column in the heatmap reflects depth, not biology.">low yield</span>':''}`,esc(r.platform||'—'),esc(r.acquisition_method||'—'),esc(r.instrument_model||'—'),esc(r.organism_name||'—'),fmt(r.n_precursors),fmt(r.n_proteins)])):empty('No run rows.')}</div>
     <div class="glass card p-5 fade-in mt-4" id="matrixCard">
       <div class="skeleton h-64 rounded-xl"></div></div>
     <div class="glass card p-5 fade-in mt-4" id="pepmapCard" style="display:none"></div>`;
@@ -648,7 +650,7 @@ async function renderSearchMatrix(searchId, mode){
     const reaches=proteins.map(p=>p.reach).filter(v=>v!=null).sort((a,b)=>a-b);
     const lo=reaches[0], hi=reaches[reaches.length-1];
     const legend=`<div class="flex flex-wrap items-center gap-5 text-[11px] text-slate-500 mb-3">
-      <span><b class="text-slate-300">cells</b>&nbsp;low<span style="display:inline-block;width:132px;height:9px;border-radius:5px;vertical-align:middle;margin:0 7px;background:linear-gradient(90deg,${_hmViridis(0)},${_hmViridis(.25)},${_hmViridis(.5)},${_hmViridis(.75)},${_hmViridis(1)})"></span>high&nbsp;<span class="text-slate-500">log2 amount, z-scored per protein</span></span>
+      <span><b class="text-slate-300">cells</b>&nbsp;low<span style="display:inline-block;width:132px;height:9px;border-radius:5px;vertical-align:middle;margin:0 7px;background:linear-gradient(90deg,${_hmViridis(0)},${_hmViridis(.25)},${_hmViridis(.5)},${_hmViridis(.75)},${_hmViridis(1)})"></span>high&nbsp;<span class="text-slate-500">log2 ${d.quantity==='maxlfq'?'MaxLFQ (run-normalised)':'summed precursor intensity (not run-normalised)'}, z-scored per protein</span></span>
       <span><span style="display:inline-block;width:11px;height:11px;background:#111a2b;border:1px solid rgba(255,255,255,.09);border-radius:2px;vertical-align:middle"></span> not identified</span>
       <span><b class="text-slate-300">strip 1</b>&nbsp;rare<span style="display:inline-block;width:132px;height:9px;border-radius:5px;vertical-align:middle;margin:0 7px;background:linear-gradient(90deg,${_hmRarityColour(0)},${_hmRarityColour(.33)},${_hmRarityColour(.66)},${_hmRarityColour(1)})"></span>common&nbsp;<span class="text-slate-500">corpus searches with this gene${reaches.length?` (${fmt(lo)}–${fmt(hi)} here)`:''}</span></span>
       <span><span style="display:inline-block;width:11px;height:11px;background:#243049;border-radius:2px;vertical-align:middle"></span> rarity not computed</span>
@@ -753,6 +755,11 @@ async function renderPeptideMap(pg, gene, searchId){
   try{
     const d=await api(`/api/protein/${encodeURIComponent(pg)}/coverage?search_id=${encodeURIComponent(searchId)}`);
     _pepMap=d; const g=gene||d.gene||pg;
+    if(d.scan_failed){
+      // A timed-out peptide scan is NOT "0 peptides": say so, never draw an empty 0% map.
+      card.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage — ${esc(g)}</h3>${empty('Peptide lookup timed out for '+esc(d.accession)+' (a very abundant protein). This is not a zero — try again in a moment.')}`;
+      return;
+    }
     if(d.custom_construct){
       card.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage — ${esc(g)}</h3><div class="py-8 text-center"><div class="text-3xl mb-2">🧪</div><div class="text-slate-300 font-medium">Custom / recombinant construct</div><div class="text-sm text-slate-500 mt-1 max-w-lg mx-auto">This accession (<span class="font-mono">${esc(d.accession)}</span>) is a placeholder from a custom FASTA — an engineered or recombinant protein with no public UniProt/NCBI entry, so there's no canonical sequence to map coverage against.</div></div>`;
       return;
@@ -888,6 +895,7 @@ function _drawPeptideMap(card, gene){
         <span class="text-slate-500 text-xs font-mono font-normal">${esc(d.accession)} · ${fmt(L)} aa · ${fmt(peps.length)} peptides</span>
         <a onclick="go('gene','${encodeURIComponent(gene)}')" class="cursor-pointer text-xs font-semibold px-2 py-0.5 rounded-lg bg-accent/15 text-accent-400 hover:bg-accent/25 ml-1" title="everything the corpus knows about ${esc(gene)}">${esc(gene)} across the corpus ↗</a></h3>
       ${pcts}</div>
+    ${d.corpus_unavailable?`<div class="text-[11px] text-amber-400 mt-2">Corpus-wide comparison timed out for this very abundant protein — showing only the peptides this experiment found.</div>`:''}
     <div class="flex flex-wrap gap-4 text-[11px] text-slate-500 my-3">${legend}${modLegend}</div>
     <div>${seqHtml}</div>
     <div id="pepmapDetail" class="mt-2"></div>`;
@@ -906,7 +914,7 @@ function pepMapDetail(ss){
     : (p.here ? row('precursor rows',fmt(p.here_n_precursors))+row('charge states',fmt(p.here_n_charges))+
         row('runs',fmt(p.here_n_runs))+row('best q-value',sci(p.here_best_q_value))
       : `<span class="text-slate-500">not found in this experiment</span>`);
-  const corpusBlock = row('precursor rows',fmt(p.n_precursors))+(p.n_charges!=null?row('charge states',fmt(p.n_charges)):'')+
+  const corpusBlock = d.corpus_unavailable ? `<span class="text-slate-500">corpus comparison unavailable (timed out)</span>` : row('precursor rows',fmt(p.n_precursors))+(p.n_charges!=null?row('charge states',fmt(p.n_charges)):'')+
     (p.n_runs!=null?row('runs',fmt(p.n_runs)):'')+row('best q-value',sci(p.best_q_value));
   const seqCol = scopeOff?'text-slate-300':(p.here?'text-accent-400':'text-teal');
   const el=$('#pepmapDetail'); if(!el)return;
@@ -2183,6 +2191,7 @@ async function loadCoverage(pg){
   const el=$('#covbox'); if(!el)return;
   try{
     const d=await api(`/api/protein/${encodeURIComponent(pg)}/coverage`);
+    if(d.scan_failed){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage</h3>${empty('Peptide lookup timed out for '+esc(d.accession)+' (a very abundant protein). This is not a zero — try again in a moment.')}`; return; }
     if(d.custom_construct){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage</h3><div class="py-8 text-center"><div class="text-3xl mb-2">🧪</div><div class="text-slate-300 font-medium">Custom / recombinant construct</div><div class="text-sm text-slate-500 mt-1 max-w-lg mx-auto">This accession (<span class="font-mono">${esc(d.accession)}</span>) is a placeholder from a custom FASTA — an engineered or recombinant protein with no public UniProt/NCBI entry, so there's no canonical sequence to map coverage against.</div></div>`; return; }
     if(!d.sequence_available){ el.innerHTML=`<h3 class="font-bold text-white mb-2">Sequence coverage</h3>${empty('Canonical sequence not available from UniProt for '+esc(d.accession)+'.')}`; return; }
     const L=d.length, peps=d.peptides||[];
