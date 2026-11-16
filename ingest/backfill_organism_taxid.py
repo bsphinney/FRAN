@@ -170,6 +170,11 @@ def main():
     print(f"before: organism_taxon_id {before:,}/{total:,} ({100*before/total:.1f}%)")
 
     pairs = list(TAXIDS.items())
+    SPLIT_SQL = """SELECT organism_name, count(DISTINCT organism_taxon_id)
+                   FROM delimp_sample_metadata WHERE organism_taxon_id IS NOT NULL
+                   GROUP BY 1 HAVING count(DISTINCT organism_taxon_id) > 1"""
+    cur.execute(SPLIT_SQL)
+    split_before = {nm for nm, _ in cur.fetchall()}
     cur.execute("""
         SELECT count(*) FROM delimp_sample_metadata m
         JOIN (SELECT * FROM unnest(%s::text[], %s::int[]) AS t(nm, tid)) t
@@ -206,11 +211,14 @@ def main():
     for nm, k in rest:
         print(f"   {str(nm)[:50]:52s} {k:>5,}")
 
-    # one name must never map to two taxids, or the species page splits
-    cur.execute("""SELECT organism_name, count(DISTINCT organism_taxon_id)
-                   FROM delimp_sample_metadata WHERE organism_taxon_id IS NOT NULL
-                   GROUP BY 1 HAVING count(DISTINCT organism_taxon_id) > 1""")
-    split = cur.fetchall()
+    # one name must never map to two taxids, or the species page splits. Only a split THIS run
+    # created is rolled back; one that was already there (e.g. a strain taxid written by another
+    # path, 2026-11-13) is reported but must not block filling every other name, every night.
+    cur.execute(SPLIT_SQL)
+    split = [(nm, k) for nm, k in cur.fetchall() if nm not in split_before]
+    if split_before:
+        print(f"\nWARN: {len(split_before)} name(s) ALREADY carried more than one taxid before this "
+              f"run (not caused by it): {sorted(split_before)[:5]}")
     if split:
         print(f"\n!! {len(split)} names now carry MORE THAN ONE taxid — rolling back")
         for nm, k in split[:5]:

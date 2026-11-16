@@ -139,17 +139,33 @@ def main() -> int:
 
     print(f"{len(ids)} search(es) to process, {a.batch} per batch")
     done = 0
+    failed: list[str] = []
+    import psycopg2
     try:
         for i in range(0, len(ids), a.batch):
             chunk = ids[i:i + a.batch]
             t = time.time()
-            _run_batch(conn, chunk)
+            try:
+                _run_batch(conn, chunk)
+            except psycopg2.errors.QueryCanceled:
+                # One huge search (the DIA-NN corpus run ingests 0.5-1.7M precursors each) can push a
+                # whole batch past the statement timeout; that used to abort the run every night
+                # (2026-11-14..16, 0% PTM rollup on new searches). Retry the batch one search at a
+                # time, skip only the search that still times out, and carry on.
+                conn.rollback()
+                for sid in chunk:
+                    try:
+                        _run_batch(conn, [sid])
+                    except psycopg2.errors.QueryCanceled:
+                        conn.rollback()
+                        failed.append(sid)
+                        print(f"  TIMEOUT on search {sid}; skipped", flush=True)
             done += len(chunk)
             print(f"  {done}/{len(ids)}  ({time.time() - t:.1f}s for {len(chunk)})", flush=True)
     finally:
         conn.close()
-    print("done")
-    return 0
+    print(f"done; {len(failed)} search(es) timed out" + (f": {', '.join(failed[:5])}" if failed else ""))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

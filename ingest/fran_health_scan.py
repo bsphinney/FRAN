@@ -1,0 +1,734 @@
+"""fran_health_scan.py - weekly check that FRAN is still filling everything it used to fill.
+
+WHY. On 2026-11-13 a survey found that since ~September almost none of FRAN's metadata had been
+filled for new data -- raw-file locations, instrument facts, PTM rollups, provenance -- because the
+scripts that fill them were never scheduled. Every individual job reported success. Nothing
+compared "how complete is NEW data" with "how complete was OLD data", and that comparison is the
+one that would have caught it in the first week. This script makes it, every week.
+
+WHAT IT CHECKS (each finding is RED / AMBER / ok):
+  fill      per-column fill rate of rows from the last 30 days vs the 90 days before that
+  coverage  per-search side tables (PTM rollup, provenance, FASTAs, XIC / spectrum lane) the same way
+  backlog   absolute counts still missing (is the filler catching up?)
+  filler    did fran_fill.py run in the last 2 days, and did every step succeed?
+  drip      parked / failed search sets, chains stranded on DependencyNeverSatisfied
+  slurm     jobs held by a launch failure, and which nodes caused them this week
+  cron      the expected crontab lines are present on login2 (from a snapshot the cron wrapper writes)
+  ingest    when the last search was ingested
+  training  is the data a model like Cascadia trains on still complete and still honest?
+            window scheme per located raw (and no reader-failure rows), every run has a split
+            flag under the current rule, no group straddles splits, no standard in test/val,
+            held-out share sane, raw md5 coverage, a random sample of located raws still on
+            disk, lane counts against the corpus, and the 3 newest DIA-NN XIC lanes opened to
+            prove q<=0.01 rows == corpus with no decoys (lanes fail silently)
+
+--heal does the safe, mechanical fixes: release held jobs off their bad node (slurm_heal.py) and
+resubmit the filler if it has not run. Everything else is reported, because it needs a decision.
+
+    python fran_health_scan.py [--heal] [--post] [--out DIR]
+
+Read-only on the database. Run as a SLURM job (fran_health.sbatch), not on the login node.
+"""
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+OUT_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health"
+FILL_DIR = os.path.join(OUT_DIR, "fill")
+CRON_SNAPSHOT = os.path.join(OUT_DIR, "crontab_login2.txt")
+DRIP_STATE = "/nfs/lssc0/flinders/proteomics/Data/FRAN_diann/corpus_2026/state.json"
+HEAL_LOG = "/quobyte/proteomics-grp/brett/scratch/corpus_drip_logs/slurm_heal_nodes.tsv"
+WEBHOOK_FILE = "/quobyte/proteomics-grp/.config/skill_slack_webhook"
+FILL_SBATCH = os.path.join(HERE, "fran_fill.sbatch")
+
+RECENT, BASE_FROM, BASE_TO = 30, 30, 120     # days: recent window, baseline window
+MIN_ROWS = 20                                 # don't judge a window with fewer rows than this
+# FIXED floors, not only a rolling baseline. The first test run proved why: the 90-day baseline was
+# itself half-decayed (hive_path 49%, PTM rollup 21%), so a slow decay only ever looked like a
+# modest drop against its own recent past. Below its floor a column is RED whatever came before.
+# Floors are what the corpus reached when the fillers were run (June-August 2026).
+FLOORS = {"raw_files.hive_path": 0.90, "raw_files.instrument_model": 0.90,
+          "raw_files.acquisition_date": 0.90, "raw_files.n_ms2_frames": 0.85,
+          "raw_files.cycle_time_sec": 0.85, "sample_metadata.organism_taxon_id": 0.90,
+          "searches with PTM rollup": 0.90, "searches with provenance row": 0.90,
+          "searches with FASTA record": 0.90, "searches with raw-file links": 0.95}
+
+# (label, FROM clause, date expression, [(column label, filled-expression)])
+FILL_CHECKS = [
+    ("raw_files", "raw_files r", "r.first_seen_at", [
+        ("hive_path", "nullif(btrim(r.hive_path),'') IS NOT NULL"),
+        ("instrument_model", "nullif(btrim(r.instrument_model),'') IS NOT NULL"),
+        ("acquisition_date", "r.acquisition_date IS NOT NULL"),
+        ("n_ms2_frames", "r.n_ms2_frames IS NOT NULL"),
+        ("cycle_time_sec", "r.cycle_time_sec IS NOT NULL"),
+        ("file_size_bytes", "r.file_size_bytes IS NOT NULL"),
+        ("md5", "nullif(btrim(r.md5),'') IS NOT NULL"),
+    ]),
+    ("sample_metadata", "delimp_sample_metadata t JOIN raw_files r ON r.raw_path = t.raw_path",
+     "r.first_seen_at", [
+        ("organism_taxon_id", "t.organism_taxon_id IS NOT NULL"),
+    ]),
+    ("search_provenance", "delimp_search_provenance t", "t.recorded_at", [
+        ("pi", "nullif(btrim(t.pi),'') IS NOT NULL"),
+        ("client", "nullif(btrim(t.client),'') IS NOT NULL"),
+        ("project", "nullif(btrim(t.project),'') IS NOT NULL"),
+    ]),
+]
+
+# Per-search side tables: (label, engine filter or None, EXISTS subquery on s.id)
+COVERAGE_CHECKS = [
+    ("PTM rollup", None, "SELECT 1 FROM delimp_search_protein_ptm x WHERE x.search_id = s.id"),
+    ("provenance row", None, "SELECT 1 FROM delimp_search_provenance x WHERE x.search_id = s.id"),
+    ("FASTA record", None, "SELECT 1 FROM delimp_search_fastas x WHERE x.search_id = s.id"),
+    ("raw-file links", None, "SELECT 1 FROM search_raw_files x WHERE x.search_id = s.id"),
+    ("XIC lane", "diann", "SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id"),
+    ("spectrum lane", "spectronaut", "SELECT 1 FROM delimp_spectrum_lane x WHERE x.search_id = s.id"),
+]
+
+EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh",
+                 "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh",
+                 "upload_lanes_to_blob.sbatch"]
+XIC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/xic_lane"   # fill_diann_xic_lanes.py
+
+findings = []   # (severity, area, message)
+metrics = {"fill": {}, "coverage": {}}   # structured numbers for delimp_qc_scan / the FRAN-QC page
+HEAL_EVENTS = "/quobyte/proteomics-grp/brett/scratch/corpus_drip_logs/slurm_heal_events.jsonl"
+PG_DISK_GB = float(os.environ.get("FRAN_PG_DISK_GB", "1600"))   # PG Farm volume since 2026-11-06
+
+
+def add(sev, area, msg):
+    findings.append((sev, area, msg))
+    print(f"[{sev}] {area}: {msg}", flush=True)
+
+
+def sh(cmd):
+    return subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True)
+
+
+def judge(area, what, recent, base, n_recent, n_base):
+    if n_recent < MIN_ROWS:
+        return
+    floor = FLOORS.get(what.split(" (")[0])
+    if area in metrics:
+        metrics[area][what] = {"recent": round(recent, 4), "base": round(base, 4), "floor": floor,
+                               "n_recent": n_recent, "n_base": n_base}
+    txt = (f"{what}: {recent:.0%} of the last {RECENT} d vs {base:.0%} before "
+           f"(n={n_recent:,}/{n_base:,})" + (f"; floor {floor:.0%}" if floor else ""))
+    if floor and recent < floor:
+        add("RED", area, txt)
+        return
+    if n_base < MIN_ROWS:
+        return
+    drop = base - recent
+    if base >= 0.5 and drop >= 0.30:
+        add("RED", area, txt)
+    elif drop >= 0.15:
+        add("AMBER", area, txt)
+
+
+def columns_of(c, table):
+    c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table,))
+    return {r[0] for r in c.fetchall()}
+
+
+def check_fill(c):
+    for label, frm, dexpr, cols in FILL_CHECKS:
+        have = columns_of(c, frm.split()[0])
+        cols = [(n, e) for n, e in cols if n in have]
+        if not cols:
+            add("AMBER", "fill", f"{label}: none of the checked columns exist any more")
+            continue
+        sel = ", ".join(
+            f"avg(({e})::int) FILTER (WHERE {dexpr} > now() - interval '{RECENT} days'), "
+            f"avg(({e})::int) FILTER (WHERE {dexpr} <= now() - interval '{BASE_FROM} days' "
+            f"AND {dexpr} > now() - interval '{BASE_TO} days')" for _, e in cols)
+        c.execute(f"""SELECT count(*) FILTER (WHERE {dexpr} > now() - interval '{RECENT} days'),
+                             count(*) FILTER (WHERE {dexpr} <= now() - interval '{BASE_FROM} days'
+                                              AND {dexpr} > now() - interval '{BASE_TO} days'),
+                             {sel} FROM {frm} WHERE {dexpr} > now() - interval '{BASE_TO} days'""")
+        row = c.fetchone()
+        n_r, n_b = row[0], row[1]
+        for i, (name, _) in enumerate(cols):
+            r, b = row[2 + 2 * i], row[3 + 2 * i]
+            if r is None:
+                continue
+            b = r if b is None else b
+            judge("fill", f"{label}.{name}", float(r), float(b), n_r, n_b)
+
+
+def check_coverage(c):
+    for label, engine, sub in COVERAGE_CHECKS:
+        eng = f"AND s.search_engine = '{engine}'" if engine else ""
+        c.execute(f"""SELECT count(*) FILTER (WHERE s.ingested_at > now() - interval '{RECENT} days'),
+                             avg((EXISTS ({sub}))::int) FILTER (WHERE s.ingested_at > now() - interval '{RECENT} days'),
+                             count(*) FILTER (WHERE s.ingested_at <= now() - interval '{BASE_FROM} days'),
+                             avg((EXISTS ({sub}))::int) FILTER (WHERE s.ingested_at <= now() - interval '{BASE_FROM} days')
+                        FROM delimp_searches s
+                       WHERE s.ingested_at > now() - interval '{BASE_TO} days' {eng}""")
+        n_r, r, n_b, b = c.fetchone()
+        if r is not None:
+            b = r if b is None else b
+            judge("coverage", f"searches with {label}" + (f" ({engine})" if engine else ""),
+                  float(r), float(b), n_r, n_b)
+
+
+def check_backlog(c):
+    c.execute("""SELECT count(*) FILTER (WHERE nullif(btrim(hive_path),'') IS NULL),
+                        count(*) FILTER (WHERE instrument_model IS NULL),
+                        count(DISTINCT raw_basename), count(*) FROM raw_files""")
+    no_path, no_inst, n_base, n = c.fetchone()
+    c.execute("""SELECT count(*) FROM delimp_searches s
+                  WHERE s.ingested_at < now() - interval '2 days'
+                    AND NOT EXISTS (SELECT 1 FROM delimp_search_protein_ptm x WHERE x.search_id = s.id)
+                    AND EXISTS (SELECT 1 FROM delimp_precursors p WHERE p.search_id = s.id
+                                AND p.protein_group IS NOT NULL LIMIT 1)""")
+    no_ptm = c.fetchone()[0]
+    c.execute("""SELECT count(*) FROM delimp_searches s
+                  WHERE s.search_engine = 'diann' AND s.ingested_at < now() - interval '2 days'
+                    AND NOT EXISTS (SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id)""")
+    no_xic = c.fetchone()[0]
+    metrics["backlog"] = {"raw_rows": n, "distinct_runs": n_base, "no_hive_path": no_path,
+                          "no_instrument": no_inst, "no_ptm": no_ptm, "diann_no_xic_lane": no_xic}
+    msg = (f"raw_files {n:,} rows / {n_base:,} distinct runs: no hive_path {no_path:,}, "
+           f"no instrument {no_inst:,}; searches >2 d old with no PTM rollup {no_ptm:,}; "
+           f"DIA-NN searches >2 d old with no XIC lane {no_xic:,}")
+    add("AMBER" if (no_ptm > 50 or no_path > 0.1 * n or no_xic > 50) else "ok", "backlog", msg)
+
+
+def check_xic_job():
+    """The daily DIA-NN XIC-lane job (fill_diann_xic_lanes): did it plan recently, did its writes fail?"""
+    plans = sorted(glob.glob(os.path.join(XIC_FILL_DIR, "plan_*.json")), key=os.path.getmtime)
+    if not plans:
+        add("RED", "xic job", f"fill_diann_xic_lanes has never planned ({XIC_FILL_DIR}); is its cron line live?")
+        return
+    newest = plans[-1]
+    age_h = (time.time() - os.path.getmtime(newest)) / 3600
+    sm = json.load(open(newest)).get("summary", {})
+    since = os.path.getmtime(plans[-2]) if len(plans) > 1 else 0
+    fails, n_res = [], 0
+    for f in glob.glob(os.path.join(XIC_FILL_DIR, "result_*.tsv")):
+        if os.path.getmtime(f) < since:
+            continue
+        for ln in open(f).read().splitlines()[1:]:
+            p = ln.split("\t")
+            n_res += 1
+            if len(p) > 2 and p[2] != "0":
+                fails.append(p[1])
+    sev = "RED" if age_h > 48 else ("AMBER" if fails else "ok")
+    add(sev, "xic job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} DIA-NN searches without a lane, "
+        f"{sm.get('planned', '?')} planned, skipped {sm.get('skipped', {})}; since then {n_res} written, "
+        f"{len(fails)} failed" + (f" (e.g. {', '.join(fails[:3])})" if fails else ""))
+
+
+def check_blob_upload():
+    """Do the lanes the website reads actually reach Azure? Hive's upload SAS expired 2026-07-23 and
+    spectrum uploads stopped for four months with nothing saying so. Reads the newest
+    fran_blob_upload log's 'UPLOAD <container> rc=' lines, and each SAS file's expiry if it has one."""
+    import re
+    from urllib.parse import unquote
+    from datetime import datetime, timezone
+    for cont in ("xic", "spectra"):
+        f = f"/quobyte/proteomics-grp/brett/.fran_blob_sas_{cont}"
+        try:
+            se = next((kv[3:] for kv in open(f).read().strip().split("&") if kv.startswith("se=")), None)
+        except OSError:
+            add("RED", "blob upload", f"no upload credential for container '{cont}' ({f}); lanes can't reach the site")
+            continue
+        if se:   # a policy-bound SAS carries no se=; its expiry lives on the container policy
+            days = (datetime.fromisoformat(unquote(se).replace("Z", "+00:00")) - datetime.now(timezone.utc)).days
+            if days < 30:
+                add("RED" if days < 7 else "AMBER", "blob upload", f"SAS for '{cont}' expires in {days} d")
+    logs = sorted(glob.glob("/quobyte/proteomics-grp/brett/scratch/fran_health/logs/fran_blob_upload_*.out"),
+                  key=os.path.getmtime)
+    if not logs:
+        add("RED", "blob upload", "fran_blob_upload has never run; new XIC/spectrum lanes are not on the site")
+        return
+    age_h = (time.time() - os.path.getmtime(logs[-1])) / 3600
+    res = re.findall(r"^UPLOAD (\S+) rc=(\d+)", open(logs[-1]).read(), re.M)
+    bad = [f"{c} rc={r}" for c, r in res if r != "0"]
+    running = age_h < 48 and not re.search(r"^=== done", open(logs[-1]).read(), re.M)
+    sev = "ok" if running else ("RED" if bad or age_h > 72 or not res else "ok")
+    add(sev, "blob upload", f"last upload log {age_h:.0f} h old"
+        + (" (still running)" if running else ": " + (", ".join(f"{c} rc={r}" for c, r in res) or "no result lines")))
+
+
+def check_ingest(c):
+    c.execute("SELECT max(ingested_at), count(*) FILTER (WHERE ingested_at > now() - interval '7 days') "
+              "FROM delimp_searches")
+    last, n7 = c.fetchone()
+    if last is None:
+        add("RED", "ingest", "no ingested searches at all?")
+        return
+    age_h = (time.time() - last.timestamp()) / 3600
+    metrics["ingest"] = {"last_age_h": round(age_h, 1), "n_7d": n7}
+    add("AMBER" if age_h > 48 else "ok", "ingest",
+        f"last search ingested {age_h:.0f} h ago; {n7:,} in the last 7 days")
+
+
+def check_db(c):
+    """Database size against the PG Farm volume. The service account cannot see the disk itself,
+    so free space is estimated the way the PG Farm admin does (relation sizes + ~5 GB for the OS).
+    The disk filling on 2026-10-05 took FRAN down for a month; this is the early warning."""
+    c.execute("SELECT pg_database_size(current_database())")
+    size = c.fetchone()[0]
+    free = PG_DISK_GB * 1024 ** 3 - size - 5 * 1024 ** 3
+    pct_free = free / (PG_DISK_GB * 1024 ** 3)
+    metrics["db"] = {"size_bytes": size, "disk_gb": PG_DISK_GB, "est_free_bytes": int(free)}
+    msg = (f"database {size / 1024 ** 3:,.0f} GiB of a {PG_DISK_GB:,.0f} GB volume; "
+           f"~{free / 1024 ** 3:,.0f} GiB free ({pct_free:.0%})")
+    add("RED" if pct_free < 0.05 else "AMBER" if pct_free < 0.15 else "ok", "database", msg)
+
+
+RAW_SAMPLE = 300          # located raws stat-ed per scan to prove the raws are still there
+
+
+def check_training(c):
+    """Readiness of the training data (design doc section 4): what silently going wrong looks like.
+    Each sub-check is its own try, so one broken query cannot hide the rest."""
+    t = metrics.setdefault("training", {})
+
+    def sub(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            add("AMBER", "training", f"{name} check errored: {repr(e)[:180]}")
+
+    def windows():
+        # Window scheme (DIA isolation windows + CE) per located raw. Reader-failure rows mean the
+        # .NET runtime / tdf reader was missing when the row was written (2026-11-13: 5,269 .raw).
+        c.execute("""SELECT count(DISTINCT r.hive_path),
+                            count(DISTINCT r.hive_path) FILTER (WHERE w.hive_path IS NOT NULL),
+                            count(DISTINCT r.hive_path) FILTER (WHERE w.windows IS NOT NULL),
+                            count(DISTINCT r.hive_path) FILTER (WHERE w.note ILIKE '%unavailable%'
+                                                                   OR w.note ILIKE '%reader failed%')
+                       FROM raw_files r LEFT JOIN delimp_run_windows w ON w.hive_path = r.hive_path
+                      WHERE nullif(btrim(r.hive_path), '') IS NOT NULL
+                        AND (r.hive_path ILIKE '%.d' OR r.hive_path ILIKE '%.raw')""")
+        n, probed, dia, broken = c.fetchone()
+        t["windows"] = {"located": n, "probed": probed, "with_dia_windows": dia, "reader_failed": broken}
+        msg = (f"window schemes: {probed:,}/{n:,} located raws probed ({probed / max(n, 1):.0%}), "
+               f"{dia:,} with DIA windows")
+        if broken:
+            add("RED", "training", msg + f"; {broken:,} recorded as reader-unavailable/failed -- the "
+                "Thermo/.NET or tdf reader was missing; rerun load_run_windows --recheck in a job "
+                "that loads dotnet-core-sdk + DOTNET_ROOT")
+        else:
+            add("AMBER" if probed < 0.9 * n else "ok", "training", msg)
+
+    def split():
+        import build_run_flags as B
+        c.execute("""SELECT count(DISTINCT lower(r.raw_basename))
+                       FROM raw_files r
+                       LEFT JOIN delimp_run_flags f ON f.run_key = lower(r.raw_basename)
+                      WHERE nullif(btrim(r.raw_basename), '') IS NOT NULL AND f.run_key IS NULL
+                        AND r.first_seen_at < now() - interval '2 days'""")
+        unflagged = c.fetchone()[0]
+        c.execute("""SELECT count(*), count(*) FILTER (WHERE split <> 'train'),
+                            count(*) FILTER (WHERE split_rule NOT LIKE %s),
+                            count(*) FILTER (WHERE shareable = 'unknown')
+                       FROM delimp_run_flags""", (B.RULE_VERSION + ":%",))
+        n, held, old_rule, unknown = c.fetchone()
+        c.execute("""SELECT group_key, count(DISTINCT split) FROM delimp_run_flags
+                      GROUP BY 1 HAVING count(DISTINCT split) > 1 LIMIT 20""")
+        straddle = c.fetchall()
+        c.execute("""SELECT max(k) FROM (SELECT count(*) k FROM delimp_run_flags GROUP BY group_key) g""")
+        biggest = c.fetchone()[0] or 0
+        c.execute("SELECT run_key, split FROM delimp_run_flags WHERE split <> 'train'")
+        std_held = [k for k, _ in c.fetchall() if B.standard_of(k)]
+        t["split"] = {"runs": n, "held_out": held, "unflagged_2d": unflagged, "old_rule": old_rule,
+                      "straddling_groups": len(straddle), "largest_group": biggest,
+                      "standards_held_out": len(std_held), "shareable_unknown": unknown}
+        frac = held / max(n, 1)
+        msg = (f"train/val/test split: {n:,} runs, {held:,} held out ({frac:.1%}), largest group "
+               f"{biggest:,}; shareable unknown {unknown:,} ({unknown / max(n, 1):.0%})")
+        problems = []
+        if straddle:
+            problems.append(f"{len(straddle)} group(s) straddle splits (leakage), e.g. "
+                            + ", ".join(g for g, _ in straddle[:3]))
+        if std_held:
+            problems.append(f"{len(std_held)} standard run(s) in val/test, e.g. {std_held[:3]}")
+        if old_rule:
+            problems.append(f"{old_rule:,} row(s) not on rule {B.RULE_VERSION}")
+        if problems:
+            add("RED", "training", msg + "; " + "; ".join(problems))
+        elif unflagged or not 0.04 <= frac <= 0.15 or biggest > 0.05 * n:
+            add("AMBER", "training", msg + (f"; {unflagged:,} run(s) >2 d old have no split flag "
+                                            f"(build_run_flags in fran_fill)" if unflagged else "")
+                + ("" if 0.04 <= frac <= 0.15 else "; held-out share outside 4-15%")
+                + ("" if biggest <= 0.05 * n else "; one group holds >5% of runs"))
+        else:
+            add("ok", "training", msg)
+
+    def md5():
+        c.execute("""SELECT count(DISTINCT hive_path),
+                            count(DISTINCT hive_path) FILTER (WHERE nullif(btrim(md5), '') IS NOT NULL)
+                       FROM raw_files WHERE nullif(btrim(hive_path), '') IS NOT NULL""")
+        n, have = c.fetchone()
+        t["md5"] = {"located": n, "hashed": have}
+        add("AMBER" if have < 0.9 * n else "ok", "training",
+            f"raw md5 (run identity / proof the raw is the one searched): {have:,}/{n:,} located raws "
+            f"({have / max(n, 1):.0%}); raw_md5 runs nightly, <=2 TB a night")
+
+    def on_disk():
+        c.execute("""SELECT hive_path FROM (SELECT DISTINCT hive_path FROM raw_files
+                                             WHERE nullif(btrim(hive_path), '') IS NOT NULL) h
+                      ORDER BY random() LIMIT %s""", (RAW_SAMPLE,))
+        paths = [r[0] for r in c.fetchall()]
+        gone = [p for p in paths if not os.path.exists(
+            os.path.join(p, "analysis.tdf_bin") if p.lower().rstrip("/").endswith(".d") else p)]
+        t["on_disk"] = {"sampled": len(paths), "missing": len(gone)}
+        msg = (f"raws still on disk: {len(paths) - len(gone)}/{len(paths)} of a random sample of "
+               f"located raws")
+        frac = len(gone) / max(len(paths), 1)
+        add("RED" if frac >= 0.02 else "AMBER" if gone else "ok", "training",
+            msg + (f"; missing e.g. {gone[:3]} -- moved or deleted raws can't feed scan-level "
+                   f"training; the weekly census + nightly fill re-locate moved ones" if gone else ""))
+
+    def lanes():
+        # Lanes are best-effort and fail silently (memory fran-lance-lane-traps).
+        #  - Spectronaut spectrum lane: normally EQUALS the corpus precursor count.
+        #  - DIA-NN XIC lane: a SUPERSET by design -- it also keeps traces DIA-NN wrote for precursors
+        #    it reported only in another run (q_value NULL). Verified 2026-11-13 on 12 lanes (8 that
+        #    an equality rule flagged): rows with q <= 0.01 == corpus rows exactly, 0 decoys. So the
+        #    registry can only show two failures: lane BELOW corpus (traces missing), and lane ~=
+        #    corpus x runs (the per-run index bug: every run given every precursor).
+        c.execute(f"""SELECT s.search_engine, l.search_id IS NULL, l.n_precursors, s.n_precursors_total,
+                             s.n_raw_files, s.search_name
+                        FROM delimp_spectrum_lane l LEFT JOIN delimp_searches s ON s.id = l.search_id
+                       WHERE l.ingested_at > now() - interval '{RECENT} days'""")
+        spec = c.fetchall()
+        c.execute(f"""SELECT s.search_engine, l.search_id IS NULL, l.n_precursors, s.n_precursors_total,
+                             s.n_raw_files, s.search_name, l.search_id
+                        FROM delimp_xic_lane l LEFT JOIN delimp_searches s ON s.id = l.search_id
+                       WHERE l.ingested_at > now() - interval '{RECENT} days'""")
+        xic = c.fetchall()
+        t["lanes"] = {"spectrum_n": len(spec), "xic_n": len(xic)}
+        for label, rows_ in (("spectrum lane", spec), ("xic lane", xic)):
+            unlinked = [r for r in rows_ if r[1]]
+            linked = [r for r in rows_ if not r[1] and r[3]]
+            sn = [r for r in linked if r[0] == "spectronaut"]
+            sn_eq = sum(1 for r in sn if r[2] == r[3])
+            below = [r for r in linked if r[0] == "diann" and r[2] < 0.98 * r[3]]
+            # Labelled designs (SILAC / plexDIA) store one corpus row per CHANNEL but one trace per
+            # (run, precursor): PROT_0749 SILAC had 220,007 rows = 75,143 pairs x ~3 channels, and
+            # its lane held exactly 75,143 at q<=0.01. Recount those as distinct pairs first.
+            channel = []
+            for r in list(below):
+                c.execute("""SELECT count(DISTINCT (raw_path, precursor_id_diann)) FROM delimp_precursors
+                              WHERE search_id = %s""", (r[6],))
+                pairs = c.fetchone()[0]
+                if pairs and r[2] >= 0.98 * pairs:
+                    below.remove(r)
+                    channel.append(r)
+            perrun = [r for r in linked if (r[4] or 0) > 2 and r[2] >= 0.75 * r[3] * r[4]]
+            t["lanes"][label] = {"unlinked": len(unlinked), "sn": len(sn), "sn_equal": sn_eq,
+                                 "diann_below_corpus": len(below), "per_run_bug": len(perrun),
+                                 "channel_designs": len(channel)}
+            msg = f"{label} (last {RECENT} d): {len(rows_):,} lane(s)" + (
+                f" ({len(channel)} multi-channel, counted per run+precursor)" if channel else "")
+            red, amber = [], []
+            if perrun:
+                red.append(f"{len(perrun)} look like the per-run index bug (lane ~= corpus x runs), "
+                           f"e.g. {[r[5] for r in perrun[:3]]}")
+            if len(sn) >= 10 and sn_eq < 0.8 * len(sn):
+                amber.append(f"only {sn_eq}/{len(sn)} Spectronaut lanes match the corpus precursor count")
+            if below:
+                amber.append(f"{len(below)} DIA-NN lane(s) hold fewer precursors than the corpus "
+                             f"(traces missing), e.g. {[r[5] for r in below[:3]]}")
+            if unlinked:
+                amber.append(f"{len(unlinked)} not linked to a search (python ingest/link_spectrum_lane.py)")
+            add("RED" if red else "AMBER" if amber else "ok", "training",
+                msg + ("; " + "; ".join(red + amber) if red or amber else ""))
+
+    def lane_deep():
+        # Open the 3 newest DIA-NN XIC lanes and prove the identity the registry can't show:
+        # q <= 0.01 rows == the corpus's distinct (run, precursor) pairs (== its row count unless the
+        # search is multi-channel), and no decoys (a decoy in a public lane is a leak).
+        import lance
+        import pyarrow.compute as pc
+        c.execute("""SELECT l.search_id, s.search_name, l.lance_path,
+                            (SELECT count(DISTINCT (p.raw_path, p.precursor_id_diann))
+                               FROM delimp_precursors p WHERE p.search_id = l.search_id)
+                       FROM delimp_xic_lane l JOIN delimp_searches s ON s.id = l.search_id
+                      WHERE s.search_engine = 'diann' AND s.n_precursors_total > 0
+                        AND l.n_precursors < 3000000
+                      ORDER BY l.ingested_at DESC LIMIT 3""")
+        res = []
+        for sid, name, path, n_corpus in c.fetchall():
+            tb = lance.dataset(path).to_table(columns=["search_id", "q_value", "is_decoy"])
+            if pc.any(pc.not_equal(tb["search_id"], str(sid))).as_py():
+                tb = tb.filter(pc.equal(tb["search_id"], str(sid)))
+            le = pc.sum(pc.less_equal(tb["q_value"], 0.01)).as_py() or 0
+            dec = pc.sum(tb["is_decoy"]).as_py() or 0
+            res.append((name, le, n_corpus, dec))
+        bad = [r for r in res if r[1] != r[2] or r[3]]
+        t["lane_deep"] = [{"search": r[0], "q01": r[1], "corpus": r[2], "decoys": r[3]} for r in res]
+        add("RED" if bad else "ok", "training",
+            f"XIC lane deep check ({len(res)} newest DIA-NN lanes opened): "
+            + ("q<=0.01 rows == corpus and 0 decoys in each" if not bad else
+               "MISMATCH " + "; ".join(f"{n}: q<=.01 {a:,} vs corpus {b:,}, decoys {d:,}"
+                                       for n, a, b, d in bad)))
+
+    for name, fn in (("windows", windows), ("split", split), ("md5", md5), ("on-disk", on_disk),
+                     ("lanes", lanes), ("lane deep", lane_deep)):
+        sub(name, fn)
+
+
+def check_filler():
+    runs = sorted(glob.glob(os.path.join(FILL_DIR, "fill_*.json")), key=os.path.getmtime)
+    if not runs:
+        add("RED", "filler", f"fran_fill.py has never written a status file in {FILL_DIR}")
+        return "stale"
+    newest = runs[-1]
+    age_h = (time.time() - os.path.getmtime(newest)) / 3600
+    try:
+        st = json.load(open(newest))
+    except (OSError, ValueError) as e:
+        add("AMBER", "filler", f"unreadable status {newest}: {e}")
+        return "stale" if age_h > 48 else "ok"
+    bad = [k for k, v in st.get("steps", {}).items() if v.get("rc") not in (0, None)]
+    # A step that stops at a time budget and resumes next night (engines_confirming) reports rc 0
+    # with work left over; flag it, or a backlog that outgrows the budget stays green forever.
+    for k, v in st.get("steps", {}).items():
+        if v.get("left"):
+            lag_d = None
+            if v.get("mark"):
+                try:
+                    from datetime import datetime, timezone
+                    lag_d = (datetime.now(timezone.utc) - datetime.fromisoformat(v["mark"])).total_seconds() / 86400
+                except ValueError:
+                    pass
+            sev = "RED" if lag_d is not None and lag_d > 3 else "AMBER"
+            add(sev, "filler", f"{k}: {v['left']} search(es) left after its time budget"
+                + (f"; caught up to {lag_d:.1f} d ago" if lag_d is not None else ""))
+    if age_h > 48:
+        add("RED", "filler", f"last fill run {age_h:.0f} h ago ({os.path.basename(newest)})")
+        return "stale"
+    if bad:
+        add("AMBER", "filler", f"last run ({os.path.basename(newest)}) failed step(s): {', '.join(bad)}")
+    else:
+        add("ok", "filler", f"last run {age_h:.0f} h ago, all {len(st.get('steps', {}))} steps rc=0")
+    return "ok"
+
+
+def check_drip():
+    try:
+        st = json.load(open(DRIP_STATE))
+    except (OSError, ValueError) as e:
+        add("AMBER", "drip", f"cannot read {DRIP_STATE}: {e}")
+        return
+    counts = {}
+    for v in st.values():
+        counts[v.get("status", "?")] = counts.get(v.get("status", "?"), 0) + 1
+    parked = [(v.get("name") or k)[:60] + " -- " + (v.get("reason") or "")[:120]
+              for k, v in st.items() if v.get("status") == "parked"]
+    metrics["drip"] = {"status_counts": counts,
+                       "parked": [{"name": (v.get("name") or k)[:80], "reason": (v.get("reason") or "")[:240]}
+                                  for k, v in st.items() if v.get("status") == "parked"][:100]}
+    add("AMBER" if parked else "ok", "drip", f"state {counts}" +
+        ("; parked sets need a human:\n    " + "\n    ".join(parked[:15]) if parked else ""))
+    r = sh("squeue -u $(id -un) -h -t PD -o '%r'")
+    reasons = r.stdout.splitlines()
+    dns = sum(1 for x in reasons if x.strip() == "DependencyNeverSatisfied")
+    held = sum(1 for x in reasons if "launch failed" in x)
+    metrics.setdefault("slurm", {}).update({"held": held, "stranded": dns})
+    if dns:
+        add("AMBER", "slurm", f"{dns} job(s) stranded on DependencyNeverSatisfied (the drip cancels "
+                              f"its own each firing; any left belong to something else)")
+    if held:
+        add("AMBER", "slurm", f"{held} job(s) held by a launch failure (slurm_heal.py releases them)")
+
+
+def check_bad_nodes():
+    if not os.path.exists(HEAL_LOG):
+        return
+    cutoff = time.strftime("%FT%T", time.localtime(time.time() - 7 * 86400))
+    per = {}
+    for line in open(HEAL_LOG):
+        p = line.rstrip("\n").split("\t")
+        if len(p) == 3 and p[0] >= cutoff and p[1] != "node":
+            per[p[1]] = per.get(p[1], 0) + int(p[2] or 0)
+    metrics.setdefault("slurm", {})["bad_nodes"] = per
+    if per:
+        add("AMBER", "slurm", "nodes that failed job launches this week (report to "
+                              f"hpc-help@ucdavis.edu if they persist): {per}")
+
+
+def check_cron():
+    if not os.path.exists(CRON_SNAPSHOT):
+        add("AMBER", "cron", f"no crontab snapshot at {CRON_SNAPSHOT} (fran_health_cron.sh writes it)")
+        return
+    age_h = (time.time() - os.path.getmtime(CRON_SNAPSHOT)) / 3600
+    txt = open(CRON_SNAPSHOT).read()
+    live = [ln for ln in txt.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    missing = [x for x in EXPECTED_CRON if not any(x in ln for ln in live)]
+    if missing:
+        add("RED", "cron", f"not scheduled (or commented out) on login2: {', '.join(missing)}")
+    else:
+        add("ok", "cron", f"all {len(EXPECTED_CRON)} FRAN cron lines live (snapshot {age_h:.0f} h old)")
+
+
+def heal(filler_state):
+    r = subprocess.run([sys.executable, os.path.join(HERE, "slurm_heal.py")], capture_output=True, text=True)
+    out = (r.stdout or "").strip().splitlines()
+    add("ok", "heal", out[-1] if out else "no held jobs")
+    if filler_state == "stale":
+        busy = sh("squeue -u \"$(id -un)\" -h -n fran_fill -o %i").stdout.split()
+        if busy:
+            add("ok", "heal", f"filler looks stale but fran_fill job(s) {', '.join(busy)} are queued/running; not resubmitting")
+            return
+        r = sh(f"sbatch --parsable {FILL_SBATCH}")
+        if r.returncode == 0:
+            add("ok", "heal", f"resubmitted the filler: job {r.stdout.strip()}")
+        else:
+            add("RED", "heal", f"could not resubmit the filler: {r.stderr.strip()[:200]}")
+
+
+def import_events(conn):
+    """Copy what the self-healing layer did into delimp_qc_event (dedupe_key makes it idempotent)."""
+    ev = []
+    try:
+        for i, line in enumerate(open(HEAL_EVENTS)):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            ev.append((d["at"], "heal", d.get("kind", "?"), d.get("summary", ""),
+                       json.dumps(d.get("detail", {})), f"heal:{d['at']}:{d.get('kind')}:{i}"))
+    except OSError:
+        pass
+    for path in glob.glob(os.path.join(FILL_DIR, "fill_*.json")):
+        try:
+            st = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        tag = os.path.basename(path)
+        steps = st.get("steps", {})
+        bad = {k: v for k, v in steps.items() if v.get("rc") not in (0, None)}
+        ev.append((st.get("finished") or st.get("started"), "fill", "fill_run",
+                   f"fill run{' (weekly)' if st.get('weekly') else ''}{' DRY' if st.get('dry_run') else ''}: "
+                   f"{len(steps)} step(s), {len(bad)} failed",
+                   json.dumps({k: {"rc": v.get("rc"), "seconds": v.get("seconds"),
+                                   "skipped": v.get("skipped")} for k, v in steps.items()}),
+                   f"fill:{tag}"))
+        for k, v in bad.items():
+            ev.append((st.get("finished") or st.get("started"), "fill", "fill_step_failed",
+                       f"{k} rc={v.get('rc')}: {(v.get('err_tail') or v.get('tail') or '')[-160:]}",
+                       json.dumps({"step": k, "rc": v.get("rc")}), f"fill:{tag}:{k}"))
+    try:
+        st = json.load(open(DRIP_STATE))
+        for k, v in st.items():
+            if v.get("status") == "parked" and v.get("parked_at"):
+                ev.append((v["parked_at"], "drip", "parked", f"parked {(v.get('name') or k)[:60]}: "
+                           f"{(v.get('reason') or '')[:200]}", json.dumps({"setkey": k}),
+                           f"drip:parked:{k}:{v['parked_at']}"))
+            elif v.get("status") == "failed" and v.get("completed_at") and "stranded" in (v.get("reason") or ""):
+                ev.append((v["completed_at"], "drip", "stranded", f"cancelled stranded chain "
+                           f"{(v.get('name') or k)[:60]}", json.dumps({"setkey": k}),
+                           f"drip:stranded:{k}:{v['completed_at']}"))
+    except (OSError, ValueError):
+        pass
+    if not ev:
+        return 0
+    from psycopg2.extras import execute_values
+    with conn.cursor() as c:
+        execute_values(c, """INSERT INTO delimp_qc_event (at, source, kind, summary, detail, dedupe_key)
+                             VALUES %s ON CONFLICT (dedupe_key) DO NOTHING""", ev,
+                       template="(%s::timestamptz,%s,%s,%s,%s::jsonb,%s)", page_size=500)
+        n = c.rowcount
+    conn.commit()
+    return n
+
+
+def record_scan(conn, kind):
+    with conn.cursor() as c:
+        c.execute("""INSERT INTO delimp_qc_scan (kind, n_red, n_amber, findings, metrics, job_id, host)
+                     VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) RETURNING id""",
+                  (kind, sum(1 for f in findings if f[0] == "RED"),
+                   sum(1 for f in findings if f[0] == "AMBER"),
+                   json.dumps([{"sev": s_, "area": a_, "msg": m} for s_, a_, m in findings]),
+                   json.dumps(metrics, default=str), os.environ.get("SLURM_JOB_ID"),
+                   os.uname().nodename))
+        sid = c.fetchone()[0]
+    conn.commit()
+    return sid
+
+
+def post(text):
+    try:
+        hook = open(WEBHOOK_FILE).read().strip()
+        req = urllib.request.Request(hook, data=json.dumps({"text": text}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=20).read()
+        print("posted to Slack")
+    except (OSError, urllib.error.URLError) as e:
+        print(f"Slack post failed ({str(e)[:120]}) -- the report file is still written")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--heal", action="store_true")
+    ap.add_argument("--post", action="store_true")
+    ap.add_argument("--out", default=OUT_DIR)
+    ap.add_argument("--kind", default="manual", choices=["daily", "weekly", "manual"])
+    ap.add_argument("--no-db", action="store_true", help="don't write delimp_qc_scan / delimp_qc_event")
+    a = ap.parse_args()
+
+    global _conn
+    from coreomics_import import _conn
+    conn = _conn()
+    conn.set_session(readonly=True, autocommit=True)
+    with conn.cursor() as c:
+        c.execute("SET statement_timeout = '15min'")
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training):
+            try:
+                fn(c)
+            except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
+                add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
+    conn.close()
+    filler_state = check_filler()
+    for fn in (check_xic_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
+    if a.heal:
+        heal(filler_state)
+
+    order = {"RED": 0, "AMBER": 1, "ok": 2}
+    findings.sort(key=lambda f: order.get(f[0], 3))
+    n_red = sum(1 for f in findings if f[0] == "RED")
+    n_amb = sum(1 for f in findings if f[0] == "AMBER")
+    head = f"FRAN weekly health scan {time.strftime('%F')}: {n_red} RED, {n_amb} AMBER"
+    body = "\n".join(f"- *{s}* {a_}: {m}" for s, a_, m in findings)
+    os.makedirs(a.out, exist_ok=True)
+    path = os.path.join(a.out, f"scan_{time.strftime('%Y%m%d_%H%M%S')}.md")
+    with open(path, "w") as fh:
+        fh.write(f"# {head}\n\n{body}\n")
+    print(f"\n{head}\nreport: {path}")
+    if not a.no_db:
+        try:
+            w = _conn()
+            n_ev = import_events(w)
+            sid = record_scan(w, a.kind)
+            w.close()
+            print(f"recorded scan {sid} and {n_ev} new event(s) for FRAN-QC")
+        except Exception as e:  # noqa: BLE001 - the report file and Slack post still happen
+            print(f"could not record to the QC tables: {repr(e)[:300]}")
+    if a.post:
+        short = "\n".join(f"- *{s}* {a_}: {m.splitlines()[0][:220]}" for s, a_, m in findings if s != "ok")
+        post(f"{head}\n{short or 'everything filling normally'}\nfull report: {path}")
+    return 0   # the scan completed; REDs live in the report. A crash still exits non-zero.
+
+
+if __name__ == "__main__":
+    sys.exit(main())
