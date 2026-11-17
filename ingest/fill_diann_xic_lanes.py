@@ -15,7 +15,13 @@ PLAN RULES (unchanged from the 2026-11-12 runner, which ingested 768 with 0 fail
   * DIA-NN searches with no delimp_xic_lane row (the registry is the only bookkeeping: a task killed
     mid-search leaves an unregistered dataset, and diann_xic_to_lance's first write is
     mode="overwrite", so the next run simply redoes it);
-  * output_dir exists and holds report.parquet and an xic/ or report_xic/ tree;
+  * output_dir exists and holds report.parquet and an xic/ or report_xic/ tree -- OR, when
+    output_dir is gone (staff renamed or moved the session folder after ingest: Cacho PROT_0835 and
+    Loots MuCer18, 2026-11-17), the drop-box entry whose fran_manifest.json names that output_dir
+    and holds report.parquet + report_xic/ (fran_deposit.py copies both since 2026-11-17). The job
+    records `via: dropbox` so a lane written from the copy is traceable;
+  * only chromatogram files that EXIST count: a drop entry's report_xic/ may hold links into the
+    moved folder, and a dead link would pass the coverage guard and fail in the writer;
   * STRICT coverage guard: .xic.parquet files / n_raw_files in 0.9..1.1, else SKIP and say why
     (a mismatch means the pairing is wrong; ingesting would attach another run's traces).
 One writer per output dataset: each search belongs to exactly one task (slice task::ntasks).
@@ -36,6 +42,34 @@ sys.path.insert(0, HERE)
 D = os.environ.get("FRAN_XIC_FILL_DIR", "/quobyte/proteomics-grp/brett/scratch/fran_health/xic_lane")
 LANCE = os.environ.get("FRAN_XIC_LANCE_DIR", "/quobyte/proteomics-grp/brett/glendon/xic_lance")
 WRITER = os.path.join(HERE, "diann_xic_to_lance.py")
+DROP = os.environ.get("FRAN_DROP_DIR", "/quobyte/proteomics-grp/fran/incoming")
+
+
+def dropbox_index(root=None):
+    """output_dir -> drop-box entry, from each entry's fran_manifest.json. Empty when the drop box
+    is unreadable: the fallback is a bonus, never a reason for the plan to fail."""
+    idx = {}
+    try:
+        ents = list(os.scandir(root or DROP))
+    except OSError:
+        return idx
+    for e in ents:
+        if not e.is_dir(follow_symlinks=False):
+            continue
+        try:
+            with open(os.path.join(e.path, "fran_manifest.json")) as fh:
+                od = (json.load(fh).get("output_dir") or "").rstrip("/")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if od:
+            idx[od] = e.path
+    return idx
+
+
+def n_xic(xd):
+    """.xic.parquet files under xd that can actually be read (a dead link does not count)."""
+    return sum(1 for dp, _dn, fns in os.walk(xd) for f in fns
+               if f.endswith(".xic.parquet") and os.path.exists(os.path.join(dp, f)))
 
 
 def plan(a):
@@ -51,6 +85,7 @@ def plan(a):
     rows = cur.fetchall()
     conn.close()
     jobs, skipped, why = [], [], {}
+    drop = dropbox_index()
 
     def skip(reason, sid, name, detail=""):
         why[reason] = why.get(reason, 0) + 1
@@ -58,21 +93,25 @@ def plan(a):
 
     for sid, name, od, nraw, ing in rows:
         sid = str(sid)
+        src, via = od, "output_dir"
         if not od or not os.path.isdir(od):
-            skip("no_output_dir", sid, name, od or "")
-            continue
-        rep = os.path.join(od, "report.parquet")
-        xd = next((x for x in (os.path.join(od, "xic"), os.path.join(od, "report_xic")) if os.path.isdir(x)), None)
+            ent = drop.get((od or "").rstrip("/"))
+            if not ent:
+                skip("no_output_dir", sid, name, od or "")
+                continue
+            src, via = ent, "dropbox"
+        rep = os.path.join(src, "report.parquet")
+        xd = next((x for x in (os.path.join(src, "xic"), os.path.join(src, "report_xic")) if os.path.isdir(x)), None)
         if not os.path.isfile(rep) or not xd:
-            skip("no_report_or_xic", sid, name, od)
+            skip("no_report_or_xic", sid, name, src)
             continue
-        nx = sum(1 for _dp, _dn, fns in os.walk(xd) for f in fns if f.endswith(".xic.parquet"))
+        nx = n_xic(xd)
         cov = nx / nraw if nraw else 0.0
         if not 0.9 <= cov <= 1.1:
             skip("coverage_mismatch", sid, name, f"{nx} xic / {nraw} runs")
             continue
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "search")[:70]
-        jobs.append(dict(sid=sid, name=name, dir=od, report=rep, xic=xd, n_xic=nx,
+        jobs.append(dict(sid=sid, name=name, dir=src, via=via, report=rep, xic=xd, n_xic=nx,
                          ingested_at=ing.isoformat() if ing else None,
                          out=f"{LANCE}/{safe}__{sid[:8]}.diann.xic.lance"))
         if a.max and len(jobs) >= a.max:
@@ -113,7 +152,7 @@ def run(a):
             tail = " / ".join(txt.strip().splitlines()[-3:])[:600]
             out.write(f"{j['sid']}\t{j['name']}\t{r.returncode}\t{time.time()-t0:.0f}\t{tail}\n")
             out.flush()
-            print(f"--- {j['name']} ({j['n_xic']} xic) rc={r.returncode} {time.time()-t0:.0f}s\n    {tail}", flush=True)
+            print(f"--- {j['name']} ({j['n_xic']} xic{', via drop box' if j.get('via') == 'dropbox' else ''}) rc={r.returncode} {time.time()-t0:.0f}s\n    {tail}", flush=True)
             ok += r.returncode == 0
             fail += r.returncode != 0
     print(f"task {a.task}/{a.ntasks}: ok={ok} fail={fail} -> {res}")
