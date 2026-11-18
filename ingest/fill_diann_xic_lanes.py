@@ -10,6 +10,13 @@ like 98-100%; it ended 2026-11-14 and from 2026-11-13 every new DIA-NN search we
     fill_diann_xic_lanes.py plan [--max N]        read-only: which searches, written to <D>/plan_<job>.json
     fill_diann_xic_lanes.py run <task> <ntasks> <plan.json>
                                                   one array task: diann_xic_to_lance.py --apply per search
+    fill_diann_xic_lanes.py prune-drop [--apply]  drop-box chromatogram copies whose lane is written
+
+DROP-BOX PRUNE. fran_deposit.py copies report_xic/ into the drop-box entry (up to 20 GB) so a renamed
+session folder cannot strand the lane. Once the lane is written that copy has done its job, and
+nothing else ever deletes drop-box entries, so it is removed here: only report_xic/ (the reports
+stay; they are small and keep the search re-ingestible), only when delimp_xic_lane has a row for
+the search the manifest names AND that row's dataset is on disk. Links are unlinked, never followed.
 
 PLAN RULES (unchanged from the 2026-11-12 runner, which ingested 768 with 0 failures):
   * DIA-NN searches with no delimp_xic_lane row (the registry is the only bookkeeping: a task killed
@@ -125,6 +132,44 @@ def plan(a):
     return out, len(jobs)
 
 
+def _tree_bytes(p):
+    if os.path.islink(p):
+        return 0
+    return sum(os.lstat(os.path.join(dp, f)).st_size for dp, _dn, fns in os.walk(p) for f in fns)
+
+
+def prune_drop(a, laned=None, root=None):
+    """Remove report_xic/ from drop-box entries whose search already has its XIC lane on disk."""
+    import shutil
+    if laned is None:
+        from coreomics_import import _conn
+        conn = _conn()
+        conn.set_session(readonly=True, autocommit=True)
+        cur = conn.cursor()
+        cur.execute("""SELECT s.output_dir, l.lance_path FROM delimp_xic_lane l
+                         JOIN delimp_searches s ON s.id = l.search_id
+                        WHERE s.search_engine = 'diann' AND s.output_dir IS NOT NULL""")
+        laned = {od.rstrip("/"): lp for od, lp in cur.fetchall()}
+        conn.close()
+    n = freed = 0
+    for od, ent in sorted(dropbox_index(root).items()):
+        lp = laned.get(od)
+        x = os.path.join(ent, "report_xic")
+        if not lp or not os.path.isdir(lp) or not os.path.lexists(x):
+            continue
+        b = _tree_bytes(x)
+        print(f"{'PRUNE' if a.apply else 'would prune'} {x} ({b / 1e9:.2f} GB; lane {lp})", flush=True)
+        if a.apply:
+            if os.path.islink(x):
+                os.unlink(x)
+            else:
+                shutil.rmtree(x)
+        n += 1
+        freed += b
+    print(f"PRUNED {n} {freed}" if a.apply else f"dry run: {n} entr(ies), {freed / 1e9:.2f} GB")
+    return n, freed
+
+
 def run(a):
     data = json.load(open(a.plan))
     jobs = data["jobs"][a.task::a.ntasks]
@@ -168,7 +213,12 @@ def main():
     r.add_argument("task", type=int)
     r.add_argument("ntasks", type=int)
     r.add_argument("plan")
+    pr = sp.add_parser("prune-drop")
+    pr.add_argument("--apply", action="store_true")
     a = ap.parse_args()
+    if a.cmd == "prune-drop":
+        prune_drop(a)
+        return 0
     if a.cmd == "plan":
         out, n = plan(a)
         print(f"PLAN {out} {n}")

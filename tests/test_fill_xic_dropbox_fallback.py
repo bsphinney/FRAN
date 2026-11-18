@@ -109,5 +109,57 @@ class DropboxFallback(unittest.TestCase):
             self.assertEqual((p["jobs"][0]["dir"], p["jobs"][0]["via"]), (od, "output_dir"))
 
 
+class PruneDrop(unittest.TestCase):
+    """Once a search's lane is written, its drop-box report_xic/ copy is removed (nothing else ever
+    deletes drop-box entries); the reports stay."""
+
+    def _setup(self, d, lane_exists=True, link=False):
+        import importlib
+        import fill_diann_xic_lanes as f
+        importlib.reload(f)
+        od = os.path.join(d, "old", "search")
+        ent = os.path.join(d, "incoming", "search__abcd1234")
+        _touch(os.path.join(ent, "fran_manifest.json"), json.dumps({"output_dir": od}))
+        _touch(os.path.join(ent, "report.parquet"))
+        target = os.path.join(d, "real_xic")
+        _touch(os.path.join(target, "run0.xic.parquet"), "y" * 100)
+        if link:
+            os.symlink(target, os.path.join(ent, "report_xic"))
+        else:
+            _touch(os.path.join(ent, "report_xic", "run0.xic.parquet"), "y" * 100)
+        lane = os.path.join(d, "lance", "s.diann.xic.lance")
+        if lane_exists:
+            os.makedirs(lane)
+        return f, ent, {od: lane}, target
+
+    def test_a_laned_search_loses_its_xic_copy_and_keeps_its_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, ent, laned, _ = self._setup(d)
+            n, freed = f.prune_drop(types.SimpleNamespace(apply=True), laned, os.path.join(d, "incoming"))
+            self.assertEqual((n, freed), (1, 100))
+            self.assertFalse(os.path.lexists(os.path.join(ent, "report_xic")))
+            self.assertTrue(os.path.isfile(os.path.join(ent, "report.parquet")))
+
+    def test_dry_run_deletes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, ent, laned, _ = self._setup(d)
+            f.prune_drop(types.SimpleNamespace(apply=False), laned, os.path.join(d, "incoming"))
+            self.assertTrue(os.path.isdir(os.path.join(ent, "report_xic")))
+
+    def test_no_lane_on_disk_keeps_the_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, ent, laned, _ = self._setup(d, lane_exists=False)
+            n, _ = f.prune_drop(types.SimpleNamespace(apply=True), laned, os.path.join(d, "incoming"))
+            self.assertEqual(n, 0)
+            self.assertTrue(os.path.isdir(os.path.join(ent, "report_xic")))
+
+    def test_a_linked_report_xic_is_unlinked_not_followed(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, ent, laned, target = self._setup(d, link=True)
+            f.prune_drop(types.SimpleNamespace(apply=True), laned, os.path.join(d, "incoming"))
+            self.assertFalse(os.path.lexists(os.path.join(ent, "report_xic")))
+            self.assertTrue(os.path.isfile(os.path.join(target, "run0.xic.parquet")))
+
+
 if __name__ == "__main__":
     unittest.main()

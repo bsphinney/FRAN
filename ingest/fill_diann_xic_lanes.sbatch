@@ -23,6 +23,9 @@ cd "$ING"
 MODE=${1:?plan or run}
 echo "===== fran_xic_lane $MODE $(date -Is) on $(hostname) job ${SLURM_JOB_ID:-} ====="
 if [ "$MODE" = plan ]; then
+    # Yesterday's lanes are written: their drop-box chromatogram copies can go (docstring). Never
+    # a reason for the plan to fail.
+    "$PY" -u fill_diann_xic_lanes.py prune-drop --apply || echo "prune-drop failed rc=$?"
     OUT=$("$PY" -u fill_diann_xic_lanes.py plan "${@:2}" | tee /dev/stderr | awk '/^PLAN /{print $2, $3}')
     PLAN=${OUT% *}; N=${OUT#* }
     if [ -z "$PLAN" ] || [ "${N:-0}" -eq 0 ]; then echo "nothing to do"; exit 0; fi
