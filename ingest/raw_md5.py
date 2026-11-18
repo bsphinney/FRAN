@@ -60,6 +60,10 @@ def main():
                      HAVING bool_or(nullif(btrim(md5), '') IS NULL)
                       ORDER BY hive_path""")
         todo = [(p, s) for i, (p, s) in enumerate(c.fetchall()) if i % a.shards == a.shard]
+    # Not held open while hashing. Reading 2 TB takes hours, and a connection left idle that long is
+    # dropped by the server side: 2026-11-18 the first flush after 104 min died with "SSL SYSCALL
+    # error: EOF detected" and the step failed. Each flush opens its own short-lived connection.
+    conn.close()
     total = sum(s or 0 for _, s in todo)
     print(f"shard {a.shard}/{a.shards}: {len(todo):,} file(s), ~{total / 1e12:.2f} TB; apply={a.apply}",
           flush=True)
@@ -73,13 +77,24 @@ def main():
             pend.clear()
             return
         from psycopg2.extras import execute_values
-        with conn.cursor() as c:
-            c.execute("SET lock_timeout = '5s'")
-            execute_values(c, """UPDATE raw_files r SET md5 = v.md5
-                                   FROM (VALUES %s) AS v(hive_path, md5)
-                                  WHERE r.hive_path = v.hive_path AND nullif(btrim(r.md5), '') IS NULL""",
-                           pend, page_size=200)
-        conn.commit()
+        import psycopg2
+        for attempt in (1, 2):      # one retry: a dropped connection must not lose a batch
+            fc = _conn()
+            try:
+                with fc.cursor() as c:
+                    c.execute("SET lock_timeout = '5s'")
+                    execute_values(c, """UPDATE raw_files r SET md5 = v.md5
+                                           FROM (VALUES %s) AS v(hive_path, md5)
+                                          WHERE r.hive_path = v.hive_path AND nullif(btrim(r.md5), '') IS NULL""",
+                                   pend, page_size=200)
+                fc.commit()
+                break
+            except psycopg2.OperationalError:
+                if attempt == 2:
+                    raise
+                time.sleep(30)
+            finally:
+                fc.close()
         pend.clear()
 
     for path, _ in todo:
@@ -104,7 +119,6 @@ def main():
             print(f"  {n_ok:,} files, {done_b / 1e12:.2f} TB, {done_b / max(el, 1) / 1e6:.0f} MB/s", flush=True)
     tsv.close()
     flush()
-    conn.close()
     el = time.time() - t0
     print(f"DONE shard {a.shard}: {n_ok:,} hashed, {n_err:,} unreadable, {done_b / 1e12:.2f} TB in "
           f"{el / 3600:.1f} h ({done_b / max(el, 1) / 1e6:.0f} MB/s)")

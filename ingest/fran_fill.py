@@ -53,7 +53,12 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATUS_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/fill"
 RECENT_DAYS = 10      # engines_confirming: first-run window, before a high-water mark exists
-ENGINES_BUDGET_S = 4 * 3600   # engines_confirming stops here; the rest waits for the next night
+ENGINES_BUDGET_S = int(os.environ.get("FRAN_ENGINES_BUDGET_S", 4 * 3600))  # then the rest waits
+# Acquisitions are independent (each UPDATE touches only its own raw files' rows), so they run on
+# this many connections at once. One connection did 43 searches in 4 h on 2026-11-18 while ~35 a day
+# arrive: serial could never catch up.
+ENGINES_WORKERS = int(os.environ.get("FRAN_ENGINES_WORKERS", 4))
+ENGINES_CHUNK = 16            # searches per parallel round; the mark advances after each round
 
 # (name, argv after the script path, timeout seconds, weekly_only). Script = name before any ":".
 STEPS = [
@@ -99,20 +104,53 @@ def run_script(name, args, timeout, dry):
             "err_tail": (err or "")[-600:]}
 
 
+def _refresh_parallel(names, workers):
+    """refresh_for() over these basenames on `workers` connections. Each basename goes to exactly
+    one worker, so two workers never update the same rows. A deadlock (against an ingest touching
+    the same acquisition) retries that worker's share once; refresh_for only writes rows whose value
+    changes, so redoing part of a share is harmless."""
+    from concurrent.futures import ThreadPoolExecutor
+    import backfill_engines_confirming as B
+    from coreomics_import import _conn
+    import psycopg2
+    names = sorted(set(names))
+    parts = [p for p in (names[i::workers] for i in range(workers)) if p]
+
+    def work(part):
+        conn = _conn()
+        try:
+            for attempt in (1, 2):
+                try:
+                    return B.refresh_for(conn, part, verbose=False)
+                except psycopg2.errors.DeadlockDetected:
+                    conn.rollback()
+                    if attempt == 2:
+                        raise
+                    time.sleep(30)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=len(parts) or 1) as ex:
+        return sum(ex.map(work, parts)), len(names)
+
+
 def engines_confirming(dry):
     """refresh_for() over the raw basenames of searches ingested since the last run (high-water mark).
 
     It used to redo every basename from the last 10 days each night, in-process and so with no step
     timeout. Once the DIA-NN corpus run made nearly every acquisition multi-engine that meant ~10x
-    repeated reads of 434M-row delimp_precursors: 13,523 s on 2026-11-14 (then a deadlock against a
-    second filler), and >23 h on 2026-11-14/15 (killed at the job time limit). Now: whole searches
-    in ingest order after the saved mark, the mark advanced after each search, stopping at a time
-    budget; what is left is reported and picked up the next night. A deadlock is retried once.
+    repeated reads of delimp_precursors: 13,523 s on 2026-11-14 (then a deadlock against a second
+    filler), and >23 h on 2026-11-14/15 (killed at the job time limit). Then: whole searches in
+    ingest order after the saved mark, stopping at a time budget. That was still one connection, and
+    on 2026-11-18 it managed 43 searches in 4 h against ~35 new a day: 8.8 days behind and growing.
+
+    Now: rounds of ENGINES_CHUNK searches in ingest order. A round's basenames are de-duplicated and
+    spread over ENGINES_WORKERS connections; the mark advances to the round's last search only when
+    the whole round is done, so a stop or failure never skips a search. Each basename is computed
+    from ALL its current rows, so doing it once per round (not once per search) gives the same value.
     """
     sys.path.insert(0, HERE)
-    import backfill_engines_confirming as B
     from coreomics_import import _conn
-    import psycopg2
     t0 = time.time()
     mark_f = os.path.join(STATUS_DIR, "engines_confirming.watermark")
     try:
@@ -131,45 +169,43 @@ def engines_confirming(dry):
                           GROUP BY s.id, s.ingested_at ORDER BY s.ingested_at""",
                       (mark, "%d days" % RECENT_DAYS))
             todo = c.fetchall()
-        if dry:
-            return {"rc": 0, "seconds": round(time.time() - t0),
-                    "tail": "dry run: %d searches after mark %s" % (len(todo), mark)}
-        done_s = changed = 0
-        seen = set()
-        for ts, names in todo:
-            if time.time() - t0 > ENGINES_BUDGET_S:
-                break
-            # no de-dup across searches: a later search from another engine changes the count again
-            for attempt in (1, 2):
-                try:
-                    changed += B.refresh_for(conn, names, verbose=False)
-                    break
-                except psycopg2.errors.DeadlockDetected:
-                    conn.rollback()
-                    if attempt == 2:
-                        raise
-                    time.sleep(30)
-            seen.update(names)
-            done_s += 1
-            with open(mark_f + ".tmp", "w") as fh:
-                fh.write(ts.isoformat())
-            os.replace(mark_f + ".tmp", mark_f)
-        left = len(todo) - done_s
-        # left / lag are machine-readable so the health scan can flag a backlog that grows while
-        # every run "succeeds" (fran_health_scan.check_filler).
-        try:
-            cur_mark = open(mark_f).read().strip()
-        except OSError:
-            cur_mark = None
-        return {"rc": 0, "seconds": round(time.time() - t0), "left": left, "mark": cur_mark,
-                "tail": "%d of %d searches after mark %s refreshed (%d basenames, %d rows changed)%s"
-                        % (done_s, len(todo), mark, len(seen), changed,
-                           "; %d left for the next run (budget %d s)" % (left, ENGINES_BUDGET_S) if left else "")}
-    except Exception as e:  # noqa: BLE001 - recorded, never stops the remaining steps
         conn.rollback()
-        return {"rc": 1, "seconds": round(time.time() - t0), "err_tail": repr(e)[:600]}
     finally:
         conn.close()
+    if dry:
+        return {"rc": 0, "seconds": round(time.time() - t0),
+                "tail": "dry run: %d searches after mark %s" % (len(todo), mark)}
+    done_s = changed = n_names = 0
+    try:
+        for i in range(0, len(todo), ENGINES_CHUNK):
+            if time.time() - t0 > ENGINES_BUDGET_S:
+                break
+            rnd = todo[i:i + ENGINES_CHUNK]
+            ch, nn = _refresh_parallel([n for _, names in rnd for n in names], ENGINES_WORKERS)
+            changed += ch
+            n_names += nn
+            done_s += len(rnd)
+            with open(mark_f + ".tmp", "w") as fh:
+                fh.write(rnd[-1][0].isoformat())
+            os.replace(mark_f + ".tmp", mark_f)
+        rc, err = 0, None
+    except Exception as e:  # noqa: BLE001 - recorded, never stops the remaining steps
+        rc, err = 1, repr(e)[:600]
+    left = len(todo) - done_s
+    # left / lag are machine-readable so the health scan can flag a backlog that grows while
+    # every run "succeeds" (fran_health_scan.check_filler).
+    try:
+        cur_mark = open(mark_f).read().strip()
+    except OSError:
+        cur_mark = None
+    res = {"rc": rc, "seconds": round(time.time() - t0), "left": left, "mark": cur_mark,
+           "workers": ENGINES_WORKERS,
+           "tail": "%d of %d searches after mark %s refreshed (%d basenames, %d rows changed, %d workers)%s"
+                   % (done_s, len(todo), mark, n_names, changed, ENGINES_WORKERS,
+                      "; %d left for the next run (budget %d s)" % (left, ENGINES_BUDGET_S) if left else "")}
+    if err:
+        res["err_tail"] = err
+    return res
 
 
 def main():
