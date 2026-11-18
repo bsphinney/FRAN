@@ -60,7 +60,11 @@ FLOORS = {"raw_files.hive_path": 0.90, "raw_files.instrument_model": 0.90,
           "raw_files.acquisition_date": 0.90, "raw_files.n_ms2_frames": 0.85,
           "raw_files.cycle_time_sec": 0.85, "sample_metadata.organism_taxon_id": 0.90,
           "searches with PTM rollup": 0.90, "searches with provenance row": 0.90,
-          "searches with FASTA record": 0.90, "searches with raw-file links": 0.95}
+          "searches with FASTA record": 0.90, "searches with raw-file links": 0.95,
+          # Lanes, per engine (an engine-specific key wins over the plain label). Set from what each
+          # lane reached when its writer ran: DIA-NN XIC 95 percent, Spectronaut spectra 86 percent
+          # of the last 60 days (2026-11-18). The other two have no writer yet: RED until they do.
+          "searches with XIC lane": 0.90, "searches with spectrum lane": 0.80}
 
 # (label, FROM clause, date expression, [(column label, filled-expression)])
 FILL_CHECKS = [
@@ -84,15 +88,30 @@ FILL_CHECKS = [
     ]),
 ]
 
-# Per-search side tables: (label, engine filter or None, EXISTS subquery on s.id)
+# Per-search side tables: (label, engine, EXISTS subquery on s.id). engine None = all searches
+# together; "*" = once PER ENGINE that has searches in the window.
+#
+# The lanes are "*" on purpose. Until 2026-11-18 they read ("XIC lane", "diann") and
+# ("spectrum lane", "spectronaut"): each lane was checked only for the engine that had a writer.
+# So the check measured what the code produced, not what a search should have, and two whole gaps
+# were invisible: 0 of 1,223 DIA-NN searches had a spectrum lane, 2 of 2,222 Spectronaut searches an
+# XIC lane. A gap no writer covers can never show up as a drop. Every engine is now measured for
+# every lane, and the lanes have floors (FLOORS) so a lane that was ALWAYS empty is RED too.
 COVERAGE_CHECKS = [
     ("PTM rollup", None, "SELECT 1 FROM delimp_search_protein_ptm x WHERE x.search_id = s.id"),
     ("provenance row", None, "SELECT 1 FROM delimp_search_provenance x WHERE x.search_id = s.id"),
     ("FASTA record", None, "SELECT 1 FROM delimp_search_fastas x WHERE x.search_id = s.id"),
     ("raw-file links", None, "SELECT 1 FROM search_raw_files x WHERE x.search_id = s.id"),
-    ("XIC lane", "diann", "SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id"),
-    ("spectrum lane", "spectronaut", "SELECT 1 FROM delimp_spectrum_lane x WHERE x.search_id = s.id"),
+    ("XIC lane", "*", "SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id"),
+    ("spectrum lane", "*", "SELECT 1 FROM delimp_spectrum_lane x WHERE x.search_id = s.id"),
 ]
+# Why a lane is short for an engine, printed with its finding so a RED says what it would take.
+GAP_NOTES = {
+    "searches with spectrum lane (diann)": "no DIA-NN spectrum writer was scheduled before 2026-11-18 "
+        "(diann_spectra_to_lance.py)",
+    "searches with XIC lane (spectronaut)": "Spectronaut XICs come from the .sne's .xic.db, extracted "
+        "on a Windows node; nothing on Hive can write them",
+}
 
 EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh",
                  "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh",
@@ -117,14 +136,14 @@ def sh(cmd):
 def judge(area, what, recent, base, n_recent, n_base):
     if n_recent < MIN_ROWS:
         return
-    floor = FLOORS.get(what.split(" (")[0])
+    floor = FLOORS.get(what, FLOORS.get(what.split(" (")[0]))
     if area in metrics:
         metrics[area][what] = {"recent": round(recent, 4), "base": round(base, 4), "floor": floor,
                                "n_recent": n_recent, "n_base": n_base}
     txt = (f"{what}: {recent:.0%} of the last {RECENT} d vs {base:.0%} before "
            f"(n={n_recent:,}/{n_base:,})" + (f"; floor {floor:.0%}" if floor else ""))
     if floor and recent < floor:
-        add("RED", area, txt)
+        add("RED", area, txt + (f" -- {GAP_NOTES[what]}" if what in GAP_NOTES else ""))
         return
     if n_base < MIN_ROWS:
         return
@@ -165,15 +184,31 @@ def check_fill(c):
             judge("fill", f"{label}.{name}", float(r), float(b), n_r, n_b)
 
 
-def check_coverage(c):
+def _coverage_runs(c):
+    """(label, engine, subquery) with every "*" expanded to each engine that has searches in the
+    window, so an engine added later is measured for every lane from its first search."""
+    c.execute(f"""SELECT DISTINCT search_engine FROM delimp_searches
+                   WHERE ingested_at > now() - interval '{BASE_TO} days' AND search_engine IS NOT NULL
+                   ORDER BY 1""")
+    engines = [r[0] for r in c.fetchall()]
     for label, engine, sub in COVERAGE_CHECKS:
-        eng = f"AND s.search_engine = '{engine}'" if engine else ""
+        if engine == "*":
+            for e in engines:
+                yield label, e, sub
+        else:
+            yield label, engine, sub
+
+
+def check_coverage(c):
+    for label, engine, sub in list(_coverage_runs(c)):
+        eng = "AND s.search_engine = %s" if engine else ""
         c.execute(f"""SELECT count(*) FILTER (WHERE s.ingested_at > now() - interval '{RECENT} days'),
                              avg((EXISTS ({sub}))::int) FILTER (WHERE s.ingested_at > now() - interval '{RECENT} days'),
                              count(*) FILTER (WHERE s.ingested_at <= now() - interval '{BASE_FROM} days'),
                              avg((EXISTS ({sub}))::int) FILTER (WHERE s.ingested_at <= now() - interval '{BASE_FROM} days')
                         FROM delimp_searches s
-                       WHERE s.ingested_at > now() - interval '{BASE_TO} days' {eng}""")
+                       WHERE s.ingested_at > now() - interval '{BASE_TO} days' {eng}""",
+                  (engine,) if engine else None)
         n_r, r, n_b, b = c.fetchone()
         if r is not None:
             b = r if b is None else b
