@@ -286,30 +286,45 @@ def decide(s, reports, registry, on_disk_rows, taken, state, strict=False, exist
 
 
 # --------------------------------------------------------------------------- state
+class StateError(Exception):
+    pass
+
+
 def load_state():
-    try:
-        with open(os.path.join(D, "state.json")) as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
+    """No file is a fresh start. A file that exists but cannot be parsed is NOT: loading it as {} would
+    forget every attempt count and every parked search, so stop and say so."""
+    f = os.path.join(D, "state.json")
+    if not os.path.exists(f):
         return {}
+    try:
+        with open(f) as fh:
+            st = json.load(fh)
+        if not isinstance(st, dict):
+            raise ValueError("not a JSON object")
+        return st
+    except (OSError, ValueError) as e:
+        raise StateError(f"{f} exists but cannot be read ({e!r}); refusing to start from an empty state. "
+                         f"Fix or move it by hand.")
 
 
 def save_state(state):
     """Atomic: write a temp file, rename over state.json. One writer (the parent process)."""
     os.makedirs(D, exist_ok=True)
-    tmp = os.path.join(D, f"state.json.tmp{os.getpid()}")
+    tmp = os.path.join(D, f"state.json.tmp.{os.uname().nodename}.{os.getpid()}.{os.environ.get('SLURM_JOB_ID', 'nojob')}")
     with open(tmp, "w") as fh:
         json.dump(state, fh, indent=1)
     os.replace(tmp, os.path.join(D, "state.json"))
 
 
-def settle_in_flight(state, jid):
+def settle_in_flight(state, jid, active=None):
     """A search left in_flight by a DIFFERENT job died mid-write (OOM, time limit, node loss): count
     it as an attempt. The same job id means a requeue after pre-emption, which is not the data's fault.
     Only searches whose child had actually STARTED are in_flight (see mark_in_flight)."""
     for sid, st in state.items():
         f = st.get("in_flight")
-        if f and f != jid:
+        if f and f != jid and active is not None and sid not in active:
+            st.pop("in_flight", None)          # the new plan no longer includes this search: nothing to charge
+        elif f and f != jid:
             st["attempts"] = st.get("attempts", 0) + 1
             st["last_error"] = f"job {f} died while writing this lane"
             st["parked"] = st["attempts"] >= MAX_ATTEMPTS
@@ -328,6 +343,101 @@ def record_failure(state, sid, err, path=None):
 
 
 _state_lock = threading.Lock()
+
+
+def _squeue_state(jobid):
+    """'RUNNING' etc., '' when squeue does not know the job, None when squeue itself failed."""
+    try:
+        r = subprocess.run(["squeue", "-h", "-j", str(jobid), "-o", "%T"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return "" if "Invalid job id" in (r.stderr or "") else None
+    return r.stdout.strip()
+
+
+def acquire_lock(jid, job_state=_squeue_state):
+    """One --apply at a time: the directory D/apply.lock holding this job id. A lock whose job squeue no
+    longer knows is stale and is taken over; one whose job is alive, or that cannot be checked, is not.
+    --dependency=singleton in the sbatch stays the first line of defence."""
+    os.makedirs(D, exist_ok=True)
+    lock = os.path.join(D, "apply.lock")
+    for _ in range(2):
+        try:
+            os.mkdir(lock)
+            with open(os.path.join(lock, "job"), "w") as fh:
+                fh.write(str(jid))
+            return lock
+        except FileExistsError:
+            try:
+                holder = open(os.path.join(lock, "job")).read().strip()
+            except OSError:
+                holder = ""
+            if holder == str(jid):
+                return lock                                    # our own, after a requeue
+            st = job_state(holder) if holder.isdigit() else None
+            if st == "":
+                shutil.rmtree(lock, ignore_errors=True)        # holder is gone: stale
+                continue
+            raise StateError(f"another --apply run holds {lock} (job {holder or '?'}, state {st or 'unknown'}); not starting")
+    raise StateError(f"could not take {lock}")
+
+
+def release_lock(lock, jid):
+    try:
+        if open(os.path.join(lock, "job")).read().strip() == str(jid):
+            shutil.rmtree(lock, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def append_jsonl(path, obj):
+    """Parent-only, one line per finished search, flushed and fsynced: a timeout loses nothing."""
+    with open(path, "a") as fh:
+        fh.write(json.dumps(obj) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+class ConnLost(Exception):
+    pass
+
+
+def is_conn_error(e):
+    try:
+        import psycopg2
+        return isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError))
+    except ImportError:
+        return False
+
+
+class Db:
+    """The one PG connection, kept honest over a many-hour run: reconnect once on a lost connection."""
+    def __init__(self, connect):
+        self.connect, self.conn = connect, connect()
+
+    def reconnect(self):
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.conn = self.connect()
+
+    def run(self, fn):
+        for attempt in (1, 2):
+            try:
+                if getattr(self.conn, "closed", 0):
+                    self.reconnect()
+                return fn(self.conn)
+            except Exception as e:  # noqa: BLE001
+                if not is_conn_error(e):
+                    raise
+                if attempt == 2:
+                    raise ConnLost(repr(e)[:200])
+                try:
+                    self.reconnect()
+                except Exception as e2:  # noqa: BLE001
+                    raise ConnLost(repr(e2)[:200])
 
 
 def mark_in_flight(state, sid, jid):
@@ -410,7 +520,24 @@ def plan(conn, a, jid):
     fill_corpus_counts(conn, searches)
     state = load_state()
     if a.apply:
-        settle_in_flight(state, jid)
+        settle_in_flight(state, jid, {s["sid"] for s in searches})
+    # A dataset a dead run verified and renamed but could not register: register it now, after the same
+    # identity check as any other register job. Only while the search is still un-laned.
+    pending, taken = [], set()
+    active = {s["sid"]: s for s in searches}
+    for sid, st in list(state.items()):
+        pr = st.get("pending_register")
+        if not pr:
+            continue
+        if sid not in active or not os.path.isdir(pr["lance_path"]) or pr["lance_path"] in registry:
+            st.pop("pending_register", None)
+            continue
+        taken.add(pr["lance_path"])
+        pending.append(dict(sid=sid, name=active[sid]["name"], action="register", lance_path=pr["lance_path"],
+                            corpus_n=active[sid]["corpus_n"], ingested_at=active[sid]["ingested_at"],
+                            corpus_runs=corpus_runs(conn, sid), pending=True,
+                            est_gb=round(dir_bytes(pr["lance_path"]) / 1e9 * 10.0 + 1.0, 1)))
+    searches = [s for s in searches if s["sid"] not in {j["sid"] for j in pending}]
     # which un-laned searches fit each unlinked registry row (name + count): >1 means ambiguous
     claims = {}
     for s in searches:
@@ -421,7 +548,7 @@ def plan(conn, a, jid):
                 claims.setdefault(p, [])
                 if s["sid"] not in claims[p]:
                     claims[p].append(s["sid"])
-    taken, jobs, skipped = set(), [], []
+    jobs, skipped = list(pending), []
     n_preflight_refused = 0
     for s in searches:
         reports = find_reports(s["names"], s["output_dir"])
@@ -484,6 +611,7 @@ def plan(conn, a, jid):
         acts[j["action"]] = acts.get(j["action"], 0) + 1
     # Cheap adoptions first, then writes: smallest report first.
     order = {"link": 0, "register": 1, "write": 2}
+    jobs = [j for j in jobs if not j.get("corpus_runs") == []]   # (identity impossible; handled in do_job too)
     jobs.sort(key=lambda j: (order[j["action"]], j.get("bytes", 0)))
     sel = []
     n_write = 0
@@ -542,6 +670,8 @@ def child_write(report, out, name, corpus_n, allow_near, runs, jid):
         return dict(ok=False, error="report has no run column; identity cannot be checked")
     lane_runs = run_set(pdf["run"].dropna().unique())
     want = set(runs)
+    if not want or not lane_runs:
+        return dict(ok=False, error=f"identity cannot be established: search has {len(want)} runs, report has {len(lane_runs)}")
     if lane_runs != want:
         return dict(ok=False, error=f"identity: report has {len(lane_runs)} runs, the search has {len(want)}; "
                                     f"report-only {sorted(lane_runs - want)[:2]}, search-only {sorted(want - lane_runs)[:2]}")
@@ -642,18 +772,28 @@ def do_job(j, strict, jid="local"):
     if not res.get("ok"):
         out.update(status="failed", error=res.get("error", "child failed"))
         return out
+
+    def fail(msg):
+        # The child already renamed a write into place: take it off the real path, so nothing
+        # unverified stays at a final path.
+        if j["action"] == "write":
+            quarantine(j, jid)
+        out.update(status="failed", error=msg)
+        return out
     if res.get("n_back") != res["n_prec"]:
-        out.update(status="failed", error=f"dataset reads back {res.get('n_back')} rows, wrote {res['n_prec']}")
-        return out
-    if j["action"] != "write" and set(res.get("runs", [])) != set(j["corpus_runs"]):
-        out.update(status="failed", error=f"identity: dataset runs {res.get('n_runs')} != search runs {len(j['corpus_runs'])}")
-        return out
+        return fail(f"dataset reads back {res.get('n_back')} rows, wrote {res['n_prec']}")
+    if j["action"] != "write":
+        if not j.get("corpus_runs") or not res.get("runs"):
+            return fail(f"identity cannot be established: search has {len(j.get('corpus_runs') or [])} runs, "
+                        f"dataset has {len(res.get('runs') or [])}")
+        if set(res["runs"]) != set(j["corpus_runs"]):
+            return fail(f"identity: dataset runs {res.get('n_runs')} != search runs {len(j['corpus_runs'])}")
+    elif not res.get("n_runs") or not j.get("corpus_runs"):
+        return fail("identity cannot be established: no runs")
     how = counts_match(res["n_prec"], j["corpus_n"], strict=not allow_near)
     out["count_check"] = how
     if not how:
-        out.update(status="failed",
-                   error=f"precursor count mismatch: lane {res['n_prec']} vs corpus {j['corpus_n']} (not registered)")
-        return out
+        return fail(f"precursor count mismatch: lane {res['n_prec']} vs corpus {j['corpus_n']} (not registered)")
     out["status"] = "verified"
     return out
 
@@ -692,8 +832,12 @@ def link_row(conn, j):
     cur = conn.cursor()
     cur.execute(LINK_SQL, (j["sid"], j["row_id"], j["lance_path"]))
     if cur.rowcount != 1:
-        conn.rollback()
-        raise RuntimeError("row was no longer unlinked")
+        # after a reconnect-retry the first attempt may have committed: that is success, not a failure
+        cur.execute("SELECT search_id FROM delimp_spectrum_lane WHERE id = %s", (j["row_id"],))
+        row = cur.fetchone()
+        if not (row and row[0] is not None and str(row[0]) == j["sid"]):
+            conn.rollback()
+            raise RuntimeError("row was no longer unlinked")
     conn.commit()
 
 
@@ -707,16 +851,25 @@ def quarantine(j, jid):
             pass
 
 
-def apply_jobs(conn, jobs, state, a, jid):
+def apply_jobs(db, jobs, state, a, jid, jsonl=None):
+    """Run the selected jobs. Returns (outcomes, aborted_reason or None)."""
     outcomes = []
     work = list(jobs)
     budget = MemBudget(MEM_BUDGET_GB)
     db_lock = threading.Lock()      # one psycopg2 connection: serialise its use
+    stop = threading.Event()
+    why = []
 
     def gated(j):
+        if stop.is_set():
+            return dict(sid=j["sid"], name=j["name"], action=j["action"], status="not_run",
+                        error="stopped: the database connection was lost")
         need = j.get("est_gb", 4.0)
         budget.acquire(need)
         try:
+            if stop.is_set():
+                return dict(sid=j["sid"], name=j["name"], action=j["action"], status="not_run",
+                            error="stopped: the database connection was lost")
             if j["action"] == "write":
                 mark_in_flight(state, j["sid"], jid)     # persisted before the child starts, only for this search
             o = do_job(j, a.strict, jid)
@@ -724,14 +877,22 @@ def apply_jobs(conn, jobs, state, a, jid):
                 try:
                     with db_lock:
                         if j["action"] == "link":
-                            link_row(conn, j)
+                            db.run(lambda c: link_row(c, j))
                             o["status"] = "linked"
                         else:
-                            register_row(conn, j, o["res"])
+                            db.run(lambda c: register_row(c, j, o["res"]))
                             o["status"] = "registered"
+                except ConnLost as e:
+                    # Not the dataset's fault: leave it at its final path, remember it, stop the job.
+                    stop.set()
+                    why.append(f"database connection lost: {e}")
+                    if j["action"] == "link":
+                        o.update(status="not_run", error=f"connection lost: {e}")
+                    else:
+                        o.update(status="pending_register", error=f"connection lost: {e}")
                 except Exception as e:  # noqa: BLE001
                     try:
-                        conn.rollback()
+                        db.conn.rollback()
                     except Exception:  # noqa: BLE001
                         pass
                     o.update(status="failed", error=repr(e)[:400])
@@ -755,14 +916,21 @@ def apply_jobs(conn, jobs, state, a, jid):
             with _state_lock:
                 if o["status"] == "failed":
                     record_failure(state, j["sid"], o["error"], j.get("lance_path") if j["action"] == "write" else None)
-                else:
+                elif o["status"] == "pending_register":
+                    res = o.get("res", {})
+                    st = state.setdefault(j["sid"], {})
+                    st["pending_register"] = dict(lance_path=j["lance_path"], n_prec=res.get("n_prec"), at=time.strftime("%FT%T"))
+                    st.pop("in_flight", None)
+                elif o["status"] != "not_run":
                     state.pop(j["sid"], None)
                 save_state(state)
             outcomes.append(o)
+            if jsonl:
+                append_jsonl(jsonl, dict(o, at=time.strftime("%FT%T")))
             print(f"--- {j['name']} [{j['action']}] {o['status']}"
                   + (f" ({o.get('count_check')})" if o.get("count_check") else "")
                   + (f": {o['error']}" if o.get("error") else ""), flush=True)
-    return outcomes
+    return outcomes, ("; ".join(why) or None)
 
 
 def main():
@@ -803,7 +971,22 @@ def main():
     jid = os.environ.get("SLURM_JOB_ID", "local" + time.strftime("%H%M%S"))
     print(f"fill_spectrum_lanes job {jid}: {'APPLY' if a.apply else 'dry run'}; write cap --max {a.max}"
           f"{' (NO CAP)' if a.max == 0 else ''}; workers {a.workers}; preflight {a.preflight}", flush=True)
-    conn = _connect()
+    lock = None
+    try:
+        if a.apply:
+            lock = acquire_lock(jid)
+        return run_main(a, jid)
+    except StateError as e:
+        print(f"STOP: {e}", flush=True)
+        return 3
+    finally:
+        if lock:
+            release_lock(lock, jid)
+
+
+def run_main(a, jid):
+    db = Db(_connect)
+    conn = db.conn
     if not a.apply:
         conn.set_session(readonly=True, autocommit=True)
     jobs, state, plan_path = plan(conn, a, jid)
@@ -813,11 +996,21 @@ def main():
         return 0
     import spectrum_lance as sln
     sln.ensure_registry(conn)
-    outcomes = apply_jobs(conn, jobs, state, a, jid)
-    cur = conn.cursor()
-    cur.execute("SELECT count(*) FROM delimp_spectrum_lane WHERE search_id IS NULL")
-    null_rows = cur.fetchone()[0]
-    conn.close()
+    conn.commit()        # end the planning transaction: no idle-in-transaction session through hours of writes
+    jsonl = os.path.join(D, f"outcomes_{jid}.jsonl")
+    outcomes, aborted = apply_jobs(db, jobs, state, a, jid, jsonl)
+    null_rows = None
+    try:
+        def q(c):
+            cur = c.cursor()
+            cur.execute("SELECT count(*) FROM delimp_spectrum_lane WHERE search_id IS NULL")
+            n = cur.fetchone()[0]
+            c.commit()
+            return n
+        null_rows = db.run(q)
+        db.conn.close()
+    except Exception:  # noqa: BLE001
+        pass
     n_fail = sum(1 for o in outcomes if o["status"] == "failed")
     counts = {}
     for o in outcomes:
@@ -826,13 +1019,16 @@ def main():
     near = [dict(name=o["name"], sid=o["sid"], lance_path=o["lance_path"], lane=o["res"].get("n_prec"))
             for o in outcomes if o.get("count_check") == "near"]
     res = dict(summary=dict(at=time.strftime("%Y-%m-%dT%H:%M:%S"), job=jid, outcomes=counts, failed=n_fail,
-                            parked=len(parked), null_search_id_rows=null_rows, near_lanes=len(near),
+                            aborted=aborted, parked=len(parked), null_search_id_rows=null_rows, near_lanes=len(near),
                             max_peak_rss_gb=max([o.get("peak_rss_gb") or 0 for o in outcomes] or [0])),
                near_lanes=near, outcomes=outcomes)
     os.makedirs(D, exist_ok=True)
     with open(os.path.join(D, f"result_{jid}.json"), "w") as fh:
         json.dump(res, fh, indent=1)
     print(json.dumps(res["summary"]))
+    if aborted:
+        print(f"ABORTED: {aborted}; verified datasets stay at their final paths, pending_register is in state.json", flush=True)
+        return 2
     return 1 if n_fail else 0
 
 

@@ -148,16 +148,16 @@ class Verification(unittest.TestCase):
         return o, calls
 
     def test_mismatch_fails(self):
-        o, _ = self.run_one(dict(ok=True, n_prec=298432, n_frag=1, md5="m", version=1, n_back=298432), 90464)
+        o, _ = self.run_one(dict(ok=True, n_prec=298432, n_frag=1, md5="m", version=1, n_back=298432, n_runs=1), 90464)
         self.assertEqual(o["status"], "failed")
         self.assertIn("mismatch", o["error"])
 
     def test_unreadable_back_fails(self):
-        o, _ = self.run_one(dict(ok=True, n_prec=1000, n_frag=1, md5="m", version=1, n_back=None), 1000)
+        o, _ = self.run_one(dict(ok=True, n_prec=1000, n_frag=1, md5="m", version=1, n_back=None, n_runs=1), 1000)
         self.assertEqual(o["status"], "failed")
 
     def test_exact_passes(self):
-        o, _ = self.run_one(dict(ok=True, n_prec=1000, n_frag=1, md5="m", version=1, n_back=1000), 1000)
+        o, _ = self.run_one(dict(ok=True, n_prec=1000, n_frag=1, md5="m", version=1, n_back=1000, n_runs=1), 1000)
         self.assertEqual((o["status"], o["count_check"]), ("verified", "exact"))
 
     def test_child_killed_is_failure(self):
@@ -331,6 +331,7 @@ class Registration(unittest.TestCase):
     class Cur:
         def __init__(self, rc): self.rc, self.sql = rc, []
         def execute(self, sql, params=None): self.sql.append((sql, params))
+        def fetchone(self): return None
 
         @property
         def rowcount(self): return self.rc
@@ -414,6 +415,223 @@ class InFlight(unittest.TestCase):
     def test_state_file_is_written_atomically(self):
         F.save_state({"a": {}})
         self.assertEqual(sorted(os.listdir(F.D)), ["state.json"])
+
+
+class Robustness(unittest.TestCase):
+    """Second review: connection loss, empty run sets, quarantine after rename, state file, lock."""
+    def setUp(self):
+        self.old = (F.D, F.LANCE)
+        F.D, F.LANCE = tempfile.mkdtemp(), tempfile.mkdtemp()
+
+    def tearDown(self):
+        F.D, F.LANCE = self.old
+
+    # -- 1. connection
+    class FakeConn:
+        def __init__(self, fail_first=0, closed=0):
+            self.closed, self.fail, self.calls, self.commits = closed, fail_first, 0, 0
+        def close(self): self.closed = 1
+        def rollback(self): pass
+        def commit(self): self.commits += 1
+
+    def job(self, name="X", action="write"):
+        p = os.path.join(F.LANCE, name + ".lance")
+        return dict(sid="s1", name=name, action=action, lance_path=p, est_gb=1.0, corpus_n=3,
+                    corpus_runs=["r1"], report="/r/x", row_id=1)
+
+    def run_apply(self, db, job, do_job_result):
+        old = F.do_job
+        F.do_job = lambda j, strict, jid="x": dict(do_job_result)
+        old_reg = F.register_row
+        try:
+            class A: workers, strict = 1, False
+            state = {}
+            outs, aborted = F.apply_jobs(db, [job], state, A, "J1", os.path.join(F.D, "o.jsonl"))
+        finally:
+            F.do_job, F.register_row = old, old_reg
+        return outs, aborted, state
+
+    def verified(self, j):
+        return dict(sid=j["sid"], name=j["name"], action=j["action"], lance_path=j["lance_path"], status="verified",
+                    count_check="exact", res=dict(n_prec=3, n_frag=1, md5="m", version=1))
+
+    def test_connection_lost_once_reconnects_and_registers(self):
+        import psycopg2
+        j = self.job()
+        os.makedirs(j["lance_path"])
+        conns = [self.FakeConn(), self.FakeConn()]
+        db = F.Db(lambda: conns.pop(0))
+        seen = []
+
+        def reg(c, jj, r):
+            seen.append(c)
+            if len(seen) == 1:
+                raise psycopg2.OperationalError("server closed the connection")
+        F.register_row = reg
+        old = F.do_job
+        F.do_job = lambda jj, strict, jid="x": self.verified(jj)
+        try:
+            class A: workers, strict = 1, False
+            outs, aborted = F.apply_jobs(db, [j], {}, A, "J1")
+        finally:
+            F.do_job = old
+        self.assertEqual(outs[0]["status"], "registered")
+        self.assertIsNone(aborted)
+        self.assertEqual(len(seen), 2)
+        self.assertIsNot(seen[0], seen[1])                       # reconnected
+        self.assertTrue(os.path.isdir(j["lance_path"]))          # not quarantined
+
+    def test_connection_cannot_be_restored_stops_job_keeps_dataset_and_records_pending(self):
+        import psycopg2
+        j = self.job()
+        os.makedirs(j["lance_path"])
+        n = []
+
+        def connect():
+            n.append(1)
+            if len(n) > 1:
+                raise psycopg2.OperationalError("no route")
+            return self.FakeConn()
+        db = F.Db(connect)
+        F.register_row = lambda c, jj, r: (_ for _ in ()).throw(psycopg2.OperationalError("gone"))
+        outs, aborted, state = None, None, {}
+        old = F.do_job
+        F.do_job = lambda jj, strict, jid="x": self.verified(jj)
+        try:
+            class A: workers, strict = 1, False
+            outs, aborted = F.apply_jobs(db, [j], state, A, "J1")
+        finally:
+            F.do_job = old
+        self.assertEqual(outs[0]["status"], "pending_register")
+        self.assertIn("connection lost", aborted)
+        self.assertTrue(os.path.isdir(j["lance_path"]))          # verified dataset stays at its final path
+        self.assertFalse(os.path.exists(j["lance_path"] + ".failed.J1"))
+        self.assertEqual(state["s1"]["pending_register"]["lance_path"], j["lance_path"])
+        self.assertEqual(state["s1"].get("attempts", 0), 0)      # no attempt charged
+
+    def test_closed_connection_is_reopened_before_use(self):
+        conns = [self.FakeConn(closed=1), self.FakeConn()]
+        db = F.Db(lambda: conns.pop(0))
+        db.conn.closed = 1
+        self.assertEqual(db.run(lambda c: c.closed), 0)
+
+    # -- 2. empty sets
+    def test_empty_run_sets_fail_in_do_job(self):
+        for runs, n_runs in (([], 0), (["r1"], 1)):
+            old = F.run_child
+            F.run_child = lambda args, stdin=None: (dict(ok=True, n_prec=3, n_frag=1, md5="m", version=1,
+                                                         n_back=3, n_runs=n_runs, runs=runs), 0)
+            try:
+                j = self.job(action="register")
+                j["corpus_runs"] = [] if runs else ["r1"]
+                o = F.do_job(j, False)
+            finally:
+                F.run_child = old
+            self.assertEqual(o["status"], "failed")
+            self.assertIn("identity", o["error"])
+
+    def test_empty_expected_runs_fail_in_child_before_writing(self):
+        need_lance(self)
+        d = tempfile.mkdtemp()
+        out = os.path.join(F.LANCE, "X.lance")
+        r = F.child_write(synth_report(d), out, "X", 3, True, [], "J9")
+        self.assertFalse(r["ok"])
+        self.assertEqual(os.listdir(F.LANCE), [])
+
+    # -- 3. quarantine after rename
+    def test_failure_after_the_rename_quarantines(self):
+        j = self.job()
+        os.makedirs(j["lance_path"])
+        old = F.run_child
+        F.run_child = lambda args, stdin=None: (dict(ok=True, n_prec=3, n_frag=1, md5="m", version=1,
+                                                     n_back=2, n_runs=1), 0)           # reopens short
+        try:
+            o = F.do_job(j, False, "J1")
+        finally:
+            F.run_child = old
+        self.assertEqual(o["status"], "failed")
+        self.assertFalse(os.path.exists(j["lance_path"]))
+        self.assertTrue(os.path.isdir(j["lance_path"] + ".failed.J1"))
+
+    def test_count_mismatch_after_the_rename_quarantines(self):
+        j = self.job()
+        j["corpus_n"] = 90000
+        os.makedirs(j["lance_path"])
+        old = F.run_child
+        F.run_child = lambda args, stdin=None: (dict(ok=True, n_prec=3, n_frag=1, md5="m", version=1,
+                                                     n_back=3, n_runs=1), 0)
+        try:
+            o = F.do_job(j, False, "J1")
+        finally:
+            F.run_child = old
+        self.assertEqual(o["status"], "failed")
+        self.assertFalse(os.path.exists(j["lance_path"]))
+
+    # -- 4. incremental outcomes
+    def test_each_outcome_is_appended_as_it_finishes(self):
+        db = F.Db(lambda: self.FakeConn())
+        j = self.job()
+        old = F.do_job
+        F.do_job = lambda jj, strict, jid="x": dict(sid=jj["sid"], name=jj["name"], action="write", status="failed", error="e")
+        try:
+            class A: workers, strict = 1, False
+            F.apply_jobs(db, [j], {}, A, "J1", os.path.join(F.D, "o.jsonl"))
+        finally:
+            F.do_job = old
+        lines = open(os.path.join(F.D, "o.jsonl")).read().splitlines()
+        self.assertEqual(json.loads(lines[0])["sid"], "s1")
+
+    # -- 5. state file and lock
+    def test_corrupt_state_stops_instead_of_loading_empty(self):
+        open(os.path.join(F.D, "state.json"), "w").write("{not json")
+        with self.assertRaises(F.StateError):
+            F.load_state()
+
+    def test_missing_state_is_a_fresh_start(self):
+        self.assertEqual(F.load_state(), {})
+
+    def test_state_temp_name_has_host_pid_job(self):
+        seen = []
+        real = os.replace
+        os.replace = lambda a, b: (seen.append(a), real(a, b))
+        try:
+            os.environ["SLURM_JOB_ID"] = "777"
+            F.save_state({"a": {}})
+        finally:
+            os.replace = real
+            os.environ.pop("SLURM_JOB_ID", None)
+        self.assertIn(os.uname().nodename, seen[0])
+        self.assertIn(str(os.getpid()), seen[0])
+        self.assertTrue(seen[0].endswith(".777"))
+
+    def test_second_apply_cannot_take_a_live_lock(self):
+        F.acquire_lock("100", job_state=lambda j: "RUNNING")
+        with self.assertRaises(F.StateError):
+            F.acquire_lock("200", job_state=lambda j: "RUNNING")
+
+    def test_stale_lock_is_taken_over(self):
+        F.acquire_lock("100", job_state=lambda j: "RUNNING")
+        lock = F.acquire_lock("200", job_state=lambda j: "")        # squeue no longer knows job 100
+        self.assertEqual(open(os.path.join(lock, "job")).read(), "200")
+
+    def test_unverifiable_lock_is_not_taken(self):
+        F.acquire_lock("100", job_state=lambda j: "RUNNING")
+        with self.assertRaises(F.StateError):
+            F.acquire_lock("200", job_state=lambda j: None)         # squeue itself failed
+
+    def test_same_job_requeue_keeps_its_lock_and_release_frees_it(self):
+        lock = F.acquire_lock("100")
+        self.assertEqual(F.acquire_lock("100"), lock)
+        F.release_lock(lock, "100")
+        self.assertFalse(os.path.exists(lock))
+
+    # -- 6. in_flight for a search the new plan dropped
+    def test_in_flight_of_a_dropped_search_is_cleared_without_charge(self):
+        st = {"gone": {"in_flight": "J1"}, "still": {"in_flight": "J1"}}
+        F.settle_in_flight(st, "J2", active={"still"})
+        self.assertNotIn("in_flight", st["gone"])
+        self.assertEqual(st["gone"].get("attempts", 0), 0)
+        self.assertEqual(st["still"]["attempts"], 1)
 
 
 class Identity(unittest.TestCase):
