@@ -998,7 +998,16 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                            -- the engine/platform GUESS in EXCLUDED is the last resort. A plain
                            -- EXCLUDED overwrite let a later Spectronaut re-ingest (no header
                            -- access -> guess) replace a good sniffed value.
-                           acquisition_method=COALESCE(%s, raw_files.acquisition_method, EXCLUDED.acquisition_method),
+                           -- A stored value that CONTRADICTS the platform (a diaPASEF label on an Orbitrap
+                           -- / .raw run: the ingest's old platform guess) must not survive: it is
+                           -- dropped so the new guess is taken. The table cannot tell a sniffed value
+                           -- from a guess, so this is the one case we can prove is wrong.
+                           acquisition_method=COALESCE(%s,
+                               CASE WHEN position('pasef' in lower(raw_files.acquisition_method)) > 0
+                                         AND (EXCLUDED.platform = 'orbitrap'
+                                              OR right(lower(raw_files.raw_path), 4) = '.raw')
+                                    THEN NULL ELSE raw_files.acquisition_method END,
+                               EXCLUDED.acquisition_method),
                            samples_per_day=COALESCE(EXCLUDED.samples_per_day, raw_files.samples_per_day),
                            gradient_minutes=COALESCE(EXCLUDED.gradient_minutes, raw_files.gradient_minutes),
                            instrument_model=COALESCE(EXCLUDED.instrument_model, raw_files.instrument_model),

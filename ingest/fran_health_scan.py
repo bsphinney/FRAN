@@ -649,33 +649,34 @@ def check_search_provenance(c):
 
 
 def check_junk_protein_group(c):
-    """Literal 'nan' / 'None' / '' stored as protein_group on the newest searches. Measured
-    2026-11-24: 80,729 such precursor rows within the 40 newest searches alone (97,143 corpus-wide
-    by 2026-11-18). Scoped by search_id; the text values are served by idx_prec_protein_group."""
+    """Literal 'nan' / 'None' / '' stored as protein_group on the newest searches. Looks at
+    delimp_proteins (tiny: ~28k rows per search, idx_proteins_search), one search at a time --
+    never delimp_precursors. Ingest writes a protein row for every group it saw, so junk in the
+    precursors shows up here too (as a 'nan' / 'UNKNOWN' protein row). Measured 2026-11-24:
+    the junk searches are found this way (e.g. 40 newest searches: 2 affected)."""
     c.execute("SELECT id, search_engine, search_name FROM delimp_searches ORDER BY ingested_at DESC LIMIT %s",
               (LAST_SEARCHES_JUNK,))
     srch = c.fetchall()
     if not srch:
         return
-    ids = [r[0] for r in srch]
-    c.execute("""SELECT search_id, count(*) FROM delimp_precursors
-                  WHERE search_id = ANY(%s::uuid[]) AND protein_group = ANY(%s) GROUP BY 1""",
-              (ids, list(JUNK_TEXT)))
-    prec = dict(c.fetchall())
-    c.execute("""SELECT count(*) FROM delimp_proteins
-                  WHERE search_id = ANY(%s::uuid[]) AND protein_group = ANY(%s)""",
-              (ids, list(JUNK_TEXT + ("UNKNOWN",))))
-    n_prot = c.fetchone()[0]
+    bad = list(JUNK_TEXT + ("UNKNOWN",))
+    prot = {}
+    for sid, _eng, _nm in srch:
+        c.execute("SELECT count(*) FROM delimp_proteins WHERE search_id = %s AND protein_group = ANY(%s)",
+                  (sid, bad))
+        n = c.fetchone()[0]
+        if n:
+            prot[sid] = n
     name = {r[0]: f"{r[1]}:{r[2]}" for r in srch}
-    metrics["junk_protein_group"] = {"searches_probed": len(ids), "searches_affected": len(prec),
-                                     "precursor_rows": sum(prec.values()), "protein_rows": n_prot}
-    if prec or n_prot:
-        worst = ", ".join(f"{name[k][:40]} ({v:,})" for k, v in sorted(prec.items(), key=lambda kv: -kv[1])[:3])
-        add("RED", "junk text", f"literal nan/None/'' protein_group in {len(prec)} of the {len(ids)} newest "
-            f"searches: {sum(prec.values()):,} precursor rows, {n_prot:,} protein rows"
-            + (f"; worst {worst}" if worst else "") + " -- ingest now writes NULL; old rows are fixed by ingest/repairs/null_nan_protein_group.py")
+    metrics["junk_protein_group"] = {"searches_probed": len(srch), "searches_affected": len(prot),
+                                     "protein_rows": sum(prot.values())}
+    if prot:
+        worst = ", ".join(f"{name[k][:40]} ({v:,})" for k, v in sorted(prot.items(), key=lambda kv: -kv[1])[:3])
+        add("RED", "junk text", f"literal nan/None/'' protein_group (protein rows) in {len(prot)} of the "
+            f"{len(srch)} newest searches: {sum(prot.values()):,} rows; worst {worst}"
+            " -- ingest now writes NULL; old rows are fixed by ingest/repairs/null_nan_protein_group.py")
     else:
-        add("ok", "junk text", f"no literal nan/None/'' protein_group in the {len(ids)} newest searches")
+        add("ok", "junk text", f"no literal nan/None/'' protein_group in the {len(srch)} newest searches")
 
 
 def check_raw_file_consistency(c):

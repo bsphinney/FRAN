@@ -31,6 +31,10 @@ def test_every_write_is_behind_apply():
             if re.search(r"\b(UPDATE|DELETE FROM)\b", l) and "execute" in l or re.search(r'^\s*"(UPDATE|DELETE FROM)', l):
                 # walk back to the nearest `if a.apply` at a lower indent
                 ind = len(l) - len(l.lstrip())
+                # a write inside the helper `_update`, which main() calls only under `if a.apply`
+                if any(lines[j].startswith("def _update") for j in range(i, -1, -1)) and \
+                        re.search(r"^\s+if a\.apply:\s*$.*?_update\(", "\n".join(lines), re.S | re.M):
+                    continue
                 ok = any(re.match(r"\s*if a\.apply", lines[j]) and (len(lines[j]) - len(lines[j].lstrip())) < ind
                          for j in range(i, -1, -1))
                 assert ok, f"{name}: write not under `if a.apply`: {l.strip()[:70]}"

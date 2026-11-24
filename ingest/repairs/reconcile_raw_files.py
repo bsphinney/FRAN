@@ -10,9 +10,11 @@ fallback GUESS (corpus_ingest._platform_from_disk / _acq_for), written when a Sp
 had no raw header to read -- not a measurement.
 
 PROPOSED RULE (not applied unless you pass --apply, and then only rule 1):
-  1. platform: instrument_model is the authority. If a copy's platform contradicts
-     instrument_labels.platform_for_model(its instrument_model), set it to the model's platform.
-     Never touches a copy whose model is NULL or unrecognised.
+  1. platform: instrument_model is the authority, and it is a property of the RUN, so any copy's
+     model speaks for all copies: if the copies that carry a recognised model all imply ONE
+     platform (instrument_labels.platform_for_model), every copy whose platform differs is set to
+     it, including a sibling with no model of its own. Runs whose models imply two platforms, or
+     that have no recognised model on any copy, are listed by name and left alone.
   2. acquisition_method: REPORT ONLY. Which copy's value is right needs the raw header; this script
      lists the conflicts and proposes the value held by the copy that also has a sniffed
      instrument_model, but does not write it.
@@ -43,19 +45,24 @@ def main():
         runs[r[0]].append(r[1:])
 
     plat_conf = acq_conf = other_conf = 0
-    fix, plat_examples, acq_examples, fixed_runs = [], [], [], set()
+    fix, plat_examples, acq_examples, fixed_runs, unresolved = [], [], [], set(), []
     for base, rows in runs.items():
         if len(rows) < 2:
             continue
         plats = {r[1] for r in rows}
         if len(plats) > 1:
             plat_conf += 1
-            for path, plat, model, *_ in rows:
-                want = platform_for_model(model)
-                if want and want != plat:
-                    fix.append((path, plat, want)); fixed_runs.add(base)
-                    if len(plat_examples) < 3:
-                        plat_examples.append(f"{base}: {path[-50:]!r} platform {plat!r} -> {want!r} (model {model!r})")
+            implied = {platform_for_model(r[2]) for r in rows if r[2]} - {None}
+            if len(implied) != 1:
+                unresolved.append((base, sorted(plats), sorted({r[2] for r in rows if r[2]}) or "no model on any copy"))
+            else:
+                want = next(iter(implied))
+                for path, plat, model, *_ in rows:
+                    if plat != want:
+                        fix.append((path, plat, want)); fixed_runs.add(base)
+                        if len(plat_examples) < 3:
+                            plat_examples.append(f"{base}: {path[-50:]!r} platform {plat!r} -> {want!r} "
+                                                 f"(this copy's model {model!r}; run implies {want})")
         if len({r[3] for r in rows if r[3]}) > 1:
             acq_conf += 1
             if len(acq_examples) < 3:
@@ -63,18 +70,20 @@ def main():
         if any(len({r[i] for r in rows if r[i] is not None}) > 1 for i in (4, 5, 6)):
             other_conf += 1
 
-    unresolved = plat_conf - len(fixed_runs)
     if a.apply:
         for batch in chunks(fix, 500):
-            for path, _old, want in batch:
-                cur.execute("UPDATE raw_files SET platform = %s WHERE raw_path = %s", (want, path))
+            for path, old, want in batch:
+                # `AND platform = old`: a concurrent change to the row is not clobbered
+                cur.execute("UPDATE raw_files SET platform = %s WHERE raw_path = %s AND platform = %s", (want, path, old))
             conn.commit()
 
     print("reconcile_raw_files: " + ("APPLIED rule 1" if a.apply else "DRY RUN (nothing written)"))
     print(f"  runs with >1 copy                              : {sum(1 for r in runs.values() if len(r) > 1):,}")
     print(f"  runs whose copies disagree on platform         : {plat_conf:,}")
     print(f"  copies rule 1 would re-label (model decides)   : {len(fix):,}")
-    print(f"  platform-conflict runs rule 1 cannot settle    : {unresolved:,} (no model on the odd copy)")
+    print(f"  platform-conflict runs rule 1 cannot settle    : {len(unresolved):,}")
+    for base, plats, models in unresolved:
+        print(f"     {base}: platforms {plats}, models {models}")
     print(f"  runs whose copies disagree on acquisition_method: {acq_conf:,}   (report only)")
     print(f"  runs disagreeing on date / size / md5          : {other_conf:,}   (report only)")
     show_examples("platform re-label", plat_examples)

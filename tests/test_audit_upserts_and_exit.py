@@ -18,14 +18,20 @@ def _src():
 
 
 def _set_clause(src, table):
-    """The `DO UPDATE SET ...` text of the upsert into `table`, as {column: expression}."""
+    """The `DO UPDATE SET ...` text of the upsert into `table`, as {column: expression}, split on
+    top-level commas (so nested COALESCE / CASE expressions stay whole)."""
     m = re.search(r"INSERT INTO " + table + r"\b.*?DO UPDATE\s+SET(.*?)\"\"\"", src, re.S)
     assert m, f"no upsert into {table}"
-    body = re.sub(r"--[^\n]*", "", m.group(1))                  # drop SQL comments
-    out = {}
-    for col, expr in re.findall(r"(\w+)\s*=\s*(COALESCE\(.*?\)|EXCLUDED\.\w+)\s*(?:,|$)", " ".join(body.split())):
-        out[col] = expr
-    return out
+    body = " ".join(re.sub(r"--[^\n]*", "", m.group(1)).split())
+    parts, depth, cur = [], 0, ""
+    for ch in body:
+        depth += (ch == "(") - (ch == ")")
+        if ch == "," and depth == 0:
+            parts.append(cur); cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return {k.strip(): v.strip() for k, v in (p.split("=", 1) for p in parts if "=" in p)}
 
 
 def test_raw_files_upsert_never_overwrites_with_null():
@@ -40,8 +46,20 @@ def test_raw_files_upsert_never_overwrites_with_null():
 def test_sniffed_acquisition_beats_stored_beats_guess():
     sets = _set_clause(_src(), "raw_files")
     # sniffed value first, the stored value second, the engine/platform guess (EXCLUDED) last
-    assert re.match(r"COALESCE\(%s, raw_files\.acquisition_method, EXCLUDED\.acquisition_method\)",
-                    sets["acquisition_method"])
+    e = sets["acquisition_method"]
+    assert e.startswith("COALESCE(%s,") and e.endswith("EXCLUDED.acquisition_method)")
+    assert "raw_files.acquisition_method" in e
+
+
+def test_stored_pasef_label_on_an_orbitrap_run_does_not_survive():
+    """The stored value is dropped (so the new guess is taken) when it contradicts the platform.
+    SQL-text test: it checks the CASE guards the stored value on both contradiction signals."""
+    e = _set_clause(_src(), "raw_files")["acquisition_method"]
+    m = re.search(r"CASE WHEN (.*?) THEN NULL ELSE raw_files\.acquisition_method END", e)
+    assert m, "stored value is not guarded by a contradiction CASE"
+    g = m.group(1)
+    assert "pasef" in g and "EXCLUDED.platform = 'orbitrap'" in g and "'.raw'" in g
+    assert e.index("%s") < e.index("CASE") < e.index("EXCLUDED.acquisition_method")   # sniffed > stored > guess
 
 
 def test_sample_metadata_upsert_keeps_organism_when_new_value_is_null():

@@ -61,23 +61,23 @@ def test_filled_provenance_is_quiet():
     assert not m.findings
 
 
-def _junk_cur(prec_rows, n_prot):
+def _junk_cur(per_search):
     return Cur([("FROM delimp_searches ORDER BY", [("sid1", "diann", "a"), ("sid2", "spectronaut", "b")]),
-                ("FROM delimp_precursors", prec_rows),
-                ("FROM delimp_proteins", [(n_prot,)])])
+                ("FROM delimp_proteins", lambda p: [(per_search.get(p[0], 0),)])])
 
 
 def test_literal_nan_protein_group_is_red_and_scoped_by_search():
     m = _scan()
-    c = _junk_cur([("sid2", 80729)], 332)
+    c = _junk_cur({"sid2": 332})
     m.check_junk_protein_group(c)
     assert _sev(m, "junk text") == ["RED"]
-    assert all("search_id = ANY" in s for s in c.log if "FROM delimp_precursors" in s or "FROM delimp_proteins" in s)
+    assert not any("delimp_precursors" in s for s in c.log), "must not touch the 1-billion-row table"
+    assert all("search_id = %s" in s for s in c.log if "FROM delimp_proteins" in s)
 
 
 def test_clean_protein_groups_are_ok():
     m = _scan()
-    m.check_junk_protein_group(_junk_cur([], 0))
+    m.check_junk_protein_group(_junk_cur({}))
     assert _sev(m, "junk text") == ["ok"]
 
 

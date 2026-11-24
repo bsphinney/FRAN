@@ -9,8 +9,11 @@
 --
 -- SAFE ON 97 M ROWS: ADD COLUMN ... NULL with NO DEFAULT is catalog-only on PostgreSQL 16 (no
 -- rewrite). lock_timeout makes it give up rather than queue behind a long query and block every
--- reader of delimp_proteins; re-run if it times out. A CHECK on a nullable column is evaluated
--- for the new (all-NULL) column only, so it does not scan the table either.
+-- reader of delimp_proteins; re-run if it times out.
+-- The CHECK is added NOT VALID: a plain ADD CONSTRAINT ... CHECK scans ALL 97 M rows while holding
+-- ACCESS EXCLUSIVE (minutes of website downtime). NOT VALID only takes the catalog lock; new and
+-- updated rows are checked from then on. VALIDATE CONSTRAINT is a separate statement, OUTSIDE the
+-- lock_timeout block, and holds only SHARE UPDATE EXCLUSIVE (readers and writers continue).
 --
 -- Fill history afterwards with: python ingest/repairs/recompute_is_contaminant.py --apply
 -- (batched by search_id), then refresh delimp_mv_protein_agg / species_proteins / top_proteins.
@@ -23,7 +26,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'delimp_proteins_contaminant_class_check') THEN
         ALTER TABLE delimp_proteins ADD CONSTRAINT delimp_proteins_contaminant_class_check
-            CHECK (contaminant_class IN ('contaminant', 'mixed', 'sample'));
+            CHECK (contaminant_class IN ('contaminant', 'mixed', 'sample')) NOT VALID;
     END IF;
 END $$;
 
@@ -35,3 +38,6 @@ COMMENT ON COLUMN delimp_proteins.contaminant_class IS
   'so mixed groups are counted as SAMPLE proteins by default; filter on this column to treat them differently.';
 
 RESET lock_timeout;
+
+-- Separate statement, no short lock_timeout: it scans the table but does not block readers/writers.
+ALTER TABLE delimp_proteins VALIDATE CONSTRAINT delimp_proteins_contaminant_class_check;
