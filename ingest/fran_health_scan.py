@@ -593,6 +593,171 @@ def heal(filler_state):
             add("RED", "heal", f"could not resubmit the filler: {r.stderr.strip()[:200]}")
 
 
+# ── Blind spots found by the 2026-11 data audit ────────────────────────────────────────────────
+# Each check below measures something the older checks could not see: they compared a column's
+# fill rate with its own past, so a column that was NEVER written (or a value that is written but
+# wrong) stayed invisible. All are cheap: delimp_searches, raw_files (44k rows), and LIMIT-bounded
+# or search_id-scoped reads of the huge tables -- never an unfiltered scan.
+
+JUNK_TEXT = ("nan", "NaN", "NAN", "None", "none", "null", "")
+LAST_SEARCHES_JUNK = 40           # newest searches probed for literal-'nan' protein groups
+LAST_SEARCHES_FILL = 10           # newest searches per engine probed for precursor fill rate
+FILL_SAMPLE_ROWS = 20_000         # precursor rows read per probed search (LIMIT, not a full scan)
+
+# Key precursor columns per engine and the fill-rate floor under which the scan goes RED. Measured
+# 2026-11-24 on the 10 newest searches of each engine (every column below was >= 0.99 there).
+# Columns an engine does not write at all (Spectronaut: normalized_intensity, ms1_area, rt_start,
+# predicted_rt, protein_ids, empirical_quality) are deliberately NOT listed -- a floor on them would
+# be permanently red and teach people to ignore the scan.
+_PREC_COMMON = ["stripped_seq", "modified_seq_proforma", "charge", "precursor_mz", "rt", "q_value",
+                "global_q_value", "intensity", "protein_group"]
+PREC_FILL_FLOORS = {
+    "diann": {c: 0.95 for c in _PREC_COMMON + ["pg_q_value", "normalized_intensity", "pep", "empirical_quality",
+                                              "ms1_area", "rt_start", "predicted_rt", "irt", "protein_ids"]},
+    "spectronaut": {**{c: 0.95 for c in _PREC_COMMON + ["pg_q_value"]}, "irt": 0.90},
+}
+
+
+def check_search_provenance(c):
+    """Searches whose provenance was never recorded: search_params_json / completed_at NULL, by
+    engine. Measured 2026-11-24: 100% of all 3,448 searches had search_params_json NULL and >99.8%
+    had completed_at NULL, and no existing check looked."""
+    c.execute(f"""SELECT search_engine,
+                         count(*) FILTER (WHERE ingested_at > now() - interval '{RECENT} days'),
+                         avg((search_params_json IS NULL)::int) FILTER (WHERE ingested_at > now() - interval '{RECENT} days'),
+                         avg((completed_at IS NULL)::int)       FILTER (WHERE ingested_at > now() - interval '{RECENT} days'),
+                         count(*),
+                         avg((search_params_json IS NULL)::int), avg((completed_at IS NULL)::int)
+                    FROM delimp_searches GROUP BY 1 ORDER BY 1""")
+    out = {}
+    for eng, n_r, p_r, c_r, n_all, p_all, c_all in c.fetchall():
+        out[eng] = {"n_recent": n_r, "params_null_recent": p_r and round(float(p_r), 4),
+                    "completed_null_recent": c_r and round(float(c_r), 4), "n_all": n_all,
+                    "params_null_all": round(float(p_all), 4), "completed_null_all": round(float(c_all), 4)}
+        # judge the recent window when it has enough searches, else the whole history
+        n, pn, cn, win = (n_r, p_r, c_r, f"last {RECENT} d") if n_r >= MIN_ROWS else (n_all, p_all, c_all, "all time")
+        if n < 5:
+            continue
+        for col, v in (("search_params_json", pn), ("completed_at", cn)):
+            v = float(v or 0)
+            txt = f"{eng}: {v:.0%} of {n:,} searches ({win}) have {col} NULL"
+            if v >= 0.90:
+                add("RED", "provenance", txt)
+            elif v >= 0.25:
+                add("AMBER", "provenance", txt)
+    metrics["provenance"] = out
+
+
+def check_junk_protein_group(c):
+    """Literal 'nan' / 'None' / '' stored as protein_group on the newest searches. Measured
+    2026-11-24: 80,729 such precursor rows within the 40 newest searches alone (97,143 corpus-wide
+    by 2026-11-18). Scoped by search_id; the text values are served by idx_prec_protein_group."""
+    c.execute("SELECT id, search_engine, search_name FROM delimp_searches ORDER BY ingested_at DESC LIMIT %s",
+              (LAST_SEARCHES_JUNK,))
+    srch = c.fetchall()
+    if not srch:
+        return
+    ids = [r[0] for r in srch]
+    c.execute("""SELECT search_id, count(*) FROM delimp_precursors
+                  WHERE search_id = ANY(%s::uuid[]) AND protein_group = ANY(%s) GROUP BY 1""",
+              (ids, list(JUNK_TEXT)))
+    prec = dict(c.fetchall())
+    c.execute("""SELECT count(*) FROM delimp_proteins
+                  WHERE search_id = ANY(%s::uuid[]) AND protein_group = ANY(%s)""",
+              (ids, list(JUNK_TEXT + ("UNKNOWN",))))
+    n_prot = c.fetchone()[0]
+    name = {r[0]: f"{r[1]}:{r[2]}" for r in srch}
+    metrics["junk_protein_group"] = {"searches_probed": len(ids), "searches_affected": len(prec),
+                                     "precursor_rows": sum(prec.values()), "protein_rows": n_prot}
+    if prec or n_prot:
+        worst = ", ".join(f"{name[k][:40]} ({v:,})" for k, v in sorted(prec.items(), key=lambda kv: -kv[1])[:3])
+        add("RED", "junk text", f"literal nan/None/'' protein_group in {len(prec)} of the {len(ids)} newest "
+            f"searches: {sum(prec.values()):,} precursor rows, {n_prot:,} protein rows"
+            + (f"; worst {worst}" if worst else "") + " -- ingest now writes NULL; old rows are fixed by ingest/repairs/null_nan_protein_group.py")
+    else:
+        add("ok", "junk text", f"no literal nan/None/'' protein_group in the {len(ids)} newest searches")
+
+
+def check_raw_file_consistency(c):
+    """Copies of one run (same raw_basename) that disagree on platform, and platform / extension /
+    acquisition contradictions. The legacy set is large and known (the extension was GUESSED from the
+    platform at ingest -- never infer vendor from it), so the severity follows what is NEW: a
+    contradiction among rows first seen in the last RECENT days means a writer is producing them
+    today. Legacy totals are reported as AMBER."""
+    c.execute(f"""SELECT count(*), count(*) FILTER (WHERE fresh)
+                    FROM (SELECT raw_basename, bool_or(first_seen_at > now() - interval '{RECENT} days') AS fresh
+                            FROM raw_files GROUP BY 1
+                          HAVING count(*) > 1 AND count(DISTINCT platform) > 1) t""")
+    n_dis, n_dis_new = c.fetchone()
+    checks = (
+        ("timsTOF platform with a .raw path", "platform = 'timstof' AND lower(raw_path) LIKE '%.raw'"),
+        ("Orbitrap platform with diaPASEF acquisition", "platform = 'orbitrap' AND acquisition_method ILIKE '%pasef%'"),
+        ("Orbitrap platform with ion-mobility range", "platform = 'orbitrap' AND mobility_min IS NOT NULL"),
+    )
+    res = {"platform_disagree_runs": n_dis, "platform_disagree_new": n_dis_new}
+    if n_dis_new:
+        add("RED", "raw_files", f"{n_dis_new:,} run(s) first seen in the last {RECENT} d have copies that "
+            f"disagree on platform ({n_dis:,} in all)")
+    elif n_dis:
+        add("AMBER", "raw_files", f"{n_dis:,} run(s) have copies that disagree on platform "
+            f"(none new in {RECENT} d) -- see ingest/repairs/reconcile_raw_files.py")
+    for label, where in checks:
+        c.execute(f"""SELECT count(*), count(*) FILTER (WHERE first_seen_at > now() - interval '{RECENT} days')
+                        FROM raw_files WHERE {where}""")
+        n_all, n_new = c.fetchone()
+        res[label] = {"all": n_all, "new": n_new}
+        if n_new:
+            add("RED", "raw_files", f"{n_new:,} raw file(s) first seen in the last {RECENT} d: {label} ({n_all:,} in all)")
+        elif n_all:
+            add("AMBER", "raw_files", f"{n_all:,} raw file(s): {label} (none new in {RECENT} d)")
+    metrics["raw_file_consistency"] = res
+
+
+def check_precursor_fill_by_engine(c):
+    """Per-engine fill rate of the key precursor columns over the newest searches, against a fixed
+    floor. A column that silently stops being written turns the scan red even when it was never
+    in the 90-day baseline. Reads at most FILL_SAMPLE_ROWS rows per search, scoped by search_id."""
+    out = {}
+    for eng, floors in PREC_FILL_FLOORS.items():
+        c.execute("SELECT id FROM delimp_searches WHERE search_engine = %s ORDER BY ingested_at DESC LIMIT %s",
+                  (eng, LAST_SEARCHES_FILL))
+        ids = [r[0] for r in c.fetchall()]
+        if len(ids) < 3:
+            continue
+        cols = list(floors)
+        agg = ", ".join(f"avg(({col} IS NOT NULL)::int)" for col in cols)
+        per = []                                   # newest first: one list of fill rates per search
+        for sid in ids:
+            c.execute(f"SELECT count(*), {agg} FROM (SELECT * FROM delimp_precursors "
+                      f"WHERE search_id = %s LIMIT {FILL_SAMPLE_ROWS}) t", (sid,))
+            row = c.fetchone()
+            if row[0]:
+                per.append([float(v or 0) for v in row[1:]])
+        if len(per) < 3:
+            continue
+        out[eng] = {}
+        bad_all, bad_new = [], []
+        for i, col in enumerate(cols):
+            mean_all = sum(p[i] for p in per) / len(per)
+            newest = per[:3]
+            mean_new = sum(p[i] for p in newest) / len(newest)
+            out[eng][col] = {"mean": round(mean_all, 4), "newest3": round(mean_new, 4), "floor": floors[col]}
+            if mean_all < floors[col]:
+                bad_all.append(f"{col} {mean_all:.0%}")
+            elif mean_new < floors[col]:
+                bad_new.append(f"{col} {mean_new:.0%}")
+        if bad_all:
+            add("RED", "precursor fill", f"{eng}: below its floor over the {len(per)} newest searches: "
+                + ", ".join(bad_all))
+        if bad_new:
+            add("RED", "precursor fill", f"{eng}: the 3 newest searches are below the floor (a column "
+                "stopped being written?): " + ", ".join(bad_new))
+        if not (bad_all or bad_new):
+            add("ok", "precursor fill", f"{eng}: all {len(cols)} key precursor columns at or above their "
+                f"floor over the {len(per)} newest searches")
+    metrics["precursor_fill"] = out
+
+
 def import_events(conn):
     """Copy what the self-healing layer did into delimp_qc_event (dedupe_key makes it idempotent)."""
     ev = []
@@ -693,6 +858,13 @@ def main():
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
+                add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
+        # data-audit blind spots (2026-11); a separate loop so it merges cleanly beside the one above
+        for fn in (check_search_provenance, check_junk_protein_group, check_raw_file_consistency,
+                   check_precursor_fill_by_engine):
+            try:
+                fn(c)
+            except Exception as e:  # noqa: BLE001
                 add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
     conn.close()
     filler_state = check_filler()
