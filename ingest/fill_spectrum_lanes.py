@@ -517,6 +517,8 @@ def report_run_set(report):
 
 def plan(conn, a, jid):
     searches, registry = gather(conn)
+    if getattr(a, "only_sids", None):
+        searches = [s for s in searches if s["sid"] in set(a.only_sids)]
     fill_corpus_counts(conn, searches)
     state = load_state()
     if a.apply:
@@ -950,6 +952,8 @@ def main():
     ap.add_argument("--max", type=int, default=40, help="at most N lane WRITES per run; 0 = NO CAP (the one-off catch-up)")
     ap.add_argument("--workers", type=int, default=4, help="reports parsed at once (memory-gated by MEM_BUDGET_GB)")
     ap.add_argument("--strict", action="store_true", help="'near' count matches fail too")
+    ap.add_argument("--only-sids", nargs="+", default=None, metavar="SEARCH_ID",
+                    help="plan only these searches (a trial run); pending registrations from earlier runs still run")
     ap.add_argument("--preflight", action="store_true",
                     help="plan: read each PARQUET report's run column and drop reports whose runs are not the search's")
     a = ap.parse_args()

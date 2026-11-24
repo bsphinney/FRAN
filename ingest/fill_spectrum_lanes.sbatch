@@ -26,9 +26,10 @@ source /etc/profile.d/modules.sh 2>/dev/null || true   # under set -u this kills
 set -uo pipefail
 export PATH=/cvmfs/hpc.ucdavis.edu/sw/spack/environments/core/view/generic/slurm/bin:$PATH
 export DELIMP_PG_TOKEN_FILE=/quobyte/proteomics-grp/brett/.pgfarm_token
-ING=/quobyte/proteomics-grp/brett/glendon/fran_ingest
+ING=${FRAN_ING:-/quobyte/proteomics-grp/brett/glendon/fran_ingest}   # FRAN_ING: run a staged copy (a trial)
 PY=/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python
 export PYTHONPATH=$ING
 cd "$ING"
 echo "===== fran_spectrum_lane $(date -Is) on $(hostname) job ${SLURM_JOB_ID:-} restart ${SLURM_RESTART_COUNT:-0} ====="
-exec "$PY" -u fill_spectrum_lanes.py --apply --max "${FRAN_SPECTRUM_MAX:-40}" --workers 4
+# FRAN_SPECTRUM_ARGS: extra flags, e.g. "--only-sids <id> <id>" for a trial
+exec "$PY" -u fill_spectrum_lanes.py --apply --preflight --max "${FRAN_SPECTRUM_MAX:-40}" --workers 4 ${FRAN_SPECTRUM_ARGS:-}
