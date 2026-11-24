@@ -306,7 +306,7 @@ def check_search_output(c):
                  WHERE s.search_engine = 'diann' AND s.ingested_at < now() - interval '2 days'""")
     n, no_rep, no_full = c.fetchone()
     c.execute("""SELECT count(*) FROM delimp_search_artifact
-                 WHERE kind = 'full_report' AND detail->>'status' = 'mismatch'""")
+                 WHERE kind = 'full_report_mismatch' AND missing_since IS NULL""")
     bad = c.fetchone()[0]
     metrics["search_output"] = {"diann_searches": n, "no_report_registered": no_rep,
                                 "no_full_report": no_full, "full_report_mismatch": bad}

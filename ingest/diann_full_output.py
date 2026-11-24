@@ -31,6 +31,8 @@ NEVER WRITES INTO A SEARCH FOLDER. DIA-NN drops `<lib>.skyline.speclib` beside i
 rewrite a .quant it decides not to reuse, so the library is symlinked and the .quant files are
 COPIED into a work folder, and DIA-NN is pointed at those. The copies are compared with the
 originals afterwards (size + mtime of the originals unchanged).
+The one thing it can open in place is a RAW file, and only for a single-shot search that has to
+be re-searched whole; a Bruker .d is refused there unless tdf_unsafe() passes it.
 
     python diann_full_output.py plan     --out todo.jsonl            # searches still to do (reads PG)
     python diann_full_output.py regen    --list todo.jsonl --shard 0/4
@@ -55,6 +57,7 @@ FULL_ROOT = os.environ.get("FRAN_DIANN_FULL_ROOT",
                            "/nfs/lssc0/flinders/proteomics/Data/FRAN_diann/_full_reports")
 WORK_ROOT = os.environ.get("FRAN_DIANN_FULL_WORK",
                            "/quobyte/proteomics-grp/brett/scratch/diann_full_report_work")
+LOCK_STALE_S = 2 * 86400            # a lock or work folder older than this was abandoned
 FULL_QVALUE = 0.5                    # DIA-NN's own guidance for counting proteins from a report
 SHA_MAX_BYTES = 512 * 1024 * 1024    # hash anything up to this; bigger files get size + mtime only
 WALK_DEPTH = 4
@@ -131,6 +134,25 @@ def dotnet_root(search_dir: str) -> str | None:
     return d if os.path.isdir(d) else None
 
 
+def tdf_unsafe(d_folder: str) -> str | None:
+    """Why opening this Bruker .d could damage it, or None. DIA-NN 2.7.0 opens analysis.tdf
+    read-write; with a stale write-ahead log beside it SQLite checkpoints mid-acquisition pages
+    into the finished file and truncates it (measured 2026-09-21). Reads 20 bytes, opens nothing."""
+    tdf = os.path.join(d_folder, "analysis.tdf")
+    for suffix in ("-wal", "-journal"):
+        f = tdf + suffix
+        if os.path.exists(f) and os.path.getsize(f) > 0:
+            return f"non-empty {os.path.basename(f)} beside the tdf"
+    try:
+        with open(tdf, "rb") as fh:
+            head = fh.read(20)
+    except OSError as e:
+        return f"analysis.tdf unreadable: {e}"
+    if len(head) < 20 or head[18:20] == b"\x02\x02":
+        return "analysis.tdf is in WAL mode (or too short to tell)"
+    return None
+
+
 def plan_regen(search_dir: str) -> dict:
     """Everything needed to re-run the report step, or the reason it cannot be."""
     cmd = logged_command(search_dir)
@@ -172,6 +194,13 @@ def plan_regen(search_dir: str) -> dict:
         gone = [r for r in raws if not os.path.exists(r)]
         if gone:
             return {"ok": False, "why": f"a full re-run needs the raw files; {len(gone)} of {len(raws)} are gone (e.g. {gone[0]})"}
+        # The report step never opens a raw file; a re-search does, and must not be the thing
+        # that damages one.
+        for r in raws:
+            if r.lower().endswith(".d"):
+                why = tdf_unsafe(r)
+                if why:
+                    return {"ok": False, "why": f"unsafe to re-open {os.path.basename(r)}: {why}"}
     else:
         missing = []
         for r in raws:
@@ -241,14 +270,20 @@ def compare_reports(orig: str, full: str) -> dict:
                 out["orig_pg_at_1pct_" + c] = pc.count_distinct(to.filter(pc.less_equal(to[c], 0.01))["Protein.Group"]).as_py()
     out["target_rows_above_1pct"] = tt.num_rows - slice_.num_rows
     # q-values of the shared rows must be the same numbers, not merely the same keys
-    if not out["keys_only_in_orig"] and not out["keys_only_in_full_slice"] and to.num_rows:
+    if (not out["keys_only_in_orig"] and not out["keys_only_in_full_slice"] and to.num_rows
+            and to.num_rows == slice_.num_rows):
         so = to.sort_by([("Run", "ascending"), ("Precursor.Id", "ascending")])
         sf = slice_.sort_by([("Run", "ascending"), ("Precursor.Id", "ascending")])
         for c in ("Q.Value", "PG.Q.Value", "Global.PG.Q.Value", "Lib.PG.Q.Value"):
             if c in so.schema.names and c in sf.schema.names:
                 d = pc.max(pc.abs(pc.subtract(pc.cast(so[c], "float64"), pc.cast(sf[c], "float64")))).as_py()
                 out["max_abs_diff_" + c] = d
-    out["parity"] = (out["keys_only_in_orig"] == 0 and out["keys_only_in_full_slice"] == 0)
+    # Same keys is not enough: the counts must agree too (a set hides a duplicated key), there
+    # must be something to compare, and the q-values of the shared rows must be the same numbers.
+    diffs = [v for k, v in out.items() if k.startswith("max_abs_diff_")]
+    out["parity"] = (out["keys_only_in_orig"] == 0 and out["keys_only_in_full_slice"] == 0
+                     and to.num_rows > 0 and to.num_rows == slice_.num_rows == len(ko)
+                     and bool(diffs) and all(d is not None and d <= 1e-6 for d in diffs))
     return out
 
 
@@ -265,6 +300,24 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
         rec.update(status="cannot_regenerate", why=plan["why"])
         return rec                       # not written to FULL_ROOT: a later run may be able to
     work = os.path.join(WORK_ROOT, search_id)
+    lock = work + ".lock"
+    me = f"{os.environ.get('SLURM_ARRAY_JOB_ID') or os.environ.get('SLURM_JOB_ID') or os.getpid()}" \
+         f"_{os.environ.get('SLURM_ARRAY_TASK_ID', '')}"
+    os.makedirs(WORK_ROOT, exist_ok=True)
+    try:
+        os.mkdir(lock)                   # atomic: one job per search, whoever asks
+    except FileExistsError:
+        owner = ""
+        try:
+            owner = open(os.path.join(lock, "owner")).read().strip()
+        except OSError:
+            pass
+        stale = time.time() - os.path.getmtime(lock) > LOCK_STALE_S
+        if owner != me and not stale:    # owner == me: this shard was preempted and requeued
+            rec.update(status="busy", why=f"another job is regenerating this search ({owner})")
+            return rec
+    with open(os.path.join(lock, "owner"), "w") as fh:
+        fh.write(me)
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(os.path.join(work, "quant"))
     os.makedirs(os.path.join(work, "out"))
@@ -322,17 +375,30 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
         clean = plan["method"] == "full_rerun" or not rec["quant_rewritten"]
         rec["status"] = "mismatch" if not rec["check"]["parity"] else ("ok" if clean else "ok_requantified")
         rec["qvalue"] = FULL_QVALUE
-        os.makedirs(dest, exist_ok=True)
-        for f in os.listdir(os.path.join(work, "out")):
-            shutil.move(os.path.join(work, "out", f), os.path.join(dest, f))
         rec["report"] = os.path.join(dest, "report.full.parquet")
         rec["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        tmp = marker + ".tmp"
-        json.dump(rec, open(tmp, "w"), indent=1)
-        os.replace(tmp, marker)
+        # The copy crosses filesystems and can be cut short by a preemption, so it lands in a
+        # sibling folder with its marker and is renamed into place whole: a half-copied report
+        # is never under the name anything reads.
+        stage = dest + ".incoming"
+        shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage)
+        for f in os.listdir(os.path.join(work, "out")):
+            shutil.move(os.path.join(work, "out", f), os.path.join(stage, f))
+        with open(os.path.join(stage, "regen.json"), "w") as fh:
+            json.dump(rec, fh, indent=1)
+        if os.path.isdir(dest):
+            old = dest + ".old"
+            shutil.rmtree(old, ignore_errors=True)
+            os.rename(dest, old)
+            os.rename(stage, dest)
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            os.rename(stage, dest)
         return rec
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(lock, ignore_errors=True)
 
 
 def note_failure(rec: dict) -> None:
@@ -349,6 +415,22 @@ def failed_recently(search_id: str, days: float = 30) -> bool:
     return os.path.exists(p) and time.time() - os.path.getmtime(p) < days * 86400
 
 
+def sweep_abandoned() -> int:
+    """Remove work folders and locks a killed job left behind (a SIGKILL skips `finally`)."""
+    n = 0
+    if not os.path.isdir(WORK_ROOT):
+        return 0
+    for name in os.listdir(WORK_ROOT):
+        p = os.path.join(WORK_ROOT, name)
+        try:
+            if time.time() - os.path.getmtime(p) > LOCK_STALE_S:
+                shutil.rmtree(p, ignore_errors=True)
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
 def cmd_regen(a):
     items = [json.loads(ln) for ln in open(a.list) if ln.strip()]
     if a.shard:
@@ -356,6 +438,7 @@ def cmd_regen(a):
         items = items[i::n]
     threads = a.threads or int(os.environ.get("SLURM_CPUS_PER_TASK", "4"))
     os.makedirs(a.results, exist_ok=True)
+    sweep_abandoned()
     res = open(os.path.join(a.results, f"regen_{os.environ.get('SLURM_JOB_ID', 'x')}_{(a.shard or '0').split('/')[0]}.jsonl"), "a")
     n = {"ok": 0}
     for it in items[: a.limit or None]:
@@ -365,7 +448,7 @@ def cmd_regen(a):
             r = {"search_id": it["id"], "search_dir": it["output_dir"], "status": "error",
                  "why": f"{type(e).__name__}: {e}"[:600]}
         n[r["status"]] = n.get(r["status"], 0) + 1
-        if not r["status"].startswith("ok"):
+        if not r["status"].startswith("ok") and r["status"] != "busy":
             note_failure(r)
         slim = {k: v for k, v in r.items() if k not in ("command", "original_command")}
         res.write(json.dumps(slim) + "\n")
@@ -446,6 +529,7 @@ DDL += [
 ]
 
 DDL += [
+    "ALTER TABLE delimp_search_artifact ADD COLUMN IF NOT EXISTS missing_since timestamptz",
     "ALTER TABLE delimp_search_provenance ADD COLUMN IF NOT EXISTS run_by text",
     "ALTER TABLE delimp_search_provenance ADD COLUMN IF NOT EXISTS run_by_source text",
     """COMMENT ON COLUMN delimp_search_provenance.run_by IS
@@ -534,7 +618,9 @@ def artifacts_for(search_id: str, search_dir: str, hash_files: bool = True):
     """Yield one dict per file: the search's own output, then the regenerated full report."""
     roots = [("search", search_dir)]
     full = os.path.join(FULL_ROOT, search_id)
-    if os.path.isdir(full):
+    # Only a finished regeneration is registered: the marker is written last, with the folder
+    # renamed into place whole, so a folder without one is not a result.
+    if os.path.exists(os.path.join(full, "regen.json")):
         roots.append(("regenerated", full))
     raws = set()
     cmd = logged_command(search_dir) if os.path.isdir(search_dir) else None
@@ -560,12 +646,14 @@ def artifacts_for(search_id: str, search_dir: str, hash_files: bool = True):
                      "mtime": st.st_mtime, "sha256": None, "n_rows": None, "columns": None,
                      "report_qvalue": None, "has_decoys": None, "detail": None}
                 if origin == "regenerated" and rel == "report.full.parquet":
-                    a["kind"] = "full_report"
+                    # A report that does not reproduce the original is kept and labelled, never
+                    # counted as the search's full report (the search stays on the to-do list).
+                    a["kind"] = "full_report" if str(regen.get("status", "")).startswith("ok") else "full_report_mismatch"
                     a["report_qvalue"] = regen.get("qvalue")
                     a["detail"] = {x: regen.get(x) for x in ("status", "method", "check", "layout", "seconds",
                                                              "quant_rewritten", "slurm_job", "finished")}
-                if a["kind"] in ("report", "report_first_pass", "full_report", "site_report",
-                                 "empirical_library") and p.endswith(".parquet"):
+                if a["kind"] in ("report", "report_first_pass", "full_report", "full_report_mismatch",
+                                 "site_report", "empirical_library") and p.endswith(".parquet"):
                     try:
                         a.update(parquet_facts(p))
                     except Exception as e:  # noqa: BLE001 -- a damaged parquet is itself the finding
@@ -593,9 +681,19 @@ _UPSERT = """INSERT INTO delimp_search_artifact
           %(has_decoys)s, %(detail)s, %(wv)s)
   ON CONFLICT (search_id, path) DO UPDATE SET
      kind = EXCLUDED.kind, size_bytes = EXCLUDED.size_bytes, mtime = EXCLUDED.mtime,
-     sha256 = COALESCE(EXCLUDED.sha256, delimp_search_artifact.sha256),
-     n_rows = COALESCE(EXCLUDED.n_rows, delimp_search_artifact.n_rows),
-     columns = COALESCE(EXCLUDED.columns, delimp_search_artifact.columns),
+     sha256 = CASE WHEN EXCLUDED.sha256 IS NOT NULL THEN EXCLUDED.sha256
+                   WHEN delimp_search_artifact.size_bytes = EXCLUDED.size_bytes
+                    AND delimp_search_artifact.mtime = EXCLUDED.mtime THEN delimp_search_artifact.sha256
+                   END,
+     n_rows = CASE WHEN EXCLUDED.n_rows IS NOT NULL THEN EXCLUDED.n_rows
+                   WHEN delimp_search_artifact.size_bytes = EXCLUDED.size_bytes
+                    AND delimp_search_artifact.mtime = EXCLUDED.mtime THEN delimp_search_artifact.n_rows
+                   END,
+     columns = CASE WHEN EXCLUDED.columns IS NOT NULL THEN EXCLUDED.columns
+                    WHEN delimp_search_artifact.size_bytes = EXCLUDED.size_bytes
+                     AND delimp_search_artifact.mtime = EXCLUDED.mtime THEN delimp_search_artifact.columns
+                    END,
+     missing_since = NULL,
      report_qvalue = COALESCE(EXCLUDED.report_qvalue, delimp_search_artifact.report_qvalue),
      has_decoys = COALESCE(EXCLUDED.has_decoys, delimp_search_artifact.has_decoys),
      detail = COALESCE(EXCLUDED.detail, delimp_search_artifact.detail),
@@ -633,7 +731,9 @@ def protein_rows(report: str):
     have = [(src, dst, how) for src, dst, how in _PROT_AGG if src in names]
     t = pf.read(columns=["Run", "Protein.Group", "Genes", "Decoy"] + [src for src, _, _ in have])
     t = t.filter(pc.equal(t["Decoy"], 0))
-    t = t.append_column("_q01", pc.cast(pc.less_equal(t["Q.Value"], 0.01), pa.int32()))
+    # strict and 32-bit, as DIA-NN's own --qvalue 0.01 filter is (see compare_reports)
+    t = t.append_column("_q01", pc.cast(pc.less(pc.cast(t["Q.Value"], pa.float32()),
+                                                pa.scalar(0.01, pa.float32())), pa.int32()))
     g = t.group_by(["Run", "Protein.Group"]).aggregate(
         [("Genes", "min"), ("Decoy", "count"), ("_q01", "sum")] + [(src, how) for src, _, how in have])
     out = {"run": g["Run"].to_pylist(), "protein_group": g["Protein.Group"].to_pylist(),
@@ -688,6 +788,50 @@ def load_proteins(conn, search_id: str, output_dir: str) -> int | None:
     return n
 
 
+def register_one(conn, it: dict, hash_files: bool = True) -> dict:
+    """Everything registration does for one search, in order: its files, who ran it, its
+    unfiltered protein groups. Returns counts. The folder must exist."""
+    import psycopg2
+    import psycopg2.extras
+    rows = []
+    for art in artifacts_for(it["id"], it["output_dir"], hash_files):
+        art.update(search_id=it["id"], wv=VERSION,
+                   columns=json.dumps(art["columns"]) if art["columns"] else None,
+                   detail=json.dumps(art["detail"]) if art["detail"] else None)
+        rows.append(art)
+    out = {"files": len(rows), "bytes": sum(r["size_bytes"] for r in rows), "conn": conn}
+    # A token lasts 7 days but an idle connection does not survive a long hash; reconnect once.
+    for attempt in (1, 2):
+        try:
+            cur = conn.cursor()
+            psycopg2.extras.execute_batch(cur, _UPSERT, rows, page_size=200)
+            # A file that was registered and is no longer there keeps its row, dated.
+            if rows:
+                cur.execute("""UPDATE delimp_search_artifact SET missing_since = now()
+                               WHERE search_id = %s AND missing_since IS NULL AND NOT (path = ANY(%s))""",
+                            (it["id"], [r["path"] for r in rows]))
+                out["gone"] = cur.rowcount
+            conn.commit()
+            break
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if attempt == 2:
+                raise
+            conn = out["conn"] = _conn()
+    who, how = run_by(it["output_dir"])
+    if who:
+        cur = conn.cursor()
+        cur.execute("""UPDATE delimp_search_provenance SET run_by = %s, run_by_source = %s
+                       WHERE search_id = %s AND run_by IS DISTINCT FROM %s""", (who, how, it["id"], who))
+        out["run_by_set"] = cur.rowcount
+        conn.commit()
+    try:
+        out["protein_rows"] = load_proteins(conn, it["id"], it["output_dir"])
+    except Exception as e:  # noqa: BLE001 -- the file registration above is already committed
+        conn.rollback()
+        out["protein_error"] = f"{type(e).__name__}: {e}"[:300]
+    return out
+
+
 def pending(cur, engine_version_like: str | None, what: str):
     """DIA-NN searches with no registered artifact of `what` ('report' or 'full_report')."""
     cur.execute("""SELECT s.id::text, s.output_dir, s.n_raw_files FROM delimp_searches s
@@ -723,7 +867,6 @@ def cmd_plan(a):
 
 
 def cmd_register(a):
-    import psycopg2.extras
     items = [json.loads(ln) for ln in open(a.list) if ln.strip()]
     if a.shard:
         i, n = (int(x) for x in a.shard.split("/"))
@@ -735,46 +878,21 @@ def cmd_register(a):
             tot["missing_dir"] += 1
             print("DIR MISSING", it["output_dir"], flush=True)
             continue
-        rows = []
-        for art in artifacts_for(it["id"], it["output_dir"], not a.no_hash):
-            art.update(search_id=it["id"], wv=VERSION,
-                       columns=json.dumps(art["columns"]) if art["columns"] else None,
-                       detail=json.dumps(art["detail"]) if art["detail"] else None)
-            rows.append(art)
         tot["searches"] += 1
-        tot["files"] += len(rows)
-        tot["bytes"] += sum(r["size_bytes"] for r in rows)
         if conn:
-            # A token lasts 7 days but an idle connection does not survive a long hash; reconnect.
-            for attempt in (1, 2):
-                try:
-                    cur = conn.cursor()
-                    psycopg2.extras.execute_batch(cur, _UPSERT, rows, page_size=200)
-                    conn.commit()
-                    break
-                except (psycopg2.OperationalError, psycopg2.InterfaceError):
-                    if attempt == 2:
-                        raise
-                    conn = _conn()
-            who, how = run_by(it["output_dir"])
-            if who:
-                cur = conn.cursor()
-                cur.execute("""UPDATE delimp_search_provenance SET run_by = %s, run_by_source = %s
-                               WHERE search_id = %s AND run_by IS DISTINCT FROM %s""",
-                            (who, how, it["id"], who))
-                tot["run_by_set"] = tot.get("run_by_set", 0) + cur.rowcount
-                conn.commit()
-            try:
-                npr = load_proteins(conn, it["id"], it["output_dir"])
-            except Exception as e:  # noqa: BLE001 -- the file registration above is already committed
-                conn.rollback()
-                npr = f"PROTEIN LOAD FAILED {type(e).__name__}: {e}"[:300]
-                tot["protein_load_failed"] = tot.get("protein_load_failed", 0) + 1
-            if isinstance(npr, int):
-                tot["protein_rows"] = tot.get("protein_rows", 0) + npr
+            r = register_one(conn, it, not a.no_hash)
+            conn = r.pop("conn")
         else:
-            npr = "-"
-        print(f"{len(rows):5d} files  {npr} protein rows  {it['output_dir']}", flush=True)
+            arts = list(artifacts_for(it["id"], it["output_dir"], False))
+            r = {"files": len(arts), "bytes": sum(x["size_bytes"] for x in arts)}
+        for k in ("files", "bytes", "gone", "run_by_set"):
+            tot[k] = tot.get(k, 0) + (r.get(k) or 0)
+        if isinstance(r.get("protein_rows"), int):
+            tot["protein_rows"] = tot.get("protein_rows", 0) + r["protein_rows"]
+        if r.get("protein_error"):
+            tot["protein_load_failed"] = tot.get("protein_load_failed", 0) + 1
+        print(f"{r['files']:5d} files  {r.get('protein_rows', '-')} protein rows  "
+              f"{r.get('protein_error', '')}  {it['output_dir']}", flush=True)
     if conn:
         cur = conn.cursor()
         try:
@@ -789,61 +907,61 @@ def cmd_register(a):
     print("SUMMARY", json.dumps(tot), "" if a.apply else "(dry run: nothing written)")
 
 
+SBATCH = "/cvmfs/hpc.ucdavis.edu/sw/spack/environments/core/view/generic/slurm/bin/sbatch"
+
+
 def cmd_nightly(a):
-    """Every DIA-NN search with no registered report or no registered full report: regenerate what
-    can be regenerated, then register. This is the post-ingest hook (fran_fill.py runs it), so a
-    search ingested today is covered tonight without corpus_ingest.py knowing about any of it."""
-    import psycopg2.extras
+    """The post-ingest hook (fran_fill.py runs it): find DIA-NN searches with no registered report
+    or no full report, and SUBMIT the work as SLURM jobs. It runs nothing itself -- a regeneration
+    can be a whole re-search -- so it costs one query and two sbatch calls wherever it is called
+    from, and a search that can never be regenerated costs nothing after its first failure."""
     conn = _conn()
     cur = conn.cursor()
-    need_full = {x["id"]: x for x in pending(cur, None, "full_report")}
-    need_reg = {x["id"]: x for x in pending(cur, None, "report")}
-    conn.close()                       # a regeneration can outlast an idle connection
-    threads = int(os.environ.get("SLURM_CPUS_PER_TASK", "2"))
-    t0, n = time.time(), {"regenerated": 0, "cannot": 0, "skipped_failed": 0, "registered": 0,
-                          "dir_missing": 0, "left": 0}
-    todo = list({**need_reg, **need_full}.values())
-    for i, it in enumerate(todo):
-        if time.time() - t0 > a.budget:
-            n["left"] = len(todo) - i
-            break
+    need_full = pending(cur, None, "full_report")
+    need_reg = pending(cur, None, "report")
+    conn.close()
+    n = {"no_report_registered": len(need_reg), "no_full_report": len(need_full), "dir_missing": 0,
+         "skipped_failed": 0}
+    regen, reg = [], {}
+    for it in need_full:
         if not os.path.isdir(it["output_dir"]):
             n["dir_missing"] += 1
-            continue
-        if it["id"] in need_full:
-            if failed_recently(it["id"]) and not a.retry_failed:
-                n["skipped_failed"] += 1
-            elif a.apply:
-                try:
-                    r = regen_one(it["id"], it["output_dir"], threads)
-                except Exception as e:  # noqa: BLE001
-                    r = {"search_id": it["id"], "search_dir": it["output_dir"], "status": "error",
-                         "why": f"{type(e).__name__}: {e}"[:600]}
-                if r["status"].startswith("ok"):
-                    n["regenerated"] += 1
-                else:
-                    n["cannot"] += 1
-                    note_failure(r)
-        if a.apply:
-            rows = []
-            for art in artifacts_for(it["id"], it["output_dir"]):
-                art.update(search_id=it["id"], wv=VERSION,
-                           columns=json.dumps(art["columns"]) if art["columns"] else None,
-                           detail=json.dumps(art["detail"]) if art["detail"] else None)
-                rows.append(art)
-            c2 = _conn()
-            psycopg2.extras.execute_batch(c2.cursor(), _UPSERT, rows, page_size=200)
-            c2.commit()
-            try:
-                if load_proteins(c2, it["id"], it["output_dir"]) is not None:
-                    n["protein_tables"] = n.get("protein_tables", 0) + 1
-            except Exception as e:  # noqa: BLE001
-                c2.rollback()
-                print("PROTEIN LOAD FAILED", it["id"], f"{type(e).__name__}: {e}"[:300])
-            c2.close()
-            n["registered"] += 1
-    print(f"{len(need_reg)} DIA-NN searches had no registered report, {len(need_full)} no full report")
-    print("SUMMARY", json.dumps(n), "" if a.apply else "(dry run: nothing regenerated or written)")
+        elif os.path.exists(os.path.join(FULL_ROOT, it["id"], "regen.json")):
+            reg[it["id"]] = it           # regenerated already (ok or not); only needs registering
+        elif failed_recently(it["id"]) and not a.retry_failed:
+            n["skipped_failed"] += 1     # tried within 30 days; _failed/<id>.json says why
+        else:
+            regen.append(it)
+    regen = regen[: a.max]
+    for it in need_reg + regen:
+        if os.path.isdir(it["output_dir"]):
+            reg.setdefault(it["id"], it)
+    # A mismatched report is registered as such and so stays in need_full; do not re-register it nightly.
+    reg = {k: v for k, v in reg.items() if k in {x["id"] for x in need_reg + regen} or not failed_recently(k)}
+    n.update(to_regenerate=len(regen), to_register=len(reg))
+    if a.apply and (regen or reg):
+        lists = os.path.join(FULL_ROOT, "_nightly")
+        os.makedirs(lists, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        dep = []
+        if regen:
+            f = os.path.join(lists, f"regen_{stamp}.jsonl")
+            with open(f, "w") as fh:
+                fh.writelines(json.dumps(x) + "\n" for x in regen)
+            r = subprocess.run([SBATCH, "--parsable", os.path.join(HERE, "diann_full_report.sbatch"), f],
+                               capture_output=True, text=True)
+            n["regen_job"] = r.stdout.strip() or f"SUBMIT FAILED: {r.stderr.strip()[:200]}"
+            if r.returncode == 0:
+                dep = ["--dependency=afterany:" + r.stdout.strip().split(";")[0]]
+        f = os.path.join(lists, f"register_{stamp}.jsonl")
+        with open(f, "w") as fh:
+            fh.writelines(json.dumps(x) + "\n" for x in reg.values())
+        r = subprocess.run([SBATCH, "--parsable", *dep, os.path.join(HERE, "diann_register_artifacts.sbatch"), f],
+                           capture_output=True, text=True)
+        n["register_job"] = r.stdout.strip() or f"SUBMIT FAILED: {r.stderr.strip()[:200]}"
+    print("SUMMARY", json.dumps(n), "" if a.apply else "(dry run: nothing submitted)")
+    if any(str(v).startswith("SUBMIT FAILED") for v in n.values()):
+        sys.exit(1)
 
 
 def main():
@@ -868,7 +986,7 @@ def main():
     p.set_defaults(fn=cmd_register)
     p = sub.add_parser("nightly")
     p.add_argument("--apply", action="store_true")
-    p.add_argument("--budget", type=int, default=5 * 3600, help="seconds; the rest waits a night")
+    p.add_argument("--max", type=int, default=400, help="most searches to regenerate per night")
     p.add_argument("--retry-failed", action="store_true")
     p.set_defaults(fn=cmd_nightly)
     a = ap.parse_args()

@@ -74,7 +74,7 @@ STEPS = [
     ("build_run_flags", ["--apply"], 3600, False),         # split + shareable per raw run
     # Every file each new DIA-NN search wrote goes in delimp_search_artifact, and its report is
     # regenerated from the saved .quant files at --qvalue 0.5 with decoys (FRAN#35).
-    ("diann_full_output", ["nightly", "--apply"], 6 * 3600, False),
+    ("diann_full_output", ["nightly", "--apply"], 600, False),
     ("raw_md5", ["--apply", "--max-bytes", "2e12"], 20 * 3600, False),  # newly located raws, <=2 TB/night
     ("predict_tissue", ["--apply"], 2 * 3600, True),
     ("predict_blood_fraction", ["--apply"], 2 * 3600, True),

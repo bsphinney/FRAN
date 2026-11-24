@@ -5,6 +5,7 @@ break silently in review is the command surgery: an option left in that makes DI
 files or write into the search folder, a path with a space split in two, or a new DIA-NN output
 file being dropped instead of registered. Those are pure functions and are tested here.
 """
+import json
 import os, sys, tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +48,8 @@ with tempfile.TemporaryDirectory() as t:
     check("log q-value is read", d.log_qvalue(S) == 0.01)
     # single-shot with --reanalyse: first-pass quants only, so the second pass has to be re-run
     os.makedirs(os.path.join(raws, "a_1.d")); os.makedirs(os.path.join(raws, "b_2.d"))
+    for n in ("a_1", "b_2"):   # a finished, rollback-mode tdf: safe to re-open
+        open(os.path.join(raws, n + ".d", "analysis.tdf"), "wb").write(b"SQLite format 3\x00\x10\x00\x01\x01" + b"\x00" * 80)
     lib = os.path.join(S, "lib.predicted.speclib"); open(lib, "w").write("x")
     cmd2 = (f"/tools/diann-linux --qvalue 0.01 --xic 10 --mobilograms --f {raws}/a_1.d --f {raws}/b_2.d "
             f"--fasta {fa} --lib {lib} --reanalyse --matrices --out {S}/report.parquet --threads 16")
@@ -81,6 +84,79 @@ KINDS = {"report.parquet": "report", "report-first-pass.parquet": "report_first_
 for rel, k in KINDS.items():
     check(f"{rel} -> {k}", d.kind_of(rel) == k, d.kind_of(rel))
 check("an unknown file is still a kind (registered, never dropped)", d.kind_of("anything") == "other")
+
+
+# ---- the parity check, the protein rows, the raw-file gate, the lock (review findings) ----
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+def _rep(path, rows):
+    cols = ["Run", "Precursor.Id", "Q.Value", "PG.Q.Value", "Global.PG.Q.Value", "Lib.PG.Q.Value",
+            "Protein.Group", "Genes", "Decoy", "PG.MaxLFQ"]
+    arr = {c: [r.get(c) for r in rows] for c in cols}
+    f32 = pa.float32()
+    typ = lambda c: f32 if c.endswith("Q.Value") or c == "PG.MaxLFQ" else (pa.int64() if c == "Decoy" else pa.string())  # noqa: E731
+    tbl = pa.table({c: pa.array(v, typ(c)) for c, v in arr.items()})
+    pq.write_table(tbl, path)
+
+
+with tempfile.TemporaryDirectory() as t:
+    base = [dict({"Run": "a", "Precursor.Id": f"P{i}", "Q.Value": 0.001, "PG.Q.Value": 0.002,
+                  "Global.PG.Q.Value": 0.003, "Lib.PG.Q.Value": 0.004, "Protein.Group": "G1",
+                  "Genes": "g", "Decoy": 0, "PG.MaxLFQ": 5.0}) for i in range(3)]
+    extra = [dict(base[0], **{"Precursor.Id": "HI", "Q.Value": 0.2, "Protein.Group": "G2", "PG.Q.Value": 0.005}),
+             dict(base[0], **{"Precursor.Id": "EDGE", "Q.Value": float(np.float32(0.01))}),
+             dict(base[0], **{"Precursor.Id": "DEC", "Decoy": 1, "Protein.Group": "D1"})]
+    o, f = os.path.join(t, "o.parquet"), os.path.join(t, "f.parquet")
+    _rep(o, base); _rep(f, base + extra)
+    c = d.compare_reports(o, f)
+    check("identical 1% rows plus rows above 1%, a boundary row and a decoy: parity", c["parity"] is True, str(c))
+    check("...and the group seen only above 1% is counted", c["pg_at_1pct_PG.Q.Value"] == 2 and c["orig_pg_at_1pct_PG.Q.Value"] == 1)
+    _rep(f, [dict(base[0], **{"PG.Q.Value": 0.009})] + base[1:] + extra)
+    check("same keys but a different protein q-value is NOT parity", d.compare_reports(o, f)["parity"] is False)
+    _rep(f, base + [base[0]] + extra)
+    check("a duplicated key is NOT parity", d.compare_reports(o, f)["parity"] is False)
+    _rep(o, []); _rep(f, extra)
+    check("an empty original is NOT parity", d.compare_reports(o, f)["parity"] is False)
+
+    _rep(f, base + extra + [dict(base[0], **{"Protein.Group": 'A,"B";C', "Precursor.Id": "Q"})])
+    cols, n = d.protein_rows(f)
+    by = {g: i for i, g in enumerate(cols["protein_group"])}
+    check("protein rows: targets only, one per (run, group)", n == 3 and "D1" not in by, str(by))
+    i = by["G1"]
+    check("...n_precursors counts every target row, n_precursors_q01 only rows strictly under 1%",
+          cols["n_precursors"][i] == 4 and cols["n_precursors_q01"][i] == 3, f'{cols["n_precursors"][i]} {cols["n_precursors_q01"][i]}')
+    check("...a group seen only above 1% is there with zero 1% precursors", cols["n_precursors_q01"][by["G2"]] == 0)
+
+    D = os.path.join(t, "x.d"); os.makedirs(D)
+    open(os.path.join(D, "analysis.tdf"), "wb").write(b"SQLite format 3\x00" + b"\x10\x00\x01\x01" + b"\x00" * 80)
+    check("a rollback-mode tdf with no sidecar is safe to open", d.tdf_unsafe(D) is None, str(d.tdf_unsafe(D)))
+    open(os.path.join(D, "analysis.tdf-wal"), "wb").write(b"x")
+    check("a non-empty -wal beside the tdf is refused", d.tdf_unsafe(D) is not None)
+    os.remove(os.path.join(D, "analysis.tdf-wal"))
+    open(os.path.join(D, "analysis.tdf"), "wb").write(b"SQLite format 3\x00" + b"\x10\x00\x02\x02" + b"\x00" * 80)
+    check("a WAL-mode tdf header is refused", d.tdf_unsafe(D) is not None)
+
+    # the lock: a second job must not touch a search another job holds
+    d.WORK_ROOT, d.FULL_ROOT = os.path.join(t, "work"), os.path.join(t, "full")
+    S = os.path.join(t, "s"); os.makedirs(os.path.join(S, "quant_step4"))
+    open(os.path.join(S, "empirical.parquet"), "w").write("x"); open(os.path.join(S, "a.d"), "w").write("x")
+    open(os.path.join(S, "quant_step4", "a.quant"), "w").write("q")
+    open(os.path.join(S, "report.log.txt"), "w").write(
+        f"DIA-NN 2.7.0\n/tools/diann-linux --f {S}/a.d --lib {S}/empirical.parquet --use-quant --temp {S}/quant_step4 --out {S}/report.parquet \n")
+    os.makedirs(os.path.join(d.WORK_ROOT, "sid.lock"))
+    open(os.path.join(d.WORK_ROOT, "sid.lock", "owner"), "w").write("someone_else")
+    r = d.regen_one("sid", S, 1)
+    check("a search another job holds comes back busy and is left alone", r["status"] == "busy", str(r)[:300])
+    check("...and its lock is still there", os.path.isdir(os.path.join(d.WORK_ROOT, "sid.lock")))
+    os.makedirs(os.path.join(d.FULL_ROOT, "half")); open(os.path.join(d.FULL_ROOT, "half", "report.full.parquet"), "w").write("x")
+    arts = list(d.artifacts_for("half", S, hash_files=False))
+    check("a regenerated folder with no marker is not registered", not [a for a in arts if a["origin"] == "regenerated"])
+    json.dump({"status": "mismatch", "qvalue": 0.5}, open(os.path.join(d.FULL_ROOT, "half", "regen.json"), "w"))
+    kinds = {a["kind"] for a in d.artifacts_for("half", S, hash_files=False) if a["origin"] == "regenerated"}
+    check("a mismatched report is labelled, never 'full_report'", "full_report_mismatch" in kinds and "full_report" not in kinds, str(kinds))
 
 print("\nFAILED: " + ", ".join(FAILS) if FAILS else "\nall passed")
 sys.exit(1 if FAILS else 0)
