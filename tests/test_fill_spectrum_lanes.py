@@ -138,9 +138,10 @@ class Verification(unittest.TestCase):
     def run_one(self, res, corpus_n):
         calls = []
         orig = F.run_child
-        F.run_child = lambda args: (res, 0)
+        F.run_child = lambda args, stdin=None: (res, 0)
         try:
-            j = dict(sid="s", name="X", action="write", report="/r/x", lance_path=f"{L}/X.lance", corpus_n=corpus_n)
+            j = dict(sid="s", name="X", action="write", report="/r/x", lance_path=f"{L}/X.lance", corpus_n=corpus_n,
+                     corpus_runs=["r1"])
             o = F.do_job(j, False)
         finally:
             F.run_child = orig
@@ -164,7 +165,8 @@ class Verification(unittest.TestCase):
         self.assertEqual(o["status"], "failed")
 
     def test_path_outside_lane_dir_refused(self):
-        j = dict(sid="s", name="X", action="write", report="/r/x", lance_path="/tmp/evil.lance", corpus_n=1)
+        j = dict(sid="s", name="X", action="write", report="/r/x", lance_path="/tmp/evil.lance", corpus_n=1,
+                 corpus_runs=["r1"])
         self.assertEqual(F.do_job(j, False)["status"], "failed")
 
 
@@ -187,9 +189,238 @@ class SyntheticRoundTrip(unittest.TestCase):
         rep = os.path.join(d, "t_Report_FRAN (Normal).parquet")
         pd.DataFrame(rows).to_parquet(rep)
         out = os.path.join(d, "t.lance")
-        w = F.child_write(rep, out, "t")
+        w = F.child_write(rep, out, "t", 3, False, ["run1"], "J1")
         self.assertEqual((w["n_prec"], w["n_frag"], w["n_back"]), (3, 12, 3))
         self.assertEqual(F.child_describe(out)["md5"], w["md5"])
+        self.assertEqual(F.child_describe(out, runs_only=True)["runs"], ["run1"])
+        self.assertFalse(os.path.exists(out + ".incoming.J1"))
+
+
+def synth_report(d, runs=("run1",), n=3):
+    """A tiny Spectronaut-shaped parquet report: n precursors per run, 4 fragments each."""
+    import pandas as pd
+    rows = [{"R.FileName": r, "PEP.StrippedSequence": f"PEPTIDE{i}", "EG.ModifiedSequence": f"_PEPTIDE{i}_",
+             "FG.Charge": 2, "EG.Qvalue": 0.001, "F.FrgMz": 100.0 + f, "F.FrgType": "y", "F.FrgNum": f + 1,
+             "F.FrgIon": f"y{f + 1}", "F.Charge": 1, "F.FrgLossType": "noloss", "F.PeakArea": 1000.0 * (f + 1),
+             "FG.PrecMz": 500.0 + i, "EG.ApexRT": 10.0 + i, "PG.ProteinGroups": "P1"}
+            for r in runs for i in range(n) for f in range(4)]
+    p = os.path.join(d, "t_Report_FRAN (Normal).parquet")
+    pd.DataFrame(rows).to_parquet(p)
+    return p
+
+
+def need_lance(tc):
+    try:
+        import lance  # noqa: F401
+        import pandas  # noqa: F401
+    except ImportError:
+        tc.skipTest("lance/pandas not installed")
+
+
+class PathSafety(unittest.TestCase):
+    """Items 1, 2, 6: the job cannot put anything on a path it did not create for that search."""
+    def setUp(self):
+        self.old = (F.LANCE, F.D)
+        self.lane = tempfile.mkdtemp()
+        F.LANCE, F.D = self.lane, tempfile.mkdtemp()
+
+    def tearDown(self):
+        F.LANCE, F.D = self.old
+
+    def test_two_same_name_searches_never_share_a_path_even_with_state_pointing_at_plain(self):
+        P = f"{self.lane}/X.lance"
+        st = {"aaaaaaaa": {"attempts": 1, "lance_path": P}, "bbbbbbbb": {"attempts": 1, "lance_path": P}}
+        taken = set()
+        rep = ["/r/X/t/X_Report_FRAN (Normal).parquet"]
+        a, _ = F.decide(S("aaaaaaaa", "X"), rep, {}, {}, taken, st)
+        b, _ = F.decide(S("bbbbbbbb", "X"), rep, {}, {}, taken, st)
+        self.assertNotEqual(a["lance_path"], b["lance_path"])
+        self.assertEqual(len({a["lance_path"], b["lance_path"]}), 2)
+
+    def test_anything_existing_at_the_path_makes_it_occupied_even_if_unopenable(self):
+        os.makedirs(f"{self.lane}/X.lance")                       # a directory that is not a Lance dataset
+        open(f"{self.lane}/X.lance/junk", "w").write("x")
+        job, _ = F.decide(S("sid1aaaa", "X"), ["/r/X/t/X_Report_FRAN (Normal).parquet"], {}, {}, set(), {})
+        self.assertEqual(job["lance_path"], f"{self.lane}/X__sid1aaaa.lance")
+
+    def test_both_plain_and_suffixed_occupied_is_refused_not_overwritten(self):
+        for n in ("X.lance", "X__sid1aaaa.lance"):
+            os.makedirs(f"{self.lane}/{n}")
+        job, skip = F.decide(S("sid1aaaa", "X"), ["/r/X/t/X_Report_FRAN (Normal).parquet"], {}, {}, set(), {})
+        self.assertIsNone(job)
+        self.assertEqual(skip["reason"], "path_occupied")
+
+    def test_child_refuses_foreign_directory_and_leaves_it_untouched(self):
+        need_lance(self)
+        d = tempfile.mkdtemp()
+        rep = synth_report(d)
+        out = f"{self.lane}/X.lance"
+        os.makedirs(out)
+        open(f"{out}/precious", "wb").write(b"irreplaceable")
+        r = F.child_write(rep, out, "X", 3, True, ["run1"], "J9")
+        self.assertFalse(r["ok"])
+        self.assertIn("refusing", r["error"])
+        self.assertEqual(os.listdir(out), ["precious"])
+        self.assertEqual(open(f"{out}/precious", "rb").read(), b"irreplaceable")
+        self.assertEqual(os.listdir(self.lane), ["X.lance"])      # no .incoming left behind either
+
+    def test_run_set_mismatch_fails_before_any_write(self):
+        need_lance(self)
+        d = tempfile.mkdtemp()
+        rep = synth_report(d, runs=("run1", "other"))
+        out = f"{self.lane}/X.lance"
+        r = F.child_write(rep, out, "X", 6, True, ["run1", "run2"], "J9")
+        self.assertFalse(r["ok"])
+        self.assertIn("identity", r["error"])
+        self.assertEqual(os.listdir(self.lane), [])               # nothing at the path, nothing incoming
+
+    def test_count_mismatch_fails_before_any_write(self):
+        need_lance(self)
+        d = tempfile.mkdtemp()
+        r = F.child_write(synth_report(d), f"{self.lane}/X.lance", "X", 9999, True, ["run1"], "J9")
+        self.assertFalse(r["ok"])
+        self.assertEqual(os.listdir(self.lane), [])
+
+    def test_suffixed_path_requires_exact_count_plain_accepts_near(self):
+        need_lance(self)
+        d = tempfile.mkdtemp()
+        rep = synth_report(d)                                      # 3 precursors; corpus says 8 (within the 10-row floor)
+        r = F.child_write(rep, f"{self.lane}/X__sid1aaaa.lance", "X", 8, False, ["run1"], "J9")
+        self.assertFalse(r["ok"])
+        r = F.child_write(rep, f"{self.lane}/X.lance", "X", 8, True, ["run1"], "J9")
+        self.assertTrue(r["ok"])
+
+    def test_failed_write_leaves_nothing_at_the_real_path(self):
+        need_lance(self)
+        import spectrum_lance as sln
+        d = tempfile.mkdtemp()
+        rep = synth_report(d)
+        real = sln.write_lance
+
+        def boom(tbl, path, mode="overwrite"):
+            os.makedirs(path)                                      # half-written incoming directory
+            open(os.path.join(path, "partial"), "w").write("x")
+            raise RuntimeError("disk full")
+        sln.write_lance = boom
+        try:
+            r = F.child_write(rep, f"{self.lane}/X.lance", "X", 3, True, ["run1"], "J9")
+        finally:
+            sln.write_lance = real
+        self.assertFalse(r["ok"])
+        self.assertEqual(os.listdir(self.lane), [])
+
+    def test_quarantine_moves_an_unregisterable_dataset_off_the_real_path(self):
+        p = f"{self.lane}/X.lance"
+        os.makedirs(p)
+        F.quarantine(dict(action="write", lance_path=p), "J9")
+        self.assertFalse(os.path.exists(p))
+        self.assertTrue(os.path.isdir(p + ".failed.J9"))
+        # and the planner can never match it: it only builds <name>.lance paths
+        self.assertNotIn(p + ".failed.J9", {f"{self.lane}/X.lance"})
+
+    def test_ambiguous_link_is_left_alone(self):
+        reg = {f"{self.lane}/X.lance": (7, None, 1000)}
+        claims = {f"{self.lane}/X.lance": ["a", "b"]}
+        job, skip = F.decide(S("a", "X"), [], reg, {}, set(), {}, claims=claims)
+        self.assertIsNone(job)
+        self.assertEqual(skip["reason"], "ambiguous_link")
+
+
+class Registration(unittest.TestCase):
+    """Item 3: the fill's own conditional upsert, and zero rows is a failure."""
+    class Cur:
+        def __init__(self, rc): self.rc, self.sql = rc, []
+        def execute(self, sql, params=None): self.sql.append((sql, params))
+
+        @property
+        def rowcount(self): return self.rc
+
+    class Conn:
+        def __init__(self, rc): self.c, self.commits, self.rollbacks = Registration.Cur(rc), 0, 0
+        def cursor(self): return self.c
+        def commit(self): self.commits += 1
+        def rollback(self): self.rollbacks += 1
+
+    J = dict(sid="s", name="X", lance_path="/l/X.lance", row_id=7)
+    R = dict(n_prec=1, n_frag=2, md5="m", version=1)
+
+    def test_sql_only_updates_unlinked_or_own_rows_and_never_coalesces(self):
+        sql = " ".join(F.UPSERT_SQL.split())
+        self.assertIn("ON CONFLICT (lance_path) DO UPDATE", sql)
+        self.assertIn("WHERE delimp_spectrum_lane.search_id IS NULL OR delimp_spectrum_lane.search_id = EXCLUDED.search_id", sql)
+        self.assertNotIn("COALESCE", sql)
+        self.assertEqual(sql.count("%"), sql.count("%s"))          # psycopg2 trap: a bare percent breaks execute()
+
+    def test_zero_rows_is_a_failure_and_nothing_is_committed(self):
+        conn = self.Conn(0)
+        with self.assertRaises(RuntimeError):
+            F.register_row(conn, self.J, self.R)
+        self.assertEqual((conn.commits, conn.rollbacks), (0, 1))
+
+    def test_one_row_commits(self):
+        conn = self.Conn(1)
+        F.register_row(conn, self.J, self.R)
+        self.assertEqual(conn.commits, 1)
+
+    def test_link_only_touches_a_still_unlinked_row_at_that_path(self):
+        self.assertIn("search_id IS NULL", F.LINK_SQL)
+        self.assertIn("lance_path = %s", F.LINK_SQL)
+        with self.assertRaises(RuntimeError):
+            F.link_row(self.Conn(0), self.J)
+
+
+class InFlight(unittest.TestCase):
+    """Item 4: only the search whose child is running is in_flight."""
+    def setUp(self):
+        self.old_d = F.D
+        F.D = tempfile.mkdtemp()
+
+    def tearDown(self):
+        F.D = self.old_d
+
+    def test_in_flight_is_per_search_and_persisted_before_the_child_starts(self):
+        seen = []
+        old = F.do_job
+
+        def spy(j, strict, jid="x"):
+            st = json.load(open(os.path.join(F.D, "state.json")))
+            seen.append((j["sid"], sorted(k for k, v in st.items() if v.get("in_flight"))))
+            return dict(sid=j["sid"], name=j["name"], action="write", status="failed", error="stub")
+        F.do_job = spy
+        try:
+            jobs = [dict(sid=f"s{i}", name=f"n{i}", action="write", lance_path=f"{L}/n{i}.lance", est_gb=1.0)
+                    for i in range(5)]
+            class A: workers, strict = 1, False
+            state = {}
+            F.apply_jobs(None, jobs, state, A, "J1")
+        finally:
+            F.do_job = old
+        for sid, flying in seen:
+            self.assertEqual(flying, [sid])                         # never the whole batch up front
+
+    def test_kill_charges_only_the_searches_that_were_running(self):
+        state = {}
+        F.mark_in_flight(state, "s1", "J1")                         # J1 started s1, then was OOM-killed
+        state.setdefault("s2", {})                                  # s2..s244 never started
+        F.settle_in_flight(state, "J2")                             # next night's job
+        self.assertEqual(state["s1"]["attempts"], 1)
+        self.assertEqual(state["s2"].get("attempts", 0), 0)
+        for _ in range(2):
+            state["s1"]["in_flight"] = "Jx"
+            F.settle_in_flight(state, "Jy")
+        self.assertTrue(state["s1"]["parked"])
+        self.assertFalse(state["s2"].get("parked"))
+
+    def test_state_file_is_written_atomically(self):
+        F.save_state({"a": {}})
+        self.assertEqual(sorted(os.listdir(F.D)), ["state.json"])
+
+
+class Identity(unittest.TestCase):
+    def test_norm_run_spellings(self):
+        self.assertEqual(F.norm_run(r"K:\Data\x\a.sne\21Dec24_MA13_1_10305.d"), "21dec24_ma13_1_10305")
+        self.assertEqual(F.norm_run("21Dec24_MA13_1_10305"), "21dec24_ma13_1_10305")
+        self.assertEqual(F.norm_run("/p/Run_A.raw"), "run_a")
 
 
 class Budget(unittest.TestCase):

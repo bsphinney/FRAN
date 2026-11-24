@@ -12,8 +12,14 @@ command -v sbatch >/dev/null || { echo "$(date '+%F %T') ABORT: sbatch not on PA
 ING=/quobyte/proteomics-grp/brett/glendon/fran_ingest
 D=/quobyte/proteomics-grp/brett/scratch/fran_health
 mkdir -p "$D/logs" "$D/spectrum_lane"
-# Never two at once: last night's job may still be writing; one writer per dataset.
-if [ -n "$(squeue -u "$(id -un)" -h -n fran_spectrum_lane -o %i 2>/dev/null)" ]; then
+# Never two at once: last night's job may still be writing; one writer per dataset. An EMPTY answer
+# means none queued; a squeue ERROR is not an answer, and must not fall through to a second submit.
+q=$(squeue -u "$(id -un)" -h -n fran_spectrum_lane -o %i 2>&1); rc=$?
+if [ $rc -ne 0 ]; then
+    echo "$(date '+%F %T') ABORT: squeue failed rc=$rc ($q); not submitting" >> "$D/logs/cron_submit.log"
+    exit 1
+fi
+if [ -n "$q" ]; then
     echo "$(date '+%F %T') fran_spectrum_lane still queued/running; skip" >> "$D/logs/cron_submit.log"
     exit 0
 fi

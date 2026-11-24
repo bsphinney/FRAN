@@ -20,8 +20,7 @@ WHAT IT DECIDES, per Spectronaut search with NO row in delimp_spectrum_lane
   register      a dataset for this search is already on disk but unregistered (a killed run) and its
                 row count matches the corpus -> verify and register it; never rewrite it.
   link          a registered dataset with search_id NULL has the matching name AND row count ->
-                set its search_id (the exact-match case; link_spectrum_lane.py then runs for the
-                rest).
+                set its search_id, after its run set is checked (see IDENTITY AND SAFETY).
   needs_reexport  no report on disk and no dataset: the search can only get a lane after a Windows
                 re-export from its .sne. Recorded every night, never attempted, never retried.
   dup_of_laned  no report, but another search's lane has the same name and the same precursor count
@@ -43,6 +42,27 @@ difference of at most max(10, 0.1 percent) is "near" and passes, because 78 of t
 that are not exact differ by under 1 percent and a handful of rows is dedup noise; anything larger
 is a FAILURE and the dataset is NOT registered. --strict makes "near" a failure too.
 
+IDENTITY AND SAFETY (added after review, 2026-11-24). The governing rule: this job must be unable to
+replace a dataset or a registry row it did not itself create for that same search.
+  * A count is not identity: two same-name searches can have close counts. The dataset's distinct
+    run names (normalised: basename, extension stripped, lower case) must EQUAL the search's runs in
+    the corpus (search_raw_files, filtered by search_id). Checked in the child after parsing and
+    BEFORE anything is written; also for `register` and `link` (read from the dataset).
+    Verified read-only on HIVE: 40/40 sampled exact-count lanes and 60/60 near-count lanes have run
+    sets equal under this normalisation.
+  * A write goes to <path>.incoming.<jobid> with mode="create", is count-checked, reopened, and only
+    then renamed to <path>. Nothing is ever written onto an existing path (any existing file or
+    directory at the path, openable or not, is foreign and refused). A failure removes the incoming
+    directory (it is this run's own); a registration failure after the rename moves the dataset to
+    <path>.failed.<jobid>. The planner only ever matches <name>.lance, never .incoming/.failed.
+  * Registration uses this module's own conditional upsert (UPSERT_SQL): it can only insert, or
+    update a row that is unlinked or already this search's; zero rows is a failure. It never calls
+    spectrum_lance.register (which COALESCEs and overwrites counts and md5 of any row at the path).
+  * "near" count matches are accepted for plain-path writes only; a suffixed path needs an exact count.
+    Every near lane is listed in the result JSON.
+  * link_spectrum_lane.py is NOT run here (it links on a unique name with no count or run check).
+    When two un-laned searches match one unlinked row it is left alone and listed as ambiguous_link.
+
 RETRIES. state.json counts failed attempts per search. A write that raises, mismatches or is killed
 counts; a job pre-empted and requeued under the SAME job id does not. After 3 the search is parked.
 If a search has several exports on disk, attempt k uses candidate k (newest first), so a stale
@@ -55,8 +75,10 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -148,8 +170,40 @@ def find_reports(names, output_dir, listdir=os.listdir, isdir=os.path.isdir, isf
     return sorted(found, key=lambda p: (os.path.basename(os.path.dirname(p)), p), reverse=True)
 
 
+RUN_EXT = re.compile(r"\.(d|raw|mzml|wiff2?|tdf)$", re.I)
+
+
+def norm_run(x):
+    """Run name as the lane's `run` column and search_raw_files.raw_path both spell it, made comparable:
+    last path component (either slash), extension dropped, lower case."""
+    b = str(x).replace("\\", "/").rstrip("/").split("/")[-1]
+    return RUN_EXT.sub("", b).lower()
+
+
+def run_set(values):
+    return {norm_run(v) for v in values if v is not None}
+
+
+def is_suffixed(path):
+    return bool(re.search(r"__[0-9a-f]{8}\.lance$", str(path)))
+
+
 def est_gb(path, nbytes):
+    # UNMEASURED factors. They are guesses (parquet decompresses roughly 10x into pandas; a TSV parsed
+    # with usecols roughly 1.5x). The child records its real peak RSS per report (peak_rss_gb in the
+    # result JSON) so these can be corrected after the first real run.
     return nbytes / 1e9 * (10.0 if str(path).lower().endswith(".parquet") else 1.5) + 1.0
+
+
+def dir_bytes(path):
+    n = 0
+    for dp, _dn, fns in os.walk(path):
+        for f in fns:
+            try:
+                n += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return n
 
 
 def counts_match(lane_n, corpus_n, strict=False):
@@ -163,30 +217,29 @@ def counts_match(lane_n, corpus_n, strict=False):
     return "near" if abs(int(lane_n) - int(corpus_n)) <= max(TOL_ABS, TOL_REL * int(corpus_n)) else None
 
 
-def lance_path_for(name, sid, taken):
-    """Plain <name>.lance when nobody holds it; else <name>__<sid8>.lance. `taken` is a set of paths
-    held by the registry, by a dataset on disk, or by an earlier search in this plan."""
-    base = os.path.join(LANCE, _safe(_strip_ts(name)) + ".lance")
-    if base not in taken:
-        return base
-    return os.path.join(LANCE, f"{_safe(_strip_ts(name))}__{str(sid)[:8]}.lance")
-
-
-def decide(s, reports, registry, on_disk_rows, taken, state, strict=False):
+def decide(s, reports, registry, on_disk_rows, taken, state, strict=False, exists=os.path.lexists, claims=None):
     """One un-laned search -> a job dict (action write|register|link) or a skip dict.
 
     s            dict: sid, name, corpus_n, ingested_at, names
     reports      find_reports() result for it (newest first), may be empty
     registry     {lance_path: (row_id, search_id, n_precursors)} for every delimp_spectrum_lane row
-    on_disk_rows {lance_path: row count} for datasets that exist on disk (only paths asked about)
-    taken        set of paths already claimed (mutated)
+    on_disk_rows {lance_path: row count} for datasets that exist on disk and open (only paths asked about)
+    taken        set of paths already chosen in this plan (mutated; EVERY chosen path is added)
     state        {sid: {"attempts": n, "parked": bool, ...}}
+    exists       path-exists test. ANY entry at a path (file, dir, unopenable dir) makes it occupied.
+    claims       {unlinked-row path: [sids of un-laned searches that match it by name and count]}
     """
+    claims = claims or {}
     sid, corpus_n = s["sid"], s["corpus_n"]
     st = state.get(sid, {})
     if st.get("parked"):
         return None, dict(sid=sid, name=s["name"], reason="parked", report=bool(reports),
                           detail=st.get("last_error", ""), ingested_at=s["ingested_at"])
+
+    def occupied(p):
+        return p in taken or p in registry or bool(exists(p))
+
+    ambiguous = None
     # 1. A dataset by this search's name that is registered with NULL search_id, or already on disk
     #    unregistered, and whose row count is this search's: adopt it rather than write another.
     for nm in s["names"]:
@@ -195,6 +248,9 @@ def decide(s, reports, registry, on_disk_rows, taken, state, strict=False):
             continue
         reg = registry.get(p)
         if reg is not None and reg[1] is None and counts_match(reg[2], corpus_n, strict):
+            if len(claims.get(p, ())) > 1:
+                ambiguous = p        # two un-laned searches fit this row: never pick one by date
+                continue
             taken.add(p)
             return dict(sid=sid, name=s["name"], action="link", row_id=reg[0], lance_path=p,
                         corpus_n=corpus_n, ingested_at=s["ingested_at"]), None
@@ -204,6 +260,9 @@ def decide(s, reports, registry, on_disk_rows, taken, state, strict=False):
                         report=reports[0] if reports else None, ingested_at=s["ingested_at"]), None
     # 2. Needs a write. No report -> the search cannot get a lane without a Windows re-export.
     if not reports:
+        if ambiguous:
+            return None, dict(sid=sid, name=s["name"], reason="ambiguous_link", report=False,
+                              detail=f"{ambiguous} fits {len(claims[ambiguous])} un-laned searches", ingested_at=s["ingested_at"])
         for nm in s["names"]:
             p = os.path.join(LANCE, _safe(_strip_ts(nm)) + ".lance")
             reg = registry.get(p)
@@ -214,10 +273,13 @@ def decide(s, reports, registry, on_disk_rows, taken, state, strict=False):
                           detail=s.get("output_dir") or "", ingested_at=s["ingested_at"])
     rep = reports[st.get("attempts", 0) % len(reports)]
     name = report_name(rep)
-    # A retry reuses the path its failed attempt used (the dataset there is unregistered and untrusted).
-    prev = st.get("lance_path")
-    path = prev if prev and prev not in registry else \
-        lance_path_for(name, sid, taken | set(registry) | set(on_disk_rows))
+    plain = os.path.join(LANCE, _safe(_strip_ts(name)) + ".lance")
+    suffixed = os.path.join(LANCE, f"{_safe(_strip_ts(name))}__{sid[:8]}.lance")
+    prev = st.get("lance_path")     # the path a failed attempt used; its dataset was removed, so it is free again
+    path = next((c for c in ([prev] if prev else []) + [plain, suffixed] if not occupied(c)), None)
+    if path is None:
+        return None, dict(sid=sid, name=s["name"], reason="path_occupied", report=True,
+                          detail=f"{plain} and {suffixed} are both taken", ingested_at=s["ingested_at"])
     taken.add(path)
     return dict(sid=sid, name=s["name"], action="write", report=rep, lance_path=path,
                 corpus_n=corpus_n, n_candidates=len(reports), ingested_at=s["ingested_at"]), None
@@ -226,28 +288,31 @@ def decide(s, reports, registry, on_disk_rows, taken, state, strict=False):
 # --------------------------------------------------------------------------- state
 def load_state():
     try:
-        return json.load(open(os.path.join(D, "state.json")))
+        with open(os.path.join(D, "state.json")) as fh:
+            return json.load(fh)
     except (OSError, ValueError):
         return {}
 
 
 def save_state(state):
+    """Atomic: write a temp file, rename over state.json. One writer (the parent process)."""
     os.makedirs(D, exist_ok=True)
     tmp = os.path.join(D, f"state.json.tmp{os.getpid()}")
-    json.dump(state, open(tmp, "w"), indent=1)
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=1)
     os.replace(tmp, os.path.join(D, "state.json"))
 
 
 def settle_in_flight(state, jid):
     """A search left in_flight by a DIFFERENT job died mid-write (OOM, time limit, node loss): count
-    it as an attempt. The same job id means a requeue after pre-emption, which is not the data's fault."""
+    it as an attempt. The same job id means a requeue after pre-emption, which is not the data's fault.
+    Only searches whose child had actually STARTED are in_flight (see mark_in_flight)."""
     for sid, st in state.items():
         f = st.get("in_flight")
         if f and f != jid:
             st["attempts"] = st.get("attempts", 0) + 1
             st["last_error"] = f"job {f} died while writing this lane"
             st["parked"] = st["attempts"] >= MAX_ATTEMPTS
-        if f and f != jid:
             st.pop("in_flight", None)
 
 
@@ -262,14 +327,24 @@ def record_failure(state, sid, err, path=None):
     st.pop("in_flight", None)
 
 
+_state_lock = threading.Lock()
+
+
+def mark_in_flight(state, sid, jid):
+    """Immediately before ONE child starts: persist that this search is being written by this job."""
+    with _state_lock:
+        state.setdefault(sid, {})["in_flight"] = jid
+        save_state(state)
+
+
 # --------------------------------------------------------------------------- plan
 def _connect():
     from coreomics_import import _conn
     return _conn()
 
 
-def gather(conn, fs=None):
-    """Read-only: every un-laned Spectronaut search, the registry, and what is on disk for them."""
+def gather(conn):
+    """Read-only: every un-laned Spectronaut search and the registry."""
     cur = conn.cursor()
     cur.execute("""SELECT s.id, s.search_name, s.output_dir, s.n_precursors_total, s.ingested_at,
                           p.real_search_name, p.report_path, p.output_dir
@@ -297,6 +372,13 @@ def fill_corpus_counts(conn, searches):
             s["corpus_n"] = cur.fetchone()[0] or None
 
 
+def corpus_runs(conn, sid):
+    """The search's runs, normalised: search_raw_files for THIS search_id (a small table; never a scan)."""
+    cur = conn.cursor()
+    cur.execute("SELECT raw_path FROM search_raw_files WHERE search_id = %s", (sid,))
+    return sorted(run_set(r[0] for r in cur.fetchall()))
+
+
 def dataset_rows(path):
     try:
         import lance
@@ -305,15 +387,62 @@ def dataset_rows(path):
         return None
 
 
+def report_run_set(report):
+    """Distinct normalised runs with q <= 0.01 in a PARQUET report (the same rows the lane keeps), reading
+    only two columns. None for a TSV (a full scan of up to 60 GB; the child checks it before writing)."""
+    if not str(report).lower().endswith(".parquet"):
+        return None
+    import pyarrow.parquet as pq
+    import backfill_fragments as B
+    names = pq.read_schema(report).names
+    cols = B._resolve(names, {"run": B.PREC_MAP["run"], "q": B.PREC_MAP["q_value"]})
+    if "run" not in cols:
+        return set()
+    t = pq.read_table(report, columns=list(dict.fromkeys(cols.values()))).to_pandas()
+    if "q" in cols:
+        import pandas as pd
+        t = t[pd.to_numeric(t[cols["q"]], errors="coerce") <= 0.01]
+    return run_set(t[cols["run"]].dropna().unique())
+
+
 def plan(conn, a, jid):
     searches, registry = gather(conn)
     fill_corpus_counts(conn, searches)
     state = load_state()
     if a.apply:
         settle_in_flight(state, jid)
+    # which un-laned searches fit each unlinked registry row (name + count): >1 means ambiguous
+    claims = {}
+    for s in searches:
+        for nm in s["names"]:
+            p = os.path.join(LANCE, _safe(_strip_ts(nm)) + ".lance")
+            reg = registry.get(p)
+            if reg is not None and reg[1] is None and counts_match(reg[2], s["corpus_n"], a.strict):
+                claims.setdefault(p, [])
+                if s["sid"] not in claims[p]:
+                    claims[p].append(s["sid"])
     taken, jobs, skipped = set(), [], []
+    n_preflight_refused = 0
     for s in searches:
         reports = find_reports(s["names"], s["output_dir"])
+        cruns = None
+        if a.preflight and reports:
+            cruns = set(corpus_runs(conn, s["sid"]))
+            keep = []
+            for r in reports:
+                try:
+                    rs = report_run_set(r)
+                except Exception:  # noqa: BLE001 - unreadable report: the child will say why
+                    rs = None
+                if rs is None or (cruns and rs == cruns):
+                    keep.append(r)
+            if not keep:
+                n_preflight_refused += 1
+                skipped.append(dict(sid=s["sid"], name=s["name"], reason="identity_mismatch", report=True,
+                                    detail=f"{len(reports)} report(s) on disk, none has this search's run set",
+                                    ingested_at=s["ingested_at"]))
+                continue
+            reports = keep
         on_disk = {}
         for nm in s["names"]:
             p = os.path.join(LANCE, _safe(_strip_ts(nm)) + ".lance")
@@ -321,8 +450,14 @@ def plan(conn, a, jid):
                 n = dataset_rows(p)
                 if n is not None:
                     on_disk[p] = n
-        job, skip = decide(s, reports, registry, on_disk, taken, state, a.strict)
+        job, skip = decide(s, reports, registry, on_disk, taken, state, a.strict, claims=claims)
         if job:
+            job["corpus_runs"] = sorted(cruns) if cruns is not None else corpus_runs(conn, s["sid"])
+            if not job["corpus_runs"]:
+                skipped.append(dict(sid=s["sid"], name=s["name"], reason="no_corpus_runs", report=bool(job.get("report")),
+                                    detail="search_raw_files has no rows for this search; identity cannot be checked",
+                                    ingested_at=s["ingested_at"]))
+                continue
             if job["action"] == "write":
                 try:
                     job["bytes"] = os.path.getsize(job["report"])
@@ -334,6 +469,10 @@ def plan(conn, a, jid):
                                         detail=f"{job['report']} ({job['bytes'] / 1e9:.0f} GB, est {job['est_gb']} GB RAM)",
                                         ingested_at=s["ingested_at"]))
                     continue
+            elif job["action"] == "register":
+                job["est_gb"] = round(dir_bytes(job["lance_path"]) / 1e9 * 10.0 + 1.0, 1)   # whole table + md5
+            else:
+                job["est_gb"] = 1.0                                                          # runs column only
             jobs.append(job)
         else:
             skipped.append(skip)
@@ -343,7 +482,7 @@ def plan(conn, a, jid):
     acts = {}
     for j in jobs:
         acts[j["action"]] = acts.get(j["action"], 0) + 1
-    # Cheap adoptions first, then writes: newest searches first, smallest report first within a day.
+    # Cheap adoptions first, then writes: smallest report first.
     order = {"link": 0, "register": 1, "write": 2}
     jobs.sort(key=lambda j: (order[j["action"]], j.get("bytes", 0)))
     sel = []
@@ -354,57 +493,105 @@ def plan(conn, a, jid):
                 continue
             n_write += 1
         sel.append(j)
-    # report_sids: every un-laned search that HAS a report (planned or parked): the health scan's RED set.
+    # report_sids: every un-laned search that HAS a usable report (planned or parked): the health scan's RED set.
     report_sids = [j["sid"] for j in jobs if j["action"] == "write"] + \
                   [k["sid"] for k in skipped if k["reason"] == "parked" and k.get("report")]
     summary = dict(at=time.strftime("%Y-%m-%dT%H:%M:%S"), unlaned=len(searches),
                    planned={**acts, "selected_writes": n_write},
                    write_bytes=sum(j.get("bytes", 0) for j in jobs if j["action"] == "write"),
-                   skipped=why, apply=bool(a.apply), job=jid)
+                   skipped=why, apply=bool(a.apply), preflight=bool(a.preflight), max=a.max, job=jid)
     os.makedirs(D, exist_ok=True)
     out = os.path.join(D, f"{'plan' if a.apply else 'dryrun_plan'}_{jid}.json")
-    json.dump(dict(summary=summary, jobs=sel, all_jobs=len(jobs), skipped=skipped,
-                   report_sids=report_sids), open(out, "w"), indent=1)
+    with open(out, "w") as fh:
+        json.dump(dict(summary=summary, jobs=sel, all_jobs=len(jobs), skipped=skipped, report_sids=report_sids), fh, indent=1)
     print(json.dumps(summary), flush=True)
     return sel, state, out
 
 
 # --------------------------------------------------------------------------- child (one report)
-def child_write(report, out, name):
-    """Parse one report with backfill_fragments' own machinery and write the dataset. Own process, so
-    a memory kill is attributable to this report and cannot take the others with it."""
+def _peak_rss_gb():
+    import resource
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(r / (1024 ** 3 if sys.platform == "darwin" else 1024 ** 2), 2)   # KB on Linux, bytes on macOS
+
+
+def _rm_own(path, jid):
+    """Delete a directory this run created: only ever <x>.incoming.<this job id>."""
+    if path.endswith(f".incoming.{jid}") and os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def child_write(report, out, name, corpus_n, allow_near, runs, jid):
+    """Parse one report with backfill_fragments' own machinery and write the dataset, safely.
+
+    Own process, so a memory kill is attributable to this report and cannot take the others with it.
+    Order: refuse if anything is at `out`; parse; the report's runs must equal the corpus runs; the
+    precursor count must match; write to <out>.incoming.<jid> (mode create); reopen; rename to `out`.
+    Nothing is written to `out` before every check has passed, so a failure leaves nothing there."""
     import backfill_fragments as B
     import pyarrow as pa
     import spectrum_lance as sln
+    if os.path.lexists(out):
+        return dict(ok=False, error=f"refusing: something already exists at {out}")
+    inc = f"{out}.incoming.{jid}"
+    _rm_own(inc, jid)                       # this job's own leftover after a requeue
     fdf, pdf = B._extract(report)
     if fdf is None or fdf.empty or pdf is None or pdf.empty:
         return dict(ok=False, error="no fragment-level rows in report")
+    if "run" not in pdf.columns:
+        return dict(ok=False, error="report has no run column; identity cannot be checked")
+    lane_runs = run_set(pdf["run"].dropna().unique())
+    want = set(runs)
+    if lane_runs != want:
+        return dict(ok=False, error=f"identity: report has {len(lane_runs)} runs, the search has {len(want)}; "
+                                    f"report-only {sorted(lane_runs - want)[:2]}, search-only {sorted(want - lane_runs)[:2]}")
     tbl, n_frag = B._assemble_table(fdf, pdf)
     del fdf, pdf
     tbl = tbl.set_column(tbl.schema.get_field_index("search_name"), "search_name",
                          pa.array([name] * tbl.num_rows, pa.string()))
-    n, md5, ver = sln.write_lance(tbl, out, mode="overwrite")
-    back = dataset_rows(out)
-    return dict(ok=True, n_prec=n, n_frag=int(n_frag), md5=md5, version=int(ver), n_back=back)
+    how = counts_match(tbl.num_rows, corpus_n, strict=not allow_near)
+    if not how:
+        return dict(ok=False, error=f"precursor count mismatch before write: report {tbl.num_rows} vs corpus {corpus_n}"
+                                    + ("" if allow_near else " (exact required on a suffixed path)"))
+    try:
+        n, md5, ver = sln.write_lance(tbl, inc, mode="create")
+        back = dataset_rows(inc)
+        if back != n:
+            _rm_own(inc, jid)
+            return dict(ok=False, error=f"incoming dataset reads back {back} rows, wrote {n}")
+        if os.path.lexists(out):
+            _rm_own(inc, jid)
+            return dict(ok=False, error=f"refusing: {out} appeared during the write")
+        os.rename(inc, out)
+    except Exception as e:  # noqa: BLE001
+        _rm_own(inc, jid)
+        return dict(ok=False, error=f"write failed: {repr(e)[:300]}")
+    return dict(ok=True, n_prec=n, n_frag=int(n_frag), md5=md5, version=int(ver), n_back=dataset_rows(out),
+                n_runs=len(lane_runs), peak_rss_gb=_peak_rss_gb())
 
 
-def child_describe(out):
-    """Open an existing dataset and compute what the registry needs (row/fragment counts, md5)."""
+def child_describe(out, runs_only=False):
+    """Open an existing dataset: its distinct runs, and (unless runs_only) what the registry needs."""
     import lance
     import pyarrow as pa
     import pyarrow.compute as pc
     import spectrum_lance as sln
     ds = lance.dataset(out)
+    if runs_only:
+        runs = sorted(run_set(ds.to_table(columns=["run"]).column("run").unique().to_pylist()))
+        n = ds.count_rows()
+        return dict(ok=True, n_prec=n, n_back=n, runs=runs, n_runs=len(runs), peak_rss_gb=_peak_rss_gb())
     sub = pa.schema([f for f in sln.SCHEMA if f.name in set(ds.schema.names)])
     tbl = ds.to_table().cast(sub)
     n_frag = int(pc.sum(pc.list_value_length(tbl["frg_mz"])).as_py() or 0) if "frg_mz" in tbl.column_names else 0
+    runs = sorted(run_set(tbl["run"].unique().to_pylist())) if "run" in tbl.column_names else []
     return dict(ok=True, n_prec=tbl.num_rows, n_frag=n_frag, md5=sln.content_md5(tbl),
-                version=int(ds.version), n_back=tbl.num_rows)
+                version=int(ds.version), n_back=tbl.num_rows, runs=runs, n_runs=len(runs), peak_rss_gb=_peak_rss_gb())
 
 
-def run_child(args):
+def run_child(args, stdin=None):
     r = subprocess.run([sys.executable, "-u", os.path.abspath(__file__)] + args,
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, input=stdin)
     for ln in reversed((r.stdout or "").splitlines()):
         if ln.startswith("CHILD_RESULT "):
             try:
@@ -423,11 +610,7 @@ def inside_lance(path):
 class MemBudget:
     """Blocks a worker until its estimated RAM fits beside the reports already in flight."""
     def __init__(self, gb):
-        import threading
         self.gb, self.used, self.cv = gb, 0.0, threading.Condition()
-
-    def __enter__(self):
-        return self
 
     def acquire(self, need):
         with self.cv:
@@ -441,25 +624,31 @@ class MemBudget:
             self.cv.notify_all()
 
 
-def do_job(j, strict):
-    """Child work for a write/register job. Returns an outcome dict (never raises)."""
+def do_job(j, strict, jid="local"):
+    """Child work for a write/register/link job. Returns an outcome dict (never raises)."""
     t0 = time.time()
     if not inside_lance(j["lance_path"]):
-        return dict(sid=j["sid"], action=j["action"], status="failed", error="path outside the lane dir")
+        return dict(sid=j["sid"], name=j.get("name"), action=j["action"], status="failed", error="path outside the lane dir")
+    allow_near = not is_suffixed(j["lance_path"]) and not strict
     if j["action"] == "write":
-        res, _ = run_child(["_write", "--report", j["report"], "--out", j["lance_path"], "--name", j["name"]])
+        res, _ = run_child(["_write", "--report", j["report"], "--out", j["lance_path"], "--name", j["name"],
+                            "--corpus-n", str(j["corpus_n"]), "--allow-near", "1" if allow_near else "0", "--jid", str(jid)],
+                           stdin=json.dumps(j["corpus_runs"]))
     else:
-        res, _ = run_child(["_describe", "--out", j["lance_path"]])
+        res, _ = run_child(["_describe", "--out", j["lance_path"]] + (["--runs-only"] if j["action"] == "link" else []))
     out = dict(sid=j["sid"], name=j["name"], action=j["action"], lance_path=j["lance_path"],
-               seconds=round(time.time() - t0), res=res)
+               seconds=round(time.time() - t0), peak_rss_gb=res.get("peak_rss_gb"), est_gb=j.get("est_gb"),
+               res={k: v for k, v in res.items() if k != "runs"})
     if not res.get("ok"):
         out.update(status="failed", error=res.get("error", "child failed"))
         return out
-    n_back = res.get("n_back")
-    if n_back != res["n_prec"]:
-        out.update(status="failed", error=f"dataset reads back {n_back} rows, wrote {res['n_prec']}")
+    if res.get("n_back") != res["n_prec"]:
+        out.update(status="failed", error=f"dataset reads back {res.get('n_back')} rows, wrote {res['n_prec']}")
         return out
-    how = counts_match(res["n_prec"], j["corpus_n"], strict)
+    if j["action"] != "write" and set(res.get("runs", [])) != set(j["corpus_runs"]):
+        out.update(status="failed", error=f"identity: dataset runs {res.get('n_runs')} != search runs {len(j['corpus_runs'])}")
+        return out
+    how = counts_match(res["n_prec"], j["corpus_n"], strict=not allow_near)
     out["count_check"] = how
     if not how:
         out.update(status="failed",
@@ -469,75 +658,111 @@ def do_job(j, strict):
     return out
 
 
-def register_outcome(conn, j, o):
-    import spectrum_lance as sln
-    r = o["res"]
-    sln.register(conn, j["sid"], j["name"], j["lance_path"], r["n_prec"], r["n_frag"], r["md5"], r["version"])
+# The fill's OWN registration. spectrum_lance.register() COALESCEs search_id, overwrites counts and md5
+# of whatever row is at the path, and commits before anyone can check. This can only insert a new row
+# or update a row that is unlinked or already this search's; anything else affects zero rows.
+UPSERT_SQL = """INSERT INTO delimp_spectrum_lane
+                  (lance_path, search_id, search_name, n_precursors, n_fragments, content_md5,
+                   lance_version, writer_version, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (lance_path) DO UPDATE SET
+                  search_id = EXCLUDED.search_id, search_name = EXCLUDED.search_name,
+                  n_precursors = EXCLUDED.n_precursors, n_fragments = EXCLUDED.n_fragments,
+                  content_md5 = EXCLUDED.content_md5, lance_version = EXCLUDED.lance_version,
+                  writer_version = EXCLUDED.writer_version, updated_at = now()
+                WHERE delimp_spectrum_lane.search_id IS NULL
+                   OR delimp_spectrum_lane.search_id = EXCLUDED.search_id"""
+
+LINK_SQL = """UPDATE delimp_spectrum_lane SET search_id = %s, updated_at = now()
+               WHERE id = %s AND lance_path = %s AND search_id IS NULL"""
+
+
+def register_row(conn, j, r):
+    from versions import SPECTRUM_LANE_WRITER_VERSION
     cur = conn.cursor()
-    cur.execute("SELECT search_id FROM delimp_spectrum_lane WHERE lance_path = %s", (j["lance_path"],))
-    row = cur.fetchone()
-    if not row or str(row[0]) != j["sid"]:
-        raise RuntimeError(f"registry row at {j['lance_path']} has search_id {row and row[0]}, expected {j['sid']}")
+    cur.execute(UPSERT_SQL, (j["lance_path"], j["sid"], j["name"], int(r["n_prec"]), int(r["n_frag"]),
+                             r["md5"], int(r["version"]), SPECTRUM_LANE_WRITER_VERSION))
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise RuntimeError(f"registry row at {j['lance_path']} belongs to another search; nothing was changed")
+    conn.commit()
+
+
+def link_row(conn, j):
+    cur = conn.cursor()
+    cur.execute(LINK_SQL, (j["sid"], j["row_id"], j["lance_path"]))
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise RuntimeError("row was no longer unlinked")
+    conn.commit()
+
+
+def quarantine(j, jid):
+    """A dataset this run created could not be registered: take it off the real path (kept, not deleted)."""
+    p = j["lance_path"]
+    if j["action"] == "write" and os.path.isdir(p):
+        try:
+            os.rename(p, f"{p}.failed.{jid}")
+        except OSError:
+            pass
 
 
 def apply_jobs(conn, jobs, state, a, jid):
     outcomes = []
-    cur = conn.cursor()
-    # links: cheap, in the parent
-    for j in [x for x in jobs if x["action"] == "link"]:
-        try:
-            cur.execute("""UPDATE delimp_spectrum_lane SET search_id = %s, updated_at = now()
-                            WHERE id = %s AND search_id IS NULL""", (j["sid"], j["row_id"]))
-            ok = cur.rowcount == 1
-            conn.commit()
-            outcomes.append(dict(sid=j["sid"], name=j["name"], action="link", status="linked" if ok else "failed",
-                                 error=None if ok else "row was no longer unlinked"))
-        except Exception as e:  # noqa: BLE001
-            conn.rollback()
-            outcomes.append(dict(sid=j["sid"], name=j["name"], action="link", status="failed", error=repr(e)[:300]))
-    work = [x for x in jobs if x["action"] in ("write", "register")]
-    for j in work:
-        if j["action"] == "write":
-            state.setdefault(j["sid"], {})["in_flight"] = jid     # so a kill is counted next run
-    save_state(state)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
-        budget = MemBudget(MEM_BUDGET_GB)
+    work = list(jobs)
+    budget = MemBudget(MEM_BUDGET_GB)
+    db_lock = threading.Lock()      # one psycopg2 connection: serialise its use
 
-        def gated(j):
-            need = j.get("est_gb", 4.0)
-            budget.acquire(need)
-            try:
-                return do_job(j, a.strict)
-            finally:
-                budget.release(need)
+    def gated(j):
+        need = j.get("est_gb", 4.0)
+        budget.acquire(need)
+        try:
+            if j["action"] == "write":
+                mark_in_flight(state, j["sid"], jid)     # persisted before the child starts, only for this search
+            o = do_job(j, a.strict, jid)
+            if o["status"] == "verified":
+                try:
+                    with db_lock:
+                        if j["action"] == "link":
+                            link_row(conn, j)
+                            o["status"] = "linked"
+                        else:
+                            register_row(conn, j, o["res"])
+                            o["status"] = "registered"
+                except Exception as e:  # noqa: BLE001
+                    try:
+                        conn.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    o.update(status="failed", error=repr(e)[:400])
+                    quarantine(j, jid)
+            return o
+        finally:
+            if j["action"] == "write":
+                with _state_lock:                      # the child has ended: it is no longer in flight
+                    if state.get(j["sid"], {}).pop("in_flight", None):
+                        save_state(state)
+            budget.release(need)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
         futs = {ex.submit(gated, j): j for j in work}
         for f in concurrent.futures.as_completed(futs):
             j = futs[f]
             try:
                 o = f.result()
-                if o["status"] == "verified":
-                    register_outcome(conn, j, o)
-                    o["status"] = "registered"
             except Exception as e:  # noqa: BLE001 - recorded; the rest still run
-                conn.rollback()
                 o = dict(sid=j["sid"], name=j["name"], action=j["action"], status="failed", error=repr(e)[:400])
-            if o["status"] == "failed":
-                record_failure(state, j["sid"], o["error"], j.get("lance_path") if j["action"] == "write" else None)
-            else:
-                state.pop(j["sid"], None)
-            save_state(state)
+            with _state_lock:
+                if o["status"] == "failed":
+                    record_failure(state, j["sid"], o["error"], j.get("lance_path") if j["action"] == "write" else None)
+                else:
+                    state.pop(j["sid"], None)
+                save_state(state)
             outcomes.append(o)
             print(f"--- {j['name']} [{j['action']}] {o['status']}"
-                  + (f" ({o.get('count_check')}, {o['res']['n_prec']:,} precursors)" if o["status"] == "registered" else "")
+                  + (f" ({o.get('count_check')})" if o.get("count_check") else "")
                   + (f": {o['error']}" if o.get("error") else ""), flush=True)
     return outcomes
-
-
-def run_linker(apply):
-    """link_spectrum_lane.py for the rest: it links only unambiguous names (never mislinks)."""
-    r = subprocess.run([sys.executable, "-u", os.path.join(HERE, "link_spectrum_lane.py")]
-                       + ([] if apply else ["--dry-run"]), capture_output=True, text=True)
-    return dict(rc=r.returncode, tail=((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-4:])
 
 
 def main():
@@ -547,41 +772,48 @@ def main():
     w.add_argument("--report", required=True)
     w.add_argument("--out", required=True)
     w.add_argument("--name", required=True)
+    w.add_argument("--corpus-n", type=int, required=True)
+    w.add_argument("--allow-near", type=int, default=0)
+    w.add_argument("--jid", required=True)
     d = sp.add_parser("_describe")
     d.add_argument("--out", required=True)
+    d.add_argument("--runs-only", action="store_true")
     ap.add_argument("--apply", action="store_true", help="write (default: plan only)")
-    ap.add_argument("--max", type=int, default=40, help="at most N lane WRITES per run (0 = no cap)")
-    ap.add_argument("--workers", type=int, default=4, help="reports parsed at once (memory: ~25 GB each, worst case)")
+    ap.add_argument("--max", type=int, default=40, help="at most N lane WRITES per run; 0 = NO CAP (the one-off catch-up)")
+    ap.add_argument("--workers", type=int, default=4, help="reports parsed at once (memory-gated by MEM_BUDGET_GB)")
     ap.add_argument("--strict", action="store_true", help="'near' count matches fail too")
+    ap.add_argument("--preflight", action="store_true",
+                    help="plan: read each PARQUET report's run column and drop reports whose runs are not the search's")
     a = ap.parse_args()
     if a.cmd == "_write":
         try:
-            res = child_write(a.report, a.out, a.name)
+            res = child_write(a.report, a.out, a.name, a.corpus_n, bool(a.allow_near), json.load(sys.stdin), a.jid)
         except Exception as e:  # noqa: BLE001
             res = dict(ok=False, error=repr(e)[:400])
         print("CHILD_RESULT " + json.dumps(res))
         return 0
     if a.cmd == "_describe":
         try:
-            res = child_describe(a.out)
+            res = child_describe(a.out, a.runs_only)
         except Exception as e:  # noqa: BLE001
             res = dict(ok=False, error=repr(e)[:400])
         print("CHILD_RESULT " + json.dumps(res))
         return 0
 
     jid = os.environ.get("SLURM_JOB_ID", "local" + time.strftime("%H%M%S"))
+    print(f"fill_spectrum_lanes job {jid}: {'APPLY' if a.apply else 'dry run'}; write cap --max {a.max}"
+          f"{' (NO CAP)' if a.max == 0 else ''}; workers {a.workers}; preflight {a.preflight}", flush=True)
     conn = _connect()
     if not a.apply:
         conn.set_session(readonly=True, autocommit=True)
     jobs, state, plan_path = plan(conn, a, jid)
     if not a.apply:
-        print(f"dry run: {len(jobs)} job(s) selected; plan {plan_path}; linker preview: {run_linker(False)}")
+        print(f"dry run: {len(jobs)} job(s) selected; plan {plan_path}")
         conn.close()
         return 0
     import spectrum_lance as sln
     sln.ensure_registry(conn)
     outcomes = apply_jobs(conn, jobs, state, a, jid)
-    linker = run_linker(True)
     cur = conn.cursor()
     cur.execute("SELECT count(*) FROM delimp_spectrum_lane WHERE search_id IS NULL")
     null_rows = cur.fetchone()[0]
@@ -591,12 +823,15 @@ def main():
     for o in outcomes:
         counts[o["status"]] = counts.get(o["status"], 0) + 1
     parked = [sid for sid, st in state.items() if st.get("parked")]
+    near = [dict(name=o["name"], sid=o["sid"], lance_path=o["lance_path"], lane=o["res"].get("n_prec"))
+            for o in outcomes if o.get("count_check") == "near"]
     res = dict(summary=dict(at=time.strftime("%Y-%m-%dT%H:%M:%S"), job=jid, outcomes=counts, failed=n_fail,
-                            parked=len(parked), null_search_id_rows=null_rows, linker=linker),
-               outcomes=outcomes)
+                            parked=len(parked), null_search_id_rows=null_rows, near_lanes=len(near),
+                            max_peak_rss_gb=max([o.get("peak_rss_gb") or 0 for o in outcomes] or [0])),
+               near_lanes=near, outcomes=outcomes)
     os.makedirs(D, exist_ok=True)
-    out = os.path.join(D, f"result_{jid}.json")
-    json.dump(res, open(out, "w"), indent=1)
+    with open(os.path.join(D, f"result_{jid}.json"), "w") as fh:
+        json.dump(res, fh, indent=1)
     print(json.dumps(res["summary"]))
     return 1 if n_fail else 0
 

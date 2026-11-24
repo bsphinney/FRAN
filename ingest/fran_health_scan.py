@@ -293,7 +293,9 @@ def check_spectrum_staleness(c):
     by_reason = {}
     for k in plan.get("skipped", []):
         by_reason.setdefault(k["reason"], set()).add(k["sid"])
-    reexport = by_reason.get("needs_reexport", set()) | by_reason.get("dup_of_laned", set())
+    reexport = set().union(*(by_reason.get(r, set()) for r in
+                             ("needs_reexport", "dup_of_laned", "identity_mismatch", "no_corpus_runs",
+                              "path_occupied", "ambiguous_link")))
     red = [(i, n) for i, n in missing if i in with_report]
     amber_reexport = [x for x in missing if x[0] in reexport]
     other = [x for x in missing if x[0] not in with_report and x[0] not in reexport]
@@ -301,7 +303,7 @@ def check_spectrum_staleness(c):
                                      "needs_reexport": len(amber_reexport), "not_in_plan": len(other)}
     msg = (f"{len(missing):,} Spectronaut searches >3 d old have no spectrum lane: {len(red)} have a report "
            f"on disk (the job should have written them), {len(amber_reexport)} need a Windows re-export "
-           f"(no report on disk, or a duplicate of an already-laned search)")
+           f"or a person (no report on disk, a report that is not this search's, a duplicate of a laned search)")
     if other:
         msg += f", {len(other)} not in the last plan (ingested since, or too big/parked: {sorted(by_reason)})"
     if red:
@@ -800,15 +802,22 @@ def main():
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '15min'")
-        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training,
-                   check_spectrum_staleness):
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
                 add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
+        try:
+            check_spectrum_staleness(c)
+        except Exception as e:  # noqa: BLE001
+            add("AMBER", "spectrum_staleness", f"check errored: {repr(e)[:200]}")
     conn.close()
     filler_state = check_filler()
-    for fn in (check_xic_job, check_spectrum_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
+    try:
+        check_spectrum_job()
+    except Exception as e:  # noqa: BLE001
+        add("AMBER", "spectrum_job", f"check errored: {repr(e)[:200]}")
+    for fn in (check_xic_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

@@ -3,6 +3,7 @@
 #SBATCH --account=publicgrp                  # free tier; the cap is 8 CPUs / 128 GB per job (ucd-hpc)
 #SBATCH --partition=low
 #SBATCH --qos=publicgrp-low-qos
+#SBATCH --dependency=singleton               # never two jobs of this name at once (belt and braces with the cron check)
 #SBATCH --requeue                            # low is preemptible; the job is safe to restart (below)
 #SBATCH --time=1-00:00:00                    # a night's cap of writes (--max) fits well inside this
 #SBATCH --nodes=1
@@ -18,7 +19,8 @@
 # registered is found on disk and verified+registered, never rewritten; a half-written one is not
 # registered and is overwritten by its own retry. One writer per dataset (one job, one planner;
 # the cron wrapper refuses to submit while a previous job is queued or running).
-#   FRAN_SPECTRUM_MAX=N  caps lane WRITES per run (default 40; raise for catch-up)
+#   FRAN_SPECTRUM_MAX=N  caps lane WRITES per run (default 40 = nightly; 0 = NO CAP, the one-off catch-up).
+#   The first log line prints the cap in force.
 set +u
 source /etc/profile.d/modules.sh 2>/dev/null || true   # under set -u this kills the job at 0 s
 set -uo pipefail
