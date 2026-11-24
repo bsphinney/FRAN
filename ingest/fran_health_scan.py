@@ -117,6 +117,8 @@ EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh
                  "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh",
                  "upload_lanes_to_blob.sbatch"]
 XIC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/xic_lane"   # fill_diann_xic_lanes.py
+SPEC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/spectrum_lane"   # fill_spectrum_lanes.py
+EXPECTED_CRON.append("fill_spectrum_lanes_cron.sh")
 
 findings = []   # (severity, area, message)
 metrics = {"fill": {}, "coverage": {}}   # structured numbers for delimp_qc_scan / the FRAN-QC page
@@ -262,6 +264,80 @@ def check_xic_job():
     add(sev, "xic job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} DIA-NN searches without a lane, "
         f"{sm.get('planned', '?')} planned, skipped {sm.get('skipped', {})}; since then {n_res} written, "
         f"{len(fails)} failed" + (f" (e.g. {', '.join(fails[:3])})" if fails else ""))
+
+
+def _newest(d, pattern):
+    return sorted(glob.glob(os.path.join(d, pattern)), key=os.path.getmtime)
+
+
+def check_spectrum_staleness(c):
+    """Spectronaut searches older than 3 days with no spectrum lane, split by what can be done.
+
+    RED only for the ones with a FRAN report on disk (per the last fill_spectrum_lanes plan): the
+    nightly job could write those, so a lane still missing after 3 days means it is not working.
+    The searches whose report no longer exists (a .sne-only output_dir) need a Windows re-export;
+    they are AMBER, counted separately, so they cannot keep this RED forever. The coverage floor in
+    check_coverage still sees them. Too-big reports and parked searches are listed, not RED."""
+    plans = _newest(SPEC_FILL_DIR, "plan_*.json")
+    c.execute("""SELECT s.id::text, s.search_name FROM delimp_searches s
+                  WHERE s.search_engine = 'spectronaut' AND s.ingested_at < now() - interval '3 days'
+                    AND NOT EXISTS (SELECT 1 FROM delimp_spectrum_lane l WHERE l.search_id = s.id)""")
+    missing = c.fetchall()
+    if not plans:
+        add("RED" if missing else "ok", "spectrum staleness",
+            f"{len(missing):,} Spectronaut searches >3 d old have no spectrum lane and fill_spectrum_lanes "
+            f"has never planned ({SPEC_FILL_DIR}), so none can be called un-writable")
+        return
+    plan = json.load(open(plans[-1]))
+    with_report = set(plan.get("report_sids", []))
+    by_reason = {}
+    for k in plan.get("skipped", []):
+        by_reason.setdefault(k["reason"], set()).add(k["sid"])
+    reexport = by_reason.get("needs_reexport", set()) | by_reason.get("dup_of_laned", set())
+    red = [(i, n) for i, n in missing if i in with_report]
+    amber_reexport = [x for x in missing if x[0] in reexport]
+    other = [x for x in missing if x[0] not in with_report and x[0] not in reexport]
+    metrics["spectrum_staleness"] = {"missing_gt3d": len(missing), "writable_missing": len(red),
+                                     "needs_reexport": len(amber_reexport), "not_in_plan": len(other)}
+    msg = (f"{len(missing):,} Spectronaut searches >3 d old have no spectrum lane: {len(red)} have a report "
+           f"on disk (the job should have written them), {len(amber_reexport)} need a Windows re-export "
+           f"(no report on disk, or a duplicate of an already-laned search)")
+    if other:
+        msg += f", {len(other)} not in the last plan (ingested since, or too big/parked: {sorted(by_reason)})"
+    if red:
+        add("RED", "spectrum staleness", msg + f"; e.g. {[n for _, n in red[:3]]}")
+    elif amber_reexport or other:
+        add("AMBER", "spectrum staleness", msg)
+    else:
+        add("ok", "spectrum staleness", msg)
+
+
+def check_spectrum_job():
+    """The daily spectrum-lane job (fill_spectrum_lanes): did it plan recently, did its writes fail?"""
+    plans = _newest(SPEC_FILL_DIR, "plan_*.json")
+    if not plans:
+        add("RED", "spectrum job", f"fill_spectrum_lanes has never planned ({SPEC_FILL_DIR}); is its cron line live?")
+        return
+    newest = plans[-1]
+    age_h = (time.time() - os.path.getmtime(newest)) / 3600
+    plan = json.load(open(newest))
+    sm = plan.get("summary", {})
+    job = sm.get("job")
+    res_f = os.path.join(SPEC_FILL_DIR, f"result_{job}.json")
+    fails, counts, parked = [], {}, None
+    if os.path.exists(res_f):
+        r = json.load(open(res_f))
+        counts = r.get("summary", {}).get("outcomes", {})
+        parked = r.get("summary", {}).get("parked")
+        fails = [o.get("name") for o in r.get("outcomes", []) if o.get("status") == "failed"]
+    # A plan with no result for its own job id after 12 h means the job died between plan and finish.
+    died = (not os.path.exists(res_f)) and age_h > 12
+    sev = "RED" if age_h > 48 else ("AMBER" if (fails or died or parked) else "ok")
+    add(sev, "spectrum job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} Spectronaut searches without a lane, "
+        f"planned {sm.get('planned', {})}, skipped {sm.get('skipped', {})}; that run: {counts or 'no result file'}, "
+        f"{len(fails)} failed" + (f" (e.g. {', '.join(map(str, fails[:3]))})" if fails else "")
+        + (f", {parked} parked after {3} failed attempts" if parked else "")
+        + ("; no result file for the last plan: the job died mid-run" if died else ""))
 
 
 def check_blob_upload():
@@ -724,14 +800,15 @@ def main():
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '15min'")
-        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training):
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training,
+                   check_spectrum_staleness):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
                 add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
     conn.close()
     filler_state = check_filler()
-    for fn in (check_xic_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
+    for fn in (check_xic_job, check_spectrum_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
