@@ -93,6 +93,37 @@ def test_spectronaut_missing_text_is_null_not_nan():
     assert [r["gene"] for r in out] == ["KRT18", None, None]
 
 
+def test_contaminant_class_three_states():
+    org = _load("organism")
+    cc = org.contaminant_class
+    assert cc("Cont_P02769") == "contaminant"
+    assert cc("Cont_P60712;Cont_P68103") == "contaminant"
+    assert cc("CON__P02769") == "contaminant" and cc("cRAP-001") == "contaminant"
+    assert cc("Cont_P02768;P02768") == "mixed"          # both orders
+    assert cc("P02768;Cont_P02768") == "mixed"
+    assert cc("A0A0G2JV65;Cont_P63103;P63102") == "mixed"
+    assert cc("P05784") == "sample" and cc("P05784;P11679") == "sample"
+    # separators / whitespace as stored: trailing or doubled ';', padded accessions, lower case
+    assert cc(" Cont_P02769 ;  ") == "contaminant"
+    assert cc("Cont_A;;Cont_B;") == "contaminant"
+    assert cc(" P05784 ; Cont_P02769") == "mixed"
+    assert cc("cont_p02769") == "contaminant"
+    for empty in (None, "", ";", " ; ", float("nan") if False else "  "):
+        assert cc(empty) is None
+
+
+def test_is_contaminant_equals_class_contaminant():
+    org = _load("organism")
+    for g in ("Cont_A", "Cont_A;B", "B;Cont_A", "B", "", None, ";", "Cont_A;Cont_B", "cRAP001;X"):
+        assert org.is_contaminant_group(g) == (org.contaminant_class(g) == "contaminant")
+
+
+def test_ingest_writes_class_only_when_the_column_exists():
+    src = open(os.path.join(_INGEST, "corpus_ingest.py"), encoding="utf-8").read()
+    assert "column_name='contaminant_class'" in src and "_have_cc" in src
+    assert '(",contaminant_class" if _have_cc else "")' in src
+
+
 if __name__ == "__main__":
     fails = 0
     for n, f in sorted(globals().items()):

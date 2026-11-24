@@ -15,7 +15,7 @@ is NOT touched.
 
     python recompute_is_contaminant.py                 # DRY RUN, 80 random searches, extrapolated
     python recompute_is_contaminant.py --sample 0      # DRY RUN over every search (exact, slower)
-    python recompute_is_contaminant.py --apply         # writes; owner only, after reviewing a dry run
+    python recompute_is_contaminant.py --apply         # writes is_contaminant and, if the column exists, contaminant_class; owner only, after reviewing a dry run
 """
 from __future__ import annotations
 
@@ -32,6 +32,15 @@ NEW_RULE = r"""(
                      WHERE btrim(x) <> '' AND x !~* '^\s*(Cont_|CON__|cRAP[-_]?\d)')
 )"""
 
+# SQL twin of organism.contaminant_class (NULL for a group with no accession).
+CLASS_RULE = r"""(CASE
+    WHEN NOT EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x) WHERE btrim(x) <> '') THEN NULL
+    WHEN NOT EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x)
+                      WHERE btrim(x) <> '' AND x !~* '^\s*(Cont_|CON__|cRAP[-_]?\d)') THEN 'contaminant'
+    WHEN EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x)
+                  WHERE btrim(x) <> '' AND x ~* '^\s*(Cont_|CON__|cRAP[-_]?\d)') THEN 'mixed'
+    ELSE 'sample' END)"""
+
 
 def main():
     ap = base_parser(__doc__.split("\n\n")[0])
@@ -42,6 +51,11 @@ def main():
 
     ids = all_search_ids(cur)
     use, estimate = pick(ids, 0 if a.apply else a.sample)
+    cur.execute("""SELECT 1 FROM information_schema.columns
+                    WHERE table_name='delimp_proteins' AND column_name='contaminant_class'""")
+    have_cc = cur.fetchone() is not None     # the migration may not be applied yet
+    classes: dict = {}
+    cc_fill = 0                              # rows whose contaminant_class would be (re)written
     tot_rows = to_true = to_false = 0
     examples_t, examples_f, changed_searches = [], [], 0
     for batch in chunks(use, a.batch):
@@ -51,6 +65,14 @@ def main():
                           FROM delimp_proteins p WHERE p.search_id = ANY(%s::uuid[])""", (batch,))
         n, t, f = cur.fetchone()
         tot_rows += n; to_true += t; to_false += f
+        cur.execute(f"SELECT {CLASS_RULE} AS k, count(*) FROM delimp_proteins p "
+                    f"WHERE p.search_id = ANY(%s::uuid[]) GROUP BY 1", (batch,))
+        for k, cnt in cur.fetchall():
+            classes[k] = classes.get(k, 0) + cnt
+        if have_cc:
+            cur.execute(f"""SELECT count(*) FROM delimp_proteins p WHERE p.search_id = ANY(%s::uuid[])
+                             AND p.contaminant_class IS DISTINCT FROM {CLASS_RULE}""", (batch,))
+            cc_fill += cur.fetchone()[0]
         if len(examples_t) < 3 and t:
             cur.execute(f"""SELECT p.search_id, p.protein_group, p.gene FROM delimp_proteins p
                              WHERE p.search_id = ANY(%s::uuid[]) AND NOT p.is_contaminant AND {NEW_RULE} LIMIT 3""", (batch,))
@@ -59,9 +81,12 @@ def main():
             cur.execute(f"""SELECT p.search_id, p.protein_group, p.gene FROM delimp_proteins p
                              WHERE p.search_id = ANY(%s::uuid[]) AND p.is_contaminant AND NOT {NEW_RULE} LIMIT 3""", (batch,))
             examples_f += [f"True -> False  {r}" for r in cur.fetchall()]
-        if a.apply and (t or f):
-            cur.execute(f"""UPDATE delimp_proteins p SET is_contaminant = {NEW_RULE}
-                             WHERE p.search_id = ANY(%s::uuid[]) AND p.is_contaminant IS DISTINCT FROM {NEW_RULE}""", (batch,))
+        if a.apply and (t or f or (have_cc and cc_fill)):
+            sets = f"is_contaminant = {NEW_RULE}" + (f", contaminant_class = {CLASS_RULE}" if have_cc else "")
+            diff = f"p.is_contaminant IS DISTINCT FROM {NEW_RULE}" + (
+                f" OR p.contaminant_class IS DISTINCT FROM {CLASS_RULE}" if have_cc else "")
+            cur.execute(f"""UPDATE delimp_proteins p SET {sets}
+                             WHERE p.search_id = ANY(%s::uuid[]) AND ({diff})""", (batch,))
             conn.commit()
             changed_searches += 1
 
@@ -74,12 +99,21 @@ def main():
     print(f"  would flip True  -> False: {to_false:,}")
     if tot_rows:
         print(f"  changed fraction of rows : {(to_true + to_false) / tot_rows:.2%}")
+    cur.execute("SELECT reltuples::bigint FROM pg_class WHERE relname = 'delimp_proteins'")
+    total_est = cur.fetchone()[0]
     if estimate and tot_rows:
-        cur.execute("SELECT reltuples::bigint FROM pg_class WHERE relname = 'delimp_proteins'")
-        total = cur.fetchone()[0]
+        total = total_est
         scale = total / tot_rows
         print(f"  ESTIMATE over ~{total:,} protein rows (sample fraction scaled by reltuples): "
               f"True->False ~{int(to_false * scale):,}, False->True ~{int(to_true * scale):,}")
+    print("  rows per contaminant_class (sample" + ("; ESTIMATE below" if estimate else "") + "):")
+    for k in ("contaminant", "mixed", "sample", None):
+        v = classes.get(k, 0)
+        print(f"    {str(k):12s} {v:>12,}" + (f"   ~{int(v * (total_est / tot_rows)):,} of ~{total_est:,}"
+                                             if estimate and tot_rows else ""))
+    print(f"  contaminant_class column exists: {have_cc}"
+          + (f"; rows whose class would be written: {cc_fill:,}" if have_cc
+             else " (migration 2026-11-24_proteins_contaminant_class.sql not applied; class is only counted)"))
     show_examples("flag would become False", examples_f)
     show_examples("flag would become True", examples_t)
     print("  after --apply: refresh delimp_mv_protein_agg, delimp_mv_species_proteins, delimp_mv_top_proteins")

@@ -82,6 +82,25 @@ def canonical_organism(name) -> str | None:
 _CONTAM_ACC = re.compile(r"^\s*(?:Cont_|CON__|cRAP[-_]?\d)", re.I)
 
 
+def contaminant_class(protein_group) -> str | None:
+    """Three-state membership of a ';'-joined protein group in the contaminant library.
+
+    'contaminant' every accession has a contaminant prefix (Cont_ / CON__ / cRAP)
+    'mixed'       some do, some do not: the search database also explains the group, so it is
+                  counted as a SAMPLE protein by default, but the fact is kept
+    'sample'      none do
+    None          no accession at all (None, "", ";", whitespace): no class is claimed
+    Accessions are split on ';' and stripped; empty parts are ignored.
+    """
+    if protein_group is None:
+        return None
+    accs = [a for a in str(protein_group).split(";") if a.strip()]
+    if not accs:
+        return None
+    n = sum(1 for a in accs if _CONTAM_ACC.match(a))
+    return "contaminant" if n == len(accs) else "mixed" if n else "sample"
+
+
 def is_contaminant_group(protein_group) -> bool:
     """True when EVERY accession of a ';'-joined protein group comes from a contaminant library.
 
@@ -90,8 +109,7 @@ def is_contaminant_group(protein_group) -> bool:
     """
     if protein_group is None:
         return False
-    accs = [a for a in str(protein_group).split(";") if a.strip()]
-    return bool(accs) and all(_CONTAM_ACC.match(a) for a in accs)
+    return contaminant_class(protein_group) == "contaminant"
 
 
 def vote_organism(pairs) -> dict:
