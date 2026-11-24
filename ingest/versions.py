@@ -82,6 +82,10 @@ XIC_TRACE_LANE_WRITER_VERSION = "1.0.0"  # 1.0.0: out of pilot. Per-channel RT (
                                          # DIA-NN before its traces are trusted. Datasets written by
                                          # 0.x carry the shared-axis MS2 time shift.
 RAW_METADATA_VERSION = "1.0.0"           # Bruker analysis.tdf + Thermo TRFP readers
+DIANN_FULL_OUTPUT_VERSION = "1.0.0"      # diann_full_output.py: the --qvalue 0.5 report regenerated
+                                         # from saved .quant files + the delimp_search_artifact
+                                         # registry of every file a search wrote. Mirrors
+                                         # diann_full_output.VERSION (tests/test_diann_full_output.py).
 
 # The duplicate guard is versioned SEPARATELY from corpus_ingest even though it lives inside it,
 # because the question you actually need to answer is "did the code that ingested this search have a
@@ -302,6 +306,7 @@ def stamp():
         "xic_trace_lane_writer": XIC_TRACE_LANE_WRITER_VERSION,
         "xic_extractor": xic_extractor_version(),
         "raw_metadata": RAW_METADATA_VERSION,
+        "diann_full_output": DIANN_FULL_OUTPUT_VERSION,
         "fran_app": fran_app_version(),
         "git_sha": git_sha(),
     }
