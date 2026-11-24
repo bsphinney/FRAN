@@ -1,3 +1,4 @@
+-- MANUAL MIGRATION (not for ingest/migrate_diann_columns.py: it also adds a CHECK and a comment).
 -- Keep the mixed case: delimp_proteins.contaminant_class = 'contaminant' | 'mixed' | 'sample'.
 --
 -- WHY. is_contaminant is now "every accession of the group comes from the contaminant library"

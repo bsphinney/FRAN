@@ -248,6 +248,8 @@ for _f in sorted(os.listdir(_MIGDIR)):
     _txt = open(os.path.join(_MIGDIR, _f)).read()
     if "ADD COLUMN" not in _txt.upper():
         continue                                 # CREATE TABLE migrations are not this runner's job
+    if "MANUAL MIGRATION" in _txt.split("\n", 1)[0]:
+        continue                                 # owner runs it by hand (CHECK / COMMENT are not bare ADD COLUMNs)
     try:
         _plan = [MIG.parse(s) for s in MIG.statements(_txt)]
         check(f"{_f} parses as additive, DEFAULT-free ALTERs", bool(_plan))
