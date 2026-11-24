@@ -9,8 +9,14 @@ This module stops choosing. It does two things per DIA-NN search:
             is read, nothing is re-searched) at --qvalue 0.5 with --report-decoys, and write the
             result to FULL_ROOT/<search_id>/report.full.parquet. The report the search itself wrote
             was filtered at --qvalue 0.01 by the skill's cfg, so rows above 1% and all decoys exist
-            only in the .quant files until this runs. The regenerated report is checked against
+            only in the .quant files until this runs. A single-shot MBR search has no
+            final-pass .quant files at all, so its final pass is re-run from the raw files
+            against its saved empirical library (plan_regen says which method and why). The regenerated report is checked against
             the original: its target rows at Q.Value <= 0.01 must be the original's rows.
+
+  proteins  (part of register) Load the regenerated report's protein groups, with no precursor
+            filter, into `delimp_diann_protein_unfiltered`: the one piece of the unfiltered output
+            that is also in SQL, so a protein count from FRAN is no longer biased low.
 
   register  Record every file under the search's output folder, and the regenerated report, in
             `delimp_search_artifact` (path, size, mtime, sha256 for files up to SHA_MAX_BYTES, and
@@ -136,46 +142,51 @@ def plan_regen(search_dir: str) -> dict:
         return {"ok": False, "why": "command names no --f input"}
     libs = [v for f, v in opts if f == "--lib"]
     reanalyse = any(f == "--reanalyse" for f, _ in opts)
-    # Two ways back to the full report, depending on which pass the saved .quant files are from.
-    #   report_step        The 5-step chain's step 5 names empirical.parquet and its quant_step4/
-    #                      files are final-pass, so the report step alone reproduces the report.
-    #   second_pass_rerun  A single-shot --reanalyse search keeps only its FIRST-pass .quant files
-    #                      (measured 2026-11-24: DIA-NN refuses them against report-lib.parquet,
-    #                      "library size mismatch"). So the original command is re-run with
-    #                      --use-quant: pass 1 comes from the .quant files, the empirical library
-    #                      is rebuilt, and pass 2 re-reads the raw files. Slower, same result.
-    lib = libs[0] if libs else None
-    if not lib or not os.path.isfile(lib):
-        return {"ok": False, "why": f"library not on disk: {lib}"}
-    method = "second_pass_rerun" if reanalyse else "report_step"
-    if reanalyse:
-        gone = [r for r in raws if not os.path.exists(r)]
-        if gone:
-            return {"ok": False, "why": f"second pass needs the raw files; {len(gone)} of {len(raws)} are gone (e.g. {gone[0]})"}
-    quants, missing = {}, []
-    for r in raws:
-        q = find_quant(search_dir, r)
-        (quants.__setitem__(r, q) if q else missing.append(os.path.basename(r)))
-    if missing:
-        return {"ok": False, "why": f"{len(missing)} of {len(raws)} runs have no .quant (e.g. {missing[0]})"}
     stems = [raw_stem(r) for r in raws]
     if len(set(stems)) != len(stems):
         return {"ok": False, "why": "two inputs share a run name; their .quant files cannot be told apart"}
-    report = os.path.join(search_dir, "report.parquet")
-    # A .quant beside the raw file is shared by every search of that raw that set no --temp, so the
-    # last one to run owns it. Only trust it when it was written during THIS search.
-    rep_m = os.path.getmtime(report) if os.path.exists(report) else None
-    stale = [os.path.basename(q) for q in quants.values()
-             if not q.startswith(search_dir) and rep_m and os.path.getmtime(q) > rep_m + 60]
-    if stale:
-        return {"ok": False, "why": f".quant beside the raw file was rewritten by a later search ({stale[0]})"}
+    quants = {}
+    # Two ways back to the full report, depending on which pass the saved .quant files are from.
+    #   report_step       The 5-step chain's step 5 names empirical.parquet and its quant_step4/
+    #                     files are final-pass, so the report step alone reproduces the report.
+    #   final_pass_rerun  A single-shot --reanalyse (MBR) search saves .quant files in its FIRST
+    #                     pass only -- DIA-NN says so in its log -- so nothing on disk holds the
+    #                     final pass. Measured 2026-11-24: DIA-NN refuses those files against
+    #                     report-lib.parquet ("library size mismatch"), and letting it rebuild the
+    #                     library from them gives a different library (3,284 precursors against
+    #                     the original 3,324) and a different report. So the final pass itself is
+    #                     re-run: the raw files against the search's own saved report-lib.parquet.
+    #                     It reads the raw files; its .quant files are kept this time.
+    if reanalyse:
+        method, lib = "final_pass_rerun", os.path.join(search_dir, "report-lib.parquet")
+        if not os.path.isfile(lib):
+            return {"ok": False, "why": "no report-lib.parquet: the final pass's library was not kept"}
+        gone = [r for r in raws if not os.path.exists(r)]
+        if gone:
+            return {"ok": False, "why": f"the final pass needs the raw files; {len(gone)} of {len(raws)} are gone (e.g. {gone[0]})"}
+    else:
+        method, lib = "report_step", (libs[0] if libs else None)
+        if not lib or not os.path.isfile(lib):
+            return {"ok": False, "why": f"library not on disk: {lib}"}
+        missing = []
+        for r in raws:
+            q = find_quant(search_dir, r)
+            (quants.__setitem__(r, q) if q else missing.append(os.path.basename(r)))
+        if missing:
+            return {"ok": False, "why": f"{len(missing)} of {len(raws)} runs have no .quant (e.g. {missing[0]})"}
+        # A .quant beside the raw file is shared by every search of that raw that set no --temp,
+        # so the last one to run owns it. Only trust it when it was written during THIS search.
+        report = os.path.join(search_dir, "report.parquet")
+        rep_m = os.path.getmtime(report) if os.path.exists(report) else None
+        stale = [os.path.basename(q) for q in quants.values()
+                 if not q.startswith(search_dir) and rep_m and os.path.getmtime(q) > rep_m + 60]
+        if stale:
+            return {"ok": False, "why": f".quant beside the raw file was rewritten by a later search ({stale[0]})"}
     fastas = [v for f, v in opts if f == "--fasta"]
     gone = [x for x in fastas if not os.path.isfile(x)]
     if gone:
         return {"ok": False, "why": f"FASTA not on disk: {gone[0]}"}
     keep = [(f, v) for f, v in opts if f not in _DROP]
-    if reanalyse:
-        keep.append(("--reanalyse", ""))
     return {"ok": True, "binary": binary, "opts": keep, "raws": raws, "quants": quants, "lib": lib,
             "method": method, "original_command": cmd,
             "layout": "chain" if os.path.isdir(os.path.join(search_dir, "quant_step4")) else "single_shot"}
@@ -261,7 +272,9 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
             argv.append(f)
             if v:
                 argv.append(v)
-        argv += ["--lib", lib, "--use-quant", "--quant-ori-names", "--temp", os.path.join(work, "quant"),
+        if plan["method"] == "report_step":
+            argv.append("--use-quant")
+        argv += ["--lib", lib, "--quant-ori-names", "--temp", os.path.join(work, "quant"),
                  "--qvalue", str(FULL_QVALUE), "--report-decoys", "--export-quant",
                  "--threads", str(threads), "--out", out]
         rec["command"] = argv
@@ -289,17 +302,25 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
             rec["log"] = os.path.join(faildir, search_id + ".log")
             return rec
         # Under report_step no .quant should change: one that did was declined by DIA-NN and
-        # re-made from the raw file. Under second_pass_rerun every one is rewritten by pass 2.
+        # re-made from the raw file. Under final_pass_rerun there were none to start with.
         rec["quant_rewritten"] = sorted(f for f, m in copies.items()
                                         if os.stat(os.path.join(work, "quant", f)).st_mtime != m)
         rec["originals_untouched"] = all((os.stat(q).st_size, os.stat(q).st_mtime) == v for q, v in before.items())
         rec["check"] = compare_reports(os.path.join(search_dir, "report.parquet"), out)
-        clean = plan["method"] == "second_pass_rerun" or not rec["quant_rewritten"]
+        clean = plan["method"] == "final_pass_rerun" or not rec["quant_rewritten"]
         rec["status"] = "mismatch" if not rec["check"]["parity"] else ("ok" if clean else "ok_requantified")
         rec["qvalue"] = FULL_QVALUE
         os.makedirs(dest, exist_ok=True)
         for f in os.listdir(os.path.join(work, "out")):
             shutil.move(os.path.join(work, "out", f), os.path.join(dest, f))
+        if plan["method"] == "final_pass_rerun":
+            # The final-pass .quant files the search itself never saved. With these the report
+            # step can be repeated later without the raw files, as it can for a chain search.
+            qd = os.path.join(dest, "quant_final")
+            os.makedirs(qd, exist_ok=True)
+            for f in os.listdir(os.path.join(work, "quant")):
+                shutil.move(os.path.join(work, "quant", f), os.path.join(qd, f))
+            rec["quant_final"] = len(os.listdir(qd))
         rec["report"] = os.path.join(dest, "report.full.parquet")
         rec["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         tmp = marker + ".tmp"
@@ -382,6 +403,42 @@ DDL = [
        '[name, arrow type]; report_qvalue is the --qvalue the file was written at. sha256 is NULL '
        'for files over 512 MB. ON DELETE CASCADE: corpus_ingest re-ingests by DELETE, and the '
        'nightly fill re-registers.'""",
+]
+
+DDL += [
+    """CREATE TABLE IF NOT EXISTS delimp_diann_protein_unfiltered (
+        search_id          uuid NOT NULL REFERENCES delimp_searches(id) ON DELETE CASCADE,
+        run                text NOT NULL,
+        protein_group      text NOT NULL,
+        raw_path           text,
+        gene               text,
+        n_precursors       integer NOT NULL,
+        n_precursors_q01   integer NOT NULL,
+        min_precursor_q    real,
+        pg_q_value         real,
+        global_pg_q_value  real,
+        lib_pg_q_value     real,
+        pg_pep             real,
+        protein_q_value    real,
+        gg_q_value         real,
+        pg_maxlfq          real,
+        pg_maxlfq_quality  real,
+        genes_maxlfq       real,
+        genes_maxlfq_unique real,
+        report_qvalue      real NOT NULL,
+        writer_version     text NOT NULL,
+        PRIMARY KEY (search_id, run, protein_group))""",
+    "CREATE INDEX IF NOT EXISTS delimp_diann_protein_unfiltered_pg ON delimp_diann_protein_unfiltered (protein_group)",
+    """COMMENT ON TABLE delimp_diann_protein_unfiltered IS
+       'DIA-NN protein groups per run with NO precursor q-value filter (FRAN#35). One row per '
+       '(search, Run, Protein.Group) over the TARGET rows of the report regenerated from saved .quant '
+       'files at --qvalue 0.5 (delimp_search_artifact kind = full_report). delimp_proteins is built '
+       'from precursors at Q.Value <= 0.01 and so misses protein groups whose precursors are all above '
+       '1 percent; count proteins from THIS table, filtering on the protein q-value you mean: '
+       'pg_q_value (per run), global_pg_q_value (experiment-wide) or lib_pg_q_value (library). '
+       'n_precursors counts every target precursor row up to 50 percent q; n_precursors_q01 only '
+       'those at Q.Value <= 0.01. Decoys are not here; they are in the report file. The site does '
+       'not read this table.'""",
 ]
 
 _KINDS = [  # first match wins; the patterns are on the path relative to the search folder
@@ -518,6 +575,86 @@ def _conn():
     return c()
 
 
+_PROT_COLS = ("search_id", "run", "protein_group", "raw_path", "gene", "n_precursors",
+              "n_precursors_q01", "min_precursor_q", "pg_q_value", "global_pg_q_value",
+              "lib_pg_q_value", "pg_pep", "protein_q_value", "gg_q_value", "pg_maxlfq",
+              "pg_maxlfq_quality", "genes_maxlfq", "genes_maxlfq_unique", "report_qvalue",
+              "writer_version")
+# report column -> (table column, how to collapse it within (Run, Protein.Group)). Every one was
+# measured constant within the group (migrations/2026-09-23), so min/max only pick the value.
+_PROT_AGG = [("Q.Value", "min_precursor_q", "min"), ("PG.Q.Value", "pg_q_value", "min"),
+             ("Global.PG.Q.Value", "global_pg_q_value", "min"), ("Lib.PG.Q.Value", "lib_pg_q_value", "min"),
+             ("PG.PEP", "pg_pep", "min"), ("Protein.Q.Value", "protein_q_value", "min"),
+             ("GG.Q.Value", "gg_q_value", "min"), ("PG.MaxLFQ", "pg_maxlfq", "max"),
+             ("PG.MaxLFQ.Quality", "pg_maxlfq_quality", "max"), ("Genes.MaxLFQ", "genes_maxlfq", "max"),
+             ("Genes.MaxLFQ.Unique", "genes_maxlfq_unique", "max")]
+
+
+def protein_rows(report: str):
+    """(Run, Protein.Group) rows from a full report: target rows only, no precursor filter."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(report)
+    names = set(pf.schema_arrow.names)
+    have = [(src, dst, how) for src, dst, how in _PROT_AGG if src in names]
+    t = pf.read(columns=["Run", "Protein.Group", "Genes", "Decoy"] + [src for src, _, _ in have])
+    t = t.filter(pc.equal(t["Decoy"], 0))
+    t = t.append_column("_q01", pc.cast(pc.less_equal(t["Q.Value"], 0.01), pa.int32()))
+    g = t.group_by(["Run", "Protein.Group"]).aggregate(
+        [("Genes", "min"), ("Decoy", "count"), ("_q01", "sum")] + [(src, how) for src, _, how in have])
+    out = {"run": g["Run"].to_pylist(), "protein_group": g["Protein.Group"].to_pylist(),
+           "gene": g["Genes_min"].to_pylist(), "n_precursors": g["Decoy_count"].to_pylist(),
+           "n_precursors_q01": g["_q01_sum"].to_pylist()}
+    for src, dst, how in have:
+        out[dst] = g[f"{src}_{how}"].to_pylist()
+    return out, g.num_rows
+
+
+def load_proteins(conn, search_id: str, output_dir: str) -> int | None:
+    """Replace this search's rows in delimp_diann_protein_unfiltered. None = nothing to load."""
+    import csv
+    import io
+    import math
+    full = os.path.join(FULL_ROOT, search_id)
+    marker, report = os.path.join(full, "regen.json"), os.path.join(full, "report.full.parquet")
+    if not (os.path.exists(marker) and os.path.exists(report)):
+        return None
+    regen = json.load(open(marker))
+    if not str(regen.get("status", "")).startswith("ok"):
+        return None                    # a report that does not reproduce the original is not loaded
+    cols, n = protein_rows(report)
+    cur = conn.cursor()
+    cur.execute("SELECT raw_path FROM search_raw_files WHERE search_id = %s", (search_id,))
+    by_stem = {raw_stem(r[0]): r[0] for r in cur.fetchall()}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+
+    def cell(v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return ""
+        return v
+
+    for i in range(n):
+        run, pg = cols["run"][i], cols["protein_group"][i]
+        if not pg:
+            continue                   # never store an empty or missing group as a name
+        gene = cols["gene"][i]
+        row = {"search_id": search_id, "run": run, "protein_group": pg,
+               "raw_path": by_stem.get(run), "gene": gene if gene else None,
+               "report_qvalue": regen.get("qvalue", FULL_QVALUE), "writer_version": VERSION}
+        for c in _PROT_COLS:
+            if c not in row:
+                row[c] = cols[c][i] if c in cols else None
+        w.writerow([cell(row[c]) for c in _PROT_COLS])
+    buf.seek(0)
+    cur.execute("DELETE FROM delimp_diann_protein_unfiltered WHERE search_id = %s", (search_id,))
+    cur.copy_expert(f"COPY delimp_diann_protein_unfiltered ({','.join(_PROT_COLS)}) "
+                    "FROM STDIN WITH (FORMAT csv, NULL '')", buf)
+    conn.commit()
+    return n
+
+
 def pending(cur, engine_version_like: str | None, what: str):
     """DIA-NN searches with no registered artifact of `what` ('report' or 'full_report')."""
     cur.execute("""SELECT s.id::text, s.output_dir, s.n_raw_files FROM delimp_searches s
@@ -555,6 +692,9 @@ def cmd_plan(a):
 def cmd_register(a):
     import psycopg2.extras
     items = [json.loads(ln) for ln in open(a.list) if ln.strip()]
+    if a.shard:
+        i, n = (int(x) for x in a.shard.split("/"))
+        items = items[i::n]
     conn = _conn() if a.apply else None
     tot = {"searches": 0, "files": 0, "missing_dir": 0, "bytes": 0}
     for it in items[: a.limit or None]:
@@ -583,7 +723,17 @@ def cmd_register(a):
                     if attempt == 2:
                         raise
                     conn = _conn()
-        print(f"{len(rows):5d} files  {it['output_dir']}", flush=True)
+            try:
+                npr = load_proteins(conn, it["id"], it["output_dir"])
+            except Exception as e:  # noqa: BLE001 -- the file registration above is already committed
+                conn.rollback()
+                npr = f"PROTEIN LOAD FAILED {type(e).__name__}: {e}"[:300]
+                tot["protein_load_failed"] = tot.get("protein_load_failed", 0) + 1
+            if isinstance(npr, int):
+                tot["protein_rows"] = tot.get("protein_rows", 0) + npr
+        else:
+            npr = "-"
+        print(f"{len(rows):5d} files  {npr} protein rows  {it['output_dir']}", flush=True)
     if conn:
         cur = conn.cursor()
         try:
@@ -643,6 +793,12 @@ def cmd_nightly(a):
             c2 = _conn()
             psycopg2.extras.execute_batch(c2.cursor(), _UPSERT, rows, page_size=200)
             c2.commit()
+            try:
+                if load_proteins(c2, it["id"], it["output_dir"]) is not None:
+                    n["protein_tables"] = n.get("protein_tables", 0) + 1
+            except Exception as e:  # noqa: BLE001
+                c2.rollback()
+                print("PROTEIN LOAD FAILED", it["id"], f"{type(e).__name__}: {e}"[:300])
             c2.close()
             n["registered"] += 1
     print(f"{len(need_reg)} DIA-NN searches had no registered report, {len(need_full)} no full report")
@@ -667,6 +823,7 @@ def main():
     p = sub.add_parser("register")
     p.add_argument("--list", required=True); p.add_argument("--apply", action="store_true")
     p.add_argument("--no-hash", action="store_true"); p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--shard", default="")
     p.set_defaults(fn=cmd_register)
     p = sub.add_parser("nightly")
     p.add_argument("--apply", action="store_true")

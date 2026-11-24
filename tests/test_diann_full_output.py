@@ -51,11 +51,15 @@ with tempfile.TemporaryDirectory() as t:
     cmd2 = (f"/tools/diann-linux --qvalue 0.01 --xic 10 --mobilograms --f {raws}/a_1.d --f {raws}/b_2.d "
             f"--fasta {fa} --lib {lib} --reanalyse --matrices --out {S}/report.parquet --threads 16")
     open(os.path.join(S, "report.log.txt"), "w").write("DIA-NN 2.7.0\n" + cmd2 + " \n")
+    check("single-shot MBR with no saved empirical library cannot be regenerated", d.plan_regen(S)["ok"] is False)
+    open(os.path.join(S, "report-lib.parquet"), "w").write("x")
     p2 = d.plan_regen(S)
-    check("single-shot --reanalyse plans a second-pass re-run", p2["ok"] and p2["method"] == "second_pass_rerun", str(p2))
+    check("single-shot --reanalyse plans a final-pass re-run", p2["ok"] and p2["method"] == "final_pass_rerun", str(p2))
+    check("...against the search's own empirical library", p2["lib"].endswith("report-lib.parquet"))
     f2 = [f for f, _ in p2["opts"]]
-    check("--reanalyse is kept for it, --xic and --mobilograms are not", "--reanalyse" in f2 and "--xic" not in f2 and "--mobilograms" not in f2)
-    # a .quant beside the raw that a LATER search rewrote must not be trusted
+    check("--reanalyse, --xic and --mobilograms are all dropped", not {"--reanalyse", "--xic", "--mobilograms"} & set(f2))
+    # a .quant beside the raw that a LATER search rewrote must not be trusted (single pass, no MBR)
+    open(os.path.join(S, "report.log.txt"), "w").write("DIA-NN 2.7.0\n" + cmd2.replace(" --reanalyse", "") + " \n")
     import shutil; shutil.rmtree(os.path.join(S, "quant_step4"))
     q = raws + "/a_1.d.quant"; open(q, "w").write("q"); open(raws + "/b_2.d.quant", "w").write("q")
     old = os.path.getmtime(os.path.join(S, "report.parquet"))

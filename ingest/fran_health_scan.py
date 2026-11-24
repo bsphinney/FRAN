@@ -317,6 +317,15 @@ def check_search_output(c):
         f"report; reasons per search are in FRAN_diann/_full_reports/_failed/")
     if bad:
         add("RED", "search output", f"{bad} regenerated reports do not reproduce the original's 1% rows")
+    c.execute("""SELECT count(*) FROM delimp_search_artifact a
+                 WHERE a.kind = 'full_report' AND a.detail->>'status' LIKE 'ok%'
+                   AND a.registered_at < now() - interval '2 days'
+                   AND NOT EXISTS (SELECT 1 FROM delimp_diann_protein_unfiltered p
+                                   WHERE p.search_id = a.search_id)""")
+    no_prot = c.fetchone()[0]
+    metrics["search_output"]["full_report_without_protein_rows"] = no_prot
+    add("AMBER" if no_prot else "ok", "search output",
+        f"{no_prot:,} DIA-NN searches have an unfiltered report but no rows in delimp_diann_protein_unfiltered")
 
 
 RAW_SAMPLE = 300          # located raws stat-ed per scan to prove the raws are still there
