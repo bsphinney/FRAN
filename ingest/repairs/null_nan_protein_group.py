@@ -31,6 +31,9 @@ from _common import base_parser, chunks, connect, show_examples
 
 JUNK = ["nan", "NaN", "NAN", "None", "none", "NONE", "null", "NULL", "", "NA", "na", "N/A", "n/a", "Na", " "]
 JUNK_PROTEINS = JUNK + ["UNKNOWN"]
+# Genes get a narrower list: "NA" is a real gene symbol (influenza neuraminidase), so only
+# spellings that can only be a stringified missing value are cleared.
+JUNK_GENES = ["nan", "NaN", "NAN", "None", "none", "NONE", "null", "NULL", ""]
 
 # SQL twin of corpus_ingest's n_protein_groups / n_proteins for one search's rows.
 COUNTS = """SELECT count(DISTINCT protein_group) FILTER (WHERE {keep}),
@@ -57,7 +60,7 @@ def main():
 
     prec = _by_value(cur, "delimp_precursors", "protein_group", JUNK)
     prot = _by_value(cur, "delimp_proteins", "protein_group", JUNK_PROTEINS)
-    gene = _by_value(cur, "delimp_proteins", "gene", JUNK)
+    gene = _by_value(cur, "delimp_proteins", "gene", JUNK_GENES)
     sids = sorted(set(prec) | set(prot) | set(gene), key=str)
 
     # before / after of the per-search protein counts, for searches that lose protein rows
@@ -91,7 +94,7 @@ def main():
             cur.execute("DELETE FROM delimp_proteins WHERE search_id = ANY(%s::uuid[]) AND protein_group = ANY(%s)",
                         (batch, JUNK_PROTEINS))
             cur.execute("UPDATE delimp_proteins SET gene = NULL WHERE search_id = ANY(%s::uuid[]) AND gene = ANY(%s)",
-                        (batch, JUNK))
+                        (batch, JUNK_GENES))
             conn.commit()
         for sid, _nm, _g0, _p0, g1, p1 in recount:
             cur.execute("UPDATE delimp_searches SET n_protein_groups_total = %s, n_proteins_total = %s WHERE id = %s",
