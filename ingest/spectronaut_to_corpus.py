@@ -285,11 +285,11 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
                 "pep": _f(r, cols, "pep"),
                 "intensity": _f(r, cols, "intensity"),
                 "normalized_intensity": _f(r, cols, "norm_intensity"),
-                "instrument": str(r.get(cols["instrument"])) if "instrument" in cols else None,
+                "instrument": _t(r, cols, "instrument"),
                 "ce": _f(r, cols, "ce"),
-                "organism": str(r.get(cols["organism"])) if "organism" in cols else None,
-                "protein_group": str(r.get(cols["protein_group"])) if "protein_group" in cols else None,
-                "gene": str(r.get(cols["gene"])) if "gene" in cols else None,
+                "organism": _t(r, cols, "organism"),
+                "protein_group": _t(r, cols, "protein_group"),   # NaN/"nan"/"" -> None, never the text
+                "gene": _t(r, cols, "gene"),
                 "engine": "spectronaut",
             }
             # MS2 fragment (spectrum-prediction training signal): present only if the
@@ -299,12 +299,12 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
             if "frg_mz" in cols:
                 rec["fragment"] = {
                     "mz": _f(r, cols, "frg_mz"),
-                    "type": str(r.get(cols["frg_type"])) if "frg_type" in cols else None,
+                    "type": _t(r, cols, "frg_type"),
                     "num": _f(r, cols, "frg_num"),
                     "charge": _f(r, cols, "frg_charge"),
-                    "loss": str(r.get(cols["frg_loss"])) if "frg_loss" in cols else None,
+                    "loss": _t(r, cols, "frg_loss"),
                     "intensity": _f(r, cols, "frg_intensity"),
-                    "ion": str(r.get(cols["frg_ion"])) if "frg_ion" in cols else None,
+                    "ion": _t(r, cols, "frg_ion"),
                     "measured_relint": _f(r, cols, "frg_measured_relint"),
                     "predicted_relint": _f(r, cols, "frg_predicted_relint"),
                 }
@@ -324,6 +324,22 @@ def iter_records(report_path: str, q_max: float = 0.01, chunksize: int = 200_000
         print(f"  [spectronaut] {sum(_unmapped_mods.values()):,} modification occurrence(s) had "
               f"no UniMod mapping and were left as literal text in modified_seq_proforma: "
               f"{detail} -- add to _MOD_UNIMOD in spectronaut_to_corpus.py", flush=True)
+
+def _t(row, cols, field):
+    """Text cell -> str, or None when missing. A pandas NaN is truthy and str(NaN) is "nan", so the
+    obvious `str(r.get(col))` wrote the literal text "nan" into protein_group (97,143 precursor
+    rows by 2026-11-18). Missing means NULL: NaN, None, and the strings nan/none/null/na/"" ."""
+    if field not in cols:
+        return None
+    v = row.get(cols[field])
+    try:
+        if v is None or pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return None if s.lower() in ("nan", "none", "null", "na", "") else s
+
 
 def _f(row, cols, field):
     if field not in cols:
