@@ -10,8 +10,8 @@ This module stops choosing. It does two things per DIA-NN search:
             result to FULL_ROOT/<search_id>/report.full.parquet. The report the search itself wrote
             was filtered at --qvalue 0.01 by the skill's cfg, so rows above 1% and all decoys exist
             only in the .quant files until this runs. A single-shot MBR search has no
-            final-pass .quant files at all, so its final pass is re-run from the raw files
-            against its saved empirical library (plan_regen says which method and why). The regenerated report is checked against
+            final-pass .quant files at all, so the search is run again from the raw files
+            (plan_regen says which method and why). The regenerated report is checked against
             the original: its target rows at Q.Value <= 0.01 must be the original's rows.
 
   proteins  (part of register) Load the regenerated report's protein groups, with no precursor
@@ -147,27 +147,32 @@ def plan_regen(search_dir: str) -> dict:
         return {"ok": False, "why": "two inputs share a run name; their .quant files cannot be told apart"}
     quants = {}
     # Two ways back to the full report, depending on which pass the saved .quant files are from.
-    #   report_step       The 5-step chain's step 5 names empirical.parquet and its quant_step4/
-    #                     files are final-pass, so the report step alone reproduces the report.
-    #   final_pass_rerun  A single-shot --reanalyse (MBR) search saves .quant files in its FIRST
-    #                     pass only -- DIA-NN says so in its log -- so nothing on disk holds the
-    #                     final pass. Measured 2026-11-24: DIA-NN refuses those files against
-    #                     report-lib.parquet ("library size mismatch"), and letting it rebuild the
-    #                     library from them gives a different library (3,284 precursors against
-    #                     the original 3,324) and a different report. So the final pass itself is
-    #                     re-run: the raw files against the search's own saved report-lib.parquet.
-    #                     It reads the raw files; its .quant files are kept this time.
+    #   report_step  The 5-step chain's step 5 names empirical.parquet and its quant_step4/ files
+    #                are final-pass, so the report step alone reproduces the report.
+    #   full_rerun   A single-shot --reanalyse (MBR) search saves .quant files in its FIRST pass
+    #                only -- DIA-NN says so in its log -- so nothing on disk holds the final pass,
+    #                and the search is run again whole from the raw files. Three shortcuts were
+    #                measured on 2026-11-24 and none reproduces the original on a multi-run set:
+    #                the report step against report-lib.parquet (DIA-NN refuses: "library size
+    #                mismatch"); a stand-alone final pass against report-lib.parquet (2-4% of the
+    #                1% rows differ); and the original command with --use-quant, which skips the
+    #                first pass, so the peak width and RT windows that pass would have calibrated
+    #                are re-derived in the second (peak width 3.56 against the original 3.592) and
+    #                again 2-4% of rows differ. DIA-NN warns of exactly this in its log.
+    method = "full_rerun" if reanalyse else "report_step"
+    lib = libs[0] if libs else None
+    if lib and not os.path.isfile(lib):
+        # A search folder that was moved or renamed after the run: its log names the old place.
+        moved = os.path.join(search_dir, os.path.basename(lib))
+        if os.path.isfile(moved):
+            lib = moved
+    if not lib or not os.path.isfile(lib):
+        return {"ok": False, "why": f"library not on disk: {lib}"}
     if reanalyse:
-        method, lib = "final_pass_rerun", os.path.join(search_dir, "report-lib.parquet")
-        if not os.path.isfile(lib):
-            return {"ok": False, "why": "no report-lib.parquet: the final pass's library was not kept"}
         gone = [r for r in raws if not os.path.exists(r)]
         if gone:
-            return {"ok": False, "why": f"the final pass needs the raw files; {len(gone)} of {len(raws)} are gone (e.g. {gone[0]})"}
+            return {"ok": False, "why": f"a full re-run needs the raw files; {len(gone)} of {len(raws)} are gone (e.g. {gone[0]})"}
     else:
-        method, lib = "report_step", (libs[0] if libs else None)
-        if not lib or not os.path.isfile(lib):
-            return {"ok": False, "why": f"library not on disk: {lib}"}
         missing = []
         for r in raws:
             q = find_quant(search_dir, r)
@@ -187,7 +192,10 @@ def plan_regen(search_dir: str) -> dict:
     if gone:
         return {"ok": False, "why": f"FASTA not on disk: {gone[0]}"}
     keep = [(f, v) for f, v in opts if f not in _DROP]
-    return {"ok": True, "binary": binary, "opts": keep, "raws": raws, "quants": quants, "lib": lib,
+    if reanalyse:
+        keep += [(f, v) for f, v in opts if f in ("--reanalyse", "--rt-profiling")]
+    th = [v for f, v in opts if f == "--threads"]
+    return {"ok": True, "binary": binary, "opts": keep, "threads": th[0] if th else None, "raws": raws, "quants": quants, "lib": lib,
             "method": method, "original_command": cmd,
             "layout": "chain" if os.path.isdir(os.path.join(search_dir, "quant_step4")) else "single_shot"}
 
@@ -212,7 +220,10 @@ def compare_reports(orig: str, full: str) -> dict:
     out["full_decoy_rows"] = pc.sum(pc.cast(dec, "int64")).as_py() if dec is not None else 0
     out["full_max_q"] = pc.max(tf["Q.Value"]).as_py()
     tgt = pc.invert(dec) if dec is not None else None
-    m = pc.less_equal(tf["Q.Value"], 0.01)
+    # DIA-NN's --qvalue 0.01 filter is strict, on 32-bit values: a row at exactly float32(0.01)
+    # is not in the original (seen on 3 searches, one row each), so the slice must be strict too.
+    import pyarrow as pa
+    m = pc.less(pc.cast(tf["Q.Value"], pa.float32()), pa.scalar(0.01, pa.float32()))
     if tgt is not None:
         m = pc.and_(m, tgt)
     slice_ = tf.filter(m)
@@ -267,6 +278,7 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
         os.symlink(plan["lib"], lib)     # DIA-NN writes <lib>.skyline.speclib beside this NAME
         copies = {f: os.stat(os.path.join(work, "quant", f)).st_mtime for f in os.listdir(os.path.join(work, "quant"))}
         out = os.path.join(work, "out", "report.full.parquet")
+        run_threads = threads
         argv = [plan["binary"]]
         for f, v in plan["opts"]:
             argv.append(f)
@@ -276,7 +288,7 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
             argv.append("--use-quant")
         argv += ["--lib", lib, "--quant-ori-names", "--temp", os.path.join(work, "quant"),
                  "--qvalue", str(FULL_QVALUE), "--report-decoys", "--export-quant",
-                 "--threads", str(threads), "--out", out]
+                 "--threads", str(run_threads), "--out", out]
         rec["command"] = argv
         rec["layout"], rec["original_command"] = plan["layout"], plan["original_command"]
         rec["method"] = plan["method"]
@@ -302,25 +314,17 @@ def regen_one(search_id: str, search_dir: str, threads: int, force: bool = False
             rec["log"] = os.path.join(faildir, search_id + ".log")
             return rec
         # Under report_step no .quant should change: one that did was declined by DIA-NN and
-        # re-made from the raw file. Under final_pass_rerun there were none to start with.
+        # re-made from the raw file. A full re-run starts with none.
         rec["quant_rewritten"] = sorted(f for f, m in copies.items()
                                         if os.stat(os.path.join(work, "quant", f)).st_mtime != m)
         rec["originals_untouched"] = all((os.stat(q).st_size, os.stat(q).st_mtime) == v for q, v in before.items())
         rec["check"] = compare_reports(os.path.join(search_dir, "report.parquet"), out)
-        clean = plan["method"] == "final_pass_rerun" or not rec["quant_rewritten"]
+        clean = plan["method"] == "full_rerun" or not rec["quant_rewritten"]
         rec["status"] = "mismatch" if not rec["check"]["parity"] else ("ok" if clean else "ok_requantified")
         rec["qvalue"] = FULL_QVALUE
         os.makedirs(dest, exist_ok=True)
         for f in os.listdir(os.path.join(work, "out")):
             shutil.move(os.path.join(work, "out", f), os.path.join(dest, f))
-        if plan["method"] == "final_pass_rerun":
-            # The final-pass .quant files the search itself never saved. With these the report
-            # step can be repeated later without the raw files, as it can for a chain search.
-            qd = os.path.join(dest, "quant_final")
-            os.makedirs(qd, exist_ok=True)
-            for f in os.listdir(os.path.join(work, "quant")):
-                shutil.move(os.path.join(work, "quant", f), os.path.join(qd, f))
-            rec["quant_final"] = len(os.listdir(qd))
         rec["report"] = os.path.join(dest, "report.full.parquet")
         rec["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         tmp = marker + ".tmp"
@@ -440,6 +444,35 @@ DDL += [
        'those at Q.Value <= 0.01. Decoys are not here; they are in the report file. The site does '
        'not read this table.'""",
 ]
+
+DDL += [
+    "ALTER TABLE delimp_search_provenance ADD COLUMN IF NOT EXISTS run_by text",
+    "ALTER TABLE delimp_search_provenance ADD COLUMN IF NOT EXISTS run_by_source text",
+    """COMMENT ON COLUMN delimp_search_provenance.run_by IS
+       'Cluster account that ran the search. Nothing the search wrote names its operator, so this '
+       'is the Unix owner of the report file (run_by_source says so). It is an account, not '
+       'necessarily a person: gc-prot-core-user is shared, and the corpus re-search drip runs '
+       'unattended under one account.'""",
+]
+
+
+def run_by(search_dir: str):
+    """(account, how it was found) for whoever ran this search, or (None, None)."""
+    import pwd
+    for name in ("report.parquet", "report.log.txt", "report.stats.tsv"):
+        f = os.path.join(search_dir, name)
+        if os.path.exists(f):
+            uid = os.stat(f).st_uid
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                user = f"uid:{uid}"
+            how = f"file owner of {name}"
+            if "/FRAN_diann/" in search_dir:
+                how += "; corpus re-search drip (unattended)"
+            return user, how
+    return None, None
+
 
 _KINDS = [  # first match wins; the patterns are on the path relative to the search folder
     (r"^report\.parquet$", "report"),
@@ -723,6 +756,14 @@ def cmd_register(a):
                     if attempt == 2:
                         raise
                     conn = _conn()
+            who, how = run_by(it["output_dir"])
+            if who:
+                cur = conn.cursor()
+                cur.execute("""UPDATE delimp_search_provenance SET run_by = %s, run_by_source = %s
+                               WHERE search_id = %s AND run_by IS DISTINCT FROM %s""",
+                            (who, how, it["id"], who))
+                tot["run_by_set"] = tot.get("run_by_set", 0) + cur.rowcount
+                conn.commit()
             try:
                 npr = load_proteins(conn, it["id"], it["output_dir"])
             except Exception as e:  # noqa: BLE001 -- the file registration above is already committed
