@@ -364,6 +364,7 @@ def main():
         conn = _pg_conn(); sln.ensure_registry(conn)
 
     tp = tf = done = skipped = 0
+    failed = []          # reports that raised, or whose registry write failed
 
     def handle(res):
         nonlocal tp, tf, done, skipped
@@ -380,6 +381,7 @@ def main():
                 note += f"  registered{'' if sid else ' (no search match)'}"
             except Exception as e:  # noqa: BLE001
                 conn.rollback(); note += f"  [warn] register: {str(e)[:70]}"
+                failed.append(name)
         print(f"  {name}: {note}")
 
     if a.workers > 1 and len(reports) > 1:
@@ -393,6 +395,7 @@ def main():
                     handle(fut.result())
                 except Exception as e:  # noqa: BLE001
                     print(f"  [warn] {os.path.basename(futs[fut])}: {str(e)[:100]}")
+                    failed.append(os.path.basename(futs[fut]))
                 if i % 25 == 0:
                     print(f"[{i}/{len(reports)}] {done} new, {skipped} skipped, {tf:,} fragments so far")
     else:
@@ -401,6 +404,7 @@ def main():
                 handle(process_one(rp, a.out_dir, a.dry_run, resume))
             except Exception as e:  # noqa: BLE001
                 print(f"  [warn] {os.path.basename(rp)}: {str(e)[:100]}")
+                failed.append(os.path.basename(rp))
             if i % 25 == 0:
                 print(f"[{i}/{len(reports)}] {done} new, {skipped} skipped, {tf:,} fragments so far")
 
@@ -408,6 +412,12 @@ def main():
           f"{tp:,} precursors / {tf:,} fragments -> {a.out_dir}")
     if conn is not None:
         conn.close()
+    if failed:
+        # Exit non-zero so a cron / sbatch wrapper sees the failure. It used to exit 0 after
+        # printing only "[warn]" lines, so a run in which every report failed looked successful.
+        print(f"FAILED: {len(failed)} of {len(reports)} report(s): {', '.join(failed[:10])}"
+              f"{' ...' if len(failed) > 10 else ''}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

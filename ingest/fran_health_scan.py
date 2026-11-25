@@ -60,7 +60,11 @@ FLOORS = {"raw_files.hive_path": 0.90, "raw_files.instrument_model": 0.90,
           "raw_files.acquisition_date": 0.90, "raw_files.n_ms2_frames": 0.85,
           "raw_files.cycle_time_sec": 0.85, "sample_metadata.organism_taxon_id": 0.90,
           "searches with PTM rollup": 0.90, "searches with provenance row": 0.90,
-          "searches with FASTA record": 0.90, "searches with raw-file links": 0.95}
+          "searches with FASTA record": 0.90, "searches with raw-file links": 0.95,
+          # Lanes, per engine (an engine-specific key wins over the plain label). Set from what each
+          # lane reached when its writer ran: DIA-NN XIC 95 percent, Spectronaut spectra 86 percent
+          # of the last 60 days (2026-11-18). The other two have no writer yet: RED until they do.
+          "searches with XIC lane": 0.90, "searches with spectrum lane": 0.80}
 
 # (label, FROM clause, date expression, [(column label, filled-expression)])
 FILL_CHECKS = [
@@ -84,20 +88,37 @@ FILL_CHECKS = [
     ]),
 ]
 
-# Per-search side tables: (label, engine filter or None, EXISTS subquery on s.id)
+# Per-search side tables: (label, engine, EXISTS subquery on s.id). engine None = all searches
+# together; "*" = once PER ENGINE that has searches in the window.
+#
+# The lanes are "*" on purpose. Until 2026-11-18 they read ("XIC lane", "diann") and
+# ("spectrum lane", "spectronaut"): each lane was checked only for the engine that had a writer.
+# So the check measured what the code produced, not what a search should have, and two whole gaps
+# were invisible: 0 of 1,223 DIA-NN searches had a spectrum lane, 2 of 2,222 Spectronaut searches an
+# XIC lane. A gap no writer covers can never show up as a drop. Every engine is now measured for
+# every lane, and the lanes have floors (FLOORS) so a lane that was ALWAYS empty is RED too.
 COVERAGE_CHECKS = [
     ("PTM rollup", None, "SELECT 1 FROM delimp_search_protein_ptm x WHERE x.search_id = s.id"),
     ("provenance row", None, "SELECT 1 FROM delimp_search_provenance x WHERE x.search_id = s.id"),
     ("FASTA record", None, "SELECT 1 FROM delimp_search_fastas x WHERE x.search_id = s.id"),
     ("raw-file links", None, "SELECT 1 FROM search_raw_files x WHERE x.search_id = s.id"),
-    ("XIC lane", "diann", "SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id"),
-    ("spectrum lane", "spectronaut", "SELECT 1 FROM delimp_spectrum_lane x WHERE x.search_id = s.id"),
+    ("XIC lane", "*", "SELECT 1 FROM delimp_xic_lane x WHERE x.search_id = s.id"),
+    ("spectrum lane", "*", "SELECT 1 FROM delimp_spectrum_lane x WHERE x.search_id = s.id"),
 ]
+# Why a lane is short for an engine, printed with its finding so a RED says what it would take.
+GAP_NOTES = {
+    "searches with spectrum lane (diann)": "no DIA-NN spectrum writer was scheduled before 2026-11-18 "
+        "(diann_spectra_to_lance.py)",
+    "searches with XIC lane (spectronaut)": "Spectronaut XICs come from the .sne's .xic.db, extracted "
+        "on a Windows node; nothing on Hive can write them",
+}
 
 EXPECTED_CRON = ["corpus_drip.sh", "corpus_ingest_drip.sh", "cron_auto_ingest.sh",
                  "fran_fill_cron.sh", "fran_health_cron.sh", "fill_diann_xic_lanes_cron.sh",
                  "upload_lanes_to_blob.sbatch"]
 XIC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/xic_lane"   # fill_diann_xic_lanes.py
+SPEC_FILL_DIR = "/quobyte/proteomics-grp/brett/scratch/fran_health/spectrum_lane"   # fill_spectrum_lanes.py
+EXPECTED_CRON.append("fill_spectrum_lanes_cron.sh")
 
 findings = []   # (severity, area, message)
 metrics = {"fill": {}, "coverage": {}}   # structured numbers for delimp_qc_scan / the FRAN-QC page
@@ -117,14 +138,14 @@ def sh(cmd):
 def judge(area, what, recent, base, n_recent, n_base):
     if n_recent < MIN_ROWS:
         return
-    floor = FLOORS.get(what.split(" (")[0])
+    floor = FLOORS.get(what, FLOORS.get(what.split(" (")[0]))
     if area in metrics:
         metrics[area][what] = {"recent": round(recent, 4), "base": round(base, 4), "floor": floor,
                                "n_recent": n_recent, "n_base": n_base}
     txt = (f"{what}: {recent:.0%} of the last {RECENT} d vs {base:.0%} before "
            f"(n={n_recent:,}/{n_base:,})" + (f"; floor {floor:.0%}" if floor else ""))
     if floor and recent < floor:
-        add("RED", area, txt)
+        add("RED", area, txt + (f" -- {GAP_NOTES[what]}" if what in GAP_NOTES else ""))
         return
     if n_base < MIN_ROWS:
         return
@@ -165,15 +186,31 @@ def check_fill(c):
             judge("fill", f"{label}.{name}", float(r), float(b), n_r, n_b)
 
 
-def check_coverage(c):
+def _coverage_runs(c):
+    """(label, engine, subquery) with every "*" expanded to each engine that has searches in the
+    window, so an engine added later is measured for every lane from its first search."""
+    c.execute(f"""SELECT DISTINCT search_engine FROM delimp_searches
+                   WHERE ingested_at > now() - interval '{BASE_TO} days' AND search_engine IS NOT NULL
+                   ORDER BY 1""")
+    engines = [r[0] for r in c.fetchall()]
     for label, engine, sub in COVERAGE_CHECKS:
-        eng = f"AND s.search_engine = '{engine}'" if engine else ""
+        if engine == "*":
+            for e in engines:
+                yield label, e, sub
+        else:
+            yield label, engine, sub
+
+
+def check_coverage(c):
+    for label, engine, sub in list(_coverage_runs(c)):
+        eng = "AND s.search_engine = %s" if engine else ""
         c.execute(f"""SELECT count(*) FILTER (WHERE s.ingested_at > now() - interval '{RECENT} days'),
                              avg((EXISTS ({sub}))::int) FILTER (WHERE s.ingested_at > now() - interval '{RECENT} days'),
                              count(*) FILTER (WHERE s.ingested_at <= now() - interval '{BASE_FROM} days'),
                              avg((EXISTS ({sub}))::int) FILTER (WHERE s.ingested_at <= now() - interval '{BASE_FROM} days')
                         FROM delimp_searches s
-                       WHERE s.ingested_at > now() - interval '{BASE_TO} days' {eng}""")
+                       WHERE s.ingested_at > now() - interval '{BASE_TO} days' {eng}""",
+                  (engine,) if engine else None)
         n_r, r, n_b, b = c.fetchone()
         if r is not None:
             b = r if b is None else b
@@ -227,6 +264,82 @@ def check_xic_job():
     add(sev, "xic job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} DIA-NN searches without a lane, "
         f"{sm.get('planned', '?')} planned, skipped {sm.get('skipped', {})}; since then {n_res} written, "
         f"{len(fails)} failed" + (f" (e.g. {', '.join(fails[:3])})" if fails else ""))
+
+
+def _newest(d, pattern):
+    return sorted(glob.glob(os.path.join(d, pattern)), key=os.path.getmtime)
+
+
+def check_spectrum_staleness(c):
+    """Spectronaut searches older than 3 days with no spectrum lane, split by what can be done.
+
+    RED only for the ones with a FRAN report on disk (per the last fill_spectrum_lanes plan): the
+    nightly job could write those, so a lane still missing after 3 days means it is not working.
+    The searches whose report no longer exists (a .sne-only output_dir) need a Windows re-export;
+    they are AMBER, counted separately, so they cannot keep this RED forever. The coverage floor in
+    check_coverage still sees them. Too-big reports and parked searches are listed, not RED."""
+    plans = _newest(SPEC_FILL_DIR, "plan_*.json")
+    c.execute("""SELECT s.id::text, s.search_name FROM delimp_searches s
+                  WHERE s.search_engine = 'spectronaut' AND s.ingested_at < now() - interval '3 days'
+                    AND NOT EXISTS (SELECT 1 FROM delimp_spectrum_lane l WHERE l.search_id = s.id)""")
+    missing = c.fetchall()
+    if not plans:
+        add("RED" if missing else "ok", "spectrum staleness",
+            f"{len(missing):,} Spectronaut searches >3 d old have no spectrum lane and fill_spectrum_lanes "
+            f"has never planned ({SPEC_FILL_DIR}), so none can be called un-writable")
+        return
+    plan = json.load(open(plans[-1]))
+    with_report = set(plan.get("report_sids", []))
+    by_reason = {}
+    for k in plan.get("skipped", []):
+        by_reason.setdefault(k["reason"], set()).add(k["sid"])
+    reexport = set().union(*(by_reason.get(r, set()) for r in
+                             ("needs_reexport", "dup_of_laned", "identity_mismatch", "corrupt_report", "no_corpus_runs",
+                              "path_occupied", "ambiguous_link")))
+    red = [(i, n) for i, n in missing if i in with_report]
+    amber_reexport = [x for x in missing if x[0] in reexport]
+    other = [x for x in missing if x[0] not in with_report and x[0] not in reexport]
+    metrics["spectrum_staleness"] = {"missing_gt3d": len(missing), "writable_missing": len(red),
+                                     "needs_reexport": len(amber_reexport), "not_in_plan": len(other)}
+    msg = (f"{len(missing):,} Spectronaut searches >3 d old have no spectrum lane: {len(red)} have a report "
+           f"on disk (the job should have written them), {len(amber_reexport)} need a Windows re-export "
+           f"or a person (no report on disk, a report that is not this search's, a duplicate of a laned search)")
+    if other:
+        msg += f", {len(other)} not in the last plan (ingested since, or too big/parked: {sorted(by_reason)})"
+    if red:
+        add("RED", "spectrum staleness", msg + f"; e.g. {[n for _, n in red[:3]]}")
+    elif amber_reexport or other:
+        add("AMBER", "spectrum staleness", msg)
+    else:
+        add("ok", "spectrum staleness", msg)
+
+
+def check_spectrum_job():
+    """The daily spectrum-lane job (fill_spectrum_lanes): did it plan recently, did its writes fail?"""
+    plans = _newest(SPEC_FILL_DIR, "plan_*.json")
+    if not plans:
+        add("RED", "spectrum job", f"fill_spectrum_lanes has never planned ({SPEC_FILL_DIR}); is its cron line live?")
+        return
+    newest = plans[-1]
+    age_h = (time.time() - os.path.getmtime(newest)) / 3600
+    plan = json.load(open(newest))
+    sm = plan.get("summary", {})
+    job = sm.get("job")
+    res_f = os.path.join(SPEC_FILL_DIR, f"result_{job}.json")
+    fails, counts, parked = [], {}, None
+    if os.path.exists(res_f):
+        r = json.load(open(res_f))
+        counts = r.get("summary", {}).get("outcomes", {})
+        parked = r.get("summary", {}).get("parked")
+        fails = [o.get("name") for o in r.get("outcomes", []) if o.get("status") == "failed"]
+    # A plan with no result for its own job id after 12 h means the job died between plan and finish.
+    died = (not os.path.exists(res_f)) and age_h > 12
+    sev = "RED" if age_h > 48 else ("AMBER" if (fails or died or parked) else "ok")
+    add(sev, "spectrum job", f"last plan {age_h:.0f} h ago: {sm.get('unlaned', '?')} Spectronaut searches without a lane, "
+        f"planned {sm.get('planned', {})}, skipped {sm.get('skipped', {})}; that run: {counts or 'no result file'}, "
+        f"{len(fails)} failed" + (f" (e.g. {', '.join(map(str, fails[:3]))})" if fails else "")
+        + (f", {parked} parked after {3} failed attempts" if parked else "")
+        + ("; no result file for the last plan: the job died mid-run" if died else ""))
 
 
 def check_blob_upload():
@@ -286,6 +399,46 @@ def check_db(c):
     msg = (f"database {size / 1024 ** 3:,.0f} GiB of a {PG_DISK_GB:,.0f} GB volume; "
            f"~{free / 1024 ** 3:,.0f} GiB free ({pct_free:.0%})")
     add("RED" if pct_free < 0.05 else "AMBER" if pct_free < 0.15 else "ok", "database", msg)
+
+
+def check_search_output(c):
+    """Is the COMPLETE output of every DIA-NN search on record (FRAN#35)? The corpus tables hold a
+    1% precursor-filtered view; delimp_search_artifact lists the files that hold the rest. Every
+    DIA-NN search must have its own report registered and a full report regenerated from .quant.
+    A count that only ever grows here means the nightly diann_full_output step is not running."""
+    if "search_id" not in columns_of(c, "delimp_search_artifact"):
+        add("RED", "search output", "delimp_search_artifact does not exist: run "
+            "`diann_full_output.py migrate --apply`; no DIA-NN output file is on record")
+        return
+    c.execute("""SELECT count(*),
+                   count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM delimp_search_artifact a
+                             WHERE a.search_id = s.id AND a.kind = 'report')),
+                   count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM delimp_search_artifact a
+                             WHERE a.search_id = s.id AND a.kind = 'full_report'))
+                 FROM delimp_searches s
+                 WHERE s.search_engine = 'diann' AND s.ingested_at < now() - interval '2 days'""")
+    n, no_rep, no_full = c.fetchone()
+    c.execute("""SELECT count(*) FROM delimp_search_artifact
+                 WHERE kind = 'full_report_mismatch' AND missing_since IS NULL""")
+    bad = c.fetchone()[0]
+    metrics["search_output"] = {"diann_searches": n, "no_report_registered": no_rep,
+                                "no_full_report": no_full, "full_report_mismatch": bad}
+    add("RED" if no_rep > 0.02 * max(n, 1) else "AMBER" if no_rep else "ok", "search output",
+        f"{no_rep:,} of {n:,} DIA-NN searches have no report file on record")
+    add("RED" if no_full > 0.25 * max(n, 1) else "AMBER" if no_full > 0.15 * max(n, 1) else "ok",
+        "search output", f"{no_full:,} of {n:,} DIA-NN searches have no unfiltered (--qvalue 0.5) "
+        f"report; reasons per search are in FRAN_diann/_full_reports/_failed/")
+    if bad:
+        add("RED", "search output", f"{bad} regenerated reports do not reproduce the original's 1% rows")
+    c.execute("""SELECT count(*) FROM delimp_search_artifact a
+                 WHERE a.kind = 'full_report' AND a.detail->>'status' LIKE 'ok%'
+                   AND a.registered_at < now() - interval '2 days'
+                   AND NOT EXISTS (SELECT 1 FROM delimp_diann_protein_unfiltered p
+                                   WHERE p.search_id = a.search_id)""")
+    no_prot = c.fetchone()[0]
+    metrics["search_output"]["full_report_without_protein_rows"] = no_prot
+    add("AMBER" if no_prot else "ok", "search output",
+        f"{no_prot:,} DIA-NN searches have an unfiltered report but no rows in delimp_diann_protein_unfiltered")
 
 
 RAW_SAMPLE = 300          # located raws stat-ed per scan to prove the raws are still there
@@ -593,6 +746,172 @@ def heal(filler_state):
             add("RED", "heal", f"could not resubmit the filler: {r.stderr.strip()[:200]}")
 
 
+# ── Blind spots found by the 2026-11 data audit ────────────────────────────────────────────────
+# Each check below measures something the older checks could not see: they compared a column's
+# fill rate with its own past, so a column that was NEVER written (or a value that is written but
+# wrong) stayed invisible. All are cheap: delimp_searches, raw_files (44k rows), and LIMIT-bounded
+# or search_id-scoped reads of the huge tables -- never an unfiltered scan.
+
+JUNK_TEXT = ("nan", "NaN", "NAN", "None", "none", "null", "")
+LAST_SEARCHES_JUNK = 40           # newest searches probed for literal-'nan' protein groups
+LAST_SEARCHES_FILL = 10           # newest searches per engine probed for precursor fill rate
+FILL_SAMPLE_ROWS = 20_000         # precursor rows read per probed search (LIMIT, not a full scan)
+
+# Key precursor columns per engine and the fill-rate floor under which the scan goes RED. Measured
+# 2026-11-24 on the 10 newest searches of each engine (every column below was >= 0.99 there).
+# Columns an engine does not write at all (Spectronaut: normalized_intensity, ms1_area, rt_start,
+# predicted_rt, protein_ids, empirical_quality) are deliberately NOT listed -- a floor on them would
+# be permanently red and teach people to ignore the scan.
+_PREC_COMMON = ["stripped_seq", "modified_seq_proforma", "charge", "precursor_mz", "rt", "q_value",
+                "global_q_value", "intensity", "protein_group"]
+PREC_FILL_FLOORS = {
+    "diann": {c: 0.95 for c in _PREC_COMMON + ["pg_q_value", "normalized_intensity", "pep", "empirical_quality",
+                                              "ms1_area", "rt_start", "predicted_rt", "irt", "protein_ids"]},
+    "spectronaut": {**{c: 0.95 for c in _PREC_COMMON + ["pg_q_value"]}, "irt": 0.90},
+}
+
+
+def check_search_provenance(c):
+    """Searches whose provenance was never recorded: search_params_json / completed_at NULL, by
+    engine. Measured 2026-11-24: 100% of all 3,448 searches had search_params_json NULL and >99.8%
+    had completed_at NULL, and no existing check looked."""
+    c.execute(f"""SELECT search_engine,
+                         count(*) FILTER (WHERE ingested_at > now() - interval '{RECENT} days'),
+                         avg((search_params_json IS NULL)::int) FILTER (WHERE ingested_at > now() - interval '{RECENT} days'),
+                         avg((completed_at IS NULL)::int)       FILTER (WHERE ingested_at > now() - interval '{RECENT} days'),
+                         count(*),
+                         avg((search_params_json IS NULL)::int), avg((completed_at IS NULL)::int)
+                    FROM delimp_searches GROUP BY 1 ORDER BY 1""")
+    out = {}
+    for eng, n_r, p_r, c_r, n_all, p_all, c_all in c.fetchall():
+        out[eng] = {"n_recent": n_r, "params_null_recent": p_r and round(float(p_r), 4),
+                    "completed_null_recent": c_r and round(float(c_r), 4), "n_all": n_all,
+                    "params_null_all": round(float(p_all), 4), "completed_null_all": round(float(c_all), 4)}
+        # judge the recent window when it has enough searches, else the whole history
+        n, pn, cn, win = (n_r, p_r, c_r, f"last {RECENT} d") if n_r >= MIN_ROWS else (n_all, p_all, c_all, "all time")
+        if n < 5:
+            continue
+        for col, v in (("search_params_json", pn), ("completed_at", cn)):
+            v = float(v or 0)
+            txt = f"{eng}: {v:.0%} of {n:,} searches ({win}) have {col} NULL"
+            if v >= 0.90:
+                add("RED", "provenance", txt)
+            elif v >= 0.25:
+                add("AMBER", "provenance", txt)
+    metrics["provenance"] = out
+
+
+def check_junk_protein_group(c):
+    """Literal 'nan' / 'None' / '' stored as protein_group on the newest searches. Looks at
+    delimp_proteins (tiny: ~28k rows per search, idx_proteins_search), one search at a time --
+    never delimp_precursors. Ingest writes a protein row for every group it saw, so junk in the
+    precursors shows up here too (as a 'nan' / 'UNKNOWN' protein row). Measured 2026-11-24:
+    the junk searches are found this way (e.g. 40 newest searches: 2 affected)."""
+    c.execute("SELECT id, search_engine, search_name FROM delimp_searches ORDER BY ingested_at DESC LIMIT %s",
+              (LAST_SEARCHES_JUNK,))
+    srch = c.fetchall()
+    if not srch:
+        return
+    bad = list(JUNK_TEXT + ("UNKNOWN",))
+    prot = {}
+    for sid, _eng, _nm in srch:
+        c.execute("SELECT count(*) FROM delimp_proteins WHERE search_id = %s AND protein_group = ANY(%s)",
+                  (sid, bad))
+        n = c.fetchone()[0]
+        if n:
+            prot[sid] = n
+    name = {r[0]: f"{r[1]}:{r[2]}" for r in srch}
+    metrics["junk_protein_group"] = {"searches_probed": len(srch), "searches_affected": len(prot),
+                                     "protein_rows": sum(prot.values())}
+    if prot:
+        worst = ", ".join(f"{name[k][:40]} ({v:,})" for k, v in sorted(prot.items(), key=lambda kv: -kv[1])[:3])
+        add("RED", "junk text", f"literal nan/None/'' protein_group (protein rows) in {len(prot)} of the "
+            f"{len(srch)} newest searches: {sum(prot.values()):,} rows; worst {worst}"
+            " -- ingest now writes NULL; old rows are fixed by ingest/repairs/null_nan_protein_group.py")
+    else:
+        add("ok", "junk text", f"no literal nan/None/'' protein_group in the {len(srch)} newest searches")
+
+
+def check_raw_file_consistency(c):
+    """Copies of one run (same raw_basename) that disagree on platform, and platform / extension /
+    acquisition contradictions. The legacy set is large and known (the extension was GUESSED from the
+    platform at ingest -- never infer vendor from it), so the severity follows what is NEW: a
+    contradiction among rows first seen in the last RECENT days means a writer is producing them
+    today. Legacy totals are reported as AMBER."""
+    c.execute(f"""SELECT count(*), count(*) FILTER (WHERE fresh)
+                    FROM (SELECT raw_basename, bool_or(first_seen_at > now() - interval '{RECENT} days') AS fresh
+                            FROM raw_files GROUP BY 1
+                          HAVING count(*) > 1 AND count(DISTINCT platform) > 1) t""")
+    n_dis, n_dis_new = c.fetchone()
+    checks = (
+        ("timsTOF platform with a .raw path", "platform = 'timstof' AND lower(raw_path) LIKE '%.raw'"),
+        ("Orbitrap platform with diaPASEF acquisition", "platform = 'orbitrap' AND acquisition_method ILIKE '%pasef%'"),
+        ("Orbitrap platform with ion-mobility range", "platform = 'orbitrap' AND mobility_min IS NOT NULL"),
+    )
+    res = {"platform_disagree_runs": n_dis, "platform_disagree_new": n_dis_new}
+    if n_dis_new:
+        add("RED", "raw_files", f"{n_dis_new:,} run(s) first seen in the last {RECENT} d have copies that "
+            f"disagree on platform ({n_dis:,} in all)")
+    elif n_dis:
+        add("AMBER", "raw_files", f"{n_dis:,} run(s) have copies that disagree on platform "
+            f"(none new in {RECENT} d) -- see ingest/repairs/reconcile_raw_files.py")
+    for label, where in checks:
+        c.execute(f"""SELECT count(*), count(*) FILTER (WHERE first_seen_at > now() - interval '{RECENT} days')
+                        FROM raw_files WHERE {where}""")
+        n_all, n_new = c.fetchone()
+        res[label] = {"all": n_all, "new": n_new}
+        if n_new:
+            add("RED", "raw_files", f"{n_new:,} raw file(s) first seen in the last {RECENT} d: {label} ({n_all:,} in all)")
+        elif n_all:
+            add("AMBER", "raw_files", f"{n_all:,} raw file(s): {label} (none new in {RECENT} d)")
+    metrics["raw_file_consistency"] = res
+
+
+def check_precursor_fill_by_engine(c):
+    """Per-engine fill rate of the key precursor columns over the newest searches, against a fixed
+    floor. A column that silently stops being written turns the scan red even when it was never
+    in the 90-day baseline. Reads at most FILL_SAMPLE_ROWS rows per search, scoped by search_id."""
+    out = {}
+    for eng, floors in PREC_FILL_FLOORS.items():
+        c.execute("SELECT id FROM delimp_searches WHERE search_engine = %s ORDER BY ingested_at DESC LIMIT %s",
+                  (eng, LAST_SEARCHES_FILL))
+        ids = [r[0] for r in c.fetchall()]
+        if len(ids) < 3:
+            continue
+        cols = list(floors)
+        agg = ", ".join(f"avg(({col} IS NOT NULL)::int)" for col in cols)
+        per = []                                   # newest first: one list of fill rates per search
+        for sid in ids:
+            c.execute(f"SELECT count(*), {agg} FROM (SELECT * FROM delimp_precursors "
+                      f"WHERE search_id = %s LIMIT {FILL_SAMPLE_ROWS}) t", (sid,))
+            row = c.fetchone()
+            if row[0]:
+                per.append([float(v or 0) for v in row[1:]])
+        if len(per) < 3:
+            continue
+        out[eng] = {}
+        bad_all, bad_new = [], []
+        for i, col in enumerate(cols):
+            mean_all = sum(p[i] for p in per) / len(per)
+            newest = per[:3]
+            mean_new = sum(p[i] for p in newest) / len(newest)
+            out[eng][col] = {"mean": round(mean_all, 4), "newest3": round(mean_new, 4), "floor": floors[col]}
+            if mean_all < floors[col]:
+                bad_all.append(f"{col} {mean_all:.0%}")
+            elif mean_new < floors[col]:
+                bad_new.append(f"{col} {mean_new:.0%}")
+        if bad_all:
+            add("RED", "precursor fill", f"{eng}: below its floor over the {len(per)} newest searches: "
+                + ", ".join(bad_all))
+        if bad_new:
+            add("RED", "precursor fill", f"{eng}: the 3 newest searches are below the floor (a column "
+                "stopped being written?): " + ", ".join(bad_new))
+        if not (bad_all or bad_new):
+            add("ok", "precursor fill", f"{eng}: all {len(cols)} key precursor columns at or above their "
+                f"floor over the {len(per)} newest searches")
+    metrics["precursor_fill"] = out
+
+
 def import_events(conn):
     """Copy what the self-healing layer did into delimp_qc_event (dedupe_key makes it idempotent)."""
     ev = []
@@ -689,13 +1008,29 @@ def main():
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '15min'")
-        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training):
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training,
+                   check_search_output):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
                 add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
+        # data-audit blind spots (2026-11); a separate loop so it merges cleanly beside the one above
+        for fn in (check_search_provenance, check_junk_protein_group, check_raw_file_consistency,
+                   check_precursor_fill_by_engine):
+            try:
+                fn(c)
+            except Exception as e:  # noqa: BLE001
+                add("AMBER", fn.__name__.replace("check_", ""), f"check errored: {repr(e)[:200]}")
+        try:
+            check_spectrum_staleness(c)
+        except Exception as e:  # noqa: BLE001
+            add("AMBER", "spectrum_staleness", f"check errored: {repr(e)[:200]}")
     conn.close()
     filler_state = check_filler()
+    try:
+        check_spectrum_job()
+    except Exception as e:  # noqa: BLE001
+        add("AMBER", "spectrum_job", f"check errored: {repr(e)[:200]}")
     for fn in (check_xic_job, check_blob_upload, check_drip, check_bad_nodes, check_cron):
         try:
             fn()

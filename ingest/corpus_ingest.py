@@ -30,6 +30,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from versions import CORPUS_INGEST_VERSION, SCHEMA_VERSION  # noqa: E402
+from organism import is_contaminant_group, is_contaminant_flag, contaminant_class  # noqa: E402 -- the ONE contaminant-membership rule
 
 
 def _versions():
@@ -426,6 +427,55 @@ def _stale_ingest_files(ignore_stale=False):
         cn.close()
 
 
+def _aggregate_proteins(recs):
+    """Per-(run, protein_group) protein rows from precursor records (see the comment below)."""
+    # protein aggregation per (run, protein_group). Protein-level abundance = SUM of the protein's
+    # precursor intensities (DIA-NN/Spectronaut give no per-PG quant column here, but each precursor
+    # carries Precursor.Quantity + protein_group, so summing is a faithful protein-quant proxy).
+    # Without this, delimp_proteins.intensity stays NULL and the species page's most/least-abundant
+    # are empty.
+    prot = {}
+    for x in recs:
+        # A missing protein group (float NaN, "nan", "None", "") is NOT a protein: it used to reach
+        # here as the literal text "nan" (a pandas NaN is truthy, so `or ""` never fired) and became
+        # a bogus delimp_proteins row. delimp_proteins.protein_group is NOT NULL, so the row is
+        # skipped; the precursor itself keeps protein_group NULL (see _pg below).
+        _pgv = _clean_text(x.get("protein_group"))
+        if _pgv is None:
+            continue
+        pgk = (str(x["run"]), _pgv)
+        a = prot.setdefault(pgk, {"peps": set(), "n": 0, "gene": _clean_gene(x.get("gene")),
+                                  "int": 0.0, "nint": 0.0, "has_int": False, "pgq": None})
+        # prefer a REAL gene symbol over a junk/None one (reports often have 'NaN'/'' for some rows)
+        if a["gene"] is None:
+            a["gene"] = _clean_gene(x.get("gene"))
+        a["peps"].add(x["stripped_seq"]); a["n"] += 1
+        iv = _flt(x.get("intensity"))
+        if iv is not None:
+            a["int"] += iv; a["has_int"] = True
+        nv = _flt(x.get("normalized_intensity"))
+        if nv is not None:
+            a["nint"] += nv
+        # protein-group q-value = best (min) PG q-value across the protein's precursors. The report
+        # carries pg_q_value per precursor; without capturing it here delimp_proteins.pg_q_value
+        # stays NULL (protein_detail's "Best PG q" + any PG-FDR filtering had nothing to read).
+        qv = _flt(x.get("pg_q_value"))
+        if qv is not None:
+            a["pgq"] = qv if a["pgq"] is None else min(a["pgq"], qv)
+        # DIA-NN's own protein- and gene-level numbers (MaxLFQ + the protein FDR family), which
+        # FRAN discarded entirely until 2026-09-23. FIRST NON-NULL WINS, not min/sum: each of
+        # these was measured constant within (run, protein_group) -- or within (run, genes), with
+        # genes itself functionally determined by protein_group -- in 100.000% of groups across
+        # six reports, so every precursor of this group carries the SAME value and aggregating
+        # would only invent a number DIA-NN did not write. Unlike `intensity` above, MaxLFQ is
+        # already a protein-level quant: summing it over precursors would multiply it by the
+        # precursor count.
+        for _k in _PROTEIN_LEVEL_COLS:
+            if a.get(_k) is None:
+                a[_k] = _flt(x.get(_k))
+    return prot
+
+
 def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
     # STALENESS GATE, before the report is even located -- see _stale_ingest_files for why it is not
     # down at the record_run site. record_run still stamps the result at the point it always did.
@@ -567,43 +617,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         # exactly what a Spectronaut BGS-schema export looks like. Silence is not evidence of an
         # Orbitrap, so ask the filesystem before falling back (see _platform_from_disk).
         platform = _platform_from_disk(output_dir, runs) or "orbitrap"
-    # protein aggregation per (run, protein_group). Protein-level abundance = SUM of the protein's
-    # precursor intensities (DIA-NN/Spectronaut give no per-PG quant column here, but each precursor
-    # carries Precursor.Quantity + protein_group, so summing is a faithful protein-quant proxy).
-    # Without this, delimp_proteins.intensity stays NULL and the species page's most/least-abundant
-    # are empty.
-    prot = {}
-    for x in recs:
-        pgk = (str(x["run"]), str(x.get("protein_group") or ""))
-        a = prot.setdefault(pgk, {"peps": set(), "n": 0, "gene": _clean_gene(x.get("gene")),
-                                  "int": 0.0, "nint": 0.0, "has_int": False, "pgq": None})
-        # prefer a REAL gene symbol over a junk/None one (reports often have 'NaN'/'' for some rows)
-        if a["gene"] is None:
-            a["gene"] = _clean_gene(x.get("gene"))
-        a["peps"].add(x["stripped_seq"]); a["n"] += 1
-        iv = _flt(x.get("intensity"))
-        if iv is not None:
-            a["int"] += iv; a["has_int"] = True
-        nv = _flt(x.get("normalized_intensity"))
-        if nv is not None:
-            a["nint"] += nv
-        # protein-group q-value = best (min) PG q-value across the protein's precursors. The report
-        # carries pg_q_value per precursor; without capturing it here delimp_proteins.pg_q_value
-        # stays NULL (protein_detail's "Best PG q" + any PG-FDR filtering had nothing to read).
-        qv = _flt(x.get("pg_q_value"))
-        if qv is not None:
-            a["pgq"] = qv if a["pgq"] is None else min(a["pgq"], qv)
-        # DIA-NN's own protein- and gene-level numbers (MaxLFQ + the protein FDR family), which
-        # FRAN discarded entirely until 2026-09-23. FIRST NON-NULL WINS, not min/sum: each of
-        # these was measured constant within (run, protein_group) -- or within (run, genes), with
-        # genes itself functionally determined by protein_group -- in 100.000% of groups across
-        # six reports, so every precursor of this group carries the SAME value and aggregating
-        # would only invent a number DIA-NN did not write. Unlike `intensity` above, MaxLFQ is
-        # already a protein-level quant: summing it over precursors would multiply it by the
-        # precursor count.
-        for _k in _PROTEIN_LEVEL_COLS:
-            if a.get(_k) is None:
-                a[_k] = _flt(x.get(_k))
+    prot = _aggregate_proteins(recs)
     # PROTEIN GROUPS vs PROTEINS (2026-07-27). Spectronaut reports both and they are NOT the same:
     # a protein group's label is the ';'-joined accessions of its members ("E2RE03;J9P669"), so 635
     # groups can expand to 1,350 proteins. FRAN stored only the group count — in a column named
@@ -979,10 +993,23 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                            ingested_schema_version)
                            VALUES (%s,%s,%s,%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s, %s)
                            ON CONFLICT (raw_path) DO UPDATE SET
-                           raw_name_anonymized=EXCLUDED.raw_name_anonymized,
-                           acquisition_method=EXCLUDED.acquisition_method,
-                           samples_per_day=EXCLUDED.samples_per_day,
-                           gradient_minutes=EXCLUDED.gradient_minutes,
+                           raw_name_anonymized=COALESCE(EXCLUDED.raw_name_anonymized, raw_files.raw_name_anonymized),
+                           -- A value SNIFFED from the raw wins; otherwise keep what is already stored;
+                           -- the engine/platform GUESS in EXCLUDED is the last resort. A plain
+                           -- EXCLUDED overwrite let a later Spectronaut re-ingest (no header
+                           -- access -> guess) replace a good sniffed value.
+                           -- A stored value that CONTRADICTS the platform (a diaPASEF label on an Orbitrap
+                           -- / .raw run: the ingest's old platform guess) must not survive: it is
+                           -- dropped so the new guess is taken. The table cannot tell a sniffed value
+                           -- from a guess, so this is the one case we can prove is wrong.
+                           acquisition_method=COALESCE(%s,
+                               CASE WHEN position('pasef' in lower(raw_files.acquisition_method)) > 0
+                                         AND (EXCLUDED.platform = 'orbitrap'
+                                              OR right(lower(raw_files.raw_path), 4) = '.raw')
+                                    THEN NULL ELSE raw_files.acquisition_method END,
+                               EXCLUDED.acquisition_method),
+                           samples_per_day=COALESCE(EXCLUDED.samples_per_day, raw_files.samples_per_day),
+                           gradient_minutes=COALESCE(EXCLUDED.gradient_minutes, raw_files.gradient_minutes),
                            instrument_model=COALESCE(EXCLUDED.instrument_model, raw_files.instrument_model),
                            instrument_serial=COALESCE(EXCLUDED.instrument_serial, raw_files.instrument_serial),
                            acquisition_date=COALESCE(EXCLUDED.acquisition_date, raw_files.acquisition_date),
@@ -998,10 +1025,12 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
                          _imodel, _iserial, md.get("acquisition_date"),
                          md.get("mass_range_min"), md.get("mass_range_max"), md.get("mobility_min"), md.get("mobility_max"),
                          md.get("n_ms1_frames"), md.get("n_ms2_frames"), md.get("file_size_bytes"),
-                         md.get("instrument_metadata_json"), SCHEMA_VERSION))
+                         md.get("instrument_metadata_json"), SCHEMA_VERSION,
+                         md.get("acquisition_method")))   # the %s in the ON CONFLICT clause
             cur.execute("""INSERT INTO delimp_sample_metadata (raw_path,sample_type,organism_taxon_id,organism_name,ingested_schema_version)
                            VALUES (%s,'study_sample',%s,%s,%s) ON CONFLICT (raw_path) DO UPDATE
-                           SET organism_taxon_id=EXCLUDED.organism_taxon_id, organism_name=EXCLUDED.organism_name""",
+                           SET organism_taxon_id=COALESCE(EXCLUDED.organism_taxon_id, delimp_sample_metadata.organism_taxon_id),
+                               organism_name=COALESCE(EXCLUDED.organism_name, delimp_sample_metadata.organism_name)""",
                         (rp, taxon, organism_name, SCHEMA_VERSION))
             cur.execute("INSERT INTO search_raw_files (search_id,raw_path,n_precursors) VALUES (%s,%s,%s)",
                         (search_id, rp, sum(1 for x in recs if str(x["run"]) == run)))
@@ -1017,21 +1046,30 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         if len(_prot_extra) != len(_PROTEIN_LEVEL_COLS):
             print(f"  [proteins] {len(_PROTEIN_LEVEL_COLS) - len(_prot_extra)} DIA-NN protein "
                   f"column(s) absent; run ingest/migrate_diann_columns.py --apply to record them")
+        # contaminant_class (contaminant / mixed / suspected / sample): written only once the migration
+        # 2026-11-24_proteins_contaminant_class.sql exists, so ingest works before and after it.
+        cur.execute("""SELECT 1 FROM information_schema.columns
+                        WHERE table_name='delimp_proteins' AND column_name='contaminant_class'""")
+        _have_cc = cur.fetchone() is not None
         psycopg2.extras.execute_values(cur,
             "INSERT INTO delimp_proteins (search_id,raw_path,protein_group,gene,n_unique_peptides,"
             "n_precursors,intensity,normalized_intensity,pg_q_value,is_contaminant,"
-            "ingested_schema_version" + "".join("," + c for c in _prot_extra) + ") VALUES %s",
-            [(search_id, raw_paths[k[0]], k[1] or "UNKNOWN", a["gene"], len(a["peps"]), a["n"],
+            "ingested_schema_version" + "".join("," + c for c in _prot_extra)
+            + (",contaminant_class" if _have_cc else "") + ") VALUES %s",
+            [(search_id, raw_paths[k[0]], k[1], a["gene"], len(a["peps"]), a["n"],
               (a["int"] if a["has_int"] else None), (a["nint"] or None), a["pgq"],
-              bool(re.search(r"KRT|keratin|cont_|contaminant", str(k[1]) + str(a["gene"]), re.I)), SCHEMA_VERSION,
-              *(a.get(c) for c in _prot_extra))
+              # Contaminant-library accession prefix decides 'contaminant' / 'mixed'; the old name
+              # rule survives only as 'suspected' (no library accession, name matches), so
+              # is_contaminant is TRUE for 'contaminant' and 'suspected' -- see organism.py.
+              is_contaminant_flag(k[1], a["gene"]), SCHEMA_VERSION,
+              *(a.get(c) for c in _prot_extra),
+              *((contaminant_class(k[1], a["gene"]),) if _have_cc else ()))
              for k, a in prot.items()], page_size=2000)
         # protein_group on each precursor = the peptide<->protein link (enables exact, fast
         # coverage + per-protein quant in the app; see FRAN_REINGEST_AUDIT.md). Included only when
         # the column exists (write_pg) — kept LAST before ingested_schema_version in tuple/header.
         def _pg(x):
-            v = x.get("protein_group")
-            return str(v) if v else None
+            return _clean_text(x.get("protein_group"))
         if recs:
             _warn_unmapped_record_keys(recs[0])
         # The DIA-NN block below must stay in the same order as the matching run of names in

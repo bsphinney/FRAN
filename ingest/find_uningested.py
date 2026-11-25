@@ -137,6 +137,12 @@ def known_keys(conn):
             names |= name_keys(name)
         if od:
             names |= name_keys(norm_path(od).rsplit("/", 1)[-1])
+            # An experiment saved as a folder holding a directory literally named ".sne" is recorded
+            # as <folder>/.sne: its last component yields no name at all, so the experiment's own
+            # name (the folder) never entered the index and its archived report looked un-ingested.
+            parts = norm_path(od).rsplit("/", 2)
+            if parts[-1] == ".sne" and len(parts) > 1:
+                names |= name_keys(parts[-2])
     return paths, names, bases
 
 
