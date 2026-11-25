@@ -38,7 +38,7 @@ rc=$?
 # Flinders. Its own state and its own lane folder; one lane at a time, no cap by default
 # (the XIC dbs waiting on the share are large, and are deleted as each lane is registered).
 echo "===== spectronaut XIC lanes $(date -Is) ====="
-"$PY" -u fill_spectronaut_xic_lanes.py --apply --max "${FRAN_SN_XIC_MAX:-0}"
+"$PY" -u fill_spectronaut_xic_lanes.py --apply --max "${FRAN_SN_XIC_MAX:-0}" --budget-hours "${FRAN_SN_XIC_BUDGET_H:-8}"
 rc2=$?
 [ "$rc" -ne 0 ] && exit "$rc"
 exit "$rc2"

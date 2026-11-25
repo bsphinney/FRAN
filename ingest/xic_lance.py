@@ -174,9 +174,12 @@ def dataset_md5(ds, batch_rows: int = MD5_BATCH_ROWS) -> str:
         # A full Spectronaut lane (fill_spectronaut_xic_lanes.build_full) carries one more column,
         # `identified`; it is part of that lane's content and of its digest. Lanes without it
         # digest exactly as before.
-        target = SCHEMA_FULL if "identified" in t.schema.names else SCHEMA
-        if t.schema != target:
-            t = t.cast(target)
+        if "identified" in t.schema.names:
+            # Always cast: these lanes carry field metadata (compression), which Schema equality
+            # ignores but the IPC stream would include.
+            t = t.cast(SCHEMA_FULL)
+        elif t.schema != SCHEMA:
+            t = t.cast(SCHEMA)
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, t.schema) as w:
             w.write_table(t)
@@ -261,6 +264,8 @@ def verify(lance_path, expected_md5, max_bytes: int = LEGACY_VERIFY_MAX_BYTES) -
     ds = lance.dataset(lance_path)
     if dataset_md5(ds) == expected_md5:
         return True
+    if "identified" in ds.schema.names:
+        return False            # a full lane never had the pre-1.2.0 digest: a mismatch is a mismatch
     # Only pre-1.2.0 rows get this far. Size the whole-table read before attempting it. On-disk
     # bytes are the cheap proxy; they over-count a dataset that still holds superseded versions,
     # which again errs toward refusing rather than dying.
