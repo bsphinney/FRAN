@@ -50,6 +50,8 @@ LOCK = r"C:\fran_sne_one\win_ingest_all.lock"
 TIMEOUT_CODE = 7     # sne_one: the Spectronaut export ran past its limit. About THAT experiment, not the setup.
 STOP_CODES = {5: "the report archive on the share is not reachable", 6: "the export drive is nearly full"}
 MAX_IN_A_ROW = 3
+MAX_TIMEOUTS_IN_A_ROW = 4   # each can cost 12 hours: four running is a hung Spectronaut, not four big experiments
+ABOUT_THE_EXPERIMENT = (3, 4, 8)   # exits that say nothing about whether this computer is set up right
 # Options that may be switched on for every experiment from the share, without touching this
 # computer: one per line in win_ingest_options.txt beside this script. Anything else is ignored.
 ALLOWED_OPTIONS = ("--no-export-xics", "--keep-local", "--no-xic-archive")
@@ -154,7 +156,7 @@ def plan(items, limit=0):
 def run_all(todo, run_one, say=log, status=write_status, first_failure_stops=True):
     """Ingest each experiment with run_one(item) -> exit code. Returns (results, stop reason or None).
     Stops on: a STOP_CODES exit, the first experiment failing, or MAX_IN_A_ROW failures in a row."""
-    results, in_a_row, done_ok, stop = [], 0, 0, None
+    results, in_a_row, done_ok, stop, timeouts = [], 0, 0, None, 0
     for i, it in enumerate(todo, 1):
         gb = it["bytes"] / 1e9 if it["bytes"] >= 0 else 0
         say(f"[{i}/{len(todo)}] START {it['stem']} ({gb:.1f} GB) {it['path']}")
@@ -170,15 +172,19 @@ def run_all(todo, run_one, say=log, status=write_status, first_failure_stops=Tru
         ok = rc == 0
         results.append({"path": it["path"], "name": it["stem"], "rc": rc, "minutes": round(mins, 1)})
         say(f"[{i}/{len(todo)}] {'OK    ' if ok else 'FAILED'} rc={rc} {mins:.0f} min  {it['stem']}")
+        timeouts = timeouts + 1 if rc == TIMEOUT_CODE else 0
         if ok:
             done_ok += 1; in_a_row = 0
             continue
+        if timeouts >= MAX_TIMEOUTS_IN_A_ROW:
+            stop = f"{MAX_TIMEOUTS_IN_A_ROW} Spectronaut exports in a row ran past their time limit"
+            break
         if rc == TIMEOUT_CODE and done_ok:
             continue            # one slow experiment: recorded as failed, never a reason to stop the run
         in_a_row += 1
         if rc in STOP_CODES:
             stop = STOP_CODES[rc]
-        elif done_ok == 0 and first_failure_stops:
+        elif done_ok == 0 and first_failure_stops and rc not in ABOUT_THE_EXPERIMENT:
             stop = "the first experiment failed, so the setup is suspect, not the experiment"
         elif in_a_row >= MAX_IN_A_ROW:
             stop = f"{MAX_IN_A_ROW} experiments failed in a row"
@@ -239,7 +245,10 @@ def main():
     back_results = []
     if not stop and back:
         log(f"=== step 4: {len(back)} experiments already in FRAN: archive a missing report, export/copy XICs ===")
-        back_results, stop = run_all(back, run_one, first_failure_stops=not results)
+        def backfill_one(it):
+            return subprocess.run([sys.executable, sne_one, "--sne", it["path"], f"--name={it['stem']}",
+                                   "--backfill-only", *opts]).returncode
+        back_results, stop = run_all(back, backfill_one, first_failure_stops=not results)
         nb = sum(1 for r in back_results if r["rc"] == 0)
         log(f"=== step 4 {'STOPPED: ' + stop if stop else 'finished'}: {nb} ok, {len(back_results) - nb} failed, "
             f"{len(back) - len(back_results)} not attempted ===")
@@ -253,7 +262,7 @@ def main():
                  n_total=len(todo), n_done=len(results), n_ok=n_ok, n_failed=len(failed), failed=failed,
                  backfill_total=len(back), backfill_done=len(back_results),
                  backfill_failed=[r for r in back_results if r["rc"] != 0])
-    return 0 if not stop and not failed else 2
+    return 0 if not stop and not failed and all(r["rc"] in (0, 8) for r in back_results) else 2
 
 
 if __name__ == "__main__":

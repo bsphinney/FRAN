@@ -386,8 +386,8 @@ def test_sne_gb_of_a_file_a_folder_and_nothing(tmp_path):
 
 
 def test_timeouts_at_the_end_do_not_stop_the_run():
-    res, stop = _run([0, 0, 7, 7, 7, 7, 0])
-    assert len(res) == 7 and stop is None
+    res, stop = _run([0, 0, 7, 7, 7, 0])
+    assert len(res) == 6 and stop is None
     res, stop = _run([7, 0])                       # nothing has worked yet: still stop
     assert len(res) == 1 and stop
 
@@ -416,3 +416,23 @@ def test_backfill_plan_takes_known_experiments_once_each_smallest_first():
              dict(status="QC_OR_TEST", stem="D", bytes=1, path="S:/D.sne")]
     got = wa.backfill_plan(items)
     assert [(i["stem"], i["path"]) for i in got] == [("B", "S:/B.sne"), ("A", "B:/A.sne")]
+
+
+def test_same_path_is_found_whatever_the_case_or_slashes():
+    rows = [("s1", r"b:\Proj\My Exp.sne", "x"), ("s2", None, "y")]
+    assert sne_one.find_same_path(r"B:/proj/my exp.sne", rows) == "s1"
+    assert sne_one.find_same_path(r"B:\proj\other.sne", rows) is None
+
+
+def test_has_xic_sees_a_report_archived_flat(tmp_path):
+    root = tmp_path / "FRAN_reports"; d = root / "My Exp" / "xic_dbs"; d.mkdir(parents=True)
+    assert not sne_one.flinders_has_xic("My Exp.sne", str(root))
+    (d / "COMPLETE.txt").write_text("1 files")
+    assert sne_one.flinders_has_xic("My Exp.sne", str(root))
+
+
+def test_four_timeouts_in_a_row_stop_the_run_and_backfill_misses_do_not():
+    res, stop = _run([0, 7, 7, 7, 7, 0])
+    assert len(res) == 5 and "time limit" in stop
+    res, stop = _run([8, 4, 0, 0])                 # first results say nothing about the setup
+    assert len(res) == 4 and stop is None
