@@ -77,6 +77,9 @@ ALTER TABLE delimp_xic_lane ADD COLUMN IF NOT EXISTS writer_version TEXT;
 """
 
 
+SCHEMA_FULL = pa.schema(list(SCHEMA) + [pa.field("identified", pa.bool_())])
+
+
 def content_md5(table: pa.Table) -> str:
     """See spectrum_lance.content_md5 — combine_chunks() is required so the checksum doesn't
     depend on how Lance happens to chunk the data on read.
@@ -168,8 +171,12 @@ def dataset_md5(ds, batch_rows: int = MD5_BATCH_ROWS) -> str:
     h = hashlib.md5()
     for t in _fixed_tables(ds.to_batches(batch_size=batch_rows), batch_rows):
         # Lance can hand back a schema carrying its own metadata; the digest must not depend on it.
-        if t.schema != SCHEMA:
-            t = t.cast(SCHEMA)
+        # A full Spectronaut lane (fill_spectronaut_xic_lanes.build_full) carries one more column,
+        # `identified`; it is part of that lane's content and of its digest. Lanes without it
+        # digest exactly as before.
+        target = SCHEMA_FULL if "identified" in t.schema.names else SCHEMA
+        if t.schema != target:
+            t = t.cast(target)
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, t.schema) as w:
             w.write_table(t)

@@ -9,9 +9,16 @@ live on the Windows computers, and nothing brought them to Hive. sne_one.py now 
 
 next to the archived report, and this job turns each complete set into a lane.
 
+WHAT IS IN THE LANE: EVERY trace in the XIC dbs (build_full), not only the identified ones. Each db
+holds a trace for every library precursor in every run, plus decoys; `identified` is true for the
+rows that are targets at q <= 0.01 in that run (what xic_lance.process_one keeps, about a third on
+the one large set measured). A precursor not in the report for a run has no rt/im/q_value there;
+one in the report for no run at all has no sequence either, only its xicdbid. Compressed with zstd.
+The site reads only DIA-NN chromatogram lanes (app/observed_xic.py), so it never sees these.
+
 WHAT IT DOES, per Spectronaut search with no row in delimp_xic_lane:
   write   an archived report has xic_dbs/COMPLETE.txt beside it -> xic_lance.process_one, in a child
-          process (one at a time: the writer holds the whole table in memory), into
+          process (one at a time), a chunk of precursors at a time, into
           <xic_lance>/.incoming.<job>/, then RENAMED to <name>__<sid8>.xic.lance and registered.
   adopt   the dataset is already at its final path but not in the registry (the job was preempted
           between the rename and the registration): it is re-read and registered, never rewritten.
@@ -75,17 +82,120 @@ def free_xic_dbs(xic_dir, lance_path, root=None):
     return n, b / 1e9
 
 
+CHUNK = 20000          # precursors per write: one db can hold millions of traces
+_RUN_ONLY = ("run", "rt", "im", "q_value")      # measured in ONE run; never borrowed from another
+
+
+def full_schema():
+    """xic_lance.SCHEMA plus `identified`, zstd on every column (measured 1.6-2.1x smaller, 2026-11-25)."""
+    import pyarrow as pa
+    import xic_lance as xln
+    md = {"lance-encoding:compression": "zstd"}
+
+    def deep(typ):
+        if pa.types.is_list(typ):
+            return pa.list_(pa.field(typ.value_field.name, deep(typ.value_type), metadata=md))
+        return typ
+    fields = [pa.field(f.name, deep(f.type), metadata=md) for f in xln.SCHEMA]
+    return pa.schema(fields + [pa.field("identified", pa.bool_(), metadata=md)])
+
+
+def full_row(fg, traces, run, db, rec, ident, sid, name):
+    """One lane row for one precursor in one run. rec: this run's report row or None. ident: the
+    precursor's run-independent identity from any run of the report, or None (never in the report:
+    a decoy, or a library precursor identified nowhere)."""
+    import xic_lance as xln
+    src = rec or ident or {}
+    own = rec or {}
+    q = xln._num(own.get("q_value"))
+    decoy = xln._truthy(src.get("is_decoy"))
+    ms1 = sum(1 for t in traces if t["ms_level"] == 1)
+    return {
+        "search_id": str(sid), "search_name": name, "raw_path": db, "run": run, "xicdbid": fg,
+        "stripped_seq": src.get("stripped_seq"), "modified_seq": src.get("modified_seq"),
+        "charge": int(xln._num(src.get("charge")) or 0), "precursor_mz": xln._num(src.get("precursor_mz")),
+        "rt": xln._num(own.get("rt")), "im": xln._num(own.get("im")), "q_value": q,
+        "is_decoy": decoy, "protein_group": src.get("protein_group"), "genes": src.get("genes"),
+        "n_traces": len(traces), "n_ms1": ms1, "n_ms2": len(traces) - ms1,
+        "trace_label": [t["label"] for t in traces], "trace_ms_level": [t["ms_level"] for t in traces],
+        "trace_rank": [t["rank"] for t in traces], "trace_rt": [t["rt"] for t in traces],
+        "trace_intensity": [t["i"] for t in traces],
+        "identified": bool(rec is not None and q is not None and q <= 0.01 and not decoy),
+    }
+
+
+def build_full(report, xic_dir, lance_path, sid, name):
+    """EVERY trace in the XIC dbs -> one Lance dataset, written a chunk at a time. Unlike
+    xic_lance.process_one (targets at q <= 0.01 only) nothing is dropped: `identified` marks the
+    rows process_one would have kept. Returns dict(n_rows, n_identified, n_traces, dbs, skipped)."""
+    import glob
+    import sqlite3
+    import lance
+    import pyarrow as pa
+    import xic_lance as xln
+    idx, err = xln.report_index(report, q_max=float("inf"), keep_decoys=True)
+    if err:
+        raise ValueError(err)
+    ident = {}
+    for per_run in idx.values():
+        for fg, r in per_run.items():
+            ident.setdefault(fg, {k: v for k, v in r.items() if k not in _RUN_ONLY})
+    dbs = sorted(d for d in glob.glob(os.path.join(xic_dir, "*.xic.db")) + glob.glob(os.path.join(xic_dir, "*.sqlite"))
+                 if not os.path.basename(d).startswith("._"))
+    if not dbs:
+        raise ValueError(f"no *.xic.db / *.sqlite under {xic_dir}")
+    schema = full_schema()
+    st = dict(n_rows=0, n_identified=0, n_traces=0, dbs=len(dbs), skipped=[], runs_not_in_report=[])
+    wrote = [False]
+
+    def flush(rows):
+        if rows:
+            lance.write_dataset(pa.Table.from_pylist(rows, schema=schema), lance_path,
+                                mode="append" if wrote[0] else "create")
+            wrote[0] = True
+            rows.clear()
+
+    for db in dbs:
+        run = os.path.basename(db)
+        for suf in (".xic.db", ".sqlite"):
+            if run.endswith(suf):
+                run = run[: -len(suf)]
+                break
+        idx_run = idx.get(run)
+        if idx_run is None:
+            st["runs_not_in_report"].append(run)
+            idx_run = {}
+        rows = []
+        try:
+            for fg, traces in xln.read_xic_db(db, None):
+                row = full_row(fg, traces, run, db, idx_run.get(fg), ident.get(fg), sid, name)
+                rows.append(row)
+                st["n_rows"] += 1; st["n_traces"] += len(traces); st["n_identified"] += row["identified"]
+                if len(rows) >= CHUNK:
+                    flush(rows)
+            flush(rows)
+        except (sqlite3.Error, OSError) as e:
+            # A db that cannot be read to the end is not half-kept: a lane missing part of a run
+            # must not look complete. Fail the search; it is retried, then parked for a person.
+            raise RuntimeError(f"unreadable XIC db {os.path.basename(db)}: {str(e)[:120]}")
+    if not wrote[0]:
+        raise RuntimeError("the XIC dbs hold no traces")
+    return st
+
+
 def describe(lance_path, sid):
     """Re-read a dataset at its final path: what register() needs, and proof it opens."""
     import lance
     import pyarrow.compute as pc
     import xic_lance as xln
     ds = lance.dataset(lance_path)
-    t = ds.to_table(columns=["search_id", "n_traces", "run"])
+    cols = ["search_id", "n_traces", "run"] + (["identified"] if "identified" in ds.schema.names else [])
+    t = ds.to_table(columns=cols)
     sids = set(t.column("search_id").unique().to_pylist())
     if not t.num_rows or sids != {str(sid)}:
         raise RuntimeError(f"{lance_path}: {t.num_rows} rows, search ids {sorted(map(str, sids))[:3]}, expected {sid}")
     return dict(ok=True, lance_path=lance_path, n_prec=t.num_rows, n_traces=int(pc.sum(t.column("n_traces")).as_py()),
+                n_identified=(int(pc.sum(t.column("identified")).as_py() or 0) if "identified" in cols else None),
                 md5=xln.dataset_md5(ds), version=int(ds.version),
                 runs=sorted(F.run_set(t.column("run").unique().to_pylist())))
 
@@ -97,7 +207,7 @@ def xic_set_for(report, isfile=os.path.isfile):
 
 
 def final_path(search_name, sid, root=None):
-    return os.path.join(root or XIC_LANCE, f"{F._safe(F._strip_ts(search_name or 'search'))}__{str(sid)[:8]}.xic.lance")
+    return os.path.join(root or XIC_LANCE, f"{F._safe(F._strip_ts(search_name or 'search'))}__{str(sid)[:8]}.full.xic.lance")
 
 
 def plan(searches, state, find_reports=F.find_reports, has_set=xic_set_for, exists=os.path.lexists):
@@ -126,7 +236,6 @@ def plan(searches, state, find_reports=F.find_reports, has_set=xic_set_for, exis
 def child(spec, jid):
     """Build one lane in this job's incoming folder and rename it into place (or adopt one already
     there), then re-read it. spec: JSON of a plan() job plus corpus_runs. Prints CHILD_RESULT."""
-    import xic_lance as xln
     j = json.loads(spec)
     report, xic_dir, out, sid, name = j["report"], j["xic_dir"], j["out"], j["sid"], j["name"]
     inc = os.path.join(os.path.dirname(out), f".incoming.{jid}")
@@ -134,9 +243,14 @@ def child(spec, jid):
     res = dict(ok=False)
     try:
         if not os.path.lexists(out):
-            lpath, n_prec, n_tr, md5, ver = xln.process_one(report, xic_dir, inc, search_id=sid, search_name=name)
-            if not lpath or not n_prec:
-                raise RuntimeError("no traces matched the report's precursors")
+            lpath = os.path.join(inc, os.path.basename(out))
+            st = build_full(report, xic_dir, lpath, sid, name)
+            if not st["n_identified"]:
+                raise RuntimeError(f"none of {st['n_rows']:,} precursors in the XIC dbs is identified in the "
+                                   f"report: the wrong report for these dbs?")
+            if st["runs_not_in_report"]:
+                print(f"  [xic] {len(st['runs_not_in_report'])} db(s) match no run of the report: "
+                      f"{st['runs_not_in_report'][:3]}", flush=True)
             # The archived report is found by NAME. A lane whose runs the search never had was built
             # from another analysis of the same name: do not keep it.
             import lance
@@ -245,7 +359,8 @@ def main():
                     freed = f"{nf} XIC dbs removed from the share ({gb:.1f} GB)"
                 except OSError as e:
                     freed = f"XIC dbs NOT removed ({e!r})"
-            print(f"--- {j['name']} registered: {r['n_prec']:,} of {j['n']:,} precursors, "
+            print(f"--- {j['name']} registered: {r['n_prec']:,} precursor-run rows, {r.get('n_identified') or 0:,} "
+                  f"identified (the search has {j['n']:,}), "
                   f"{r['n_traces']:,} traces, {int(time.time()-t0)}s; {freed}", flush=True)
         else:
             n_fail += 1

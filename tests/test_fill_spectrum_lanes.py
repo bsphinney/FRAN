@@ -744,7 +744,7 @@ def test_xic_plan_writes_only_complete_sets_at_a_path_with_the_search_id():
     jobs, skipped = X.plan(searches, {"cccccccc-3": {"attempts": 3}}, find_reports=find, has_set=has,
                            exists=lambda p: "Exp_D" in p)
     assert [(j["sid"], j["adopt"]) for j in jobs] == [("aaaaaaaa-1", False), ("dddddddd-4", True)]
-    assert jobs[0]["out"].endswith("/Exp_A__aaaaaaaa.xic.lance")
+    assert jobs[0]["out"].endswith("/Exp_A__aaaaaaaa.full.xic.lance")
     assert skipped == {"no_xic_dbs_on_flinders": 1, "parked": 1}
 
 
@@ -773,3 +773,38 @@ def test_free_xic_dbs_only_inside_a_complete_archived_set():
     n, gb = X.free_xic_dbs(d, "/l/x.lance", root)
     assert n == 2 and sorted(os.listdir(d)) == ["COMPLETE.txt", "LANE_BUILT.txt", "keep.txt"]
     assert os.listdir(other) and "a.xic.db" in os.listdir(other)
+
+
+def test_full_row_never_borrows_another_runs_measurements():
+    import fill_spectronaut_xic_lanes as X
+    tr = [dict(label="y4", ms_level=2, rank=1, rt=[1.0, 1.1], i=[5.0, 6.0]), dict(label="M", ms_level=1, rank=0, rt=[1.0], i=[9.0])]
+    rec = dict(stripped_seq="PEPTIDEK", charge=2, precursor_mz=450.2, rt=12.5, im=0.9, q_value=0.001, is_decoy="False")
+    ident = {k: v for k, v in rec.items() if k not in X._RUN_ONLY}
+    a = X.full_row(7, tr, "run1", "/x/run1.xic.db", rec, ident, "sid", "n")
+    assert a["identified"] and a["rt"] == 12.5 and a["n_ms1"] == 1 and a["n_ms2"] == 1
+    b = X.full_row(7, tr, "run2", "/x/run2.xic.db", None, ident, "sid", "n")        # not identified in run2
+    assert not b["identified"] and b["stripped_seq"] == "PEPTIDEK" and b["rt"] is None and b["q_value"] is None
+    c = X.full_row(8, tr, "run2", "/x/run2.xic.db", None, None, "sid", "n")         # never in the report
+    assert not c["identified"] and c["stripped_seq"] is None and c["xicdbid"] == 8
+    d = X.full_row(7, tr, "run1", "/x", dict(rec, q_value=0.2), ident, "sid", "n")
+    e = X.full_row(7, tr, "run1", "/x", dict(rec, is_decoy="True"), ident, "sid", "n")
+    assert not d["identified"] and d["q_value"] == 0.2 and not e["identified"] and e["is_decoy"]
+
+
+def test_full_lane_round_trip_describe_and_verify():
+    import pytest
+    lance = pytest.importorskip("lance")
+    import pyarrow as pa
+    import fill_spectronaut_xic_lanes as X
+    import xic_lance as xln
+    tr = [dict(label="y4", ms_level=2, rank=1, rt=[1.0, 1.1], i=[5.0, 6.0])]
+    rec = dict(stripped_seq="PEPTIDEK", charge=2, precursor_mz=450.2, rt=12.5, im=0.9, q_value=0.001, is_decoy="False")
+    rows = [X.full_row(i, tr, "run1", "/x/run1.xic.db", rec if i % 3 == 0 else None, None, "sid", "n") for i in range(300)]
+    p = os.path.join(tempfile.mkdtemp(), "a.full.xic.lance")
+    lance.write_dataset(pa.Table.from_pylist(rows[:200], schema=X.full_schema()), p, mode="create")
+    lance.write_dataset(pa.Table.from_pylist(rows[200:], schema=X.full_schema()), p, mode="append")
+    r = X.describe(p, "sid")
+    assert (r["n_prec"], r["n_identified"], r["n_traces"], r["runs"]) == (300, 100, 300, ["run1"])
+    assert xln.verify(p, r["md5"])
+    with pytest.raises(RuntimeError):
+        X.describe(p, "another-search")
