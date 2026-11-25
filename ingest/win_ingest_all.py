@@ -42,6 +42,19 @@ import node_report  # noqa: E402
 LOCK = r"C:\fran_sne_one\win_ingest_all.lock"
 STOP_CODES = {5: "the report archive on the share is not reachable", 6: "the export drive is nearly full"}
 MAX_IN_A_ROW = 3
+# Options that may be switched on for every experiment from the share, without touching this
+# computer: one per line in win_ingest_options.txt beside this script. Anything else is ignored.
+ALLOWED_OPTIONS = ("--export-xics", "--keep-local", "--no-xic-archive")
+
+
+def extra_options(path=None):
+    path = path or os.path.join(HERE, "win_ingest_options.txt")
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            want = [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
+    except OSError:
+        return []
+    return [o for o in ALLOWED_OPTIONS if o in want]
 
 
 def log(m):
@@ -183,8 +196,12 @@ def main():
 
     sne_one = os.path.join(HERE, "sne_one.py")
 
+    opts = extra_options()
+    if opts:
+        log("options from win_ingest_options.txt: " + " ".join(opts))
+
     def run_one(it):
-        return subprocess.run([sys.executable, sne_one, "--sne", it["path"], f"--name={it['stem']}"]).returncode
+        return subprocess.run([sys.executable, sne_one, "--sne", it["path"], f"--name={it['stem']}", *opts]).returncode
 
     results, stop = run_all(todo, run_one)
     n_ok = sum(1 for r in results if r["rc"] == 0)

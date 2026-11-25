@@ -4,6 +4,8 @@
   2. corpus_ingest --bulk-copy, keyed on the .sne path (--output-dir), so a re-run replaces
   3. COPY THE REPORT TO FLINDERS (<share>\\Data\\FRAN_reports\\<sne name>\\<export folder>\\)
      and, once the copy is verified, delete the export from C: (logs are kept)
+     and the XIC dbs (an _XIC-DBs folder beside the .sne) to .../<export folder>/xic_dbs/, from
+     which Hive builds the chromatogram lane
   4. sne_xic_ingest, when an _XIC-DBs folder sits beside the .sne
 
   py sne_one.py --sne "<path.sne>" --name "<search_name>" [--xic-dir "<dir>"] [--batch-size N]
@@ -96,6 +98,68 @@ def pick_report(out, since):
     reps = [p for p in glob.glob(os.path.join(out, "**", "*Report_FRAN*.tsv"), recursive=True)
             if os.path.getsize(p) > 0 and os.path.getmtime(p) >= since - 5]
     return max(reps, key=os.path.getsize) if reps else None
+
+
+XIC_SUBDIR = "xic_dbs"
+XIC_DONE = "COMPLETE.txt"
+
+
+def is_xic_db(fn):
+    """Spectronaut's "All XIC" export: one SQLite file per raw file. Never a macOS ._ stub."""
+    f = fn.lower()
+    return (f.endswith(".xic.db") or f.endswith(".sqlite")) and not fn.startswith("._")
+
+
+def flinders_report_path(sne, reports_root=None):
+    """The newest archived FRAN report for this .sne on Flinders, or None."""
+    top = flinders_report_dir(sne, reports_root)
+    found = []
+    try:
+        dirs = [top] + [os.path.join(top, e) for e in os.listdir(top) if os.path.isdir(os.path.join(top, e))]
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            found += [os.path.join(d, fn) for fn in os.listdir(d)
+                      if is_report(fn) and os.path.isfile(os.path.join(d, fn)) and os.path.getsize(os.path.join(d, fn)) > 0]
+        except OSError:
+            pass
+    return max(found, key=lambda p: (os.path.basename(os.path.dirname(p)), p)) if found else None
+
+
+def flinders_has_xic(sne, reports_root=None):
+    """True when a COMPLETE set of XIC dbs is archived beside any archived report of this .sne."""
+    top = flinders_report_dir(sne, reports_root)
+    try:
+        return any(os.path.isfile(os.path.join(top, e, XIC_SUBDIR, XIC_DONE)) for e in os.listdir(top))
+    except OSError:
+        return False
+
+
+def copy_xic_dbs_to_flinders(xic_dir, dest_report):
+    """Copy the *.xic.db files to <the archived report's folder>/xic_dbs/, where Hive builds the
+    chromatogram lane from them. Same .part-then-rename rule as the report; COMPLETE.txt is written
+    LAST and holds the file count, so Hive never builds a lane from half a set. Returns (n, GB)."""
+    dest = os.path.join(os.path.dirname(dest_report), XIC_SUBDIR)
+    os.makedirs(dest, exist_ok=True)
+    names = sorted(f for f in os.listdir(xic_dir) if is_xic_db(f) and os.path.isfile(os.path.join(xic_dir, f)))
+    if not names:
+        raise OSError(f"no *.xic.db in {xic_dir}")
+    total = 0
+    for fn in names:
+        src, dst = os.path.join(xic_dir, fn), os.path.join(dest, fn)
+        want = os.path.getsize(src); total += want
+        if os.path.isfile(dst) and os.path.getsize(dst) == want:
+            continue
+        part = dst + ".part"
+        shutil.copyfile(src, part)
+        if os.path.getsize(part) != want:
+            raise OSError(f"copy of {fn} is {os.path.getsize(part)} bytes, source is {want}")
+        os.replace(part, dst)
+    with open(os.path.join(dest, XIC_DONE + ".part"), "w") as fh:
+        fh.write(f"{len(names)} files\n{total} bytes\nfrom {xic_dir}\n")
+    os.replace(os.path.join(dest, XIC_DONE + ".part"), os.path.join(dest, XIC_DONE))
+    return len(names), total / 1e9
 
 
 def free_gb(path):
@@ -212,6 +276,12 @@ def main():
                     help="refuse to start with less free space than this on the export drive (default 60)")
     ap.add_argument("--keep-local", action="store_true",
                     help="keep the export on C: after it is archived on Flinders (default: delete it)")
+    ap.add_argument("--export-xics", action="store_true",
+                    help="when no _XIC-DBs folder sits beside the .sne, ask Spectronaut to export the "
+                         "XICs too (--setXICExportDirectory). Only works for an .sne saved WITH ion "
+                         "traces, and can write more than a GB per raw file to C:")
+    ap.add_argument("--no-xic-archive", action="store_true",
+                    help="do not copy the XIC dbs to Flinders (the search then gets no chromatogram lane)")
     ap.add_argument("--force-ingest", action="store_true",
                     help="ingest even though FRAN holds a search with this experiment's name from another path")
     a = ap.parse_args()
@@ -229,6 +299,21 @@ def main():
     ndb = len(glob.glob(os.path.join(xd, "*.xic.db"))) if xd else 0
     log(f"=== {name} === sne={sne} xic-dir={xd} ({ndb} dbs)")
     archive = not a.no_flinders_copy
+    xsrc = xd                       # where the XIC dbs are; xd is cleared below when the PG step is skipped
+    xic_archive = archive and not a.no_xic_archive
+
+    def archive_xics(dest_report):
+        """Copy the XIC dbs beside the archived report. True when done or not needed, False on failure."""
+        if not (xic_archive and xsrc and dest_report) or flinders_has_xic(sne):
+            return True
+        t = time.time()
+        try:
+            n, gb = copy_xic_dbs_to_flinders(xsrc, dest_report)
+            log(f"XIC dbs archived on Flinders: {n} files, {gb:.1f} GB in {int(time.time()-t)}s")
+            return True
+        except OSError as e:
+            log(f"XIC dbs NOT archived on Flinders ({e}): no chromatogram lane until this is re-run")
+            return False
     if name != sne_stem(sne):
         log(f"note: --name differs from the .sne name ({sne_stem(sne)!r}); the report is archived "
             f"under the .sne name, which is what Hive matches on")
@@ -249,7 +334,10 @@ def main():
         con.close()
         archived = (not archive) or flinders_has_report(sne)
         if archived and ((not xd) or xic_present):
-            log(f"SKIP (already ingested{' + XIC' if xic_present else ''}, report on Flinders): {name}"); return
+            # Nothing to export. The XIC dbs may still be missing on Flinders: a plain copy.
+            ok = archive_xics(flinders_report_path(sne))
+            log(f"SKIP (already ingested{' + XIC' if xic_present else ''}, report on Flinders): {name}")
+            sys.exit(0 if ok else 4)
         ingest = False        # the search row is there: never delete and re-insert it for an export
         if (not xd) or xic_present:
             # Ingested, but its report never reached Flinders: export and archive only.
@@ -266,8 +354,10 @@ def main():
             # The same experiment, ingested from another drive or folder. Ingesting it again from
             # here would store it twice. Its report is archived by the .sne NAME, which is the same.
             if (not archive) or flinders_has_report(sne):
+                ok = archive_xics(flinders_report_path(sne))
                 log(f"SKIP: FRAN already holds this experiment as search {other[0]} from {other[1]} "
-                    f"(--force-ingest if it really is a different search)"); return
+                    f"(--force-ingest if it really is a different search)")
+                sys.exit(0 if ok else 4)
             ingest = False; xd = None
             log(f"FRAN already holds this experiment as search {other[0]} from {other[1]}, with NO "
                 f"report on Flinders -> export + archive only (--force-ingest to ingest it anyway)")
@@ -278,12 +368,23 @@ def main():
     log("step 1: manageSNE export (Spectronaut, TSV) ...")
     t0 = time.time()
     try:
-        rc = subprocess.run(["dotnet", DLL, "manageSNE", "-sne", sne, "-o", out, "-rs", RS],
+        # --setXICExportDirectory is a GLOBAL option and must come BEFORE the command (manual, Table 13).
+        xexp = os.path.join(out, "xics_" + time.strftime("%Y%m%d_%H%M%S")) if (a.export_xics and not xsrc) else None
+        if xexp:
+            os.makedirs(xexp, exist_ok=True)
+        pre = ["--setXICExportDirectory", xexp] if xexp else []
+        rc = subprocess.run(["dotnet", DLL, *pre, "manageSNE", "-sne", sne, "-o", out, "-rs", RS],
                             stdout=open(os.path.join(out, "manageSNE.log"), "w"), stderr=subprocess.STDOUT,
                             timeout=2400).returncode
     except subprocess.TimeoutExpired:
         log("manageSNE TIMEOUT (>40min) -> abort this .sne (hung export)"); sys.exit(1)
     rep = pick_report(out, t0)
+    if xexp:
+        got = [f for f in os.listdir(xexp) if is_xic_db(f)]
+        log(f"XIC export from the .sne: {len(got)} db(s) in {xexp}"
+            + ("" if got else " (none: was the .sne saved WITH ion traces?)"))
+        if got:
+            xsrc = xexp
     log(f"step 1 rc={rc} in {int(time.time()-t0)}s; FRAN report={'yes' if rep else 'NONE'}")
     if not rep:
         log("NO FRAN report from this export -> abort (see manageSNE.log)"); sys.exit(1)
@@ -314,6 +415,9 @@ def main():
             dst = copy_report_to_flinders(rep, sne)
             archived_ok = True
             log(f"step 3: report archived on Flinders in {int(time.time()-t0)}s -> {dst}")
+            if not archive_xics(dst):
+                archive_failed = True
+                archived_ok = False          # keep the local export: it may hold the only XIC dbs
         except OSError as e:
             archive_failed = True
             log(f"step 3 FAILED: report NOT archived on Flinders ({e}). The search is ingested but "
