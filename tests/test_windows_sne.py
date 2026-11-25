@@ -364,8 +364,8 @@ def test_xic_copy_failure_leaves_no_complete_marker(tmp_path, monkeypatch):
 
 def test_share_options_file_only_passes_known_flags(tmp_path):
     p = tmp_path / "win_ingest_options.txt"
-    p.write_text("# trial\n--export-xics\n--force-ingest\nrm -rf\n", encoding="utf-8")
-    assert wa.extra_options(str(p)) == ["--export-xics"]
+    p.write_text("# trial\n--no-export-xics\n--force-ingest\nrm -rf\n", encoding="utf-8")
+    assert wa.extra_options(str(p)) == ["--no-export-xics"]
     assert wa.extra_options(str(tmp_path / "none.txt")) == []
 
 
@@ -386,7 +386,53 @@ def test_sne_gb_of_a_file_a_folder_and_nothing(tmp_path):
 
 
 def test_timeouts_at_the_end_do_not_stop_the_run():
-    res, stop = _run([0, 0, 7, 7, 7, 7, 0])
-    assert len(res) == 7 and stop is None
+    res, stop = _run([0, 0, 7, 7, 7, 0])
+    assert len(res) == 6 and stop is None
     res, stop = _run([7, 0])                       # nothing has worked yet: still stop
     assert len(res) == 1 and stop
+
+
+def test_watch_export_kills_on_timeout_and_on_a_full_disk():
+    class P:
+        def __init__(self, ends_after): self.n, self.ends, self.killed, self.returncode = 0, ends_after, False, None
+        def poll(self):
+            self.n += 1
+            if self.n > self.ends: self.returncode = 0; return 0
+            return None
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+    tick = iter(range(0, 100000, 30))
+    clock = lambda: next(tick)
+    p = P(3); assert sne_one.watch_export(p, 600, "x", 15, free=lambda o: 100, clock=clock, sleep=lambda s: None) is None and not p.killed
+    p = P(10**6); assert sne_one.watch_export(p, 600, "x", 15, free=lambda o: 100, clock=clock, sleep=lambda s: None) == "timeout" and p.killed
+    p = P(10**6); assert sne_one.watch_export(p, 10**9, "x", 15, free=lambda o: 5, clock=clock, sleep=lambda s: None) == "disk" and p.killed
+
+
+def test_backfill_plan_takes_known_experiments_once_each_smallest_first():
+    items = [dict(status="INGESTED", stem="A", bytes=500, path="B:/A.sne"),
+             dict(status="SAME_NAME", stem="a", bytes=10, path="S:/A.sne"),
+             dict(status="SAME_NAME", stem="B", bytes=20, path="S:/B.sne"),
+             dict(status="MISSED", stem="C", bytes=1, path="S:/C.sne"),
+             dict(status="QC_OR_TEST", stem="D", bytes=1, path="S:/D.sne")]
+    got = wa.backfill_plan(items)
+    assert [(i["stem"], i["path"]) for i in got] == [("B", "S:/B.sne"), ("A", "B:/A.sne")]
+
+
+def test_same_path_is_found_whatever_the_case_or_slashes():
+    rows = [("s1", r"b:\Proj\My Exp.sne", "x"), ("s2", None, "y")]
+    assert sne_one.find_same_path(r"B:/proj/my exp.sne", rows) == "s1"
+    assert sne_one.find_same_path(r"B:\proj\other.sne", rows) is None
+
+
+def test_has_xic_sees_a_report_archived_flat(tmp_path):
+    root = tmp_path / "FRAN_reports"; d = root / "My Exp" / "xic_dbs"; d.mkdir(parents=True)
+    assert not sne_one.flinders_has_xic("My Exp.sne", str(root))
+    (d / "COMPLETE.txt").write_text("1 files")
+    assert sne_one.flinders_has_xic("My Exp.sne", str(root))
+
+
+def test_four_timeouts_in_a_row_stop_the_run_and_backfill_misses_do_not():
+    res, stop = _run([0, 7, 7, 7, 7, 0])
+    assert len(res) == 5 and "time limit" in stop
+    res, stop = _run([8, 4, 0, 0])                 # first results say nothing about the setup
+    assert len(res) == 4 and stop is None

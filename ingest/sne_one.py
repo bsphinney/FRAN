@@ -100,6 +100,7 @@ def pick_report(out, since):
     return max(reps, key=os.path.getsize) if reps else None
 
 
+NO_XIC_MARKER = "NO_XIC_IN_SNE.txt"
 XIC_SUBDIR = "xic_dbs"
 XIC_DONE = "COMPLETE.txt"
 
@@ -131,7 +132,8 @@ def flinders_has_xic(sne, reports_root=None):
     """True when a COMPLETE set of XIC dbs is archived beside any archived report of this .sne."""
     top = flinders_report_dir(sne, reports_root)
     try:
-        return any(os.path.isfile(os.path.join(top, e, XIC_SUBDIR, XIC_DONE)) for e in os.listdir(top))
+        return (os.path.isfile(os.path.join(top, XIC_SUBDIR, XIC_DONE))      # report directly in <stem>/
+                or any(os.path.isfile(os.path.join(top, e, XIC_SUBDIR, XIC_DONE)) for e in os.listdir(top)))
     except OSError:
         return False
 
@@ -179,6 +181,48 @@ def export_timeout_min(gb, override=0):
     if override and override > 0:
         return float(override)
     return min(12 * 60.0, 40.0 + 30.0 * max(gb, 0.0))
+
+
+def kill_tree(proc):
+    """Stop the export AND anything it started. On Windows Popen.kill() ends only the one process;
+    a worker left running keeps writing to C: and keeps its files locked against the clean-up."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def find_same_path(sne, rows):
+    """The search FRAN holds for exactly this .sne path, compared the way find_missed_sne compares
+    (case, slashes and drive letters normalised). rows: (id, output_dir, search_name). id or None."""
+    from find_uningested import norm_path
+    me = norm_path(sne)
+    return next((sid for sid, od, _ in rows if od and norm_path(od) == me), None)
+
+
+def watch_export(proc, limit_s, out, stop_free_gb, poll_s=30, free=None, clock=time.time, sleep=time.sleep):
+    """Wait for the Spectronaut export. Returns None when it ended by itself, "timeout" when it ran
+    past limit_s, "disk" when the export drive fell under stop_free_gb (XIC dbs run to GBs per raw
+    file and nobody is watching). In both of those cases the process is killed first."""
+    free = free or free_gb
+    t0 = clock()
+    while True:
+        if proc.poll() is not None:
+            return None
+        why = "timeout" if clock() - t0 > limit_s else ("disk" if free(out) < stop_free_gb else None)
+        if why:
+            kill_tree(proc)
+            try:
+                proc.wait(timeout=60)
+            except Exception:  # noqa: BLE001
+                pass
+            return why
+        sleep(poll_s)
 
 
 def free_gb(path):
@@ -297,22 +341,25 @@ def main():
                     help="keep the export on C: after it is archived on Flinders (default: delete it)")
     ap.add_argument("--export-timeout-min", type=float, default=0,
                     help="minutes Spectronaut may take to export (default: 40 + 30 per GB of .sne, at most 720)")
-    ap.add_argument("--export-xics", action="store_true",
-                    help="when no _XIC-DBs folder sits beside the .sne, ask Spectronaut to export the "
-                         "XICs too (--setXICExportDirectory). Only works for an .sne saved WITH ion "
-                         "traces, and can write more than a GB per raw file to C:")
+    ap.add_argument("--no-export-xics", action="store_true",
+                    help="do not ask Spectronaut for the XICs. By default, when no _XIC-DBs folder sits "
+                         "beside the .sne, the export also writes them (--setXICExportDirectory); that "
+                         "only yields files for an .sne saved WITH ion traces")
+    ap.add_argument("--export-xics", action="store_true", help=argparse.SUPPRESS)   # old name: now the default
+    ap.add_argument("--stop-free-gb", type=float, default=15.0,
+                    help="kill an export when the export drive has less than this left (default 15)")
+    ap.add_argument("--min-share-free-tb", type=float, default=20.0,
+                    help="do not export or copy XIC dbs when the share has less than this free (default 20)")
     ap.add_argument("--no-xic-archive", action="store_true",
                     help="do not copy the XIC dbs to Flinders (the search then gets no chromatogram lane)")
+    ap.add_argument("--backfill-only", action="store_true",
+                    help="never ingest: only archive a missing report / XIC dbs for an experiment FRAN "
+                         "already holds. Exits 8, exporting nothing, when FRAN does not hold it")
     ap.add_argument("--force-ingest", action="store_true",
                     help="ingest even though FRAN holds a search with this experiment's name from another path")
     a = ap.parse_args()
     sne, name = a.sne, a.name
     out = export_dir(name, sne)
-    fg = free_gb(out)
-    if fg < a.min_free_gb:
-        log(f"only {fg:.0f} GB free on the export drive ({OUTBASE}), need {a.min_free_gb:g} -> abort "
-            f"before exporting (free space, or lower --min-free-gb)"); sys.exit(6)
-    os.makedirs(out, exist_ok=True)
     xd = a.xic_dir
     if not xd:
         cand = [d for d in glob.glob(os.path.join(os.path.dirname(sne), "*_XIC-DBs")) if glob.glob(os.path.join(d, "*.xic.db"))]
@@ -325,8 +372,11 @@ def main():
 
     def archive_xics(dest_report):
         """Copy the XIC dbs beside the archived report. True when done or not needed, False on failure."""
-        if not (xic_archive and xsrc and dest_report) or flinders_has_xic(sne):
+        if not (xic_archive and share_ok and xsrc) or flinders_has_xic(sne):
             return True
+        if not dest_report:
+            log("XIC dbs NOT archived: no archived report found on Flinders to put them beside")
+            return False
         t = time.time()
         try:
             n, gb = copy_xic_dbs_to_flinders(xsrc, dest_report)
@@ -342,65 +392,139 @@ def main():
         log(f"NO report archive at {REPORTS} -> abort (is the Flinders share mapped? "
             f"--no-flinders-copy skips the archive, and the spectrum lane with it)"); sys.exit(5)
 
-    # resume: skip fully-done items (report ingested AND archived AND (no xic dir OR xic already present))
+    no_xic_marker = os.path.join(flinders_report_dir(sne), NO_XIC_MARKER)
+    share_ok = True
+    if xic_archive:
+        try:
+            share_ok = free_gb(REPORTS) / 1000.0 >= a.min_share_free_tb
+        except OSError:
+            share_ok = False
+        if not share_ok:
+            log(f"under {a.min_share_free_tb:g} TB free on the share: XIC dbs are NOT exported or copied this run")
+
+    def xic_needed(cur, sid):
+        """Does this experiment still need its XIC dbs on Flinders? Not when they are there, when an
+        earlier export showed the .sne holds none, or when the search already has an XIC lane."""
+        if not (xic_archive and share_ok) or flinders_has_xic(sne) or os.path.isfile(no_xic_marker):
+            return False
+        if sid:
+            cur.execute("SELECT 1 FROM delimp_xic_lane WHERE search_id::text=%s LIMIT 1", (str(sid),))
+            if cur.fetchone():
+                return False
+        return True
+
+    # resume: skip fully-done items (report ingested AND archived AND XICs dealt with)
     con = db(); c = con.cursor()
-    c.execute("SELECT id FROM delimp_searches WHERE output_dir=%s AND n_precursors_total>0 LIMIT 1", (sne,))
-    done = c.fetchone()
+    c.execute("SELECT id, output_dir, search_name FROM delimp_searches "
+              "WHERE search_engine='spectronaut' AND n_precursors_total>0")
+    sn_rows = c.fetchall()
+    same = find_same_path(sne, sn_rows)
+    done = (same,) if same else None
     ingest = True
+    need_x = True
     if done:
         xic_present = False
         if xd:
             c.execute("SELECT 1 FROM delimp_precursor_xic WHERE search_id=%s LIMIT 1", (done[0],))
             xic_present = c.fetchone() is not None
+        need_x = xic_needed(c, done[0])
         con.close()
         archived = (not archive) or flinders_has_report(sne)
-        if archived and ((not xd) or xic_present):
+        export_for_xic = need_x and not xsrc and not a.no_export_xics
+        ingest = False        # the search row is there: never delete and re-insert it for an export
+        if archived and ((not xd) or xic_present) and not export_for_xic:
             # Nothing to export. The XIC dbs may still be missing on Flinders: a plain copy.
-            ok = archive_xics(flinders_report_path(sne))
+            ok = archive_xics(flinders_report_path(sne)) if need_x else True
             log(f"SKIP (already ingested{' + XIC' if xic_present else ''}, report on Flinders): {name}")
             sys.exit(0 if ok else 4)
-        ingest = False        # the search row is there: never delete and re-insert it for an export
         if (not xd) or xic_present:
-            # Ingested, but its report never reached Flinders: export and archive only.
             xd = None
-            log("already ingested, but NO report on Flinders -> export + archive only (no re-ingest)")
+            log("already ingested -> export only (no re-ingest): "
+                + ("no report on Flinders" if not archived else "XICs to export for the chromatogram lane"))
         else:
             log("report already ingested; XIC missing -> export + XIC only (no re-ingest)")
     else:
-        c.execute("SELECT id, output_dir, search_name FROM delimp_searches "
-                  "WHERE search_engine='spectronaut' AND n_precursors_total>0")
-        other = None if a.force_ingest else find_known_elsewhere(sne, c.fetchall())
+        other = None if a.force_ingest else find_known_elsewhere(sne, sn_rows)
+        if a.backfill_only and not other:
+            con.close()
+            log(f"backfill only: FRAN holds no Spectronaut search for this experiment -> nothing done: {name}")
+            sys.exit(8)
+        need_x = xic_needed(c, other[0] if other else None)
         con.close()
         if other:
             # The same experiment, ingested from another drive or folder. Ingesting it again from
             # here would store it twice. Its report is archived by the .sne NAME, which is the same.
-            if (not archive) or flinders_has_report(sne):
-                ok = archive_xics(flinders_report_path(sne))
+            export_for_xic = need_x and not xsrc and not a.no_export_xics
+            if ((not archive) or flinders_has_report(sne)) and not export_for_xic:
+                ok = archive_xics(flinders_report_path(sne)) if need_x else True
                 log(f"SKIP: FRAN already holds this experiment as search {other[0]} from {other[1]} "
                     f"(--force-ingest if it really is a different search)")
                 sys.exit(0 if ok else 4)
             ingest = False; xd = None
-            log(f"FRAN already holds this experiment as search {other[0]} from {other[1]}, with NO "
-                f"report on Flinders -> export + archive only (--force-ingest to ingest it anyway)")
+            log(f"FRAN already holds this experiment as search {other[0]} from {other[1]} -> export + "
+                f"archive only, no ingest (--force-ingest to ingest it anyway)")
 
     # 1) export FRAN report (v21) as TSV. NOT --writeParquet: manageSNE's parquet writer HANGS at
     # "Generating Experiment Report" on some .sne (leaves a ~27KB stub, never returns). TSV is
     # reliable and spectronaut_to_corpus/sne_xic_ingest both read TSV. Timeout guards any other hang.
     limit_min = export_timeout_min(sne_gb(sne), a.export_timeout_min)
-    log(f"step 1: manageSNE export (Spectronaut, TSV); .sne is {sne_gb(sne):.1f} GB, limit {limit_min:.0f} min ...")
+    # XICs: when no _XIC-DBs folder sits beside the .sne, ask Spectronaut for them in the same export.
+    # --setXICExportDirectory is a GLOBAL option and must come BEFORE the command (manual, Table 13).
+    os.makedirs(out, exist_ok=True)
+    # Anything already in this experiment's export folder is left over from a failed run and is
+    # about to be exported again: remove it first, or failed experiments pile up on C:.
+    stale = remove_local_export(out)
+    if stale > 0.01:
+        log(f"removed {stale:.1f} GB left on C: by an earlier failed run of this experiment")
+    fg = free_gb(out)
+    if fg < a.min_free_gb:
+        log(f"only {fg:.0f} GB free on the export drive ({OUTBASE}), need {a.min_free_gb:g} -> abort "
+            f"before exporting (free space, or lower --min-free-gb)"); sys.exit(6)
+
+    def note_no_xic(why_text):
+        """So a re-run does not export this experiment's XICs again for the same result."""
+        try:
+            os.makedirs(os.path.dirname(no_xic_marker), exist_ok=True)
+            with open(no_xic_marker, "w") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M')} {why_text}: {sne}\n(delete this file to try again)\n")
+        except OSError:
+            pass
+
+    def export(with_xics):
+        xdir = os.path.join(out, "xics_" + time.strftime("%Y%m%d_%H%M%S")) if with_xics else None
+        if xdir:
+            os.makedirs(xdir, exist_ok=True)
+        log(f"step 1: manageSNE export (Spectronaut, TSV{' + XICs' if xdir else ''}); .sne is "
+            f"{sne_gb(sne):.1f} GB, limit {limit_min:.0f} min ...")
+        pre = ["--setXICExportDirectory", xdir] if xdir else []
+        with open(os.path.join(out, "manageSNE.log"), "w") as lf:
+            proc = subprocess.Popen(["dotnet", DLL, *pre, "manageSNE", "-sne", sne, "-o", out, "-rs", RS],
+                                    stdout=lf, stderr=subprocess.STDOUT)
+            why = watch_export(proc, limit_min * 60, out, a.stop_free_gb)
+        return xdir, why, proc.returncode
+
     t0 = time.time()
-    try:
-        # --setXICExportDirectory is a GLOBAL option and must come BEFORE the command (manual, Table 13).
-        xexp = os.path.join(out, "xics_" + time.strftime("%Y%m%d_%H%M%S")) if (a.export_xics and not xsrc) else None
-        if xexp:
-            os.makedirs(xexp, exist_ok=True)
-        pre = ["--setXICExportDirectory", xexp] if xexp else []
-        rc = subprocess.run(["dotnet", DLL, *pre, "manageSNE", "-sne", sne, "-o", out, "-rs", RS],
-                            stdout=open(os.path.join(out, "manageSNE.log"), "w"), stderr=subprocess.STDOUT,
-                            timeout=limit_min * 60).returncode
-    except subprocess.TimeoutExpired:
-        log(f"manageSNE TIMEOUT (>{limit_min:.0f} min) -> abort this .sne (hung, or needs a longer "
-            f"--export-timeout-min)"); sys.exit(7)
+    xexp, why, rc = export(need_x and not xsrc and not a.no_export_xics)
+    if why == "disk" and xexp:
+        # The XICs of this experiment do not fit on C:. That is about this experiment, not the
+        # computer: clear it, remember it, and export the report alone.
+        time.sleep(5)
+        remove_local_export(out)
+        log(f"export STOPPED: under {a.stop_free_gb:g} GB left on C: while writing XICs. Partial export "
+            f"removed ({free_gb(out):.0f} GB free now). Exporting again WITHOUT XICs")
+        if archive:
+            note_no_xic("the XIC dbs of this experiment do not fit on the export drive")
+        need_x = False
+        t0 = time.time()
+        xexp, why, rc = export(False)
+    if why:
+        time.sleep(5)
+        remove_local_export(out)
+        if why == "timeout":
+            log(f"manageSNE TIMEOUT (>{limit_min:.0f} min) -> abort this .sne (hung, or needs a longer "
+                f"--export-timeout-min). Partial export removed"); sys.exit(7)
+        log(f"export STOPPED: under {a.stop_free_gb:g} GB left on the export drive, with no XICs being "
+            f"written. Partial export removed ({free_gb(out):.0f} GB free now)"); sys.exit(6)
     rep = pick_report(out, t0)
     if xexp:
         got = [f for f in os.listdir(xexp) if is_xic_db(f)]
@@ -408,20 +532,25 @@ def main():
             + ("" if got else " (none: was the .sne saved WITH ion traces?)"))
         if got:
             xsrc = xexp
+        elif rep and archive:
+            note_no_xic("Spectronaut wrote no XIC dbs for this experiment")
     log(f"step 1 rc={rc} in {int(time.time()-t0)}s; FRAN report={'yes' if rep else 'NONE'}")
     if not rep:
+        remove_local_export(out)
         log("NO FRAN report from this export -> abort (see manageSNE.log)"); sys.exit(1)
 
     # 2) ingest report (raw-metadata auto-populates via corpus_ingest go-forward wiring)
     if ingest:
         log("step 2: corpus_ingest --bulk-copy ...")
         t0 = time.time()
-        rc2 = subprocess.run([sys.executable, os.path.join(FRAN, "corpus_ingest.py"), rep,
-                              "--engine", "spectronaut", "--name", name, "--output-dir", sne, "--bulk-copy"],
-                             stdout=open(os.path.join(out, "ingest.log"), "w"), stderr=subprocess.STDOUT).returncode
+        with open(os.path.join(out, "ingest.log"), "w") as lf:
+            rc2 = subprocess.run([sys.executable, os.path.join(FRAN, "corpus_ingest.py"), rep,
+                                  "--engine", "spectronaut", "--name", name, "--output-dir", sne, "--bulk-copy"],
+                                 stdout=lf, stderr=subprocess.STDOUT).returncode
         log(f"step 2 rc={rc2} in {int(time.time()-t0)}s")
         if rc2 != 0:
-            log("corpus_ingest FAILED -> abort (see ingest.log); report NOT archived"); sys.exit(2)
+            remove_local_export(out)
+            log("corpus_ingest FAILED -> abort (see ingest.log); report NOT archived, export removed"); sys.exit(2)
 
     # 3) archive the report on Flinders, AFTER a good ingest: a report that reached Flinders without
     # its search would be picked up by Hive's auto-ingest under a second output_dir.
@@ -452,9 +581,13 @@ def main():
         cleanup()
         sys.exit(4 if archive_failed else 0)
     con = db(); c = con.cursor()
-    c.execute("SELECT id, n_precursors_total FROM delimp_searches WHERE output_dir=%s ORDER BY ingested_at DESC LIMIT 1", (sne,))
+    if done:
+        c.execute("SELECT id, n_precursors_total FROM delimp_searches WHERE id=%s", (done[0],))
+    else:
+        c.execute("SELECT id, n_precursors_total FROM delimp_searches WHERE output_dir=%s ORDER BY ingested_at DESC LIMIT 1", (sne,))
     row = c.fetchone(); con.close()
     if not row:
+        cleanup()
         # corpus_ingest's duplicate guard exits 0 without writing when another output_dir already
         # holds the same raw files and precursor count: there is no row under this path.
         log("no search row under this .sne after ingest (see ingest.log: duplicate guard?) -> abort XIC"); sys.exit(3)
@@ -468,9 +601,10 @@ def main():
     rc3 = subprocess.run(xargs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for t in (rc3.stdout.strip().splitlines()[-3:] if rc3.stdout else []): log("  xic> " + t)
     log(f"step 4 rc={rc3.returncode} in {int(time.time()-t0)}s")
-    log(f"DONE (report+XIC ok): {name}" if (rc3.returncode == 0 and "upserted" in (rc3.stdout or "")) else f"DONE (report ok, XIC issue): {name}")
+    xic_ok = rc3.returncode == 0 and "upserted" in (rc3.stdout or "")
+    log(f"DONE (report+XIC ok): {name}" if xic_ok else f"DONE (report ok, XIC issue): {name}")
     cleanup()
-    sys.exit(4 if archive_failed else 0)
+    sys.exit(4 if archive_failed else (0 if xic_ok else 3))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,10 @@
              free space. Anything failing stops the run before it touches a single experiment.
   2. FIND    find_missed_sne: every .sne on the local drives FRAN has never ingested.
   3. INGEST  sne_one.py on each MISSED experiment, smallest first, one at a time.
+  4. BACKFILL sne_one.py on each experiment FRAN ALREADY holds: nothing is ingested again. Where the
+             report never reached Flinders it is exported and archived (spectrum lane), and where
+             the XIC dbs are not on Flinders they are copied, or exported from the .sne
+             (chromatogram lane). An experiment with nothing missing takes seconds.
 
   --list-only    stop after step 2 (nothing is ingested)
   --limit N      ingest at most N experiments this run
@@ -46,9 +50,11 @@ LOCK = r"C:\fran_sne_one\win_ingest_all.lock"
 TIMEOUT_CODE = 7     # sne_one: the Spectronaut export ran past its limit. About THAT experiment, not the setup.
 STOP_CODES = {5: "the report archive on the share is not reachable", 6: "the export drive is nearly full"}
 MAX_IN_A_ROW = 3
+MAX_TIMEOUTS_IN_A_ROW = 4   # each can cost 12 hours: four running is a hung Spectronaut, not four big experiments
+ABOUT_THE_EXPERIMENT = (3, 4, 8)   # exits that say nothing about whether this computer is set up right
 # Options that may be switched on for every experiment from the share, without touching this
 # computer: one per line in win_ingest_options.txt beside this script. Anything else is ignored.
-ALLOWED_OPTIONS = ("--export-xics", "--keep-local", "--no-xic-archive")
+ALLOWED_OPTIONS = ("--no-export-xics", "--keep-local", "--no-xic-archive")
 
 
 def extra_options(path=None):
@@ -124,6 +130,21 @@ def take_lock(path=None):
     return True
 
 
+def backfill_plan(items):
+    """Experiments FRAN ALREADY holds (from this path or another), one per name, smallest first.
+    sne_one.py is run on each: it never ingests them again; it archives the report on Flinders when
+    that is missing (spectrum lane) and exports/copies the XIC dbs when those are (chromatogram
+    lane), and returns in seconds when there is nothing to do."""
+    seen, out = set(), []
+    for it in sorted((it for it in items if it["status"] in ("INGESTED", "SAME_NAME")),
+                     key=lambda it: (it["status"] != "INGESTED", it["bytes"] if it["bytes"] >= 0 else float("inf"),
+                                     it["path"].lower())):
+        k = it["stem"].lower()
+        if k not in seen:
+            seen.add(k); out.append(it)
+    return sorted(out, key=lambda it: (it["bytes"] if it["bytes"] >= 0 else float("inf"), it["path"].lower()))
+
+
 def plan(items, limit=0):
     """What this run ingests: MISSED only, smallest first (an early small success proves the setup
     before the big ones start)."""
@@ -132,10 +153,10 @@ def plan(items, limit=0):
     return todo[:limit] if limit else todo
 
 
-def run_all(todo, run_one, say=log, status=write_status):
+def run_all(todo, run_one, say=log, status=write_status, first_failure_stops=True):
     """Ingest each experiment with run_one(item) -> exit code. Returns (results, stop reason or None).
     Stops on: a STOP_CODES exit, the first experiment failing, or MAX_IN_A_ROW failures in a row."""
-    results, in_a_row, done_ok, stop = [], 0, 0, None
+    results, in_a_row, done_ok, stop, timeouts = [], 0, 0, None, 0
     for i, it in enumerate(todo, 1):
         gb = it["bytes"] / 1e9 if it["bytes"] >= 0 else 0
         say(f"[{i}/{len(todo)}] START {it['stem']} ({gb:.1f} GB) {it['path']}")
@@ -151,15 +172,19 @@ def run_all(todo, run_one, say=log, status=write_status):
         ok = rc == 0
         results.append({"path": it["path"], "name": it["stem"], "rc": rc, "minutes": round(mins, 1)})
         say(f"[{i}/{len(todo)}] {'OK    ' if ok else 'FAILED'} rc={rc} {mins:.0f} min  {it['stem']}")
+        timeouts = timeouts + 1 if rc == TIMEOUT_CODE else 0
         if ok:
             done_ok += 1; in_a_row = 0
             continue
+        if timeouts >= MAX_TIMEOUTS_IN_A_ROW:
+            stop = f"{MAX_TIMEOUTS_IN_A_ROW} Spectronaut exports in a row ran past their time limit"
+            break
         if rc == TIMEOUT_CODE and done_ok:
             continue            # one slow experiment: recorded as failed, never a reason to stop the run
         in_a_row += 1
         if rc in STOP_CODES:
             stop = STOP_CODES[rc]
-        elif done_ok == 0:
+        elif done_ok == 0 and first_failure_stops and rc not in ABOUT_THE_EXPERIMENT:
             stop = "the first experiment failed, so the setup is suspect, not the experiment"
         elif in_a_row >= MAX_IN_A_ROW:
             stop = f"{MAX_IN_A_ROW} experiments failed in a row"
@@ -172,6 +197,8 @@ def main():
     ap = argparse.ArgumentParser(description="Check this computer, find the .sne experiments FRAN lacks, ingest them.")
     ap.add_argument("--list-only", action="store_true", help="check and list; ingest nothing")
     ap.add_argument("--limit", type=int, default=0, help="ingest at most N experiments this run")
+    ap.add_argument("--no-backfill", action="store_true",
+                    help="skip step 4 (reports and XICs for experiments FRAN already holds)")
     ap.add_argument("--roots", nargs="*", default=None, help="folders to scan (default: every local drive)")
     a = ap.parse_args()
 
@@ -195,9 +222,14 @@ def main():
     counts = {s: sum(1 for it in items if it["status"] == s) for s in find_missed_sne.STATUSES}
     todo = plan(items, a.limit)
     log("scan: " + " ".join(f"{k}={v}" for k, v in counts.items()) + f"  list={tsv}")
-    if a.list_only or not todo:
-        log("list only: nothing ingested" if a.list_only else "nothing to ingest")
-        write_status(state="listed" if a.list_only else "finished", counts=counts, list=tsv, n_total=len(todo))
+    back = [] if a.no_backfill else backfill_plan(items)
+    if a.limit:
+        back = back[:max(0, a.limit - len(todo))]
+    log(f"plan: {len(todo)} to ingest, then {len(back)} already in FRAN to check for a missing report or XICs")
+    if a.list_only or not (todo or back):
+        log("list only: nothing ingested" if a.list_only else "nothing to do")
+        write_status(state="listed" if a.list_only else "finished", counts=counts, list=tsv,
+                     n_total=len(todo), n_backfill=len(back))
         return 0
 
     sne_one = os.path.join(HERE, "sne_one.py")
@@ -209,7 +241,17 @@ def main():
     def run_one(it):
         return subprocess.run([sys.executable, sne_one, "--sne", it["path"], f"--name={it['stem']}", *opts]).returncode
 
-    results, stop = run_all(todo, run_one)
+    results, stop = run_all(todo, run_one) if todo else ([], None)
+    back_results = []
+    if not stop and back:
+        log(f"=== step 4: {len(back)} experiments already in FRAN: archive a missing report, export/copy XICs ===")
+        def backfill_one(it):
+            return subprocess.run([sys.executable, sne_one, "--sne", it["path"], f"--name={it['stem']}",
+                                   "--backfill-only", *opts]).returncode
+        back_results, stop = run_all(back, backfill_one, first_failure_stops=not results)
+        nb = sum(1 for r in back_results if r["rc"] == 0)
+        log(f"=== step 4 {'STOPPED: ' + stop if stop else 'finished'}: {nb} ok, {len(back_results) - nb} failed, "
+            f"{len(back) - len(back_results)} not attempted ===")
     n_ok = sum(1 for r in results if r["rc"] == 0)
     failed = [r for r in results if r["rc"] != 0]
     log(f"=== {'STOPPED: ' + stop if stop else 'FINISHED'}: {n_ok} ingested, {len(failed)} failed, "
@@ -217,8 +259,10 @@ def main():
     for r in failed:
         log(f"  failed rc={r['rc']}: {r['path']}")
     write_status(state="stopped" if stop else "finished", stop_reason=stop, counts=counts, list=tsv,
-                 n_total=len(todo), n_done=len(results), n_ok=n_ok, n_failed=len(failed), failed=failed)
-    return 0 if not stop and not failed else 2
+                 n_total=len(todo), n_done=len(results), n_ok=n_ok, n_failed=len(failed), failed=failed,
+                 backfill_total=len(back), backfill_done=len(back_results),
+                 backfill_failed=[r for r in back_results if r["rc"] != 0])
+    return 0 if not stop and not failed and all(r["rc"] in (0, 8) for r in back_results) else 2
 
 
 if __name__ == "__main__":

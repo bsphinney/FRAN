@@ -743,9 +743,9 @@ def test_xic_plan_writes_only_complete_sets_at_a_path_with_the_search_id():
     has = lambda r: None if "Exp B" in r else os.path.dirname(r) + "/xic_dbs"
     jobs, skipped = X.plan(searches, {"cccccccc-3": {"attempts": 3}}, find_reports=find, has_set=has,
                            exists=lambda p: "Exp_D" in p)
-    assert [j["sid"] for j in jobs] == ["aaaaaaaa-1"]
+    assert [(j["sid"], j["adopt"]) for j in jobs] == [("aaaaaaaa-1", False), ("dddddddd-4", True)]
     assert jobs[0]["out"].endswith("/Exp_A__aaaaaaaa.xic.lance")
-    assert skipped == {"no_xic_dbs_on_flinders": 1, "parked": 1, "path_occupied_unregistered": 1}
+    assert skipped == {"no_xic_dbs_on_flinders": 1, "parked": 1}
 
 
 def test_xic_set_needs_the_complete_marker(tmp_path=None):
@@ -756,3 +756,20 @@ def test_xic_set_needs_the_complete_marker(tmp_path=None):
     assert X.xic_set_for(rep) is None
     open(os.path.join(d, "xic_dbs", "COMPLETE.txt"), "w").write("1 files")
     assert X.xic_set_for(rep) == os.path.join(d, "xic_dbs")
+
+
+def test_free_xic_dbs_only_inside_a_complete_archived_set():
+    import fill_spectronaut_xic_lanes as X
+    root = tempfile.mkdtemp()
+    d = os.path.join(root, "Exp", "ts", "xic_dbs"); os.makedirs(d)
+    for fn in ("r1.xic.db", "r2.xic.db", "keep.txt"):
+        open(os.path.join(d, fn), "w").write("x" * 10)
+    assert X.free_xic_dbs(d, "/l/x.lance", root) == (0, 0.0)            # no COMPLETE.txt
+    open(os.path.join(d, "COMPLETE.txt"), "w").write("2 files")
+    other = os.path.join(tempfile.mkdtemp(), "xic_dbs"); os.makedirs(other)
+    open(os.path.join(other, "COMPLETE.txt"), "w").write("1"); open(os.path.join(other, "a.xic.db"), "w").write("x")
+    assert X.free_xic_dbs(other, "/l/x.lance", root) == (0, 0.0)        # outside the archive
+    assert X.free_xic_dbs(os.path.dirname(d), "/l/x.lance", root) == (0, 0.0)   # not an xic_dbs folder
+    n, gb = X.free_xic_dbs(d, "/l/x.lance", root)
+    assert n == 2 and sorted(os.listdir(d)) == ["COMPLETE.txt", "LANE_BUILT.txt", "keep.txt"]
+    assert os.listdir(other) and "a.xic.db" in os.listdir(other)
