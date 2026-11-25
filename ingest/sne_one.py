@@ -162,6 +162,25 @@ def copy_xic_dbs_to_flinders(xic_dir, dest_report):
     return len(names), total / 1e9
 
 
+def sne_gb(sne):
+    """Size of the experiment in GB: the .sne file, or everything under a .sne directory. 0 if unreadable."""
+    try:
+        if os.path.isfile(sne):
+            return os.path.getsize(sne) / 1e9
+        return sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(sne) for f in fs) / 1e9
+    except OSError:
+        return 0.0
+
+
+def export_timeout_min(gb, override=0):
+    """How long Spectronaut may take to write the report before the export is called hung.
+    It was a flat 40 minutes, and the largest experiments need hours (six needed about 8 h in August
+    2026). 40 minutes, plus 30 minutes per GB of .sne, never more than 12 hours."""
+    if override and override > 0:
+        return float(override)
+    return min(12 * 60.0, 40.0 + 30.0 * max(gb, 0.0))
+
+
 def free_gb(path):
     """Free space, in GB, on the drive that holds `path` (the nearest existing parent)."""
     p = os.path.abspath(path)
@@ -276,6 +295,8 @@ def main():
                     help="refuse to start with less free space than this on the export drive (default 60)")
     ap.add_argument("--keep-local", action="store_true",
                     help="keep the export on C: after it is archived on Flinders (default: delete it)")
+    ap.add_argument("--export-timeout-min", type=float, default=0,
+                    help="minutes Spectronaut may take to export (default: 40 + 30 per GB of .sne, at most 720)")
     ap.add_argument("--export-xics", action="store_true",
                     help="when no _XIC-DBs folder sits beside the .sne, ask Spectronaut to export the "
                          "XICs too (--setXICExportDirectory). Only works for an .sne saved WITH ion "
@@ -365,7 +386,8 @@ def main():
     # 1) export FRAN report (v21) as TSV. NOT --writeParquet: manageSNE's parquet writer HANGS at
     # "Generating Experiment Report" on some .sne (leaves a ~27KB stub, never returns). TSV is
     # reliable and spectronaut_to_corpus/sne_xic_ingest both read TSV. Timeout guards any other hang.
-    log("step 1: manageSNE export (Spectronaut, TSV) ...")
+    limit_min = export_timeout_min(sne_gb(sne), a.export_timeout_min)
+    log(f"step 1: manageSNE export (Spectronaut, TSV); .sne is {sne_gb(sne):.1f} GB, limit {limit_min:.0f} min ...")
     t0 = time.time()
     try:
         # --setXICExportDirectory is a GLOBAL option and must come BEFORE the command (manual, Table 13).
@@ -375,9 +397,10 @@ def main():
         pre = ["--setXICExportDirectory", xexp] if xexp else []
         rc = subprocess.run(["dotnet", DLL, *pre, "manageSNE", "-sne", sne, "-o", out, "-rs", RS],
                             stdout=open(os.path.join(out, "manageSNE.log"), "w"), stderr=subprocess.STDOUT,
-                            timeout=2400).returncode
+                            timeout=limit_min * 60).returncode
     except subprocess.TimeoutExpired:
-        log("manageSNE TIMEOUT (>40min) -> abort this .sne (hung export)"); sys.exit(1)
+        log(f"manageSNE TIMEOUT (>{limit_min:.0f} min) -> abort this .sne (hung, or needs a longer "
+            f"--export-timeout-min)"); sys.exit(7)
     rep = pick_report(out, t0)
     if xexp:
         got = [f for f in os.listdir(xexp) if is_xic_db(f)]

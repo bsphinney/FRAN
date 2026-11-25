@@ -367,3 +367,26 @@ def test_share_options_file_only_passes_known_flags(tmp_path):
     p.write_text("# trial\n--export-xics\n--force-ingest\nrm -rf\n", encoding="utf-8")
     assert wa.extra_options(str(p)) == ["--export-xics"]
     assert wa.extra_options(str(tmp_path / "none.txt")) == []
+
+
+def test_export_limit_scales_with_the_experiment():
+    assert sne_one.export_timeout_min(0) == 40
+    assert sne_one.export_timeout_min(2) == 100
+    assert sne_one.export_timeout_min(16) == 520
+    assert sne_one.export_timeout_min(500) == 720
+    assert sne_one.export_timeout_min(500, override=30) == 30
+
+
+def test_sne_gb_of_a_file_a_folder_and_nothing(tmp_path):
+    f = tmp_path / "a.sne"; f.write_bytes(b"x" * 3000)
+    d = tmp_path / "b.sne"; (d / "sub").mkdir(parents=True); (d / "sub" / "p").write_bytes(b"x" * 5000)
+    assert sne_one.sne_gb(str(f)) == pytest.approx(3e-6)
+    assert sne_one.sne_gb(str(d)) == pytest.approx(5e-6)
+    assert sne_one.sne_gb(str(tmp_path / "none.sne")) == 0.0
+
+
+def test_timeouts_at_the_end_do_not_stop_the_run():
+    res, stop = _run([0, 0, 7, 7, 7, 7, 0])
+    assert len(res) == 7 and stop is None
+    res, stop = _run([7, 0])                       # nothing has worked yet: still stop
+    assert len(res) == 1 and stop
