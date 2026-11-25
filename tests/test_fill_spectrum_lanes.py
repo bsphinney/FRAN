@@ -789,3 +789,22 @@ def test_full_row_never_borrows_another_runs_measurements():
     d = X.full_row(7, tr, "run1", "/x", dict(rec, q_value=0.2), ident, "sid", "n")
     e = X.full_row(7, tr, "run1", "/x", dict(rec, is_decoy="True"), ident, "sid", "n")
     assert not d["identified"] and d["q_value"] == 0.2 and not e["identified"] and e["is_decoy"]
+
+
+def test_full_lane_round_trip_describe_and_verify():
+    import pytest
+    lance = pytest.importorskip("lance")
+    import pyarrow as pa
+    import fill_spectronaut_xic_lanes as X
+    import xic_lance as xln
+    tr = [dict(label="y4", ms_level=2, rank=1, rt=[1.0, 1.1], i=[5.0, 6.0])]
+    rec = dict(stripped_seq="PEPTIDEK", charge=2, precursor_mz=450.2, rt=12.5, im=0.9, q_value=0.001, is_decoy="False")
+    rows = [X.full_row(i, tr, "run1", "/x/run1.xic.db", rec if i % 3 == 0 else None, None, "sid", "n") for i in range(300)]
+    p = os.path.join(tempfile.mkdtemp(), "a.full.xic.lance")
+    lance.write_dataset(pa.Table.from_pylist(rows[:200], schema=X.full_schema()), p, mode="create")
+    lance.write_dataset(pa.Table.from_pylist(rows[200:], schema=X.full_schema()), p, mode="append")
+    r = X.describe(p, "sid")
+    assert (r["n_prec"], r["n_identified"], r["n_traces"], r["runs"]) == (300, 100, 300, ["run1"])
+    assert xln.verify(p, r["md5"])
+    with pytest.raises(RuntimeError):
+        X.describe(p, "another-search")
