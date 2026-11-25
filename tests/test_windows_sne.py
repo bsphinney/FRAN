@@ -241,3 +241,90 @@ def test_local_export_removed_only_inside_its_own_folder(tmp_path):
 
 def test_free_gb_of_a_folder_that_does_not_exist_yet(tmp_path):
     assert sne_one.free_gb(str(tmp_path / "not" / "yet")) > 0
+
+
+def test_node_report_appends_per_host_and_never_raises(tmp_path):
+    import node_report
+    p = node_report.report("preflight", "a\nb", str(tmp_path))
+    node_report.report("preflight", "c", str(tmp_path))
+    lines = open(p, encoding="utf-8").read().splitlines()
+    assert [l[20:] for l in lines] == ["a", "b", "c"]
+    assert os.path.dirname(p) == os.path.join(str(tmp_path), "node_reports", node_report.host())
+    assert node_report.report("x", "y", os.path.join(str(tmp_path), "file-not-dir", "\0")) is None
+
+
+# ------------------------------------------------------------------ find_missed_sne: QC / lists
+def test_qc_and_test_names_are_listed_not_ingested_unless_included(tmp_path):
+    paths, names, bases = _known([])
+    items = [_item(r"B:\p\Lumos QC 2025.sne", "Lumos QC 2025"),
+             _item(r"B:\p\method test\RealName.sne", "RealName"),
+             _item(r"B:\p\Protest_march.sne", "Protest_march"),          # 'test' inside a word
+             _item(r"B:\p\Kept Test.sne", "Kept Test"),
+             _item(r"B:\p\Dropped.sne", "Dropped")]
+    out = {it["stem"]: it["status"] for it in fm.classify(
+        items, paths, names, bases, now=1e9, include={"kept test"}, exclude={r"b:\p\dropped.sne"})}
+    assert out == {"Lumos QC 2025": "QC_OR_TEST", "RealName": "QC_OR_TEST", "Protest_march": "MISSED",
+                   "Kept Test": "MISSED", "Dropped": "EXCLUDED"}
+
+
+def test_read_list_skips_comments_and_missing_file(tmp_path):
+    p = tmp_path / "exclude.txt"
+    p.write_text('# no\n\n"B:\\p\\X.sne"\nSome Name\n', encoding="utf-8")
+    assert fm.read_list(str(p)) == {"b:\\p\\x.sne", "some name"}
+    assert fm.read_list(str(tmp_path / "none.txt")) == set()
+
+
+# ------------------------------------------------------------------ win_ingest_all
+import win_ingest_all as wa  # noqa: E402
+
+
+def _todo(*sizes):
+    return [dict(_item(rf"B:\p\E{i}.sne", f"E{i}", size=s), status="MISSED") for i, s in enumerate(sizes)]
+
+
+def test_plan_is_missed_only_smallest_first_with_limit():
+    items = _todo(30, 10, 20) + [dict(_item(r"B:\p\Q.sne", "Q", size=1), status="QC_OR_TEST"),
+                                 dict(_item(r"B:\p\S.sne", "S", size=1), status="SAME_NAME")]
+    assert [it["stem"] for it in wa.plan(items)] == ["E1", "E2", "E0"]
+    assert [it["stem"] for it in wa.plan(items, 2)] == ["E1", "E2"]
+
+
+def _run(codes):
+    seq = iter(codes)
+    return wa.run_all(_todo(*range(1, len(codes) + 1)), lambda it: next(seq), say=lambda m: None, status=lambda **k: None)
+
+
+def test_first_failure_stops_everything():
+    res, stop = _run([1, 0, 0])
+    assert len(res) == 1 and "first experiment failed" in stop
+
+
+def test_one_failure_in_the_middle_is_skipped_over():
+    res, stop = _run([0, 2, 0, 0])
+    assert [r["rc"] for r in res] == [0, 2, 0, 0] and stop is None
+
+
+def test_three_failures_in_a_row_stop_the_run():
+    res, stop = _run([0, 1, 1, 1, 0])
+    assert len(res) == 4 and "in a row" in stop
+
+
+def test_full_drive_or_lost_share_stops_at_once():
+    res, stop = _run([0, 6, 0])
+    assert len(res) == 2 and "full" in stop
+    res, stop = _run([0, 0, 5, 0])
+    assert len(res) == 3 and "share" in stop
+
+
+def test_lock_is_taken_once_and_a_dead_owner_is_replaced(tmp_path):
+    p = str(tmp_path / "d" / "x.lock")
+    assert wa.take_lock(p) and wa.take_lock(p)              # our own pid: still ours
+    open(p, "w").write("999999999")                         # a process that does not exist
+    assert wa.take_lock(p)
+    import subprocess as sp, sys as _s
+    child = sp.Popen([_s.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        open(p, "w").write(str(child.pid))
+        assert not wa.take_lock(p)                          # a live owner keeps it
+    finally:
+        child.kill(); child.wait()
