@@ -729,3 +729,30 @@ def test_dot_sne_directory_is_named_by_its_folder():
     assert "My Exp" in f.candidate_names("Custom Name", None, r"B:\\proj\\My Exp\\.sne", None)
     assert "My Exp" in f.candidate_names("Custom Name", None, r"B:\\proj\\My Exp.sne", None)
     assert "" not in f.candidate_names("n", None, r"B:\\proj\\My Exp\\.sne", None)
+
+
+def test_xic_plan_writes_only_complete_sets_at_a_path_with_the_search_id():
+    import fill_spectronaut_xic_lanes as X
+    searches = [dict(sid="aaaaaaaa-1", name="20250101_010101_Exp A", output_dir=r"B:\\p\\Exp A.sne", n=10),
+                dict(sid="bbbbbbbb-2", name="Exp B", output_dir=r"B:\\p\\Exp B.sne", n=10),
+                dict(sid="cccccccc-3", name="Exp C", output_dir=r"B:\\p\\Exp C.sne", n=10),
+                dict(sid="dddddddd-4", name="Exp D", output_dir=r"B:\\p\\Exp D.sne", n=10)]
+    reports = {"Exp A": ["/r/Exp A/ts/x_Report_FRAN (Normal).tsv"], "Exp B": ["/r/Exp B/ts/x_Report_FRAN (Normal).tsv"],
+               "Exp C": ["/r/Exp C/ts/x_Report_FRAN (Normal).tsv"], "Exp D": ["/r/Exp D/ts/x_Report_FRAN (Normal).tsv"]}
+    find = lambda names, od: next((v for k, v in reports.items() if k in names), [])
+    has = lambda r: None if "Exp B" in r else os.path.dirname(r) + "/xic_dbs"
+    jobs, skipped = X.plan(searches, {"cccccccc-3": {"attempts": 3}}, find_reports=find, has_set=has,
+                           exists=lambda p: "Exp_D" in p)
+    assert [j["sid"] for j in jobs] == ["aaaaaaaa-1"]
+    assert jobs[0]["out"].endswith("/Exp_A__aaaaaaaa.xic.lance")
+    assert skipped == {"no_xic_dbs_on_flinders": 1, "parked": 1, "path_occupied_unregistered": 1}
+
+
+def test_xic_set_needs_the_complete_marker(tmp_path=None):
+    import fill_spectronaut_xic_lanes as X
+    d = tempfile.mkdtemp()
+    rep = os.path.join(d, "x_Report_FRAN (Normal).tsv")
+    os.makedirs(os.path.join(d, "xic_dbs"))
+    assert X.xic_set_for(rep) is None
+    open(os.path.join(d, "xic_dbs", "COMPLETE.txt"), "w").write("1 files")
+    assert X.xic_set_for(rep) == os.path.join(d, "xic_dbs")

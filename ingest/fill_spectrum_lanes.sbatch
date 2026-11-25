@@ -32,4 +32,12 @@ export PYTHONPATH=$ING
 cd "$ING"
 echo "===== fran_spectrum_lane $(date -Is) on $(hostname) job ${SLURM_JOB_ID:-} restart ${SLURM_RESTART_COUNT:-0} ====="
 # FRAN_SPECTRUM_ARGS: extra flags, e.g. "--only-sids <id> <id>" for a trial
-exec "$PY" -u fill_spectrum_lanes.py --apply --preflight --max "${FRAN_SPECTRUM_MAX:-40}" --workers 4 ${FRAN_SPECTRUM_ARGS:-}
+"$PY" -u fill_spectrum_lanes.py --apply --preflight --max "${FRAN_SPECTRUM_MAX:-40}" --workers 4 ${FRAN_SPECTRUM_ARGS:-}
+rc=$?
+# Then the chromatogram (XIC) lane for Spectronaut searches whose XIC dbs sne_one.py archived on
+# Flinders. Its own state and its own lane folder; one lane at a time. FRAN_SN_XIC_MAX=0 = no cap.
+echo "===== spectronaut XIC lanes $(date -Is) ====="
+"$PY" -u fill_spectronaut_xic_lanes.py --apply --max "${FRAN_SN_XIC_MAX:-10}"
+rc2=$?
+[ "$rc" -ne 0 ] && exit "$rc"
+exit "$rc2"
