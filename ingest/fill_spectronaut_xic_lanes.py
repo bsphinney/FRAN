@@ -22,10 +22,14 @@ WHAT IT DOES, per Spectronaut search with no row in delimp_xic_lane:
           <xic_lance>/.incoming.<job>/, then RENAMED to <name>__<sid8>.xic.lance and registered.
   adopt   the dataset is already at its final path but not in the registry (the job was preempted
           between the rename and the registration): it is re-read and registered, never rewritten.
-  free    ONLY with FRAN_SN_XIC_FREE_DBS=1: after a lane is registered and re-read, the *.xic.db
-          copies beside the archived report are deleted (COMPLETE.txt stays, LANE_BUILT.txt is
-          added). Off by default: the lane keeps targets at q <= 0.01 only, so the dbs hold traces
-          (decoys, precursors not identified in that run) that the lane does not.
+  free    ONLY with FRAN_SN_XIC_FREE_DBS=1, and only for a lane BUILT in this run that covers every
+          run of the search: the *.xic.db copies beside the archived report are deleted
+          (COMPLETE.txt stays, LANE_BUILT.txt is added). Off by default.
+
+NOT LOSSLESS IN THREE WAYS (read_xic_db / report_index, unchanged): a trace with no data points is
+dropped; a report row with no q-value gives its precursor no identity; and a precursor the report
+never lists has is_decoy NULL (unknown), not false. `n_precursors` in the registry is the IDENTIFIED
+count, the number the health scan compares with the search.
   (none)  no complete XIC set on Flinders: counted, nothing attempted. Most searches: the XICs were
           never exported from Spectronaut.
 
@@ -56,9 +60,8 @@ D = os.environ.get("FRAN_SN_XIC_FILL_DIR", "/quobyte/proteomics-grp/brett/scratc
 XIC_SUBDIR, XIC_DONE = "xic_dbs", "COMPLETE.txt"       # the names sne_one.py writes
 MAX_ATTEMPTS = 3
 REPORTS_ROOT = os.environ.get("FRAN_REPORTS_ROOT", "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports")
-# OFF unless asked for. The lane holds only target precursors at q <= 0.01 per run (report_index);
-# the XIC dbs also hold decoys and every library precursor in every run -- about two thirds of the
-# traces on the one large set measured. Deleting the dbs discards those.
+# OFF unless asked for: nothing is deleted from the share until a person has decided the lanes are
+# what is wanted.
 KEEP_DBS = os.environ.get("FRAN_SN_XIC_FREE_DBS", "0") != "1"
 
 
@@ -77,7 +80,9 @@ def free_xic_dbs(xic_dir, lance_path, root=None):
     n = b = 0
     for fn in os.listdir(d):
         f = os.path.join(d, fn)
-        if fn.lower().endswith((".xic.db", ".sqlite")) and os.path.isfile(f) and not os.path.islink(f):
+        # exactly the names build_full reads: a file it never read is never deleted
+        if (fn.endswith((".xic.db", ".sqlite")) and not fn.startswith("._")
+                and os.path.isfile(f) and not os.path.islink(f)):
             b += os.path.getsize(f); os.remove(f); n += 1
     return n, b / 1e9
 
@@ -108,7 +113,7 @@ def full_row(fg, traces, run, db, rec, ident, sid, name):
     src = rec or ident or {}
     own = rec or {}
     q = xln._num(own.get("q_value"))
-    decoy = xln._truthy(src.get("is_decoy"))
+    decoy = xln._truthy(src.get("is_decoy")) if src else None      # never in the report: unknown, not "target"
     ms1 = sum(1 for t in traces if t["ms_level"] == 1)
     return {
         "search_id": str(sid), "search_name": name, "raw_path": db, "run": run, "xicdbid": fg,
@@ -120,7 +125,7 @@ def full_row(fg, traces, run, db, rec, ident, sid, name):
         "trace_label": [t["label"] for t in traces], "trace_ms_level": [t["ms_level"] for t in traces],
         "trace_rank": [t["rank"] for t in traces], "trace_rt": [t["rt"] for t in traces],
         "trace_intensity": [t["i"] for t in traces],
-        "identified": bool(rec is not None and q is not None and q <= 0.01 and not decoy),
+        "identified": bool(rec is not None and q is not None and q <= 0.01 and decoy is False),
     }
 
 
@@ -145,7 +150,7 @@ def build_full(report, xic_dir, lance_path, sid, name):
     if not dbs:
         raise ValueError(f"no *.xic.db / *.sqlite under {xic_dir}")
     schema = full_schema()
-    st = dict(n_rows=0, n_identified=0, n_traces=0, dbs=len(dbs), skipped=[], runs_not_in_report=[])
+    st = dict(n_rows=0, n_identified=0, n_traces=0, dbs=len(dbs), runs=set())
     wrote = [False]
 
     def flush(rows):
@@ -163,8 +168,10 @@ def build_full(report, xic_dir, lance_path, sid, name):
                 break
         idx_run = idx.get(run)
         if idx_run is None:
-            st["runs_not_in_report"].append(run)
-            idx_run = {}
+            # Every row of this db would lose its rt, q-value and identified flag. Not a lane.
+            raise RuntimeError(f"XIC db {os.path.basename(db)} matches no run (R.FileName) of the report: "
+                               f"the wrong report for these dbs, or a renamed file")
+        st["runs"].add(F.norm_run(run))
         rows = []
         try:
             for fg, traces in xln.read_xic_db(db, None):
@@ -189,15 +196,21 @@ def describe(lance_path, sid):
     import pyarrow.compute as pc
     import xic_lance as xln
     ds = lance.dataset(lance_path)
-    cols = ["search_id", "n_traces", "run"] + (["identified"] if "identified" in ds.schema.names else [])
-    t = ds.to_table(columns=cols)
-    sids = set(t.column("search_id").unique().to_pylist())
-    if not t.num_rows or sids != {str(sid)}:
-        raise RuntimeError(f"{lance_path}: {t.num_rows} rows, search ids {sorted(map(str, sids))[:3]}, expected {sid}")
-    return dict(ok=True, lance_path=lance_path, n_prec=t.num_rows, n_traces=int(pc.sum(t.column("n_traces")).as_py()),
-                n_identified=(int(pc.sum(t.column("identified")).as_py() or 0) if "identified" in cols else None),
-                md5=xln.dataset_md5(ds), version=int(ds.version),
-                runs=sorted(F.run_set(t.column("run").unique().to_pylist())))
+    full = "identified" in ds.schema.names
+    cols = ["search_id", "n_traces", "run"] + (["identified"] if full else [])
+    sids, runs, n_rows, n_tr, n_id = set(), set(), 0, 0, 0
+    for b in ds.scanner(columns=cols, batch_size=100_000).to_batches():      # never the whole dataset
+        n_rows += b.num_rows
+        sids |= set(pc.unique(b.column("search_id")).to_pylist())
+        runs |= F.run_set(pc.unique(b.column("run")).to_pylist())
+        n_tr += int(pc.sum(b.column("n_traces")).as_py() or 0)
+        if full:
+            n_id += int(pc.sum(b.column("identified")).as_py() or 0)
+    if not n_rows or sids != {str(sid)}:
+        raise RuntimeError(f"{lance_path}: {n_rows} rows, search ids {sorted(map(str, sids))[:3]}, expected {sid}")
+    return dict(ok=True, lance_path=lance_path, n_rows=n_rows, n_prec=(n_id if full else n_rows), n_traces=n_tr,
+                n_identified=(n_id if full else None), md5=xln.dataset_md5(ds), version=int(ds.version),
+                runs=sorted(runs))
 
 
 def xic_set_for(report, isfile=os.path.isfile):
@@ -236,39 +249,80 @@ def plan(searches, state, find_reports=F.find_reports, has_set=xic_set_for, exis
 def child(spec, jid):
     """Build one lane in this job's incoming folder and rename it into place (or adopt one already
     there), then re-read it. spec: JSON of a plan() job plus corpus_runs. Prints CHILD_RESULT."""
-    j = json.loads(spec)
+    with open(spec) as fh:                 # a file, not an argument: a search can have thousands of runs
+        j = json.loads(fh.read())
     report, xic_dir, out, sid, name = j["report"], j["xic_dir"], j["out"], j["sid"], j["name"]
-    inc = os.path.join(os.path.dirname(out), f".incoming.{jid}")
-    os.makedirs(inc, exist_ok=True)
+    inc = os.path.join(os.path.dirname(out), f"{INCOMING}{jid}")
     res = dict(ok=False)
+    built = False
     try:
+        corpus = set(j.get("corpus_runs") or [])
+        if not corpus:
+            raise RuntimeError("the search has no runs recorded (search_raw_files): cannot check that these "
+                               "XIC dbs belong to it")
         if not os.path.lexists(out):
+            # A requeue keeps the job id: a half-written dataset from before the preemption is here.
+            shutil.rmtree(inc, ignore_errors=True)
+            os.makedirs(inc, exist_ok=True)
+            want = complete_count(xic_dir)
             lpath = os.path.join(inc, os.path.basename(out))
             st = build_full(report, xic_dir, lpath, sid, name)
             if not st["n_identified"]:
                 raise RuntimeError(f"none of {st['n_rows']:,} precursors in the XIC dbs is identified in the "
                                    f"report: the wrong report for these dbs?")
-            if st["runs_not_in_report"]:
-                print(f"  [xic] {len(st['runs_not_in_report'])} db(s) match no run of the report: "
-                      f"{st['runs_not_in_report'][:3]}", flush=True)
+            if want is not None and st["dbs"] != want:
+                raise RuntimeError(f"{st['dbs']} XIC dbs read, COMPLETE.txt says {want}: an incomplete or stale set")
             # The archived report is found by NAME. A lane whose runs the search never had was built
             # from another analysis of the same name: do not keep it.
-            import lance
-            runs = F.run_set(lance.dataset(lpath).to_table(columns=["run"]).column("run").unique().to_pylist())
-            extra = sorted(runs - set(j.get("corpus_runs") or runs))
+            extra = sorted(st["runs"] - corpus)
             if extra:
                 raise RuntimeError(f"report/XIC runs the search does not have ({len(extra)}, e.g. {extra[:2]}): "
                                    f"a different analysis of the same name?")
             if os.path.lexists(out):
                 raise RuntimeError(f"{out} appeared during the write; never replaced")
             os.rename(lpath, out)
+            built = True
         res = describe(out, sid)
+        missing = sorted(corpus - set(res["runs"]))
+        res["built"] = built
+        res["missing_runs"] = len(missing)
+        if missing:
+            print(f"  [xic] the lane lacks {len(missing)} of the search's {len(corpus)} runs, e.g. {missing[:2]}", flush=True)
     except Exception as e:  # noqa: BLE001
         res = dict(ok=False, error=repr(e)[:300])
     finally:
         shutil.rmtree(inc, ignore_errors=True)          # only ever this job's own incoming folder
     print("CHILD_RESULT " + json.dumps(res), flush=True)
     return 0 if res["ok"] else 1
+
+
+INCOMING = ".incoming_snfull."
+
+
+def complete_count(xic_dir):
+    """The file count sne_one.py wrote in COMPLETE.txt ("N files"), or None when unreadable."""
+    try:
+        with open(os.path.join(xic_dir, XIC_DONE)) as fh:
+            return int(fh.readline().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def sweep_incoming(root, jid, max_age_days=2, now=None):
+    """Remove this job type's incoming folders left by jobs that were killed (a timeout does not
+    run the child's clean-up). Only our own prefix, never this job's, never a recent one."""
+    now = now or time.time()
+    n = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for e in names:
+        d = os.path.join(root, e)
+        if (e.startswith(INCOMING) and e != f"{INCOMING}{jid}" and os.path.isdir(d) and not os.path.islink(d)
+                and now - os.path.getmtime(d) > max_age_days * 86400):
+            shutil.rmtree(d, ignore_errors=True); n += 1
+    return n
 
 
 def run_child(args):
@@ -317,7 +371,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--max", type=int, default=10, help="lanes written per run (0 = no cap)")
-    ap.add_argument("--child", metavar="JSON", help=argparse.SUPPRESS)
+    ap.add_argument("--budget-hours", type=float, default=0,
+                    help="start no new lane after this many hours (0 = no limit)")
+    ap.add_argument("--child", metavar="SPECFILE", help=argparse.SUPPRESS)
     a = ap.parse_args()
     jid = os.environ.get("SLURM_JOB_ID", f"local{os.getpid()}")
     if a.child:
@@ -338,11 +394,24 @@ def main():
     os.makedirs(D, exist_ok=True)
     import xic_lance as xln
     db.run(lambda c: xln.ensure_registry(c))
+    swept = sweep_incoming(XIC_LANCE, jid)
+    if swept:
+        print(f"removed {swept} incoming folder(s) left by killed jobs", flush=True)
     n_ok = n_fail = 0
+    started = time.time()
+    specf = os.path.join(D, f"spec_{jid}.json")
     for j in todo:
+        if a.budget_hours and time.time() - started > a.budget_hours * 3600:
+            print(f"time budget of {a.budget_hours:g} h used: {len(todo) - n_ok - n_fail} lane(s) left for the next run", flush=True)
+            break
         t0 = time.time()
-        runs = db.run(lambda c: F.corpus_runs(c, j["sid"]))
-        r = run_child(["--child=" + json.dumps(dict(j, corpus_runs=runs))])
+        try:
+            runs = db.run(lambda c: F.corpus_runs(c, j["sid"]))
+            with open(specf, "w") as fh:
+                json.dump(dict(j, corpus_runs=runs), fh)
+            r = run_child(["--child", specf])
+        except Exception as e:  # noqa: BLE001 -- one search must not end the night for the rest
+            r = dict(ok=False, error=f"could not start: {e!r}"[:300])
         if r.get("ok"):
             try:
                 db.run(lambda c: xln.register(c, j["sid"], j["name"], r["lance_path"], r["n_prec"],
@@ -353,13 +422,15 @@ def main():
             n_ok += 1
             state.pop(j["sid"], None)
             freed = "XIC dbs kept"
-            if not KEEP_DBS:
+            if not KEEP_DBS and not (r.get("built") and not r.get("missing_runs")):
+                freed = "XIC dbs kept (the lane was adopted, or lacks runs of the search)"
+            elif not KEEP_DBS:
                 try:
                     nf, gb = free_xic_dbs(j["xic_dir"], r["lance_path"])
                     freed = f"{nf} XIC dbs removed from the share ({gb:.1f} GB)"
                 except OSError as e:
                     freed = f"XIC dbs NOT removed ({e!r})"
-            print(f"--- {j['name']} registered: {r['n_prec']:,} precursor-run rows, {r.get('n_identified') or 0:,} "
+            print(f"--- {j['name']} registered: {r.get('n_rows', 0):,} precursor-run rows, {r['n_prec']:,} "
                   f"identified (the search has {j['n']:,}), "
                   f"{r['n_traces']:,} traces, {int(time.time()-t0)}s; {freed}", flush=True)
         else:

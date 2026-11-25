@@ -436,3 +436,12 @@ def test_four_timeouts_in_a_row_stop_the_run_and_backfill_misses_do_not():
     assert len(res) == 5 and "time limit" in stop
     res, stop = _run([8, 4, 0, 0])                 # first results say nothing about the setup
     assert len(res) == 4 and stop is None
+
+
+def test_leftover_xics_needs_the_export_ok_marker(tmp_path):
+    out = tmp_path / "exp"
+    assert sne_one.leftover_xics(str(out)) is None
+    a = out / "xics_20261201_010101"; b = out / "xics_20261202_010101"; a.mkdir(parents=True); b.mkdir()
+    (a / "r.xic.db").write_bytes(b"x"); (a / "EXPORT_OK.txt").write_text("1 files")
+    (b / "r.xic.db").write_bytes(b"x")                       # newer, but the export never finished
+    assert sne_one.leftover_xics(str(out)) == str(a)

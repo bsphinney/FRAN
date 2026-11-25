@@ -1,3 +1,4 @@
+import time
 """fill_spectrum_lanes.py's decisions and its health-scan checks, with no database, no Lance, no HIVE.
 
 What this CANNOT prove: that a real report parses and a real dataset writes. That path
@@ -785,7 +786,7 @@ def test_full_row_never_borrows_another_runs_measurements():
     b = X.full_row(7, tr, "run2", "/x/run2.xic.db", None, ident, "sid", "n")        # not identified in run2
     assert not b["identified"] and b["stripped_seq"] == "PEPTIDEK" and b["rt"] is None and b["q_value"] is None
     c = X.full_row(8, tr, "run2", "/x/run2.xic.db", None, None, "sid", "n")         # never in the report
-    assert not c["identified"] and c["stripped_seq"] is None and c["xicdbid"] == 8
+    assert not c["identified"] and c["stripped_seq"] is None and c["xicdbid"] == 8 and c["is_decoy"] is None
     d = X.full_row(7, tr, "run1", "/x", dict(rec, q_value=0.2), ident, "sid", "n")
     e = X.full_row(7, tr, "run1", "/x", dict(rec, is_decoy="True"), ident, "sid", "n")
     assert not d["identified"] and d["q_value"] == 0.2 and not e["identified"] and e["is_decoy"]
@@ -804,7 +805,26 @@ def test_full_lane_round_trip_describe_and_verify():
     lance.write_dataset(pa.Table.from_pylist(rows[:200], schema=X.full_schema()), p, mode="create")
     lance.write_dataset(pa.Table.from_pylist(rows[200:], schema=X.full_schema()), p, mode="append")
     r = X.describe(p, "sid")
-    assert (r["n_prec"], r["n_identified"], r["n_traces"], r["runs"]) == (300, 100, 300, ["run1"])
+    assert (r["n_rows"], r["n_prec"], r["n_identified"], r["n_traces"], r["runs"]) == (300, 100, 100, 300, ["run1"])
     assert xln.verify(p, r["md5"])
     with pytest.raises(RuntimeError):
         X.describe(p, "another-search")
+
+
+def test_sweep_incoming_only_old_folders_of_this_job_type():
+    import fill_spectronaut_xic_lanes as X
+    root = tempfile.mkdtemp()
+    for n in (".incoming_snfull.111", ".incoming_snfull.222", ".incoming.999", "a.full.xic.lance"):
+        os.makedirs(os.path.join(root, n))
+    later = time.time() + 5 * 86400
+    assert X.sweep_incoming(root, "222", now=time.time()) == 0             # all recent
+    assert X.sweep_incoming(root, "222", now=later) == 1
+    assert sorted(os.listdir(root)) == [".incoming.999", ".incoming_snfull.222", "a.full.xic.lance"]
+
+
+def test_complete_count_reads_the_marker():
+    import fill_spectronaut_xic_lanes as X
+    d = tempfile.mkdtemp()
+    assert X.complete_count(d) is None
+    open(os.path.join(d, "COMPLETE.txt"), "w").write("12 files\n999 bytes\n")
+    assert X.complete_count(d) == 12
