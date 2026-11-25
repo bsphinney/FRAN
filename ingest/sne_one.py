@@ -45,7 +45,14 @@ REPORTS = os.path.join(os.path.dirname(FRAN), "FRAN_reports")
 
 
 def log(m):
+    """To the console, and to node_reports/<HOST>/sne_one.log on the share so the run can be
+    followed from Hive (there is no shell into this computer)."""
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
+    try:
+        import node_report
+        node_report.report("sne_one", m, FRAN if os.path.isdir(FRAN) else None)
+    except Exception:  # noqa: BLE001 -- a status line must never stop an ingest
+        pass
 
 
 def db():

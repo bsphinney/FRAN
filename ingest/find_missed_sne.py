@@ -21,6 +21,10 @@ STATUS
                  review these by hand (a re-search saved under an old name would look like this).
   INGESTED       FRAN holds a search recorded from exactly this path.
   TOO_NEW        modified in the last --min-age-hours (default 2): Spectronaut may still be writing.
+  QC_OR_TEST     never ingested, but its name or folder says QC or test (find_uningested's QC rule,
+                 plus the words test / testing / demo / tutorial). Listed, NOT put in the .cmd file.
+                 To ingest one anyway, add its path to missed_sne\\include.txt (one per line).
+  EXCLUDED       its path or name is in missed_sne\\exclude.txt (one per line). Never ingested.
 
 WHY NAMES, NOT PATHS. The same .sne sits on several drives (B: project folders, S:\\sne_storage,
 the R:/K: share), and FRAN records whichever path it was ingested from. Matching on the path alone
@@ -38,7 +42,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from find_uningested import name_keys, norm_path, known_keys, prune  # noqa: E402 -- the ONE matching rule
+from find_uningested import name_keys, norm_path, known_keys, prune, name_qc_signal  # noqa: E402 -- the ONE matching rule
 
 # Never worth walking on a Windows system drive, and never a place an experiment is saved.
 SKIP_DIRS = {"$recycle.bin", "system volume information", "windows", "program files",
@@ -134,19 +138,50 @@ def has_xic_dbs(sne_path, listdir=os.listdir, isdir=os.path.isdir):
         return False
 
 
-def classify(items, paths, names, bases, now=None, min_age_hours=2.0):
+_TEST_RE = __import__("re").compile(r"(?i)(?<![a-z0-9])(test|testing|tests|demo|tutorial|delete ?me|junk)(?![a-z])")
+
+
+def qc_or_test(path, stem):
+    """Why this experiment looks like QC or a test, or None: the name, or one of the two folders
+    above it. find_uningested.name_qc_signal is the corpus's own QC rule; the test words are extra."""
+    parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+    for text in [stem] + parts[-3:-1]:
+        sig = name_qc_signal(text)
+        if sig:
+            return f"{text!r} {sig}"
+        m = _TEST_RE.search(text or "")
+        if m:
+            return f"{text!r} contains {m.group(1)!r}"
+    return None
+
+
+def read_list(path):
+    """Lines of a hand-kept include/exclude file, lower-cased; blank lines and # comments skipped."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return {l.strip().strip('"').lower() for l in fh if l.strip() and not l.lstrip().startswith("#")}
+    except OSError:
+        return set()
+
+
+def classify(items, paths, names, bases, now=None, min_age_hours=2.0, include=(), exclude=()):
     """items: dicts with path, stem, bytes, mtime. Adds status, matched_by, n_copies, in place, and
-    returns them sorted (MISSED first, largest first)."""
+    returns them sorted (MISSED first, largest first). include/exclude: lower-cased paths or names."""
     now = time.time() if now is None else now
     known_names = names | bases
     groups = {}
     for it in items:
+        mine = {it["path"].lower(), it["stem"].lower()}
         if norm_path(it["path"]) in paths:
             it["status"], it["matched_by"] = "INGESTED", "path"
         elif name_keys(it["stem"]) & known_names:
             it["status"], it["matched_by"] = "SAME_NAME", "name"
+        elif mine & set(exclude):
+            it["status"], it["matched_by"] = "EXCLUDED", "exclude.txt"
         elif it["mtime"] and now - it["mtime"] < min_age_hours * 3600:
             it["status"], it["matched_by"] = "TOO_NEW", ""
+        elif qc_or_test(it["path"], it["stem"]) and not (mine & set(include)):
+            it["status"], it["matched_by"] = "QC_OR_TEST", qc_or_test(it["path"], it["stem"])
         else:
             it["status"], it["matched_by"] = "MISSED", ""
             groups.setdefault((it["stem"].lower(), it["bytes"]), []).append(it)
@@ -158,7 +193,7 @@ def classify(items, paths, names, bases, now=None, min_age_hours=2.0):
             if i:
                 it["status"] = "COPY"
                 it["matched_by"] = grp[0]["path"]
-    order = {"MISSED": 0, "COPY": 1, "TOO_NEW": 2, "SAME_NAME": 3, "INGESTED": 4}
+    order = {"MISSED": 0, "COPY": 1, "QC_OR_TEST": 2, "TOO_NEW": 3, "EXCLUDED": 4, "SAME_NAME": 5, "INGESTED": 6}
     return sorted(items, key=lambda x: (order[x["status"]], -x["bytes"], x["path"].lower()))
 
 
@@ -200,17 +235,17 @@ def _db():
     return conn
 
 
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    ap = argparse.ArgumentParser(description="List .sne experiments on this computer that FRAN has never ingested.")
-    ap.add_argument("roots", nargs="*", help="folders or drives to scan (default: every local fixed drive)")
-    ap.add_argument("--include-network", action="store_true", help="also scan mapped network drives")
-    ap.add_argument("--max-depth", type=int, default=14)
-    ap.add_argument("--min-age-hours", type=float, default=2.0)
-    ap.add_argument("--out-dir", default=os.path.join(here, "missed_sne"))
-    a = ap.parse_args()
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATUSES = ("MISSED", "COPY", "QC_OR_TEST", "TOO_NEW", "EXCLUDED", "SAME_NAME", "INGESTED")
 
-    roots = a.roots or local_drives(a.include_network)
+
+def scan(roots=None, include_network=False, max_depth=14, min_age_hours=2.0, out_dir=None):
+    """The whole job: walk, match against FRAN, write the list and the .cmd file.
+    Returns (items, tsv path, cmd path). Raises SystemExit when there is nothing to scan."""
+    here = HERE
+    out_dir = out_dir or os.path.join(here, "missed_sne")
+    a = argparse.Namespace(max_depth=max_depth, min_age_hours=min_age_hours, out_dir=out_dir)
+    roots = list(roots or []) or local_drives(include_network)
     roots = [r for r in roots if os.path.isdir(r)]
     if not roots:
         sys.exit("no folders to scan (give one or more paths)")
@@ -226,21 +261,42 @@ def main():
     for path, stem in found:
         size, mt = _size_mtime(path)
         items.append({"path": path, "stem": stem, "bytes": size, "mtime": mt, "xic": has_xic_dbs(path)})
-    items = classify(items, paths, names, bases, min_age_hours=a.min_age_hours)
+    items = classify(items, paths, names, bases, min_age_hours=a.min_age_hours,
+                     include=read_list(os.path.join(a.out_dir, "include.txt")),
+                     exclude=read_list(os.path.join(a.out_dir, "exclude.txt")))
 
     host = socket.gethostname().split(".")[0]
     tsv, cmd = write_outputs(items, a.out_dir, host, time.strftime("%Y%m%d"),
                              os.path.join(here, "sne_one.py"))
-    n = {s: sum(1 for it in items if it["status"] == s) for s in
-         ("MISSED", "COPY", "TOO_NEW", "SAME_NAME", "INGESTED")}
+    n = {s: sum(1 for it in items if it["status"] == s) for s in STATUSES}
     gb = sum(it["bytes"] for it in items if it["status"] == "MISSED" and it["bytes"] > 0) / 1e9
     print(f"\nwalked {seen:,} folders; {len(items)} .sne found")
     print(f"  MISSED     {n['MISSED']:>5}   ({gb:,.1f} GB) -> in the .cmd file")
     print(f"  COPY       {n['COPY']:>5}   further copies of a MISSED experiment")
+    print(f"  QC_OR_TEST {n['QC_OR_TEST']:>5}   name says QC or test: listed, not ingested (include.txt overrides)")
+    print(f"  EXCLUDED   {n['EXCLUDED']:>5}   in exclude.txt")
     print(f"  TOO_NEW    {n['TOO_NEW']:>5}   modified in the last {a.min_age_hours:g} h")
     print(f"  SAME_NAME  {n['SAME_NAME']:>5}   FRAN has this name from another path (review by hand)")
     print(f"  INGESTED   {n['INGESTED']:>5}")
     print(f"\nlist:     {tsv}\ncommands: {cmd}")
+    try:
+        import node_report
+        node_report.report("find_missed_sne", f"roots={', '.join(roots)} found={len(items)} "
+                           + " ".join(f"{k}={v}" for k, v in n.items()) + f" missed_gb={gb:.1f} list={tsv}")
+    except Exception:  # noqa: BLE001
+        pass
+    return items, tsv, cmd
+
+
+def main():
+    ap = argparse.ArgumentParser(description="List .sne experiments on this computer that FRAN has never ingested.")
+    ap.add_argument("roots", nargs="*", help="folders or drives to scan (default: every local fixed drive)")
+    ap.add_argument("--include-network", action="store_true", help="also scan mapped network drives")
+    ap.add_argument("--max-depth", type=int, default=14)
+    ap.add_argument("--min-age-hours", type=float, default=2.0)
+    ap.add_argument("--out-dir", default=os.path.join(HERE, "missed_sne"))
+    a = ap.parse_args()
+    scan(a.roots, a.include_network, a.max_depth, a.min_age_hours, a.out_dir)
 
 
 if __name__ == "__main__":
