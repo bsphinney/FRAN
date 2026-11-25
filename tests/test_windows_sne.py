@@ -364,8 +364,8 @@ def test_xic_copy_failure_leaves_no_complete_marker(tmp_path, monkeypatch):
 
 def test_share_options_file_only_passes_known_flags(tmp_path):
     p = tmp_path / "win_ingest_options.txt"
-    p.write_text("# trial\n--export-xics\n--force-ingest\nrm -rf\n", encoding="utf-8")
-    assert wa.extra_options(str(p)) == ["--export-xics"]
+    p.write_text("# trial\n--no-export-xics\n--force-ingest\nrm -rf\n", encoding="utf-8")
+    assert wa.extra_options(str(p)) == ["--no-export-xics"]
     assert wa.extra_options(str(tmp_path / "none.txt")) == []
 
 
@@ -390,3 +390,29 @@ def test_timeouts_at_the_end_do_not_stop_the_run():
     assert len(res) == 7 and stop is None
     res, stop = _run([7, 0])                       # nothing has worked yet: still stop
     assert len(res) == 1 and stop
+
+
+def test_watch_export_kills_on_timeout_and_on_a_full_disk():
+    class P:
+        def __init__(self, ends_after): self.n, self.ends, self.killed, self.returncode = 0, ends_after, False, None
+        def poll(self):
+            self.n += 1
+            if self.n > self.ends: self.returncode = 0; return 0
+            return None
+        def kill(self): self.killed = True
+        def wait(self, timeout=None): return 0
+    tick = iter(range(0, 100000, 30))
+    clock = lambda: next(tick)
+    p = P(3); assert sne_one.watch_export(p, 600, "x", 15, free=lambda o: 100, clock=clock, sleep=lambda s: None) is None and not p.killed
+    p = P(10**6); assert sne_one.watch_export(p, 600, "x", 15, free=lambda o: 100, clock=clock, sleep=lambda s: None) == "timeout" and p.killed
+    p = P(10**6); assert sne_one.watch_export(p, 10**9, "x", 15, free=lambda o: 5, clock=clock, sleep=lambda s: None) == "disk" and p.killed
+
+
+def test_backfill_plan_takes_known_experiments_once_each_smallest_first():
+    items = [dict(status="INGESTED", stem="A", bytes=500, path="B:/A.sne"),
+             dict(status="SAME_NAME", stem="a", bytes=10, path="S:/A.sne"),
+             dict(status="SAME_NAME", stem="B", bytes=20, path="S:/B.sne"),
+             dict(status="MISSED", stem="C", bytes=1, path="S:/C.sne"),
+             dict(status="QC_OR_TEST", stem="D", bytes=1, path="S:/D.sne")]
+    got = wa.backfill_plan(items)
+    assert [(i["stem"], i["path"]) for i in got] == [("B", "S:/B.sne"), ("A", "B:/A.sne")]
