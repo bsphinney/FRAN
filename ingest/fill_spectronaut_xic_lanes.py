@@ -15,10 +15,10 @@ WHAT IT DOES, per Spectronaut search with no row in delimp_xic_lane:
           <xic_lance>/.incoming.<job>/, then RENAMED to <name>__<sid8>.xic.lance and registered.
   adopt   the dataset is already at its final path but not in the registry (the job was preempted
           between the rename and the registration): it is re-read and registered, never rewritten.
-  free    after a lane is registered and re-read, the *.xic.db copies beside the archived report are
-          DELETED (FRAN_SN_XIC_KEEP_DBS=1 keeps them). They are copies: at ~1.6 GB per raw file a
-          full set for the corpus is larger than the free space on the share. COMPLETE.txt stays
-          and LANE_BUILT.txt is added, so the Windows side does not export them again.
+  free    ONLY with FRAN_SN_XIC_FREE_DBS=1: after a lane is registered and re-read, the *.xic.db
+          copies beside the archived report are deleted (COMPLETE.txt stays, LANE_BUILT.txt is
+          added). Off by default: the lane keeps targets at q <= 0.01 only, so the dbs hold traces
+          (decoys, precursors not identified in that run) that the lane does not.
   (none)  no complete XIC set on Flinders: counted, nothing attempted. Most searches: the XICs were
           never exported from Spectronaut.
 
@@ -49,7 +49,10 @@ D = os.environ.get("FRAN_SN_XIC_FILL_DIR", "/quobyte/proteomics-grp/brett/scratc
 XIC_SUBDIR, XIC_DONE = "xic_dbs", "COMPLETE.txt"       # the names sne_one.py writes
 MAX_ATTEMPTS = 3
 REPORTS_ROOT = os.environ.get("FRAN_REPORTS_ROOT", "/nfs/lssc0/flinders/proteomics/Data/FRAN_reports")
-KEEP_DBS = os.environ.get("FRAN_SN_XIC_KEEP_DBS", "0") == "1"
+# OFF unless asked for. The lane holds only target precursors at q <= 0.01 per run (report_index);
+# the XIC dbs also hold decoys and every library precursor in every run -- about two thirds of the
+# traces on the one large set measured. Deleting the dbs discards those.
+KEEP_DBS = os.environ.get("FRAN_SN_XIC_FREE_DBS", "0") != "1"
 
 
 def free_xic_dbs(xic_dir, lance_path, root=None):
