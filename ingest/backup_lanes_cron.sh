@@ -6,7 +6,7 @@ SBIN=/cvmfs/hpc.ucdavis.edu/sw/spack/environments/core/view/generic/slurm/bin
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOG=/quobyte/proteomics-grp/brett/scratch/fran_health/logs/cron_submit.log
 ME=$(id -un)                       # cron has no $USER
-if ! q=$("$SBIN/squeue" -h -u "$ME" -n fran_lane_backup -t PENDING,RUNNING 2>&1); then
+if ! q=$("$SBIN/squeue" -h -u "$ME" -n fran_lane_backup -t PENDING,RUNNING,CONFIGURING,COMPLETING,SUSPENDED,REQUEUED 2>&1); then
   echo "$(date '+%F %T') lane_backup ABORT: squeue failed ($q); not submitting blind" >> "$LOG"; exit 1
 fi
 if [ -n "$q" ]; then echo "$(date '+%F %T') lane_backup skip: one already queued or running" >> "$LOG"; exit 0; fi
