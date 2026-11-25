@@ -3,6 +3,7 @@
   1. manageSNE export with the FRAN report schema (FRAN.rs), as TSV, to the local C: drive
   2. corpus_ingest --bulk-copy, keyed on the .sne path (--output-dir), so a re-run replaces
   3. COPY THE REPORT TO FLINDERS (<share>\\Data\\FRAN_reports\\<sne name>\\<export folder>\\)
+     and, once the copy is verified, delete the export from C: (logs are kept)
   4. sne_xic_ingest, when an _XIC-DBs folder sits beside the .sne
 
   py sne_one.py --sne "<path.sne>" --name "<search_name>" [--xic-dir "<dir>"] [--batch-size N]
@@ -90,6 +91,32 @@ def pick_report(out, since):
     return max(reps, key=os.path.getsize) if reps else None
 
 
+def free_gb(path):
+    """Free space, in GB, on the drive that holds `path` (the nearest existing parent)."""
+    p = os.path.abspath(path)
+    while not os.path.isdir(p) and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    return shutil.disk_usage(p).free / 1e9
+
+
+def remove_local_export(out, base=None):
+    """Delete the export folders inside ONE per-.sne folder, keeping its log files. Only ever a
+    direct child of the export base (C:\\fran_sne_one), never anything else. Returns GB freed.
+    Called only after the report is verified on Flinders: without this every report stayed on C:
+    and an unattended batch filled the drive."""
+    base = os.path.abspath(base or OUTBASE)
+    out = os.path.abspath(out)
+    if os.path.dirname(out) != base or not os.path.isdir(out):
+        return 0.0
+    freed = 0
+    for e in os.listdir(out):
+        d = os.path.join(out, e)
+        if os.path.isdir(d) and not os.path.islink(d):
+            freed += sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(d) for f in fs)
+            shutil.rmtree(d, ignore_errors=True)
+    return freed / 1e9
+
+
 def find_known_elsewhere(sne, rows):
     """A search FRAN already holds for this experiment under ANOTHER path, or None.
     rows: (id, output_dir, search_name) of the Spectronaut searches. The same .sne sits on several
@@ -174,11 +201,20 @@ def main():
     ap.add_argument("--batch-size", type=int, default=0)
     ap.add_argument("--no-flinders-copy", action="store_true",
                     help="do not archive the report on Flinders (the search then gets no spectrum lane)")
+    ap.add_argument("--min-free-gb", type=float, default=60.0,
+                    help="refuse to start with less free space than this on the export drive (default 60)")
+    ap.add_argument("--keep-local", action="store_true",
+                    help="keep the export on C: after it is archived on Flinders (default: delete it)")
     ap.add_argument("--force-ingest", action="store_true",
                     help="ingest even though FRAN holds a search with this experiment's name from another path")
     a = ap.parse_args()
     sne, name = a.sne, a.name
-    out = export_dir(name, sne); os.makedirs(out, exist_ok=True)
+    out = export_dir(name, sne)
+    fg = free_gb(out)
+    if fg < a.min_free_gb:
+        log(f"only {fg:.0f} GB free on the export drive ({OUTBASE}), need {a.min_free_gb:g} -> abort "
+            f"before exporting (free space, or lower --min-free-gb)"); sys.exit(6)
+    os.makedirs(out, exist_ok=True)
     xd = a.xic_dir
     if not xd:
         cand = [d for d in glob.glob(os.path.join(os.path.dirname(sne), "*_XIC-DBs")) if glob.glob(os.path.join(d, "*.xic.db"))]
@@ -259,10 +295,17 @@ def main():
     # 3) archive the report on Flinders, AFTER a good ingest: a report that reached Flinders without
     # its search would be picked up by Hive's auto-ingest under a second output_dir.
     archive_failed = False
+    archived_ok = False
+
+    def cleanup():
+        if archived_ok and not a.keep_local:
+            log(f"local export removed ({remove_local_export(out):.1f} GB freed on C:; logs kept in {out})")
+
     if archive:
         t0 = time.time()
         try:
             dst = copy_report_to_flinders(rep, sne)
+            archived_ok = True
             log(f"step 3: report archived on Flinders in {int(time.time()-t0)}s -> {dst}")
         except OSError as e:
             archive_failed = True
@@ -272,6 +315,7 @@ def main():
     # 4) XIC (if dbs present)
     if not xd:
         log(f"DONE ({'report only, no _XIC-DBs' if ingest else 'archive only'}): {name}")
+        cleanup()
         sys.exit(4 if archive_failed else 0)
     con = db(); c = con.cursor()
     c.execute("SELECT id, n_precursors_total FROM delimp_searches WHERE output_dir=%s ORDER BY ingested_at DESC LIMIT 1", (sne,))
@@ -291,6 +335,7 @@ def main():
     for t in (rc3.stdout.strip().splitlines()[-3:] if rc3.stdout else []): log("  xic> " + t)
     log(f"step 4 rc={rc3.returncode} in {int(time.time()-t0)}s")
     log(f"DONE (report+XIC ok): {name}" if (rc3.returncode == 0 and "upserted" in (rc3.stdout or "")) else f"DONE (report ok, XIC issue): {name}")
+    cleanup()
     sys.exit(4 if archive_failed else 0)
 
 

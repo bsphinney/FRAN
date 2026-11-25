@@ -224,3 +224,20 @@ def test_known_elsewhere_by_name_not_by_this_path():
     assert sne_one.find_known_elsewhere(r"B:\copy\Folder Exp.sne", rows)[0] == "s3"
     assert sne_one.find_known_elsewhere(r"B:\proj\Other.sne", rows) is None      # its own row
     assert sne_one.find_known_elsewhere(r"B:\proj\Brand New.sne", rows) is None
+
+
+def test_local_export_removed_only_inside_its_own_folder(tmp_path):
+    base = tmp_path / "fran_sne_one"
+    out = base / "exp_abcd1234"; (out / "20261125_x").mkdir(parents=True)
+    (out / "20261125_x" / "x_Report_FRAN (Normal).tsv").write_bytes(b"x" * 2000)
+    (out / "manageSNE.log").write_text("log")
+    assert sne_one.remove_local_export(str(out), str(base)) == pytest.approx(2e-6)
+    assert sorted(os.listdir(out)) == ["manageSNE.log"]
+    other = tmp_path / "elsewhere"; (other / "d").mkdir(parents=True); (other / "d" / "f").write_text("keep")
+    assert sne_one.remove_local_export(str(other), str(base)) == 0.0          # not under the base
+    assert sne_one.remove_local_export(str(base), str(base)) == 0.0           # the base itself
+    assert (other / "d" / "f").exists() and out.exists()
+
+
+def test_free_gb_of_a_folder_that_does_not_exist_yet(tmp_path):
+    assert sne_one.free_gb(str(tmp_path / "not" / "yet")) > 0
