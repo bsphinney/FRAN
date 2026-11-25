@@ -27,6 +27,8 @@ STEPS (order is load-bearing -- see each script's docstring):
                                   (its docstring says corpus_ingest calls it; nothing does)
   9 refresh_search_ptm            per-search PTM rollup for searches that have none
     build_run_flags               train/val/test split (set once) + shareable class per raw run
+    diann_full_output nightly     registers every file each DIA-NN search wrote and regenerates
+                                  its report unfiltered (--qvalue 0.5, decoys) from saved .quant
     raw_md5                       md5 of every newly located raw (capped at 2 TB a night)
  --weekly adds:
  10 predict_tissue, 11 predict_blood_fraction   whole-corpus rescoring (scores depend on the
@@ -70,6 +72,9 @@ STEPS = [
     ("engines_confirming", None, 3600, False),            # in-process, see engines_confirming()
     ("refresh_search_ptm", ["--batch", "10"], 4 * 3600, False),   # 50 timed out on 1M+-precursor searches
     ("build_run_flags", ["--apply"], 3600, False),         # split + shareable per raw run
+    # Every file each new DIA-NN search wrote goes in delimp_search_artifact, and its report is
+    # regenerated from the saved .quant files at --qvalue 0.5 with decoys (FRAN#35).
+    ("diann_full_output", ["nightly", "--apply"], 600, False),
     ("raw_md5", ["--apply", "--max-bytes", "2e12"], 20 * 3600, False),  # newly located raws, <=2 TB/night
     ("predict_tissue", ["--apply"], 2 * 3600, True),
     ("predict_blood_fraction", ["--apply"], 2 * 3600, True),

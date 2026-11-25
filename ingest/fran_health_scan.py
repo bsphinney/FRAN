@@ -288,6 +288,46 @@ def check_db(c):
     add("RED" if pct_free < 0.05 else "AMBER" if pct_free < 0.15 else "ok", "database", msg)
 
 
+def check_search_output(c):
+    """Is the COMPLETE output of every DIA-NN search on record (FRAN#35)? The corpus tables hold a
+    1% precursor-filtered view; delimp_search_artifact lists the files that hold the rest. Every
+    DIA-NN search must have its own report registered and a full report regenerated from .quant.
+    A count that only ever grows here means the nightly diann_full_output step is not running."""
+    if "search_id" not in columns_of(c, "delimp_search_artifact"):
+        add("RED", "search output", "delimp_search_artifact does not exist: run "
+            "`diann_full_output.py migrate --apply`; no DIA-NN output file is on record")
+        return
+    c.execute("""SELECT count(*),
+                   count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM delimp_search_artifact a
+                             WHERE a.search_id = s.id AND a.kind = 'report')),
+                   count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM delimp_search_artifact a
+                             WHERE a.search_id = s.id AND a.kind = 'full_report'))
+                 FROM delimp_searches s
+                 WHERE s.search_engine = 'diann' AND s.ingested_at < now() - interval '2 days'""")
+    n, no_rep, no_full = c.fetchone()
+    c.execute("""SELECT count(*) FROM delimp_search_artifact
+                 WHERE kind = 'full_report_mismatch' AND missing_since IS NULL""")
+    bad = c.fetchone()[0]
+    metrics["search_output"] = {"diann_searches": n, "no_report_registered": no_rep,
+                                "no_full_report": no_full, "full_report_mismatch": bad}
+    add("RED" if no_rep > 0.02 * max(n, 1) else "AMBER" if no_rep else "ok", "search output",
+        f"{no_rep:,} of {n:,} DIA-NN searches have no report file on record")
+    add("RED" if no_full > 0.25 * max(n, 1) else "AMBER" if no_full > 0.15 * max(n, 1) else "ok",
+        "search output", f"{no_full:,} of {n:,} DIA-NN searches have no unfiltered (--qvalue 0.5) "
+        f"report; reasons per search are in FRAN_diann/_full_reports/_failed/")
+    if bad:
+        add("RED", "search output", f"{bad} regenerated reports do not reproduce the original's 1% rows")
+    c.execute("""SELECT count(*) FROM delimp_search_artifact a
+                 WHERE a.kind = 'full_report' AND a.detail->>'status' LIKE 'ok%'
+                   AND a.registered_at < now() - interval '2 days'
+                   AND NOT EXISTS (SELECT 1 FROM delimp_diann_protein_unfiltered p
+                                   WHERE p.search_id = a.search_id)""")
+    no_prot = c.fetchone()[0]
+    metrics["search_output"]["full_report_without_protein_rows"] = no_prot
+    add("AMBER" if no_prot else "ok", "search output",
+        f"{no_prot:,} DIA-NN searches have an unfiltered report but no rows in delimp_diann_protein_unfiltered")
+
+
 RAW_SAMPLE = 300          # located raws stat-ed per scan to prove the raws are still there
 
 
@@ -855,7 +895,8 @@ def main():
     conn.set_session(readonly=True, autocommit=True)
     with conn.cursor() as c:
         c.execute("SET statement_timeout = '15min'")
-        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training):
+        for fn in (check_db, check_fill, check_coverage, check_backlog, check_ingest, check_training,
+                   check_search_output):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001 - one broken check must not hide the others
