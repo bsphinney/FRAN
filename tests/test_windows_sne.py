@@ -328,3 +328,42 @@ def test_lock_is_taken_once_and_a_dead_owner_is_replaced(tmp_path):
         assert not wa.take_lock(p)                          # a live owner keeps it
     finally:
         child.kill(); child.wait()
+
+
+# ------------------------------------------------------------------ sne_one: XIC dbs to Flinders
+def test_xic_dbs_archived_beside_the_report_complete_marker_last(tmp_path):
+    rep = _export(tmp_path)
+    root = tmp_path / "FRAN_reports"; root.mkdir()
+    sne = r"B:\proj\My Exp.sne"
+    dst = sne_one.copy_report_to_flinders(rep, sne, str(root))
+    assert sne_one.flinders_report_path(sne, str(root)) == dst
+    xd = tmp_path / "My_XIC-DBs"; xd.mkdir()
+    (xd / "run1.xic.db").write_bytes(b"a" * 300); (xd / "run2.xic.db").write_bytes(b"b" * 500)
+    (xd / "._run1.xic.db").write_bytes(b"stub"); (xd / "notes.txt").write_text("no")
+    assert not sne_one.flinders_has_xic(sne, str(root))
+    n, gb = sne_one.copy_xic_dbs_to_flinders(str(xd), dst)
+    d = os.path.join(os.path.dirname(dst), "xic_dbs")
+    assert n == 2 and sorted(os.listdir(d)) == ["COMPLETE.txt", "run1.xic.db", "run2.xic.db"]
+    assert open(os.path.join(d, "COMPLETE.txt")).read().startswith("2 files\n800 bytes")
+    assert sne_one.flinders_has_xic(sne, str(root))
+
+
+def test_xic_copy_failure_leaves_no_complete_marker(tmp_path, monkeypatch):
+    rep = _export(tmp_path)
+    root = tmp_path / "FRAN_reports"; root.mkdir()
+    dst = sne_one.copy_report_to_flinders(rep, "X.sne", str(root))
+    xd = tmp_path / "x"; xd.mkdir(); (xd / "r.xic.db").write_bytes(b"a" * 300)
+    monkeypatch.setattr(sne_one.shutil, "copyfile", lambda s, d: open(d, "wb").write(b"zz"))
+    with pytest.raises(OSError):
+        sne_one.copy_xic_dbs_to_flinders(str(xd), dst)
+    assert not sne_one.flinders_has_xic("X.sne", str(root))
+    empty = tmp_path / "e"; empty.mkdir()
+    with pytest.raises(OSError):
+        sne_one.copy_xic_dbs_to_flinders(str(empty), dst)
+
+
+def test_share_options_file_only_passes_known_flags(tmp_path):
+    p = tmp_path / "win_ingest_options.txt"
+    p.write_text("# trial\n--export-xics\n--force-ingest\nrm -rf\n", encoding="utf-8")
+    assert wa.extra_options(str(p)) == ["--export-xics"]
+    assert wa.extra_options(str(tmp_path / "none.txt")) == []
