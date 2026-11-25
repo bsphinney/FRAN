@@ -124,7 +124,11 @@ def is_report(fn):
 def candidate_names(search_name, real_name, output_dir, report_path):
     """Names a search's report directory could carry, with and without the export timestamp."""
     out = []
-    for s in (search_name, real_name, re.sub(r"\.sne$", "", _base(output_dir), flags=re.I),
+    od = str(output_dir or "").replace("\\", "/").rstrip("/")
+    # An experiment saved as <folder>/.sne (a directory literally named ".sne") is named by its
+    # folder: the last component gives nothing, and sne_one.py archives its report under the folder name.
+    od_name = _base(od[:-5]) if od.lower().endswith("/.sne") else re.sub(r"\.sne$", "", _base(od), flags=re.I)
+    for s in (search_name, real_name, od_name,
               report_name(report_path) if report_path else None):
         if s:
             for k in (s, _strip_ts(s)):

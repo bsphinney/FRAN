@@ -722,3 +722,10 @@ class HealthChecks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_dot_sne_directory_is_named_by_its_folder():
+    import fill_spectrum_lanes as f
+    assert "My Exp" in f.candidate_names("Custom Name", None, r"B:\\proj\\My Exp\\.sne", None)
+    assert "My Exp" in f.candidate_names("Custom Name", None, r"B:\\proj\\My Exp.sne", None)
+    assert "" not in f.candidate_names("n", None, r"B:\\proj\\My Exp\\.sne", None)
