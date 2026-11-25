@@ -15,6 +15,9 @@ WHAT IT WILL NOT DO. It never ingests an experiment FRAN already holds under ano
 (SAME_NAME), a second copy of the same experiment (COPY), one whose name says QC or test
 (QC_OR_TEST), one being written right now (TOO_NEW), or one listed in missed_sne\\exclude.txt.
 
+A SPECTRONAUT EXPORT may take 40 minutes plus 30 per GB of .sne (at most 12 hours). One that runs
+past that is recorded as failed and the run goes on to the next experiment.
+
 IT STOPS BY ITSELF when the FIRST experiment fails (nothing has worked on this computer yet, so the
 fault is the setup, not the experiment), after 3 failures in a row, or when the export drive is
 full or the share is gone. A single failure in the middle is recorded and the run moves on.
@@ -40,6 +43,7 @@ sys.path.insert(0, HERE)
 import node_report  # noqa: E402
 
 LOCK = r"C:\fran_sne_one\win_ingest_all.lock"
+TIMEOUT_CODE = 7     # sne_one: the Spectronaut export ran past its limit. About THAT experiment, not the setup.
 STOP_CODES = {5: "the report archive on the share is not reachable", 6: "the export drive is nearly full"}
 MAX_IN_A_ROW = 3
 # Options that may be switched on for every experiment from the share, without touching this
@@ -150,6 +154,8 @@ def run_all(todo, run_one, say=log, status=write_status):
         if ok:
             done_ok += 1; in_a_row = 0
             continue
+        if rc == TIMEOUT_CODE and done_ok:
+            continue            # one slow experiment: recorded as failed, never a reason to stop the run
         in_a_row += 1
         if rc in STOP_CODES:
             stop = STOP_CODES[rc]
