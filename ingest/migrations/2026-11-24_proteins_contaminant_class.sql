@@ -5,13 +5,16 @@
 -- (organism.is_contaminant_flag: contaminant OR suspected). A group such as 'A0A0G2JV65;Cont_P63103;P63102' contains a
 -- contaminant accession AND a real one; as a boolean that fact is lost. This stores it.
 --
+-- RUN IT IN AUTOCOMMIT (plain `psql -f`): never with `psql -1` or inside BEGIN. In one transaction the
+-- ACCESS EXCLUSIVE lock taken by ADD COLUMN would be held through the VALIDATE scan of the whole table.
+--
 -- NOT applied by the app or the ingest. The OWNER runs it once, as the table owner (`delimp`).
 -- The ingest writes the column only when it exists, so ingest works before and after this.
 --
--- SAFE ON 97 M ROWS: ADD COLUMN ... NULL with NO DEFAULT is catalog-only on PostgreSQL 16 (no
+-- SAFE ON 105 M ROWS: ADD COLUMN ... NULL with NO DEFAULT is catalog-only on PostgreSQL 16 (no
 -- rewrite). lock_timeout makes it give up rather than queue behind a long query and block every
 -- reader of delimp_proteins; re-run if it times out.
--- The CHECK is added NOT VALID: a plain ADD CONSTRAINT ... CHECK scans ALL 97 M rows while holding
+-- The CHECK is added NOT VALID: a plain ADD CONSTRAINT ... CHECK scans ALL 105 M rows while holding
 -- ACCESS EXCLUSIVE (minutes of website downtime). NOT VALID only takes the catalog lock; new and
 -- updated rows are checked from then on. VALIDATE CONSTRAINT is a separate statement, OUTSIDE the
 -- lock_timeout block, and holds only SHARE UPDATE EXCLUSIVE (readers and writers continue).

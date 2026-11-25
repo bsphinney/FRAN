@@ -20,7 +20,7 @@ from recompute_is_contaminant import CLASS_RULE, NEW_RULE
 EDGE = ["P05784", "Cont_P02769", "Cont_P02768;P02768", "P02768;Cont_P02768", ";", ";;", "", " ", "  ;  ",
         "CON__P02769", "cRAP-001;Cont_X", " Cont_A;Cont_B", "Cont_A;;Cont_B;", "cont_p02769", "cRAP001",
         "Cont_", "nan", " P05784 ; Cont_P02769", "Cont_A; P1", "A;B;C", "\tCont_A", "P04264", "KRT1;P04264",
-        "Q9XYZ_contaminant", "P1;keratin"]
+        "Q9XYZ_contaminant", "P1;keratin", "\t", "Cont_A;\t", "Cont_A;\n;Cont_B", " \t ;P1"]
 EDGE_GENES = [None, "", "KRT1", "krt6b", "ALB", "Keratin-like", "CONT_X", "contaminant", "nan"]
 # every edge group with every edge gene, plus the awkward case of a name match split across the join
 EDGE_PAIRS = [(g, e) for g in EDGE for e in EDGE_GENES] + [("KR", "T1"), ("cont", "_x"), ("P1;Cont_A", "KRT1")]

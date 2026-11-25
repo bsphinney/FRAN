@@ -35,10 +35,10 @@ _HAS = r"x ~* '^\s*(Cont_|CON__|cRAP[-_]?\d)'"
 _NAME = r"(p.protein_group || coalesce(p.gene, 'None')) ~* 'KRT|keratin|cont_|contaminant'"
 _ACC = "unnest(string_to_array(p.protein_group, ';')) AS a(x)"
 CLASS_RULE = rf"""(CASE
-    WHEN NOT EXISTS (SELECT 1 FROM {_ACC} WHERE btrim(x) <> '')
+    WHEN NOT EXISTS (SELECT 1 FROM {_ACC} WHERE x ~ '[^[:space:]]')
          THEN (CASE WHEN {_NAME} THEN 'suspected' END)
-    WHEN NOT EXISTS (SELECT 1 FROM {_ACC} WHERE btrim(x) <> '' AND NOT ({_HAS})) THEN 'contaminant'
-    WHEN EXISTS (SELECT 1 FROM {_ACC} WHERE btrim(x) <> '' AND {_HAS}) THEN 'mixed'
+    WHEN NOT EXISTS (SELECT 1 FROM {_ACC} WHERE x ~ '[^[:space:]]' AND NOT ({_HAS})) THEN 'contaminant'
+    WHEN EXISTS (SELECT 1 FROM {_ACC} WHERE x ~ '[^[:space:]]' AND {_HAS}) THEN 'mixed'
     WHEN {_NAME} THEN 'suspected'
     ELSE 'sample' END)"""
 

@@ -79,7 +79,7 @@ def canonical_organism(name) -> str | None:
 
 # Accession prefixes of contaminant libraries: Spectronaut "Universal Contaminant Protein FASTA"
 # (Cont_P02769), MaxQuant contaminants.fasta (CON__P02769), cRAP (cRAP-001 / cRAP001).
-_CONTAM_ACC = re.compile(r"^\s*(?:Cont_|CON__|cRAP[-_]?\d)", re.I)
+_CONTAM_ACC = re.compile(r"^\s*(?:Cont_|CON__|cRAP[-_]?\d)", re.I | re.ASCII)
 
 
 # The flag the corpus carried before the 2026-11 audit (corpus_ingest.ingest, the ONE writer for both
@@ -87,7 +87,7 @@ _CONTAM_ACC = re.compile(r"^\s*(?:Cont_|CON__|cRAP[-_]?\d)", re.I)
 # of str(protein_group) + str(gene) -- the two joined with nothing between, None rendered as "None".
 # It matched keratins and the like by NAME, whatever database they came from. Kept only to name the
 # 'suspected' class; it never overrides an accession-prefix verdict.
-_OLD_NAME_RULE = re.compile(r"KRT|keratin|cont_|contaminant", re.I)
+_OLD_NAME_RULE = re.compile(r"KRT|keratin|cont_|contaminant", re.I | re.ASCII)
 
 
 def contaminant_class(protein_group, gene=None) -> str | None:
