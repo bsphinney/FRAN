@@ -164,4 +164,63 @@ def test_outputs_list_everything_but_command_only_missed(tmp_path):
     rows = open(tsv, encoding="utf-8").read().splitlines()
     assert len(rows) == 4 and rows[1].split("\t")[:4] == ["MISSED", r"B:\p\New One.sne", "New One", "2.00"]
     lines = [l for l in open(cmd, encoding="utf-8").read().splitlines() if l.startswith("py ")]
-    assert lines == [r'py "K:\Data\FRAN_SNE_export\sne_one.py" --sne "B:\p\New One.sne" --name "New One"']
+    assert lines == [r'py "K:\Data\FRAN_SNE_export\sne_one.py" --sne "B:\p\New One.sne" --name="New One"']
+
+
+def test_cmd_line_survives_percent_and_leading_dash():
+    line = fm.command_for({"path": r"B:\p\100%_x (a&b).sne", "stem": "-100%_x (a&b)"}, r"K:\s\sne_one.py")
+    assert line == r'py "K:\s\sne_one.py" --sne "B:\p\100%%_x (a&b).sne" --name="-100%%_x (a&b)"'
+
+
+def test_xic_dbs_beside_a_windows_path():
+    seen = {}
+    def listdir(d):
+        seen["d"] = d
+        return ["Exp_XIC-DBs", "other"]
+    assert fm.has_xic_dbs(r"B:\proj\Exp.sne", listdir=listdir, isdir=lambda p: True)
+    assert seen["d"] == r"B:\proj"
+
+
+def test_dot_sne_directory_is_known_by_its_folder():
+    paths, names, bases = _known([(r"B:\proj\My Exp\.sne", "Custom Name")])
+    assert "my exp" in names
+    out = fm.classify([_item(r"S:\copy\My Exp.sne", "My Exp")], paths, names, bases, now=1e9)
+    assert out[0]["status"] == "SAME_NAME"
+
+
+# ------------------------------------------------------------------ sne_one: review fixes
+def test_stem_never_raises_index_error():
+    with pytest.raises(ValueError):
+        sne_one.sne_stem(".sne")
+    with pytest.raises(ValueError):
+        sne_one.sne_stem(r"x:\.sne")
+
+
+def test_export_dir_is_unique_per_sne_even_with_a_shared_long_name():
+    long = "A" * 90
+    a = sne_one.export_dir(long + "_one", r"B:\p\one.sne", "C:/o")
+    b = sne_one.export_dir(long + "_two", r"B:\p\two.sne", "C:/o")
+    assert a != b
+    assert sne_one.export_dir("n", r"B:\P\One.sne", "C:/o") == sne_one.export_dir("n", r"b:\p\one.sne", "C:/o")
+
+
+def test_pick_report_ignores_an_older_export(tmp_path):
+    old = tmp_path / "20260101_000000_x"; old.mkdir()
+    new = tmp_path / "20261125_000000_x"; new.mkdir()
+    (old / "x_Report_FRAN (Normal).tsv").write_bytes(b"o" * 5000)       # bigger, but stale
+    (new / "x_Report_FRAN (Normal).tsv").write_bytes(b"n" * 10)
+    t0 = 2_000_000_000.0
+    os.utime(old / "x_Report_FRAN (Normal).tsv", (t0 - 9999, t0 - 9999))
+    os.utime(new / "x_Report_FRAN (Normal).tsv", (t0 + 60, t0 + 60))
+    assert sne_one.pick_report(str(tmp_path), t0) == str(new / "x_Report_FRAN (Normal).tsv")
+    assert sne_one.pick_report(str(tmp_path), t0 + 9999) is None
+
+
+def test_known_elsewhere_by_name_not_by_this_path():
+    rows = [("s1", r"S:\sne_storage\20250101_010101_My Exp.sne", "whatever"),
+            ("s2", r"B:\proj\Other.sne", "Other"),
+            ("s3", r"D:\x\Folder Exp\.sne", "Renamed")]
+    assert sne_one.find_known_elsewhere(r"B:\proj\My Exp.sne", rows)[0] == "s1"
+    assert sne_one.find_known_elsewhere(r"B:\copy\Folder Exp.sne", rows)[0] == "s3"
+    assert sne_one.find_known_elsewhere(r"B:\proj\Other.sne", rows) is None      # its own row
+    assert sne_one.find_known_elsewhere(r"B:\proj\Brand New.sne", rows) is None

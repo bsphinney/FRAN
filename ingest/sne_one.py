@@ -22,6 +22,7 @@ auto-ingest scan (both match *.tsv / *.parquet) can pick up a half-written repor
 """
 import argparse
 import glob
+import hashlib
 import os
 import re
 import shutil
@@ -64,9 +65,52 @@ def is_report(fn):
 def sne_stem(sne):
     """The folder name Hive looks for: the .sne file name without its extension. For a directory
     literally named ".sne" (Spectronaut's store inside an experiment folder) it is the parent's name."""
-    p = str(sne).replace("\\", "/").rstrip("/")
-    stem = re.sub(r"\.sne$", "", p.rsplit("/", 1)[-1], flags=re.I)
-    return stem or p.rsplit("/", 2)[-2]
+    parts = [x for x in str(sne).replace("\\", "/").rstrip("/").split("/") if x]
+    stem = re.sub(r"\.sne$", "", parts[-1], flags=re.I) if parts else ""
+    if not stem and len(parts) > 1:
+        stem = re.sub(r"^[A-Za-z]:$", "", parts[-2])
+    if not stem:
+        raise ValueError(f"cannot name the experiment from {sne!r}")
+    return stem
+
+
+def export_dir(name, sne, base=None):
+    """A local export folder for ONE .sne: the readable name plus a hash of the .sne path. The name
+    alone, cut to 70 characters, put two experiments with a long common prefix in one folder, and
+    'the largest report in the folder' could then be the other experiment's."""
+    tag = hashlib.md5(str(sne).lower().encode("utf-8")).hexdigest()[:8]
+    return os.path.join(base or OUTBASE, re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:60] + "_" + tag)
+
+
+def pick_report(out, since):
+    """The FRAN report THIS run exported: non-empty, written at or after `since` (a re-run leaves the
+    older exports in the folder). The largest when one export wrote several."""
+    reps = [p for p in glob.glob(os.path.join(out, "**", "*Report_FRAN*.tsv"), recursive=True)
+            if os.path.getsize(p) > 0 and os.path.getmtime(p) >= since - 5]
+    return max(reps, key=os.path.getsize) if reps else None
+
+
+def find_known_elsewhere(sne, rows):
+    """A search FRAN already holds for this experiment under ANOTHER path, or None.
+    rows: (id, output_dir, search_name) of the Spectronaut searches. The same .sne sits on several
+    drives (B: project folders, S:\\sne_storage, the share); FRAN records the one it was ingested
+    from. Same rule as find_missed_sne's SAME_NAME: the .sne name against each search's output_dir
+    name and search_name, export timestamps ignored."""
+    from find_uningested import name_keys, norm_path
+    want = name_keys(sne_stem(sne))
+    me = norm_path(sne)
+    for sid, od, nm in rows:
+        if od and norm_path(od) == me:
+            continue
+        keys = set(name_keys(nm)) if nm else set()
+        if od:
+            parts = norm_path(od).rsplit("/", 2)
+            keys |= name_keys(parts[-1])
+            if parts[-1] == ".sne" and len(parts) > 1:
+                keys |= name_keys(parts[-2])
+        if want & keys:
+            return sid, od, nm
+    return None
 
 
 def flinders_report_dir(sne, reports_root=None):
@@ -79,7 +123,10 @@ def flinders_has_report(sne, reports_root=None):
     top = flinders_report_dir(sne, reports_root)
     if not os.path.isdir(top):
         return False
-    dirs = [top] + [os.path.join(top, e) for e in os.listdir(top) if os.path.isdir(os.path.join(top, e))]
+    try:
+        dirs = [top] + [os.path.join(top, e) for e in os.listdir(top) if os.path.isdir(os.path.join(top, e))]
+    except OSError:
+        return False
     for d in dirs:
         try:
             for fn in os.listdir(d):
@@ -127,9 +174,11 @@ def main():
     ap.add_argument("--batch-size", type=int, default=0)
     ap.add_argument("--no-flinders-copy", action="store_true",
                     help="do not archive the report on Flinders (the search then gets no spectrum lane)")
+    ap.add_argument("--force-ingest", action="store_true",
+                    help="ingest even though FRAN holds a search with this experiment's name from another path")
     a = ap.parse_args()
     sne, name = a.sne, a.name
-    out = os.path.join(OUTBASE, re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:70]); os.makedirs(out, exist_ok=True)
+    out = export_dir(name, sne); os.makedirs(out, exist_ok=True)
     xd = a.xic_dir
     if not xd:
         cand = [d for d in glob.glob(os.path.join(os.path.dirname(sne), "*_XIC-DBs")) if glob.glob(os.path.join(d, "*.xic.db"))]
@@ -137,6 +186,9 @@ def main():
     ndb = len(glob.glob(os.path.join(xd, "*.xic.db"))) if xd else 0
     log(f"=== {name} === sne={sne} xic-dir={xd} ({ndb} dbs)")
     archive = not a.no_flinders_copy
+    if name != sne_stem(sne):
+        log(f"note: --name differs from the .sne name ({sne_stem(sne)!r}); the report is archived "
+            f"under the .sne name, which is what Hive matches on")
     if archive and not os.path.isdir(REPORTS):
         log(f"NO report archive at {REPORTS} -> abort (is the Flinders share mapped? "
             f"--no-flinders-copy skips the archive, and the spectrum lane with it)"); sys.exit(5)
@@ -155,14 +207,27 @@ def main():
         archived = (not archive) or flinders_has_report(sne)
         if archived and ((not xd) or xic_present):
             log(f"SKIP (already ingested{' + XIC' if xic_present else ''}, report on Flinders): {name}"); return
+        ingest = False        # the search row is there: never delete and re-insert it for an export
         if (not xd) or xic_present:
             # Ingested, but its report never reached Flinders: export and archive only.
-            ingest = False; xd = None
+            xd = None
             log("already ingested, but NO report on Flinders -> export + archive only (no re-ingest)")
         else:
-            log("report already ingested; XIC missing -> will redo export+XIC")
+            log("report already ingested; XIC missing -> export + XIC only (no re-ingest)")
     else:
+        c.execute("SELECT id, output_dir, search_name FROM delimp_searches "
+                  "WHERE search_engine='spectronaut' AND n_precursors_total>0")
+        other = None if a.force_ingest else find_known_elsewhere(sne, c.fetchall())
         con.close()
+        if other:
+            # The same experiment, ingested from another drive or folder. Ingesting it again from
+            # here would store it twice. Its report is archived by the .sne NAME, which is the same.
+            if (not archive) or flinders_has_report(sne):
+                log(f"SKIP: FRAN already holds this experiment as search {other[0]} from {other[1]} "
+                    f"(--force-ingest if it really is a different search)"); return
+            ingest = False; xd = None
+            log(f"FRAN already holds this experiment as search {other[0]} from {other[1]}, with NO "
+                f"report on Flinders -> export + archive only (--force-ingest to ingest it anyway)")
 
     # 1) export FRAN report (v21) as TSV. NOT --writeParquet: manageSNE's parquet writer HANGS at
     # "Generating Experiment Report" on some .sne (leaves a ~27KB stub, never returns). TSV is
@@ -175,11 +240,10 @@ def main():
                             timeout=2400).returncode
     except subprocess.TimeoutExpired:
         log("manageSNE TIMEOUT (>40min) -> abort this .sne (hung export)"); sys.exit(1)
-    reps = [p for p in glob.glob(os.path.join(out, "**", "*Report_FRAN*.tsv"), recursive=True) if os.path.getsize(p) > 0]
-    log(f"step 1 rc={rc} in {int(time.time()-t0)}s; FRAN report(s)={len(reps)}")
-    if not reps:
-        log("NO FRAN report -> abort (see manageSNE.log)"); sys.exit(1)
-    rep = max(reps, key=os.path.getsize)
+    rep = pick_report(out, t0)
+    log(f"step 1 rc={rc} in {int(time.time()-t0)}s; FRAN report={'yes' if rep else 'NONE'}")
+    if not rep:
+        log("NO FRAN report from this export -> abort (see manageSNE.log)"); sys.exit(1)
 
     # 2) ingest report (raw-metadata auto-populates via corpus_ingest go-forward wiring)
     if ingest:
@@ -213,7 +277,9 @@ def main():
     c.execute("SELECT id, n_precursors_total FROM delimp_searches WHERE output_dir=%s ORDER BY ingested_at DESC LIMIT 1", (sne,))
     row = c.fetchone(); con.close()
     if not row:
-        log("no search row after ingest -> abort XIC"); sys.exit(3)
+        # corpus_ingest's duplicate guard exits 0 without writing when another output_dir already
+        # holds the same raw files and precursor count: there is no row under this path.
+        log("no search row under this .sne after ingest (see ingest.log: duplicate guard?) -> abort XIC"); sys.exit(3)
     sid, nprec = row
     log(f"search_id={sid} n_precursors={nprec}")
     xargs = [sys.executable, os.path.join(FRAN, "sne_xic_ingest.py"), "--report", rep, "--xic-dir", xd, "--search-id", sid, "--pg"]

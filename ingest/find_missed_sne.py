@@ -125,7 +125,8 @@ def _drive_rank(path):
 
 def has_xic_dbs(sne_path, listdir=os.listdir, isdir=os.path.isdir):
     """True when an <anything>_XIC-DBs folder sits beside the .sne (sne_one.py ingests it)."""
-    parent = os.path.dirname(sne_path.rstrip("\\/"))
+    p = sne_path.rstrip("\\/")
+    parent = p[:max(p.rfind("\\"), p.rfind("/"))]      # either separator: tests run on POSIX
     try:
         return any(e.lower().endswith("_xic-dbs") and isdir(os.path.join(parent, e))
                    for e in listdir(parent))
@@ -162,8 +163,11 @@ def classify(items, paths, names, bases, now=None, min_age_hours=2.0):
 
 
 def command_for(it, script="sne_one.py"):
-    """The sne_one.py line for one experiment. Double quotes inside a name cannot occur on Windows."""
-    return f'py "{script}" --sne "{it["path"]}" --name "{it["stem"]}"'
+    """The sne_one.py line for one experiment, for a .cmd file. A double quote cannot occur in a
+    Windows file name; a percent sign can, and cmd expands it even inside quotes, so it is doubled.
+    --name=... so a name that starts with a dash is not read as an option."""
+    q = lambda s: str(s).replace("%", "%%")   # noqa: E731
+    return f'py "{q(script)}" --sne "{q(it["path"])}" --name="{q(it["stem"])}"'
 
 
 def write_outputs(items, out_dir, host, day, script="sne_one.py"):
@@ -179,7 +183,7 @@ def write_outputs(items, out_dir, host, day, script="sne_one.py"):
                         time.strftime("%Y-%m-%d %H:%M", time.localtime(it["mtime"])) if it["mtime"] else "",
                         it["n_copies"], "yes" if it.get("xic") else "no", it["matched_by"]])
     with open(cmd, "w", encoding="utf-8", newline="\r\n") as fh:
-        fh.write("@echo off\nrem One line per experiment FRAN has never ingested. Review, then run.\n")
+        fh.write("@echo off\nchcp 65001 >nul\nrem One line per experiment FRAN has never ingested. Review, then run.\n")
         for it in items:
             if it["status"] == "MISSED":
                 fh.write(command_for(it, script) + "\n")
