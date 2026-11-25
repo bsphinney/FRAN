@@ -515,10 +515,21 @@ def report_run_set(report):
     return run_set(t[cols["run"]].dropna().unique())
 
 
+def link_claims(searches, registry, strict=False):
+    claims = {}
+    for s in searches:
+        for nm in s["names"]:
+            p = os.path.join(LANCE, _safe(_strip_ts(nm)) + ".lance")
+            reg = registry.get(p)
+            if reg is not None and reg[1] is None and counts_match(reg[2], s["corpus_n"], strict):
+                claims.setdefault(p, [])
+                if s["sid"] not in claims[p]:
+                    claims[p].append(s["sid"])
+    return claims
+
+
 def plan(conn, a, jid):
     searches, registry = gather(conn)
-    if getattr(a, "only_sids", None):
-        searches = [s for s in searches if s["sid"] in set(a.only_sids)]
     fill_corpus_counts(conn, searches)
     state = load_state()
     if a.apply:
@@ -540,16 +551,12 @@ def plan(conn, a, jid):
                             corpus_runs=corpus_runs(conn, sid), pending=True,
                             est_gb=round(dir_bytes(pr["lance_path"]) / 1e9 * 10.0 + 1.0, 1)))
     searches = [s for s in searches if s["sid"] not in {j["sid"] for j in pending}]
-    # which un-laned searches fit each unlinked registry row (name + count): >1 means ambiguous
-    claims = {}
-    for s in searches:
-        for nm in s["names"]:
-            p = os.path.join(LANCE, _safe(_strip_ts(nm)) + ".lance")
-            reg = registry.get(p)
-            if reg is not None and reg[1] is None and counts_match(reg[2], s["corpus_n"], a.strict):
-                claims.setdefault(p, [])
-                if s["sid"] not in claims[p]:
-                    claims[p].append(s["sid"])
+    # which un-laned searches fit each unlinked registry row (name + count): >1 means ambiguous.
+    # Computed over ALL un-laned searches, before any --only-sids narrowing, or a trial would "link"
+    # a row the full run treats as ambiguous.
+    claims = link_claims(searches, registry, a.strict)
+    if getattr(a, "only_sids", None):
+        searches = [s for s in searches if s["sid"] in set(a.only_sids)]
     jobs, skipped = list(pending), []
     n_preflight_refused = 0
     for s in searches:

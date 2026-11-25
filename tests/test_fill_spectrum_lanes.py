@@ -326,6 +326,16 @@ class PathSafety(unittest.TestCase):
         self.assertEqual(skip["reason"], "ambiguous_link")
 
 
+class TrialNarrowing(unittest.TestCase):
+    def test_claims_are_over_all_unlaned_searches_so_a_trial_cannot_resolve_an_ambiguity(self):
+        reg = {f"{L}/X.lance": (7, None, 1000)}
+        both = [S("a", "X"), S("b", "X")]
+        self.assertEqual(sorted(F.link_claims(both, reg)[f"{L}/X.lance"]), ["a", "b"])
+        # planning only "a" (a trial) with claims from the full list still sees the ambiguity
+        job, skip = F.decide(S("a", "X"), [], reg, {}, set(), {}, claims=F.link_claims(both, reg))
+        self.assertEqual(skip["reason"], "ambiguous_link")
+
+
 class Registration(unittest.TestCase):
     """Item 3: the fill's own conditional upsert, and zero rows is a failure."""
     class Cur:
