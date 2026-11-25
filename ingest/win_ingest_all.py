@@ -249,7 +249,7 @@ def main():
             return subprocess.run([sys.executable, sne_one, "--sne", it["path"], f"--name={it['stem']}",
                                    "--backfill-only", *opts]).returncode
         back_results, stop = run_all(back, backfill_one, first_failure_stops=not results)
-        nb = sum(1 for r in back_results if r["rc"] == 0)
+        nb = sum(1 for r in back_results if r["rc"] in (0, 8))      # 8 = not in FRAN: nothing to backfill
         log(f"=== step 4 {'STOPPED: ' + stop if stop else 'finished'}: {nb} ok, {len(back_results) - nb} failed, "
             f"{len(back) - len(back_results)} not attempted ===")
     n_ok = sum(1 for r in results if r["rc"] == 0)
@@ -261,7 +261,7 @@ def main():
     write_status(state="stopped" if stop else "finished", stop_reason=stop, counts=counts, list=tsv,
                  n_total=len(todo), n_done=len(results), n_ok=n_ok, n_failed=len(failed), failed=failed,
                  backfill_total=len(back), backfill_done=len(back_results),
-                 backfill_failed=[r for r in back_results if r["rc"] != 0])
+                 backfill_failed=[r for r in back_results if r["rc"] not in (0, 8)])
     return 0 if not stop and not failed and all(r["rc"] in (0, 8) for r in back_results) else 2
 
 

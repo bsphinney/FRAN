@@ -183,6 +183,25 @@ def export_timeout_min(gb, override=0):
     return min(12 * 60.0, 40.0 + 30.0 * max(gb, 0.0))
 
 
+EXPORT_OK = "EXPORT_OK.txt"
+
+
+def leftover_xics(out):
+    """A COMPLETE XIC export still on C: from an earlier run whose copy to Flinders failed (the
+    newest xics_* folder holding EXPORT_OK.txt and at least one db), or None."""
+    try:
+        dirs = sorted((os.path.join(out, e) for e in os.listdir(out) if e.startswith("xics_")), reverse=True)
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            if os.path.isfile(os.path.join(d, EXPORT_OK)) and any(is_xic_db(f) for f in os.listdir(d)):
+                return d
+        except OSError:
+            pass
+    return None
+
+
 def kill_tree(proc):
     """Stop the export AND anything it started. On Windows Popen.kill() ends only the one process;
     a worker left running keeps writing to C: and keeps its files locked against the clean-up."""
@@ -368,6 +387,8 @@ def main():
     log(f"=== {name} === sne={sne} xic-dir={xd} ({ndb} dbs)")
     archive = not a.no_flinders_copy
     xsrc = xd                       # where the XIC dbs are; xd is cleared below when the PG step is skipped
+    if a.backfill_only:
+        xd = None                   # backfill writes nothing to the database, the XIC table included
     xic_archive = archive and not a.no_xic_archive
 
     def archive_xics(dest_report):
@@ -470,6 +491,17 @@ def main():
     limit_min = export_timeout_min(sne_gb(sne), a.export_timeout_min)
     # XICs: when no _XIC-DBs folder sits beside the .sne, ask Spectronaut for them in the same export.
     # --setXICExportDirectory is a GLOBAL option and must come BEFORE the command (manual, Table 13).
+    # An earlier run exported the XICs but could not copy them to Flinders: copy them now, instead
+    # of asking Spectronaut for hours to write them again.
+    left = leftover_xics(out) if (need_x and not xsrc and archive and not ingest) else None
+    dest = flinders_report_path(sne) if left else None
+    if left and dest:
+        xsrc = left
+        ok = archive_xics(dest)
+        if ok and not a.keep_local:
+            remove_local_export(out)
+        log(f"DONE (XIC dbs from an earlier export {'archived' if ok else 'still NOT archived'}): {name}")
+        sys.exit(0 if ok else 4)
     os.makedirs(out, exist_ok=True)
     # Anything already in this experiment's export folder is left over from a failed run and is
     # about to be exported again: remove it first, or failed experiments pile up on C:.
@@ -532,6 +564,8 @@ def main():
             + ("" if got else " (none: was the .sne saved WITH ion traces?)"))
         if got:
             xsrc = xexp
+            with open(os.path.join(xexp, EXPORT_OK), "w") as fh:     # the export ran to its end
+                fh.write(f"{len(got)} files\n")
         elif rep and archive:
             note_no_xic("Spectronaut wrote no XIC dbs for this experiment")
     log(f"step 1 rc={rc} in {int(time.time()-t0)}s; FRAN report={'yes' if rep else 'NONE'}")
@@ -561,12 +595,16 @@ def main():
         if archived_ok and not a.keep_local:
             log(f"local export removed ({remove_local_export(out):.1f} GB freed on C:; logs kept in {out})")
 
+    # An experiment FRAN already holds, exported again only for its XICs: its report is on Flinders
+    # already. A second copy would give Hive's lane job two reports to choose between.
+    existing = flinders_report_path(sne) if (archive and not ingest) else None
     if archive:
         t0 = time.time()
         try:
-            dst = copy_report_to_flinders(rep, sne)
+            dst = existing or copy_report_to_flinders(rep, sne)
             archived_ok = True
-            log(f"step 3: report archived on Flinders in {int(time.time()-t0)}s -> {dst}")
+            log(f"step 3: report {'already' if existing else 'archived'} on Flinders "
+                f"({int(time.time()-t0)}s) -> {dst}")
             if not archive_xics(dst):
                 archive_failed = True
                 archived_ok = False          # keep the local export: it may hold the only XIC dbs
