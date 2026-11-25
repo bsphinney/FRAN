@@ -18,4 +18,4 @@ set -uo pipefail
 LIST="${1:?usage: sbatch diann_full_report.sbatch todo.jsonl}"
 ING="${FRAN_INGEST_DIR:-/quobyte/proteomics-grp/brett/glendon/fran_ingest}"
 PY="${FRAN_PY:-/quobyte/proteomics-grp/brett/envs/alphadia2/bin/python}"
-"$PY" -u "$ING/diann_full_output.py" regen --list "$LIST" --shard "${SLURM_ARRAY_TASK_ID}/8"
+"$PY" -u "$ING/diann_full_output.py" regen --list "$LIST" --shard "${SLURM_ARRAY_TASK_ID}/8" ${FRAN_REGEN_ARGS:-}
