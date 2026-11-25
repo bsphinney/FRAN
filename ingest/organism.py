@@ -82,23 +82,41 @@ def canonical_organism(name) -> str | None:
 _CONTAM_ACC = re.compile(r"^\s*(?:Cont_|CON__|cRAP[-_]?\d)", re.I)
 
 
-def contaminant_class(protein_group) -> str | None:
-    """Three-state membership of a ';'-joined protein group in the contaminant library.
+# The flag the corpus carried before the 2026-11 audit (corpus_ingest.ingest, the ONE writer for both
+# the DIA-NN and the Spectronaut path, origin/main corpus_ingest.py:1026): a case-insensitive search
+# of str(protein_group) + str(gene) -- the two joined with nothing between, None rendered as "None".
+# It matched keratins and the like by NAME, whatever database they came from. Kept only to name the
+# 'suspected' class; it never overrides an accession-prefix verdict.
+_OLD_NAME_RULE = re.compile(r"KRT|keratin|cont_|contaminant", re.I)
+
+
+def contaminant_class(protein_group, gene=None) -> str | None:
+    """Membership of a ';'-joined protein group in the contaminant library, four states.
 
     'contaminant' every accession has a contaminant prefix (Cont_ / CON__ / cRAP)
     'mixed'       some do, some do not: the search database also explains the group, so it is
                   counted as a SAMPLE protein by default, but the fact is kept
-    'sample'      none do
-    None          no accession at all (None, "", ";", whitespace): no class is claimed
+    'suspected'   none do, but the OLD name rule matches protein_group + gene (e.g. KRT1 under a
+                  plain UniProt accession). Kept flagged as before: is_contaminant stays TRUE
+    'sample'      none do, and the old name rule does not match
+    None          no accession at all (None, "", ";", whitespace) and no name match
+    `gene` is the stored gene string (None when absent); it only matters for 'suspected'.
     Accessions are split on ';' and stripped; empty parts are ignored.
     """
-    if protein_group is None:
-        return None
-    accs = [a for a in str(protein_group).split(";") if a.strip()]
-    if not accs:
-        return None
+    accs = [] if protein_group is None else [a for a in str(protein_group).split(";") if a.strip()]
     n = sum(1 for a in accs if _CONTAM_ACC.match(a))
-    return "contaminant" if n == len(accs) else "mixed" if n else "sample"
+    if accs and n == len(accs):
+        return "contaminant"
+    if n:
+        return "mixed"
+    if _OLD_NAME_RULE.search(str(protein_group) + str(gene)):
+        return "suspected"
+    return "sample" if accs else None
+
+
+def is_contaminant_flag(protein_group, gene=None) -> bool:
+    """The stored delimp_proteins.is_contaminant: class 'contaminant' or 'suspected'."""
+    return contaminant_class(protein_group, gene) in ("contaminant", "suspected")
 
 
 def is_contaminant_group(protein_group) -> bool:
@@ -109,7 +127,7 @@ def is_contaminant_group(protein_group) -> bool:
     """
     if protein_group is None:
         return False
-    return contaminant_class(protein_group) == "contaminant"
+    return contaminant_class(protein_group) == "contaminant"   # prefix-only: gene never consulted
 
 
 def vote_organism(pairs) -> dict:

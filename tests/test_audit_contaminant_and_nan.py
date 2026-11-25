@@ -41,19 +41,19 @@ def _recs():
     ]
 
 
-def test_sample_keratins_are_not_contaminants():
+def test_sample_keratins_are_not_library_contaminants():
     org = _load("organism")
     for g in ("P05784", "P11679", "P19001"):           # KRT18, KRT8, KRT19 by accession
-        assert not org.is_contaminant_group(g)
+        assert not org.is_contaminant_group(g)         # prefix-only: organism voting is unchanged
 
 
-def test_contaminant_is_membership_not_name():
+def test_contaminant_flag_is_prefix_then_old_name_rule():
     ci = _load("corpus_ingest")
     src = open(os.path.join(_INGEST, "corpus_ingest.py"), encoding="utf-8").read()
-    assert "KRT|keratin|cont_|contaminant" not in src, "the name regex is back"
+    assert "KRT|keratin|cont_|contaminant" not in src, "the name regex belongs in organism.py only"
     prot = ci._aggregate_proteins(_recs())
-    flags = {k[1]: ci.is_contaminant_group(k[1]) for k in prot}
-    assert flags["P05784"] is False and flags["P11679"] is False
+    flags = {k[1]: ci.is_contaminant_flag(k[1], a["gene"]) for k, a in prot.items()}
+    assert flags["P05784"] is True and flags["P11679"] is True   # 'suspected': KRT by name, no library accession
     assert flags["Cont_P02769"] is True
     assert flags["Cont_P02768;P02768"] is False        # mixed group: the sample database also explains it
 
@@ -93,7 +93,7 @@ def test_spectronaut_missing_text_is_null_not_nan():
     assert [r["gene"] for r in out] == ["KRT18", None, None]
 
 
-def test_contaminant_class_three_states():
+def test_contaminant_class_four_states():
     org = _load("organism")
     cc = org.contaminant_class
     assert cc("Cont_P02769") == "contaminant"
@@ -108,13 +108,29 @@ def test_contaminant_class_three_states():
     assert cc("Cont_A;;Cont_B;") == "contaminant"
     assert cc(" P05784 ; Cont_P02769") == "mixed"
     assert cc("cont_p02769") == "contaminant"
-    for empty in (None, "", ";", " ; ", float("nan") if False else "  "):
+    for empty in (None, "", ";", " ; ", "  "):
         assert cc(empty) is None
 
 
-def test_is_contaminant_equals_class_contaminant():
+def test_suspected_is_the_old_name_rule_without_a_library_accession():
     org = _load("organism")
-    for g in ("Cont_A", "Cont_A;B", "B;Cont_A", "B", "", None, ";", "Cont_A;Cont_B", "cRAP001;X"):
+    cc, flag = org.contaminant_class, org.is_contaminant_flag
+    assert cc("P04264", "KRT1") == "suspected" and flag("P04264", "KRT1")
+    assert cc("P04264", "krt6b") == "suspected"                 # case-insensitive, as the old regex
+    assert cc("P1", "Keratin-like") == "suspected"
+    assert cc("Q9XYZ_contaminant", None) == "suspected"         # protein_group is searched too
+    assert cc("P1", "ALB") == "sample" and not flag("P1", "ALB")
+    assert cc("P1", None) == "sample"                           # None renders as "None": no match
+    assert cc("KR", "T1") == "suspected"                        # joined with nothing between, as before
+    # the library prefix always wins over the name
+    assert cc("Cont_P04264", "KRT1") == "contaminant"
+    assert cc("P04264;Cont_P04264", "KRT1") == "mixed" and not flag("P04264;Cont_P04264", "KRT1")
+    assert cc("", "KRT1") == "suspected" and cc("", None) is None
+
+
+def test_is_contaminant_group_stays_prefix_only():
+    org = _load("organism")
+    for g in ("Cont_A", "Cont_A;B", "B;Cont_A", "B", "", None, ";", "Cont_A;Cont_B", "cRAP001;X", "P04264;KRT1"):
         assert org.is_contaminant_group(g) == (org.contaminant_class(g) == "contaminant")
 
 

@@ -3,9 +3,11 @@
 OLD rule (corpus_ingest, until 2026-11): a NAME regex over protein_group + gene
 (KRT|keratin|cont_|contaminant). It flagged the sample's own cytokeratins and disagreed with the
 database a protein came from.
-NEW rule (organism.is_contaminant_group): a protein group is a contaminant only when EVERY
-accession in it carries a contaminant-library prefix (Cont_ / CON__ / cRAP). A group that mixes a
-Cont_ accession with a real one is NOT a contaminant: the sample database explains it too.
+NEW rule (organism.contaminant_class / is_contaminant_flag), four classes by accession prefix
+(Cont_ / CON__ / cRAP): 'contaminant' = EVERY accession has it; 'mixed' = some do (the sample
+database explains the group too: flag becomes FALSE); 'suspected' = none do but the OLD name regex
+matches protein_group || gene (flag stays TRUE, so keratins under plain UniProt accessions are not
+silently turned into sample proteins); 'sample' = neither. is_contaminant = contaminant OR suspected.
 
 Where the flag is stored: delimp_proteins.is_contaminant is the only per-row copy. The materialized
 views delimp_mv_protein_agg, delimp_mv_species_proteins and delimp_mv_top_proteins aggregate it
@@ -27,23 +29,21 @@ import time
 
 from _common import base_parser, chunks, connect, all_search_ids, pick, show_examples
 
-# SQL twin of organism.is_contaminant_group: at least one non-empty accession, and none that lacks a
-# contaminant prefix. Same pattern as organism._CONTAM_ACC. Verified against the Python function
-# on real protein groups before this script was handed over (see the report).
-NEW_RULE = r"""(
-    EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x) WHERE btrim(x) <> '')
-    AND NOT EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x)
-                     WHERE btrim(x) <> '' AND x !~* '^\s*(Cont_|CON__|cRAP[-_]?\d)')
-)"""
-
-# SQL twin of organism.contaminant_class (NULL for a group with no accession).
-CLASS_RULE = r"""(CASE
-    WHEN NOT EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x) WHERE btrim(x) <> '') THEN NULL
-    WHEN NOT EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x)
-                      WHERE btrim(x) <> '' AND x !~* '^\s*(Cont_|CON__|cRAP[-_]?\d)') THEN 'contaminant'
-    WHEN EXISTS (SELECT 1 FROM unnest(string_to_array(p.protein_group, ';')) AS a(x)
-                  WHERE btrim(x) <> '' AND x ~* '^\s*(Cont_|CON__|cRAP[-_]?\d)') THEN 'mixed'
+# SQL twins of organism.contaminant_class(protein_group, gene) / is_contaminant_flag. The old name
+# rule is str(protein_group) + str(gene) (None -> "None"); protein_group is NOT NULL here.
+_HAS = r"x ~* '^\s*(Cont_|CON__|cRAP[-_]?\d)'"
+_NAME = r"(p.protein_group || coalesce(p.gene, 'None')) ~* 'KRT|keratin|cont_|contaminant'"
+_ACC = "unnest(string_to_array(p.protein_group, ';')) AS a(x)"
+CLASS_RULE = rf"""(CASE
+    WHEN NOT EXISTS (SELECT 1 FROM {_ACC} WHERE btrim(x) <> '')
+         THEN (CASE WHEN {_NAME} THEN 'suspected' END)
+    WHEN NOT EXISTS (SELECT 1 FROM {_ACC} WHERE btrim(x) <> '' AND NOT ({_HAS})) THEN 'contaminant'
+    WHEN EXISTS (SELECT 1 FROM {_ACC} WHERE btrim(x) <> '' AND {_HAS}) THEN 'mixed'
+    WHEN {_NAME} THEN 'suspected'
     ELSE 'sample' END)"""
+
+# is_contaminant = class IN ('contaminant', 'suspected')
+NEW_RULE = f"(coalesce({CLASS_RULE} IN ('contaminant', 'suspected'), false))"
 
 
 def _update(conn, cur, batch, have_cc, only_flag, retries=4):
@@ -110,17 +110,21 @@ def main():
     use, estimate = pick(ids, a.sample)
     classes: dict = {}
     cc_fill = 0                              # rows whose contaminant_class would be (re)written (all batches)
-    tot_rows = to_true = to_false = flip_mixed = flip_none = 0
-    examples_t, examples_f = [], []
+    tot_rows = to_true = to_false = flip_mixed = flip_other = 0
+    kept_suspected = unexplained = 0         # flagged today, no contaminant accession: kept as 'suspected' / NOT matched by the old rule
+    examples_t, examples_f, examples_u = [], [], []
     for batch in chunks(use, a.batch):
         cur.execute(f"""SELECT count(*),
                                count(*) FILTER (WHERE NOT p.is_contaminant AND {NEW_RULE}),
                                count(*) FILTER (WHERE p.is_contaminant AND NOT {NEW_RULE}),
                                count(*) FILTER (WHERE p.is_contaminant AND {CLASS_RULE} = 'mixed'),
-                               count(*) FILTER (WHERE p.is_contaminant AND {CLASS_RULE} = 'sample')
+                               count(*) FILTER (WHERE p.is_contaminant AND NOT {NEW_RULE} AND {CLASS_RULE} IS DISTINCT FROM 'mixed'),
+                               count(*) FILTER (WHERE p.is_contaminant AND {CLASS_RULE} = 'suspected'),
+                               count(*) FILTER (WHERE p.is_contaminant AND {CLASS_RULE} IS NOT DISTINCT FROM 'sample')
                           FROM delimp_proteins p WHERE p.search_id = ANY(%s::uuid[])""", (batch,))
-        n, t, f, fm, fn = cur.fetchone()
-        tot_rows += n; to_true += t; to_false += f; flip_mixed += fm; flip_none += fn
+        n, t, f, fm, fo, ks, un = cur.fetchone()
+        tot_rows += n; to_true += t; to_false += f; flip_mixed += fm; flip_other += fo
+        kept_suspected += ks; unexplained += un
         cur.execute(f"SELECT {CLASS_RULE} AS k, count(*) FROM delimp_proteins p "
                     f"WHERE p.search_id = ANY(%s::uuid[]) GROUP BY 1", (batch,))
         for k, cnt in cur.fetchall():
@@ -133,6 +137,11 @@ def main():
             cur.execute(f"""SELECT p.search_id, p.protein_group, p.gene FROM delimp_proteins p
                              WHERE p.search_id = ANY(%s::uuid[]) AND NOT p.is_contaminant AND {NEW_RULE} LIMIT 3""", (batch,))
             examples_t += [f"False -> True  {r}" for r in cur.fetchall()]
+        if len(examples_u) < 10 and un:
+            cur.execute(f"""SELECT p.protein_group, p.gene FROM delimp_proteins p
+                             WHERE p.search_id = ANY(%s::uuid[]) AND p.is_contaminant
+                               AND {CLASS_RULE} IS NOT DISTINCT FROM 'sample' LIMIT %s""", (batch, 10 - len(examples_u)))
+            examples_u += [f"unexplained  {r}" for r in cur.fetchall()]
         if len(examples_f) < 3 and f:
             cur.execute(f"""SELECT p.search_id, p.protein_group, p.gene FROM delimp_proteins p
                              WHERE p.search_id = ANY(%s::uuid[]) AND p.is_contaminant AND NOT {NEW_RULE} LIMIT 3""", (batch,))
@@ -144,8 +153,11 @@ def main():
     print(f"  protein rows examined: {tot_rows:,}")
     print(f"  would flip False -> True : {to_true:,}")
     print(f"  would flip True  -> False: {to_false:,}")
-    print(f"     of the True->False flips: mixed group (has a Cont_ accession AND a real one): {flip_mixed:,}; "
-          f"no contaminant accession at all (old name pattern only): {flip_none:,}")
+    print(f"     of the True->False flips: 'mixed' (a contaminant accession AND a real one): {flip_mixed:,}; "
+          f"anything else: {flip_other:,}")
+    print(f"  flagged today, no contaminant accession, kept TRUE as 'suspected' (old name rule matches): {kept_suspected:,}")
+    print(f"  flagged today, no contaminant accession, NOT matched by the reconstructed old rule "
+          f"(UNEXPLAINED; would flip to False): {unexplained:,}")
     if tot_rows:
         print(f"  changed fraction of rows : {(to_true + to_false) / tot_rows:.2%}")
     cur.execute("SELECT reltuples::bigint FROM pg_class WHERE relname = 'delimp_proteins'")
@@ -153,10 +165,10 @@ def main():
     if estimate and tot_rows:
         scale = total_est / tot_rows
         print(f"  ESTIMATE over ~{total_est:,} protein rows (sample fraction scaled by reltuples): "
-              f"True->False ~{int(to_false * scale):,} (mixed ~{int(flip_mixed * scale):,}, name-only ~{int(flip_none * scale):,}), "
+              f"True->False ~{int(to_false * scale):,} (mixed ~{int(flip_mixed * scale):,}, other ~{int(flip_other * scale):,}), "
               f"False->True ~{int(to_true * scale):,}")
     print("  rows per contaminant_class (sample" + ("; ESTIMATE below" if estimate else "") + "):")
-    for k in ("contaminant", "mixed", "sample", None):
+    for k in ("contaminant", "mixed", "suspected", "sample", None):
         v = classes.get(k, 0)
         print(f"    {str(k):12s} {v:>12,}" + (f"   ~{int(v * (total_est / tot_rows)):,} of ~{total_est:,}"
                                              if estimate and tot_rows else ""))
@@ -164,6 +176,7 @@ def main():
           + (f"; rows whose class would be written (full run): {cc_fill:,}" if have_cc
              else " (migration 2026-11-24_proteins_contaminant_class.sql not applied; class is only counted)"))
     show_examples("flag would become False", examples_f)
+    show_examples("UNEXPLAINED (flagged, no contaminant accession, old name rule does not match)", examples_u, 10)
     show_examples("flag would become True", examples_t)
     print("  after --apply: refresh delimp_mv_protein_agg, delimp_mv_species_proteins, delimp_mv_top_proteins")
     conn.close()

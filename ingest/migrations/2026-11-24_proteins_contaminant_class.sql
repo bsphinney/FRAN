@@ -1,8 +1,8 @@
 -- MANUAL MIGRATION (not for ingest/migrate_diann_columns.py: it also adds a CHECK and a comment).
--- Keep the mixed case: delimp_proteins.contaminant_class = 'contaminant' | 'mixed' | 'sample'.
+-- Keep the mixed case: delimp_proteins.contaminant_class = 'contaminant' | 'mixed' | 'suspected' | 'sample'.
 --
 -- WHY. is_contaminant is now "every accession of the group comes from the contaminant library"
--- (organism.is_contaminant_group). A group such as 'A0A0G2JV65;Cont_P63103;P63102' contains a
+-- (organism.is_contaminant_flag: contaminant OR suspected). A group such as 'A0A0G2JV65;Cont_P63103;P63102' contains a
 -- contaminant accession AND a real one; as a boolean that fact is lost. This stores it.
 --
 -- NOT applied by the app or the ingest. The OWNER runs it once, as the table owner (`delimp`).
@@ -27,15 +27,17 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'delimp_proteins_contaminant_class_check') THEN
         ALTER TABLE delimp_proteins ADD CONSTRAINT delimp_proteins_contaminant_class_check
-            CHECK (contaminant_class IN ('contaminant', 'mixed', 'sample')) NOT VALID;
+            CHECK (contaminant_class IN ('contaminant', 'mixed', 'suspected', 'sample')) NOT VALID;
     END IF;
 END $$;
 
 COMMENT ON COLUMN delimp_proteins.contaminant_class IS
   'Membership of the protein group in the contaminant library (accession prefix Cont_ / CON__ / cRAP). '
   '''contaminant'' = EVERY accession is from the contaminant library; ''mixed'' = some are (the search '
-  'database also explains the group); ''sample'' = none are. NULL = not yet computed (rows ingested '
-  'before 2026-11-24 until the repair runs). is_contaminant is exactly (contaminant_class = ''contaminant''), '
+  'database also explains the group); ''suspected'' = none are, but the legacy name rule matches '
+  '(KRT / keratin / cont_ / contaminant in protein_group or gene), e.g. KRT1 under a plain UniProt accession; '
+  '''sample'' = none are and no name match. NULL = not yet computed (rows ingested before 2026-11-24 '
+  'until the repair runs). is_contaminant = (contaminant_class IN (''contaminant'', ''suspected'')), '
   'so mixed groups are counted as SAMPLE proteins by default; filter on this column to treat them differently.';
 
 RESET lock_timeout;

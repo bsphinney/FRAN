@@ -30,7 +30,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from versions import CORPUS_INGEST_VERSION, SCHEMA_VERSION  # noqa: E402
-from organism import is_contaminant_group, contaminant_class  # noqa: E402 -- the ONE contaminant-membership rule
+from organism import is_contaminant_group, is_contaminant_flag, contaminant_class  # noqa: E402 -- the ONE contaminant-membership rule
 
 
 def _versions():
@@ -1046,7 +1046,7 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
         if len(_prot_extra) != len(_PROTEIN_LEVEL_COLS):
             print(f"  [proteins] {len(_PROTEIN_LEVEL_COLS) - len(_prot_extra)} DIA-NN protein "
                   f"column(s) absent; run ingest/migrate_diann_columns.py --apply to record them")
-        # contaminant_class (contaminant / mixed / sample): written only once the migration
+        # contaminant_class (contaminant / mixed / suspected / sample): written only once the migration
         # 2026-11-24_proteins_contaminant_class.sql exists, so ingest works before and after it.
         cur.execute("""SELECT 1 FROM information_schema.columns
                         WHERE table_name='delimp_proteins' AND column_name='contaminant_class'""")
@@ -1058,11 +1058,12 @@ def ingest(searchdir, engine, organism_name, taxon, name, dry, output_dir=None):
             + (",contaminant_class" if _have_cc else "") + ") VALUES %s",
             [(search_id, raw_paths[k[0]], k[1], a["gene"], len(a["peps"]), a["n"],
               (a["int"] if a["has_int"] else None), (a["nint"] or None), a["pgq"],
-              # By MEMBERSHIP of the contaminant database, never by name: the old name regex
-              # flagged real human cytokeratins from the sample.
-              is_contaminant_group(k[1]), SCHEMA_VERSION,
+              # Contaminant-library accession prefix decides 'contaminant' / 'mixed'; the old name
+              # rule survives only as 'suspected' (no library accession, name matches), so
+              # is_contaminant is TRUE for 'contaminant' and 'suspected' -- see organism.py.
+              is_contaminant_flag(k[1], a["gene"]), SCHEMA_VERSION,
               *(a.get(c) for c in _prot_extra),
-              *((contaminant_class(k[1]),) if _have_cc else ()))
+              *((contaminant_class(k[1], a["gene"]),) if _have_cc else ()))
              for k, a in prot.items()], page_size=2000)
         # protein_group on each precursor = the peptide<->protein link (enables exact, fast
         # coverage + per-protein quant in the app; see FRAN_REINGEST_AUDIT.md). Included only when
