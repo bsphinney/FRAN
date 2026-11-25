@@ -497,6 +497,24 @@ def dataset_rows(path):
         return None
 
 
+def report_structure_error(report):
+    """None when a parquet report's footer is self-consistent, else why not. Metadata only (no data is
+    read): found 2026-11-24 when AV-new-DB failed with 'Unexpected end of stream' -- its footer says 128
+    columns but row groups 0 and 4 hold 127, in all 7 byte-identical exports; others say 'file only has
+    125 columns'. pyarrow cannot read such a file, so it is a source defect, not a reader bug."""
+    if not str(report).lower().endswith(".parquet"):
+        return None
+    import pyarrow.parquet as pq
+    try:
+        m = pq.ParquetFile(report).metadata
+    except Exception as e:  # noqa: BLE001
+        return f"footer unreadable: {repr(e)[:80]}"
+    bad = [i for i in range(m.num_row_groups) if m.row_group(i).num_columns != m.num_columns]
+    if bad:
+        return f"{len(bad)} of {m.num_row_groups} row groups have a column count other than the footer's {m.num_columns}"
+    return None
+
+
 def report_run_set(report):
     """Distinct normalised runs with q <= 0.01 in a PARQUET report (the same rows the lane keeps), reading
     only two columns. None for a TSV (a full scan of up to 60 GB; the child checks it before writing)."""
@@ -564,8 +582,12 @@ def plan(conn, a, jid):
         cruns = None
         if a.preflight and reports:
             cruns = set(corpus_runs(conn, s["sid"]))
-            keep = []
+            keep, corrupt = [], []
             for r in reports:
+                err = report_structure_error(r)
+                if err:
+                    corrupt.append(err)
+                    continue
                 try:
                     rs = report_run_set(r)
                 except Exception:  # noqa: BLE001 - unreadable report: the child will say why
@@ -574,8 +596,10 @@ def plan(conn, a, jid):
                     keep.append(r)
             if not keep:
                 n_preflight_refused += 1
-                skipped.append(dict(sid=s["sid"], name=s["name"], reason="identity_mismatch", report=True,
-                                    detail=f"{len(reports)} report(s) on disk, none has this search's run set",
+                skipped.append(dict(sid=s["sid"], name=s["name"], reason="corrupt_report" if corrupt else "identity_mismatch",
+                                    report=True,
+                                    detail=(f"{len(corrupt)} of {len(reports)} report(s) corrupt: {corrupt[0]}" if corrupt else
+                                            f"{len(reports)} report(s) on disk, none has this search's run set"),
                                     ingested_at=s["ingested_at"]))
                 continue
             reports = keep

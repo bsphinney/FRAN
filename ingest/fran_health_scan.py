@@ -294,7 +294,7 @@ def check_spectrum_staleness(c):
     for k in plan.get("skipped", []):
         by_reason.setdefault(k["reason"], set()).add(k["sid"])
     reexport = set().union(*(by_reason.get(r, set()) for r in
-                             ("needs_reexport", "dup_of_laned", "identity_mismatch", "no_corpus_runs",
+                             ("needs_reexport", "dup_of_laned", "identity_mismatch", "corrupt_report", "no_corpus_runs",
                               "path_occupied", "ambiguous_link")))
     red = [(i, n) for i, n in missing if i in with_report]
     amber_reexport = [x for x in missing if x[0] in reexport]
