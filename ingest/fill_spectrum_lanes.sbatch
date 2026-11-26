@@ -35,10 +35,17 @@ echo "===== fran_spectrum_lane $(date -Is) on $(hostname) job ${SLURM_JOB_ID:-} 
 "$PY" -u fill_spectrum_lanes.py --apply --preflight --max "${FRAN_SPECTRUM_MAX:-40}" --workers 4 ${FRAN_SPECTRUM_ARGS:-}
 rc=$?
 # Then the chromatogram (XIC) lane for Spectronaut searches whose XIC dbs sne_one.py archived on
-# Flinders. Its own state and its own lane folder; one lane at a time, no cap by default
-# (the XIC dbs waiting on the share are large, and are deleted as each lane is registered).
+# Flinders. ON HOLD by default: the lane format (every trace vs identified-only, compression) is
+# not settled until real exports have been measured, so this step only LISTS what is waiting.
+# FRAN_SN_XIC_BUILD=1 makes it write lanes (its own state and lane folder, one lane at a time).
+# The XIC dbs on the share are never deleted here unless FRAN_SN_XIC_FREE_DBS=1 is also set.
 echo "===== spectronaut XIC lanes $(date -Is) ====="
-"$PY" -u fill_spectronaut_xic_lanes.py --apply --max "${FRAN_SN_XIC_MAX:-0}" --budget-hours "${FRAN_SN_XIC_BUDGET_H:-8}"
+if [ "${FRAN_SN_XIC_BUILD:-0}" = "1" ]; then
+  "$PY" -u fill_spectronaut_xic_lanes.py --apply --max "${FRAN_SN_XIC_MAX:-0}" --budget-hours "${FRAN_SN_XIC_BUDGET_H:-8}"
+else
+  echo "on hold (FRAN_SN_XIC_BUILD is not 1): listing only, no lane is written"
+  "$PY" -u fill_spectronaut_xic_lanes.py
+fi
 rc2=$?
 [ "$rc" -ne 0 ] && exit "$rc"
 exit "$rc2"
